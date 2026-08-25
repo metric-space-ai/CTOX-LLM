@@ -40,7 +40,13 @@ def layer_number(name: str) -> int | None:
     return int(component) if component.isdigit() else None
 
 
-def choose_dtype(name: str, shape: list[int]) -> str:
+def choose_dtype(
+    name: str,
+    shape: list[int],
+    q_proj_q4_start: int,
+    linear_out_q4_start: int,
+    late_ffn_q4_start: int,
+) -> str:
     elements = math.prod(shape)
     if name.endswith(".A_log") or name.endswith(".dt_bias"):
         return "f32"
@@ -49,13 +55,23 @@ def choose_dtype(name: str, shape: list[int]) -> str:
     layer = layer_number(name)
     if name == "lm_head.weight":
         return "q4_b64"
-    if ".self_attn." in name:
-        return "q4_b64"
-    if name.endswith(".linear_attn.out_proj.weight"):
-        return "q4_b64"
-    if layer is not None and layer >= 59 and ".mlp." in name:
-        return "q4_b64"
     if name.startswith("mtp.") and ".self_attn." in name:
+        return "q4_b64"
+    layer = layer_number(name)
+    if ".self_attn." in name and any(
+        name.endswith(suffix)
+        for suffix in (".k_proj.weight", ".v_proj.weight", ".o_proj.weight")
+    ):
+        return "q4_b64"
+    if name.endswith(".self_attn.q_proj.weight") and layer is not None and layer >= q_proj_q4_start:
+        return "q4_b64"
+    if (
+        name.endswith(".linear_attn.out_proj.weight")
+        and layer is not None
+        and layer >= linear_out_q4_start
+    ):
+        return "q4_b64"
+    if layer is not None and layer >= late_ffn_q4_start and ".mlp." in name:
         return "q4_b64"
     return "q2_b64"
 
@@ -77,7 +93,9 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--late-ffn-q4-start", type=int, default=59)
+    parser.add_argument("--q-proj-q4-start", type=int, default=35)
+    parser.add_argument("--linear-out-q4-start", type=int, default=64)
+    parser.add_argument("--late-ffn-q4-start", type=int, default=64)
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
@@ -106,15 +124,13 @@ def main() -> None:
         if tensor_group not in {"text", "mtp"}:
             continue
         shape = shapes[name]
-        dtype = choose_dtype(name, shape)
-        # Allow sensitivity search to move the late-FFN boundary without
-        # modifying code.
-        layer = layer_number(name)
-        if layer is not None and ".mlp." in name and len(shape) == 2 and shape[-1] % BLOCK == 0:
-            if layer >= args.late_ffn_q4_start:
-                dtype = "q4_b64"
-            elif dtype == "q4_b64" and ".self_attn." not in name:
-                dtype = "q2_b64"
+        dtype = choose_dtype(
+            name,
+            shape,
+            args.q_proj_q4_start,
+            args.linear_out_q4_start,
+            args.late_ffn_q4_start,
+        )
         elements = math.prod(shape)
         size = packed_bytes(dtype, elements)
         logical_bytes = align(logical_bytes)
@@ -164,6 +180,8 @@ def main() -> None:
         "vision": "separate",
         "mtp": "resident",
         "late_ffn_q4_start": args.late_ffn_q4_start,
+        "q_proj_q4_start": args.q_proj_q4_start,
+        "linear_out_q4_start": args.linear_out_q4_start,
         "total_bytes": total_bytes,
         "gib": total_bytes / 1024**3,
         "fold_limit_bytes": FOLD_LIMIT,
