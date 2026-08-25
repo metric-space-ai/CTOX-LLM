@@ -21,8 +21,11 @@
       "required_first_profile": "sm86"
     },
     "metal": {
-      "state": "contract",
-      "production_allowed": false
+      "state": "candidate",
+      "production_allowed": false,
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec"],
+      "evidence": "METAL_KERNEL_NOTES.md",
+      "promotion_blocker": "same-device numeric verifier and benchmark"
     },
     "snapdragon": {
       "state": "contract",
