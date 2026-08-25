@@ -162,7 +162,7 @@ impl TensorEntry {
             }
             return self.dtype.expected_bytes(self.elements()?);
         }
-        if self.shape.len() != 2 || self.shape[1] % BLOCK_LEN as u64 != 0 {
+        if self.shape.len() != 2 || !self.shape[1].is_multiple_of(BLOCK_LEN as u64) {
             return Err(EngineError::Shape(format!(
                 "mixed tensor {} must be a block-aligned matrix",
                 self.name

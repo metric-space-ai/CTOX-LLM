@@ -13,6 +13,7 @@ pub mod kv_cache;
 pub mod loader;
 pub mod memory;
 pub mod quant;
+pub mod release;
 pub mod sampler;
 pub mod server;
 pub mod wire;

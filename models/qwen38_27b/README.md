@@ -98,3 +98,10 @@ Five verified batches contribute 593 unchanged final identities; the remaining
 1,735 samples require 16 token-aware batches and a projected 18.5263 GiB. The
 subtraction preserves the complete 36-domain/15-language corpus contract rather
 than selecting a coding-only or English-only cache subset.
+
+The signed, backend-neutral release and memory-admission schema is implemented
+in `src/release.rs` and documented in
+[`docs/RELEASE_MANIFEST_V2.md`](docs/RELEASE_MANIFEST_V2.md). It binds one
+logical Q2/Q4+MTP identity across differently packed CUDA, Metal, CPU, and
+Snapdragon artifacts. No final release manifest can be sealed until recovery
+and held-out qualification freeze the actual logical checkpoint.

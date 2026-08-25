@@ -275,6 +275,12 @@ Contract work in Phase 0 may proceed alongside the data pipeline, but neither
 backend tuning nor Greppy integration may invent a model identity before the
 logical checkpoint and manifest contract are frozen.
 
+The `ctox.model-release.v2` Rust schema, signed integrity envelope, chunk and
+loader contract, backend logical-equivalence verifier, and checked memory-peak
+formulas are implemented. The actual release instance, tokenizer/template
+digests, measured platform profiles, and lifecycle ABI remain open until the
+final logical checkpoint and engine exist.
+
 The immediate execution batch is:
 
 1. emit an exact final-minus-verified 1,735-record cohort and a report binding

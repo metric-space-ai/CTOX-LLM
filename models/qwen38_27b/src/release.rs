@@ -1,0 +1,789 @@
+//! Signed release and backend-pack contract for one canonical logical model.
+
+use std::collections::HashSet;
+use std::path::{Component, Path};
+
+use ed25519_dalek::{Signature, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::config::{Qwen38Config, MODEL_ID};
+use crate::{EngineError, Result};
+
+pub const RELEASE_FORMAT: &str = "ctox.model-release.v2";
+pub const ED25519_ALGORITHM: &str = "ed25519-sha256";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseManifest {
+    pub format: String,
+    pub release_id: String,
+    pub model: CanonicalModelIdentity,
+    pub tokenizer: TokenizerContract,
+    pub packages: Vec<ReleasePackage>,
+    pub memory_profiles: Vec<MemoryProfile>,
+    pub integrity: ManifestIntegrity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalModelIdentity {
+    pub model_id: String,
+    pub architecture: String,
+    pub bf16_repository: String,
+    pub bf16_revision: String,
+    pub bf16_root_sha256: String,
+    pub logical_checkpoint_sha256: String,
+    pub logical_tensor_root_sha256: String,
+    pub recovery_sha256: String,
+    pub fixed_logical_qcodes: bool,
+    pub allowed_large_matrix_types: Vec<LogicalQuantType>,
+    pub mtp: MtpIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogicalQuantType {
+    Q2B64,
+    Q4B64,
+    MixedQ2Q4B64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MtpIdentity {
+    pub resident_with_text: bool,
+    pub layers: u32,
+    pub logical_sha256: String,
+    pub every_draft_token_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenizerContract {
+    pub tokenizer_root_sha256: String,
+    pub chat_template_sha256: String,
+    pub reasoning_format: String,
+    pub tool_call_format: String,
+    pub special_tokens: Vec<SpecialToken>,
+    pub files: Vec<ReleaseFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecialToken {
+    pub name: String,
+    pub id: u32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseFile {
+    pub relative_path: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub chunks: Vec<FileChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChunk {
+    pub index: u32,
+    pub offset: u64,
+    pub length: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageKind {
+    TextMtp,
+    Vision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleasePackage {
+    pub package_id: String,
+    pub kind: PackageKind,
+    pub default_download: bool,
+    pub packs: Vec<BackendPack>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    Cpu,
+    Cuda,
+    Metal,
+    Snapdragon,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendPack {
+    pub pack_id: String,
+    pub backend: BackendKind,
+    pub hardware_profile: String,
+    pub artifact: ReleaseFile,
+    pub artifact_manifest_sha256: String,
+    pub logical_checkpoint_sha256: String,
+    pub logical_tensor_root_sha256: String,
+    pub deterministic_repack: bool,
+    pub requantized: bool,
+    pub contains_mtp: bool,
+    pub loader: LoaderContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoaderContract {
+    pub strategy: LoaderStrategy,
+    pub maximum_resident_full_model_copies: u8,
+    pub retains_full_cpu_copy: bool,
+    pub retains_full_device_copy: bool,
+    pub supports_resumable_download: bool,
+    pub supports_atomic_activation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoaderStrategy {
+    DirectMmap,
+    WindowedUpload,
+    SharedBuffer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryProfile {
+    pub profile_id: String,
+    pub pack_id: String,
+    pub context_tokens: u64,
+    pub sessions: u32,
+    pub resident_model_bytes: u64,
+    pub persistent_backend_graph_bytes: u64,
+    pub persistent_runtime_bytes: u64,
+    pub linear_state_bytes_per_session: u64,
+    pub kv: KvMemoryFormula,
+    pub prefill_scratch_peak_bytes: u64,
+    pub decode_scratch_peak_bytes: u64,
+    pub loader_transient_peak_bytes: u64,
+    pub accelerator_unattributed_reserve_bytes: u64,
+    pub hard_limit_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvMemoryFormula {
+    pub fixed_bytes_per_session: u64,
+    pub bytes_per_token_per_session: u64,
+    pub retained_q4_tokens_per_session: u64,
+    pub q4_delta_bytes_per_token: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestIntegrity {
+    pub unsigned_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<ManifestSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestSignature {
+    pub algorithm: String,
+    pub key_id: String,
+    pub signature_hex: String,
+}
+
+#[derive(Serialize)]
+struct UnsignedManifest<'a> {
+    format: &'a str,
+    release_id: &'a str,
+    model: &'a CanonicalModelIdentity,
+    tokenizer: &'a TokenizerContract,
+    packages: &'a [ReleasePackage],
+    memory_profiles: &'a [MemoryProfile],
+}
+
+impl ReleaseFile {
+    fn validate(&self) -> Result<()> {
+        let path = Path::new(&self.relative_path);
+        if self.relative_path.is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return invalid(format!("unsafe release path {}", self.relative_path));
+        }
+        if self.bytes == 0 || !valid_sha256(&self.sha256) || self.chunks.is_empty() {
+            return invalid(format!(
+                "release file {} has invalid size, digest, or chunks",
+                self.relative_path
+            ));
+        }
+        let mut next_offset = 0_u64;
+        for (expected_index, chunk) in self.chunks.iter().enumerate() {
+            if chunk.index as usize != expected_index
+                || chunk.offset != next_offset
+                || chunk.length == 0
+                || !valid_sha256(&chunk.sha256)
+            {
+                return invalid(format!(
+                    "release file {} has invalid chunk {}",
+                    self.relative_path, expected_index
+                ));
+            }
+            next_offset = next_offset
+                .checked_add(chunk.length)
+                .ok_or_else(|| EngineError::InvalidArtifact("chunk range overflows".into()))?;
+        }
+        if next_offset != self.bytes {
+            return invalid(format!(
+                "release file {} chunks cover {}, expected {}",
+                self.relative_path, next_offset, self.bytes
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl KvMemoryFormula {
+    pub fn bytes(&self, context_tokens: u64, sessions: u32) -> Result<u64> {
+        let per_session = self
+            .bytes_per_token_per_session
+            .checked_mul(context_tokens)
+            .and_then(|value| {
+                self.q4_delta_bytes_per_token
+                    .checked_mul(self.retained_q4_tokens_per_session.min(context_tokens))
+                    .and_then(|q4| value.checked_add(q4))
+            })
+            .and_then(|value| value.checked_add(self.fixed_bytes_per_session))
+            .ok_or_else(|| EngineError::MemoryBudget("KV formula overflows".into()))?;
+        per_session
+            .checked_mul(sessions as u64)
+            .ok_or_else(|| EngineError::MemoryBudget("KV session total overflows".into()))
+    }
+}
+
+impl MemoryProfile {
+    fn checked_sum(values: &[u64], label: &str) -> Result<u64> {
+        values.iter().try_fold(0_u64, |sum, value| {
+            sum.checked_add(*value)
+                .ok_or_else(|| EngineError::MemoryBudget(format!("{label} overflows")))
+        })
+    }
+
+    pub fn steady_bytes(&self) -> Result<u64> {
+        let session_state = self
+            .linear_state_bytes_per_session
+            .checked_mul(self.sessions as u64)
+            .ok_or_else(|| EngineError::MemoryBudget("linear state overflows".into()))?;
+        Self::checked_sum(
+            &[
+                self.resident_model_bytes,
+                self.persistent_backend_graph_bytes,
+                self.persistent_runtime_bytes,
+                session_state,
+                self.kv.bytes(self.context_tokens, self.sessions)?,
+                self.accelerator_unattributed_reserve_bytes,
+            ],
+            "steady memory",
+        )
+    }
+
+    pub fn prefill_peak_bytes(&self) -> Result<u64> {
+        Self::checked_sum(
+            &[self.steady_bytes()?, self.prefill_scratch_peak_bytes],
+            "prefill peak",
+        )
+    }
+
+    pub fn decode_peak_bytes(&self) -> Result<u64> {
+        Self::checked_sum(
+            &[self.steady_bytes()?, self.decode_scratch_peak_bytes],
+            "decode peak",
+        )
+    }
+
+    pub fn load_peak_bytes(&self) -> Result<u64> {
+        Self::checked_sum(
+            &[
+                self.resident_model_bytes,
+                self.persistent_backend_graph_bytes,
+                self.persistent_runtime_bytes,
+                self.loader_transient_peak_bytes,
+                self.accelerator_unattributed_reserve_bytes,
+            ],
+            "load peak",
+        )
+    }
+
+    pub fn maximum_peak_bytes(&self) -> Result<u64> {
+        Ok(self
+            .load_peak_bytes()?
+            .max(self.prefill_peak_bytes()?)
+            .max(self.decode_peak_bytes()?))
+    }
+}
+
+impl ReleaseManifest {
+    fn unsigned_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&UnsignedManifest {
+            format: &self.format,
+            release_id: &self.release_id,
+            model: &self.model,
+            tokenizer: &self.tokenizer,
+            packages: &self.packages,
+            memory_profiles: &self.memory_profiles,
+        })?)
+    }
+
+    pub fn computed_unsigned_sha256(&self) -> Result<String> {
+        Ok(format!("{:x}", Sha256::digest(self.unsigned_bytes()?)))
+    }
+
+    pub fn seal_unsigned(&mut self) -> Result<()> {
+        self.integrity.unsigned_sha256 = self.computed_unsigned_sha256()?;
+        self.integrity.signature = None;
+        Ok(())
+    }
+
+    pub fn verify_signature(&self, expected_key_id: &str, public_key: &[u8; 32]) -> Result<()> {
+        self.validate()?;
+        let envelope =
+            self.integrity.signature.as_ref().ok_or_else(|| {
+                EngineError::InvalidArtifact("release manifest is not signed".into())
+            })?;
+        if envelope.algorithm != ED25519_ALGORITHM || envelope.key_id != expected_key_id {
+            return invalid("release signature algorithm or key id does not match trust policy");
+        }
+        let signature_bytes = decode_hex::<64>(&envelope.signature_hex, "release signature")?;
+        let signature = Signature::from_bytes(&signature_bytes);
+        let key = VerifyingKey::from_bytes(public_key)
+            .map_err(|error| EngineError::InvalidArtifact(error.to_string()))?;
+        let digest = decode_hex::<32>(&self.integrity.unsigned_sha256, "unsigned digest")?;
+        key.verify_strict(&digest, &signature).map_err(|_| {
+            EngineError::InvalidArtifact("release signature verification failed".into())
+        })
+    }
+
+    pub fn verify_backend_pack_equivalence(&self, first: &str, second: &str) -> Result<()> {
+        self.validate()?;
+        let find = |pack_id: &str| {
+            self.packages
+                .iter()
+                .flat_map(|package| &package.packs)
+                .find(|pack| pack.pack_id == pack_id)
+                .ok_or_else(|| {
+                    EngineError::InvalidArtifact(format!(
+                        "backend pack {pack_id} is not in release {}",
+                        self.release_id
+                    ))
+                })
+        };
+        let first = find(first)?;
+        let second = find(second)?;
+        if first.logical_checkpoint_sha256 != second.logical_checkpoint_sha256
+            || first.logical_tensor_root_sha256 != second.logical_tensor_root_sha256
+        {
+            return invalid("backend packs do not represent the same logical checkpoint");
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.format != RELEASE_FORMAT || self.release_id.is_empty() {
+            return invalid("release format or release id is invalid");
+        }
+        if self.model.model_id != MODEL_ID
+            || self.model.architecture.is_empty()
+            || self.model.bf16_repository.is_empty()
+            || !valid_lower_hex(&self.model.bf16_revision, 40)
+            || !valid_sha256(&self.model.bf16_root_sha256)
+            || !valid_sha256(&self.model.logical_checkpoint_sha256)
+            || !valid_sha256(&self.model.logical_tensor_root_sha256)
+            || !valid_sha256(&self.model.recovery_sha256)
+            || !self.model.fixed_logical_qcodes
+        {
+            return invalid("canonical model identity is incomplete");
+        }
+        let expected_quant_types = [
+            LogicalQuantType::Q2B64,
+            LogicalQuantType::Q4B64,
+            LogicalQuantType::MixedQ2Q4B64,
+        ];
+        if self.model.allowed_large_matrix_types != expected_quant_types
+            || !self.model.mtp.resident_with_text
+            || self.model.mtp.layers == 0
+            || !valid_sha256(&self.model.mtp.logical_sha256)
+            || !self.model.mtp.every_draft_token_verified
+        {
+            return invalid("quantization or resident MTP identity is invalid");
+        }
+        if !valid_sha256(&self.tokenizer.tokenizer_root_sha256)
+            || !valid_sha256(&self.tokenizer.chat_template_sha256)
+            || self.tokenizer.reasoning_format.is_empty()
+            || self.tokenizer.tool_call_format.is_empty()
+            || self.tokenizer.special_tokens.is_empty()
+            || self.tokenizer.files.is_empty()
+        {
+            return invalid("tokenizer/template contract is incomplete");
+        }
+        let mut token_names = HashSet::new();
+        let mut token_ids = HashSet::new();
+        for token in &self.tokenizer.special_tokens {
+            if token.name.is_empty()
+                || token.text.is_empty()
+                || !token_names.insert(&token.name)
+                || !token_ids.insert(token.id)
+            {
+                return invalid("special token names and ids must be unique and non-empty");
+            }
+        }
+        let mut file_paths = HashSet::new();
+        for file in &self.tokenizer.files {
+            file.validate()?;
+            if !file_paths.insert(&file.relative_path) {
+                return invalid("release file paths must be globally unique");
+            }
+        }
+
+        let mut package_ids = HashSet::new();
+        let mut pack_ids = HashSet::new();
+        let mut pack_keys = HashSet::new();
+        let mut text_packages = 0;
+        let mut default_packages = 0;
+        let mut text_tensor_root: Option<&str> = None;
+        for package in &self.packages {
+            if package.package_id.is_empty()
+                || package.packs.is_empty()
+                || !package_ids.insert(&package.package_id)
+            {
+                return invalid("release package ids must be unique and non-empty");
+            }
+            if package.kind == PackageKind::TextMtp {
+                text_packages += 1;
+            }
+            if package.default_download {
+                default_packages += 1;
+                if package.kind != PackageKind::TextMtp {
+                    return invalid("only the text+MTP package may be a default download");
+                }
+            }
+            for pack in &package.packs {
+                pack.artifact.validate()?;
+                if pack.pack_id.is_empty()
+                    || pack.hardware_profile.is_empty()
+                    || !pack_ids.insert(&pack.pack_id)
+                    || !pack_keys.insert((package.kind, pack.backend, &pack.hardware_profile))
+                    || !file_paths.insert(&pack.artifact.relative_path)
+                    || !valid_sha256(&pack.artifact_manifest_sha256)
+                    || pack.logical_checkpoint_sha256 != self.model.logical_checkpoint_sha256
+                    || pack.logical_tensor_root_sha256 != self.model.logical_tensor_root_sha256
+                    || !pack.deterministic_repack
+                    || pack.requantized
+                {
+                    return invalid(
+                        "backend pack identity or deterministic-repack contract failed",
+                    );
+                }
+                if package.kind == PackageKind::TextMtp {
+                    if !pack.contains_mtp {
+                        return invalid("every text backend pack must contain resident MTP");
+                    }
+                    if text_tensor_root
+                        .replace(&pack.logical_tensor_root_sha256)
+                        .is_some_and(|root| root != pack.logical_tensor_root_sha256)
+                    {
+                        return invalid("text backend packs have different logical tensor roots");
+                    }
+                } else if pack.contains_mtp {
+                    return invalid("vision package must not duplicate MTP");
+                }
+                if pack.loader.maximum_resident_full_model_copies != 1
+                    || pack.loader.retains_full_cpu_copy
+                    || !pack.loader.supports_resumable_download
+                    || !pack.loader.supports_atomic_activation
+                {
+                    return invalid(
+                        "loader permits duplicate model residency or lacks install safety",
+                    );
+                }
+            }
+        }
+        if text_packages != 1 || default_packages != 1 {
+            return invalid("release needs exactly one default text+MTP package");
+        }
+
+        let mut profile_ids = HashSet::new();
+        let mut profiled_packs = HashSet::new();
+        for profile in &self.memory_profiles {
+            if profile.profile_id.is_empty()
+                || !profile_ids.insert(&profile.profile_id)
+                || !pack_ids.contains(&profile.pack_id)
+                || profile.context_tokens == 0
+                || profile.context_tokens > Qwen38Config::default().max_position_embeddings as u64
+                || profile.sessions == 0
+                || profile.resident_model_bytes == 0
+                || profile.hard_limit_bytes == 0
+            {
+                return invalid("memory profile identity or dimensions are invalid");
+            }
+            if profile.maximum_peak_bytes()? > profile.hard_limit_bytes {
+                return Err(EngineError::MemoryBudget(format!(
+                    "memory profile {} exceeds its hard limit",
+                    profile.profile_id
+                )));
+            }
+            profiled_packs.insert(&profile.pack_id);
+        }
+        if profiled_packs.len() != pack_ids.len() {
+            return invalid("every backend pack requires at least one admitted memory profile");
+        }
+
+        if self.computed_unsigned_sha256()? != self.integrity.unsigned_sha256 {
+            return invalid("release manifest unsigned SHA-256 mismatch");
+        }
+        if let Some(signature) = &self.integrity.signature {
+            if signature.algorithm != ED25519_ALGORITHM
+                || signature.key_id.is_empty()
+                || decode_hex::<64>(&signature.signature_hex, "release signature").is_err()
+            {
+                return invalid("release signature envelope is invalid");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    valid_lower_hex(value, 64)
+}
+
+fn valid_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn decode_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
+    if value.len() != N * 2 {
+        return invalid(format!("{label} has the wrong encoded length"));
+    }
+    let mut decoded = [0_u8; N];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| EngineError::InvalidArtifact(format!("{label} is not lowercase hex")))?;
+    }
+    if value.bytes().any(|byte| (b'A'..=b'F').contains(&byte)) {
+        return invalid(format!("{label} is not lowercase hex"));
+    }
+    Ok(decoded)
+}
+
+fn invalid<T>(message: impl Into<String>) -> Result<T> {
+    Err(EngineError::InvalidArtifact(message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    use super::*;
+
+    fn digest(character: char) -> String {
+        std::iter::repeat_n(character, 64).collect()
+    }
+
+    fn file(path: &str, bytes: u64, character: char) -> ReleaseFile {
+        ReleaseFile {
+            relative_path: path.into(),
+            bytes,
+            sha256: digest(character),
+            chunks: vec![FileChunk {
+                index: 0,
+                offset: 0,
+                length: bytes,
+                sha256: digest(character),
+            }],
+        }
+    }
+
+    fn manifest() -> ReleaseManifest {
+        let pack = BackendPack {
+            pack_id: "text-cuda-sm86".into(),
+            backend: BackendKind::Cuda,
+            hardware_profile: "sm86".into(),
+            artifact: file("packs/text-cuda-sm86.ctoxq", 8_000_000_000, 'a'),
+            artifact_manifest_sha256: digest('b'),
+            logical_checkpoint_sha256: digest('c'),
+            logical_tensor_root_sha256: digest('d'),
+            deterministic_repack: true,
+            requantized: false,
+            contains_mtp: true,
+            loader: LoaderContract {
+                strategy: LoaderStrategy::WindowedUpload,
+                maximum_resident_full_model_copies: 1,
+                retains_full_cpu_copy: false,
+                retains_full_device_copy: true,
+                supports_resumable_download: true,
+                supports_atomic_activation: true,
+            },
+        };
+        let mut manifest = ReleaseManifest {
+            format: RELEASE_FORMAT.into(),
+            release_id: "qwen38-27b-test.1".into(),
+            model: CanonicalModelIdentity {
+                model_id: MODEL_ID.into(),
+                architecture: "Qwen3_5ForCausalLM".into(),
+                bf16_repository: MODEL_ID.into(),
+                bf16_revision: "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0".into(),
+                bf16_root_sha256: digest('e'),
+                logical_checkpoint_sha256: digest('c'),
+                logical_tensor_root_sha256: digest('d'),
+                recovery_sha256: digest('f'),
+                fixed_logical_qcodes: true,
+                allowed_large_matrix_types: vec![
+                    LogicalQuantType::Q2B64,
+                    LogicalQuantType::Q4B64,
+                    LogicalQuantType::MixedQ2Q4B64,
+                ],
+                mtp: MtpIdentity {
+                    resident_with_text: true,
+                    layers: 1,
+                    logical_sha256: digest('1'),
+                    every_draft_token_verified: true,
+                },
+            },
+            tokenizer: TokenizerContract {
+                tokenizer_root_sha256: digest('2'),
+                chat_template_sha256: digest('3'),
+                reasoning_format: "qwen38_reasoning_v1".into(),
+                tool_call_format: "qwen38_tool_call_v1".into(),
+                special_tokens: vec![SpecialToken {
+                    name: "eos".into(),
+                    id: 1,
+                    text: "<eos>".into(),
+                }],
+                files: vec![file("tokenizer/tokenizer.json", 1024, '4')],
+            },
+            packages: vec![ReleasePackage {
+                package_id: "text-mtp".into(),
+                kind: PackageKind::TextMtp,
+                default_download: true,
+                packs: vec![pack],
+            }],
+            memory_profiles: vec![MemoryProfile {
+                profile_id: "cuda-sm86-16k".into(),
+                pack_id: "text-cuda-sm86".into(),
+                context_tokens: 16_384,
+                sessions: 1,
+                resident_model_bytes: 8_000_000_000,
+                persistent_backend_graph_bytes: 64 << 20,
+                persistent_runtime_bytes: 64 << 20,
+                linear_state_bytes_per_session: 144 << 20,
+                kv: KvMemoryFormula {
+                    fixed_bytes_per_session: 0,
+                    bytes_per_token_per_session: 9_216,
+                    retained_q4_tokens_per_session: 384,
+                    q4_delta_bytes_per_token: 8_192,
+                },
+                prefill_scratch_peak_bytes: 128 << 20,
+                decode_scratch_peak_bytes: 32 << 20,
+                loader_transient_peak_bytes: 64 << 20,
+                accelerator_unattributed_reserve_bytes: 64 << 20,
+                hard_limit_bytes: 10 << 30,
+            }],
+            integrity: ManifestIntegrity {
+                unsigned_sha256: String::new(),
+                signature: None,
+            },
+        };
+        manifest.seal_unsigned().unwrap();
+        manifest
+    }
+
+    #[test]
+    fn release_round_trips_and_binds_every_semantic_field() {
+        let manifest = manifest();
+        manifest.validate().unwrap();
+        let json = serde_json::to_vec(&manifest).unwrap();
+        let decoded: ReleaseManifest = serde_json::from_slice(&json).unwrap();
+        decoded.validate().unwrap();
+        let mut changed = decoded;
+        changed.tokenizer.chat_template_sha256 = digest('5');
+        assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn backend_requantization_and_duplicate_residency_are_rejected() {
+        let mut manifest = manifest();
+        manifest.packages[0].packs[0].requantized = true;
+        manifest.seal_unsigned().unwrap();
+        assert!(manifest.validate().is_err());
+        manifest.packages[0].packs[0].requantized = false;
+        manifest.packages[0].packs[0]
+            .loader
+            .maximum_resident_full_model_copies = 2;
+        manifest.seal_unsigned().unwrap();
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn memory_profiles_use_the_declared_context_formula_and_limit() {
+        let mut over_limit = manifest();
+        let profile = &over_limit.memory_profiles[0];
+        assert_eq!(profile.kv.bytes(16_384, 1).unwrap(), 154_140_672);
+        assert!(profile.maximum_peak_bytes().unwrap() < profile.hard_limit_bytes);
+        over_limit.memory_profiles[0].hard_limit_bytes = 8_000_000_000;
+        over_limit.seal_unsigned().unwrap();
+        assert!(over_limit.validate().is_err());
+
+        let mut context_overflow = manifest();
+        context_overflow.memory_profiles[0].context_tokens = 262_145;
+        context_overflow.seal_unsigned().unwrap();
+        assert!(context_overflow.validate().is_err());
+    }
+
+    #[test]
+    fn trusted_ed25519_signature_binds_the_unsigned_digest() {
+        let mut manifest = manifest();
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let digest =
+            decode_hex::<32>(&manifest.integrity.unsigned_sha256, "unsigned digest").unwrap();
+        let signature = signing_key.sign(&digest);
+        manifest.integrity.signature = Some(ManifestSignature {
+            algorithm: ED25519_ALGORITHM.into(),
+            key_id: "test-key".into(),
+            signature_hex: signature
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        });
+        manifest
+            .verify_signature("test-key", &signing_key.verifying_key().to_bytes())
+            .unwrap();
+        manifest.release_id.push_str("-changed");
+        assert!(manifest
+            .verify_signature("test-key", &signing_key.verifying_key().to_bytes())
+            .is_err());
+    }
+
+    #[test]
+    fn physical_backend_packs_must_share_one_logical_tensor_root() {
+        let mut manifest = manifest();
+        let mut metal = manifest.packages[0].packs[0].clone();
+        metal.pack_id = "text-metal-apple9".into();
+        metal.backend = BackendKind::Metal;
+        metal.hardware_profile = "apple9".into();
+        metal.artifact = file("packs/text-metal-apple9.ctoxq", 8_000_001_024, '5');
+        manifest.packages[0].packs.push(metal);
+        let mut metal_memory = manifest.memory_profiles[0].clone();
+        metal_memory.profile_id = "metal-apple9-16k".into();
+        metal_memory.pack_id = "text-metal-apple9".into();
+        manifest.memory_profiles.push(metal_memory);
+        manifest.seal_unsigned().unwrap();
+        manifest
+            .verify_backend_pack_equivalence("text-cuda-sm86", "text-metal-apple9")
+            .unwrap();
+
+        manifest.packages[0].packs[1].logical_tensor_root_sha256 = digest('6');
+        manifest.seal_unsigned().unwrap();
+        assert!(manifest
+            .verify_backend_pack_equivalence("text-cuda-sm86", "text-metal-apple9")
+            .is_err());
+    }
+}

@@ -19,6 +19,7 @@ android-jni = ["dep:jni"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2"
 half = { version = "2", features = ["serde"] }
 jni = { version = "0.21", optional = true }
 memmap2 = "0.9"
