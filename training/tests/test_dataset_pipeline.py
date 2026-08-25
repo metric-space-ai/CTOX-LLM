@@ -87,7 +87,11 @@ from score_quant_sensitivity import quantized_entries, row_group_document  # noq
 from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
 from select_primary_domain_supplement import select_supplement  # noqa: E402
-from select_coverage_supplement import select_joint_supplement  # noqa: E402
+from select_coverage_supplement import (  # noqa: E402
+    assigned_tag,
+    primary_assignment,
+    select_joint_supplement,
+)
 from split_manifests import split  # noqa: E402
 from teacher_runtime import FLA_KERNEL_REVISION, weight_max_memory  # noqa: E402
 from teacher_cache_dataset import VerifiedTeacherCache  # noqa: E402
@@ -379,13 +383,14 @@ class DatasetPipelineTests(unittest.TestCase):
         ]
         candidate_tags = {
             sample_id: {
+                "id": sample_id,
                 "primary_label": "code",
                 "labels": ["code"],
                 "scores": {"code": 0.9},
             }
             for sample_id in ("code-en", "code-de")
         }
-        selected, evidence = select_joint_supplement(
+        selected, selected_tags, evidence = select_joint_supplement(
             baseline,
             baseline_tags,
             candidates,
@@ -396,9 +401,25 @@ class DatasetPipelineTests(unittest.TestCase):
             "train",
             domain_margin=0,
             minimum_confidence=0.8,
+            primary_tie_tolerance=0.02,
         )
         self.assertEqual({record["id"] for record in selected}, {"code-en", "code-de"})
+        self.assertEqual({tag["id"] for tag in selected_tags}, {"code-en", "code-de"})
         self.assertTrue(all(not values for values in evidence["remaining_requirements"].values()))
+
+    def test_near_tie_domain_assignment_is_explicit_and_bounded(self) -> None:
+        tag = {
+            "id": "bio",
+            "primary_label": "medicine",
+            "scores": {"medicine": 0.91, "biology": 0.90, "chemistry": 0.70},
+        }
+        requirements = {"domain_primary": Counter({"biology": 2})}
+        assignment = primary_assignment(tag, requirements, 0.7, 0.02)
+        self.assertEqual(assignment, "biology")
+        effective = assigned_tag(tag, assignment)
+        self.assertEqual(effective["primary_source"], "near_tie_coverage_assignment")
+        self.assertAlmostEqual(effective["primary_margin_from_classifier_max"], 0.01)
+        self.assertIsNone(primary_assignment(tag, requirements, 0.7, 0.005))
 
     def test_domain_gate_requires_clear_primary_examples_not_only_multilabel_hits(self) -> None:
         rubric = {

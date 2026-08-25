@@ -126,6 +126,13 @@ per-language diversity, and aggregate non-English-family cells, preferring
 broader coverage and then lower token cost. It fails with the unresolved cells
 when the candidate pool is insufficient and re-runs both complete gates over
 the combined cohort before writing release evidence.
+Because independent NLI scores can produce unstable argmax choices between
+sibling domains, the selector may assign one candidate to a non-argmax primary
+only when that domain itself exceeds the rubric confidence and lies within the
+declared 0.02 score tolerance of the classifier maximum. The emitted tag keeps
+the pre-assignment primary, target score, exact margin, and
+`primary_source=near_tie_coverage_assignment`; one sample can close only one
+primary cell. The effective supplement tags are a separately hashed output.
 Large candidate pools may be classified as independent GPU shards.
 `merge_domain_tags.py` accepts them only when their union is an exact,
 duplicate-free match for the materialized candidate IDs, restores materialized
