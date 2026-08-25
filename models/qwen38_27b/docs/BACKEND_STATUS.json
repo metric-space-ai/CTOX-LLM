@@ -29,9 +29,9 @@
     "metal": {
       "state": "candidate",
       "production_allowed": false,
-      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec"],
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "resident_projection_reuse", "batched_command_encoding"],
       "evidence": "METAL_KERNEL_NOTES.md",
-      "promotion_blocker": "same-device numeric verifier and benchmark"
+      "promotion_blocker": "zero-copy artifact ownership, complete graph kernels, controlled roofline/reference evidence, and full-model golden run"
     },
     "snapdragon": {
       "state": "contract",
