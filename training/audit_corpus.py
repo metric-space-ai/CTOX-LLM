@@ -46,8 +46,9 @@ def is_structured(text: str) -> bool:
     return stripped.startswith(("{", "[", "<", "```"))
 
 
-def audit(path: Path, tokenizer: Any) -> tuple[dict[str, Any], set[str]]:
+def audit(path: Path, tokenizer: Any) -> tuple[dict[str, Any], set[str], set[str]]:
     ids: set[str] = set()
+    payload_hashes: set[str] = set()
     categories: Counter[str] = Counter()
     languages: Counter[str] = Counter()
     sources: Counter[str] = Counter()
@@ -71,11 +72,25 @@ def audit(path: Path, tokenizer: Any) -> tuple[dict[str, Any], set[str]]:
             actual_payload = hashlib.sha256(canonical_text(record).encode("utf-8")).hexdigest()
             if actual_payload != record["prompt_sha256"]:
                 raise ValueError(f"{path}:{line_number} has a changed recovery payload")
+            if actual_payload in payload_hashes:
+                raise ValueError(f"{path}:{line_number} duplicates a recovery payload")
+            payload_hashes.add(actual_payload)
+            messages = normalize_messages(record.get("messages", []))
+            conditioning = [
+                message
+                for message in messages
+                if message.get("role") != "assistant"
+                and (
+                    str(message.get("content") or "").strip()
+                    or message.get("tool_calls")
+                )
+            ]
+            if messages and not conditioning:
+                raise ValueError(f"{path}:{line_number} has no conditioning content")
             rendered = render_record(tokenizer, record)
             prompt_tokens.append(
                 len(tokenizer(rendered, add_special_tokens=False).input_ids)
             )
-            messages = normalize_messages(record.get("messages", []))
             if len(messages) > 2:
                 multi_turn += 1
             tools = record.get("tools") or []
@@ -113,6 +128,7 @@ def audit(path: Path, tokenizer: Any) -> tuple[dict[str, Any], set[str]]:
             "structured_final_answers": structured_answers,
         },
         ids,
+        payload_hashes,
     )
 
 
@@ -134,11 +150,16 @@ def main() -> None:
         args.tokenizer, revision=args.tokenizer_revision
     )
     try:
-        train, train_ids = audit(args.train, tokenizer)
-        evaluation, evaluation_ids = audit(args.evaluation, tokenizer)
+        train, train_ids, train_payloads = audit(args.train, tokenizer)
+        evaluation, evaluation_ids, evaluation_payloads = audit(args.evaluation, tokenizer)
         overlap = train_ids & evaluation_ids
         if overlap:
             raise ValueError(f"train/evaluation overlap contains {len(overlap)} records")
+        payload_overlap = train_payloads & evaluation_payloads
+        if payload_overlap:
+            raise ValueError(
+                f"train/evaluation payload overlap contains {len(payload_overlap)} records"
+            )
     except ValueError as error:
         raise SystemExit(str(error)) from error
     document = {
@@ -148,6 +169,7 @@ def main() -> None:
         "train": train,
         "evaluation": evaluation,
         "train_evaluation_overlap": 0,
+        "train_evaluation_payload_overlap": 0,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None

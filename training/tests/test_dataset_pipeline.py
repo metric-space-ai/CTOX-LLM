@@ -57,6 +57,7 @@ from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_by
 from plan_teacher_cache import sample_tensor_bytes  # noqa: E402
 from plan_teacher_batches import batches as plan_teacher_batches  # noqa: E402
 from prompt_format import normalize_content, normalize_messages, normalize_tool_call  # noqa: E402
+from filter_recovery_cohort import filter_records  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
 from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
 try:  # Optional local training dependency; exercised in the pinned GPU venv.
@@ -103,6 +104,45 @@ from run_teacher_batches import completed_batch_matches  # noqa: E402
 
 
 class DatasetPipelineTests(unittest.TestCase):
+    @staticmethod
+    def recovery_record(sample_id: str, prompt: str, answer: str) -> dict:
+        record = {
+            "id": sample_id,
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": answer},
+            ],
+        }
+        record["prompt_sha256"] = hashlib.sha256(
+            canonical_text(record).encode("utf-8")
+        ).hexdigest()
+        return record
+
+    def test_cohort_filter_rejects_empty_conditioning_and_duplicate_payloads(self) -> None:
+        valid = self.recovery_record("valid", "Explain it", "A useful answer")
+        duplicate = dict(valid, id="duplicate")
+        empty = self.recovery_record("empty", "", "An unconditioned answer")
+        tags = [{"id": record["id"]} for record in (valid, duplicate, empty)]
+        kept, kept_tags, removed = filter_records(
+            [valid, duplicate, empty], tags
+        )
+        self.assertEqual([record["id"] for record in kept], ["valid"])
+        self.assertEqual([tag["id"] for tag in kept_tags], ["valid"])
+        self.assertEqual(
+            removed,
+            Counter({"duplicate_payload": 1, "empty_conditioning": 1}),
+        )
+
+    def test_cohort_filter_rejects_cross_partition_payload(self) -> None:
+        record = self.recovery_record("evaluation", "Prompt", "Answer")
+        digest = record["prompt_sha256"]
+        kept, kept_tags, removed = filter_records(
+            [record], [{"id": "evaluation"}], {digest}
+        )
+        self.assertEqual(kept, [])
+        self.assertEqual(kept_tags, [])
+        self.assertEqual(removed, Counter({"cross_partition_payload": 1}))
+
     class FakeRecoveryTensor:
         def __init__(self, shape, dtype="torch.float16"):
             self.shape = shape
