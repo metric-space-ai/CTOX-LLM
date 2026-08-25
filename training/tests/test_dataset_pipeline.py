@@ -13,8 +13,10 @@ sys.path.insert(0, str(TRAINING))
 from build_manifest import canonical_text, category_for, recovery_payload  # noqa: E402
 from collect_activation_stats import checkpoint_weight_name  # noqa: E402
 from materialize_prompts import load_manifests  # noqa: E402
+from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
 from optimize_q4_budget import layout_bytes  # noqa: E402
 from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
+from score_quant_sensitivity import row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from verify_vendor_manifest import verify  # noqa: E402
 
@@ -103,6 +105,39 @@ class DatasetPipelineTests(unittest.TestCase):
             checkpoint_weight_name("model.layers.12.mlp.down_proj"),
             "model.language_model.layers.12.mlp.down_proj.weight",
         )
+
+    def test_mtp_names_map_to_frozen_checkpoint(self) -> None:
+        self.assertEqual(
+            mtp_checkpoint_weight_name("layers.0.eh_proj"),
+            "mtp.fc.weight",
+        )
+        self.assertEqual(
+            mtp_checkpoint_weight_name("layers.0.mtp_block.self_attn.q_proj"),
+            "mtp.layers.0.self_attn.q_proj.weight",
+        )
+        mapping = mtp_parameter_mapping(
+            {
+                "mtp.fc.weight",
+                "mtp.pre_fc_norm_embedding.weight",
+                "mtp.layers.0.mlp.down_proj.weight",
+            },
+            1,
+        )
+        self.assertEqual(mapping["mtp.fc.weight"], "layers.0.eh_proj.weight")
+        self.assertEqual(
+            mapping["mtp.layers.0.mlp.down_proj.weight"],
+            "layers.0.mtp_block.mlp.down_proj.weight",
+        )
+        with self.assertRaisesRegex(ValueError, "exactly one MTP layer"):
+            mtp_parameter_mapping(set(), 2)
+
+    def test_row_group_records_exact_quantized_bytes(self) -> None:
+        group = row_group_document(2, 512, 768, 5120, 10.0, 2.0, 100.0)
+        self.assertEqual(group["row_start"], 512)
+        self.assertEqual(group["row_end"], 768)
+        self.assertEqual(group["q2_bytes"], 368640)
+        self.assertEqual(group["q4_bytes"], 696320)
+        self.assertEqual(group["quality_gain"], 8.0)
 
     def test_q4_budget_uses_complete_aligned_layout(self) -> None:
         plan = {

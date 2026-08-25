@@ -18,6 +18,7 @@ def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file
     if output.exists():
         raise SystemExit(f"refusing to overwrite {output}")
     accumulated: dict[str, dict[str, Any]] = {}
+    row_counts: dict[str, Any] = {}
     sample_ids: list[str] = []
     seen_ids: set[str] = set()
     reference_keys: set[str] | None = None
@@ -33,7 +34,14 @@ def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file
             if reference_keys is not None and keys != reference_keys:
                 raise ValueError(f"{path} has a different tensor set")
             if reference_metadata is not None:
-                for field in ("model", "revision", "target_tensors", "unobserved_tensors"):
+                for field in (
+                    "model",
+                    "revision",
+                    "target_tensors",
+                    "unobserved_tensors",
+                    "input_only_tensors",
+                    "row_frequency_tensors",
+                ):
                     if metadata.get(field) != reference_metadata.get(field):
                         raise ValueError(f"{path} metadata field {field} differs")
             reference_keys = keys
@@ -50,19 +58,40 @@ def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file
             for base in bases:
                 count = int(source.get_tensor(f"{base}.token_count")[0])
                 input_sum = source.get_tensor(f"{base}.input_mean_sq").double() * count
-                output_sum = source.get_tensor(f"{base}.output_mean_sq").double() * count
+                output_key = f"{base}.output_mean_sq"
+                output_sum = (
+                    source.get_tensor(output_key).double() * count if output_key in keys else None
+                )
                 state = accumulated.setdefault(
                     base,
-                    {"input_sum": torch.zeros_like(input_sum), "output_sum": torch.zeros_like(output_sum), "count": 0},
+                    {
+                        "input_sum": torch.zeros_like(input_sum),
+                        "output_sum": torch.zeros_like(output_sum) if output_sum is not None else None,
+                        "count": 0,
+                    },
                 )
+                if (state["output_sum"] is None) != (output_sum is None):
+                    raise ValueError(f"{path} changes output-statistics availability for {base}")
                 state["input_sum"] += input_sum
-                state["output_sum"] += output_sum
+                if output_sum is not None:
+                    state["output_sum"] += output_sum
                 state["count"] += count
+            for key in (key for key in keys if key.endswith(".row_count")):
+                base = key.removesuffix(".row_count")
+                values = source.get_tensor(key).long()
+                if base not in row_counts:
+                    row_counts[base] = torch.zeros_like(values)
+                row_counts[base] += values
     tensors = {}
     for base, state in accumulated.items():
         tensors[f"{base}.input_mean_sq"] = (state["input_sum"] / state["count"]).float()
-        tensors[f"{base}.output_mean_sq"] = (state["output_sum"] / state["count"]).float()
+        if state["output_sum"] is not None:
+            tensors[f"{base}.output_mean_sq"] = (
+                state["output_sum"] / state["count"]
+            ).float()
         tensors[f"{base}.token_count"] = torch.tensor([state["count"]], dtype=torch.int64)
+    for base, values in row_counts.items():
+        tensors[f"{base}.row_count"] = values
     assert reference_metadata is not None
     output.parent.mkdir(parents=True, exist_ok=True)
     save_file(
