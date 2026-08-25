@@ -184,6 +184,10 @@ linear modules with those packed operators, loads every remaining frozen
 FP16/FP32 norm and recurrent parameter from the same container, excludes MTP
 for its separate graph, and fails if any meta parameter or unmatched module
 remains. Only logarithmic recovery scales retain gradients.
+The separate MTP installer constructs the single full-attention draft layer on
+meta, maps its eight native packed matrices through the pinned checkpoint-name
+contract, loads its frozen norms from the same container, and preserves the
+main graph's shared packed embedding and LM head.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized
