@@ -43,6 +43,30 @@ fn main() -> anyhow::Result<()> {
             FoldMemoryPlan::gib(plan.runtime_bytes)
         );
         println!(
+            "  code/rodata:  {:.3} GiB",
+            FoldMemoryPlan::gib(plan.runtime_budget.executable_code_and_rodata_bytes)
+        );
+        println!(
+            "  Java/JNI/UI:  {:.3} GiB",
+            FoldMemoryPlan::gib(plan.runtime_budget.java_jni_ui_bytes)
+        );
+        println!(
+            "  graph/control:{:.3} GiB",
+            FoldMemoryPlan::gib(plan.runtime_budget.tokenizer_sampler_graph_bytes)
+        );
+        println!(
+            "  native heap:  {:.3} GiB",
+            FoldMemoryPlan::gib(plan.runtime_budget.native_heap_stacks_allocator_bytes)
+        );
+        println!(
+            "  accel control:{:.3} GiB",
+            FoldMemoryPlan::gib(plan.runtime_budget.accelerator_commands_descriptors_bytes)
+        );
+        println!(
+            "  workspaces:   {:.3} GiB",
+            FoldMemoryPlan::gib(plan.runtime_budget.kernel_workspaces_bytes)
+        );
+        println!(
             "total:          {:.3} GiB",
             FoldMemoryPlan::gib(plan.total_bytes)
         );

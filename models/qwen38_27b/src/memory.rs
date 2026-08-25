@@ -10,6 +10,74 @@ pub const FOLD_HARD_LIMIT_BYTES: u64 = 10 * GIB;
 pub const FOLD_RUNTIME_BUDGET_BYTES: u64 = 550 * MIB;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RuntimeMemoryBudget {
+    pub executable_code_and_rodata_bytes: u64,
+    pub java_jni_ui_bytes: u64,
+    pub tokenizer_sampler_graph_bytes: u64,
+    pub native_heap_stacks_allocator_bytes: u64,
+    pub accelerator_commands_descriptors_bytes: u64,
+    pub kernel_workspaces_bytes: u64,
+    pub admission_telemetry_bytes: u64,
+}
+
+impl RuntimeMemoryBudget {
+    pub const fn fold_default() -> Self {
+        Self {
+            executable_code_and_rodata_bytes: 32 * MIB,
+            java_jni_ui_bytes: 64 * MIB,
+            tokenizer_sampler_graph_bytes: 64 * MIB,
+            native_heap_stacks_allocator_bytes: 64 * MIB,
+            accelerator_commands_descriptors_bytes: 96 * MIB,
+            kernel_workspaces_bytes: 208 * MIB,
+            admission_telemetry_bytes: 22 * MIB,
+        }
+    }
+
+    pub const fn total_bytes(self) -> u64 {
+        self.executable_code_and_rodata_bytes
+            + self.java_jni_ui_bytes
+            + self.tokenizer_sampler_graph_bytes
+            + self.native_heap_stacks_allocator_bytes
+            + self.accelerator_commands_descriptors_bytes
+            + self.kernel_workspaces_bytes
+            + self.admission_telemetry_bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ResidentMemorySnapshot {
+    /// Android process PSS, including Java/native/file-backed resident pages.
+    pub process_pss_bytes: u64,
+    /// Counted deliberately: the engine must not depend on compressed swap.
+    pub process_swap_pss_bytes: u64,
+    /// DMA/QNN/Vulkan memory not already attributed to process PSS.
+    pub accelerator_unattributed_bytes: u64,
+}
+
+impl ResidentMemorySnapshot {
+    pub fn accounted_bytes(self) -> Result<u64> {
+        self.process_pss_bytes
+            .checked_add(self.process_swap_pss_bytes)
+            .and_then(|value| value.checked_add(self.accelerator_unattributed_bytes))
+            .ok_or_else(|| EngineError::MemoryBudget("measured memory counter overflow".into()))
+    }
+
+    pub fn admit(self, additional_bytes: u64) -> Result<u64> {
+        let projected = self
+            .accounted_bytes()?
+            .checked_add(additional_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("projected memory counter overflow".into()))?;
+        if projected > FOLD_TARGET_BYTES {
+            return Err(EngineError::MemoryBudget(format!(
+                "admission projects {:.3} GiB, above 9.7 GiB operating target",
+                projected as f64 / GIB as f64
+            )));
+        }
+        Ok(projected)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FoldMemoryPlan {
     pub context_tokens: u64,
     pub weights_bytes: u64,
@@ -17,6 +85,7 @@ pub struct FoldMemoryPlan {
     pub kv_scale_bytes: u64,
     pub kv_q4_recent_and_sink_bytes: u64,
     pub linear_state_bytes: u64,
+    pub runtime_budget: RuntimeMemoryBudget,
     pub runtime_bytes: u64,
     pub total_bytes: u64,
     pub target_bytes: u64,
@@ -65,12 +134,15 @@ impl FoldMemoryPlan {
             * config.linear_value_head_dim as u64;
         let linear_state_bytes = linear_state_values * 4;
 
+        let runtime_budget = RuntimeMemoryBudget::fold_default();
+        let runtime_bytes = runtime_budget.total_bytes();
+        debug_assert_eq!(runtime_bytes, FOLD_RUNTIME_BUDGET_BYTES);
         let total_bytes = weights_bytes
             + kv_raw_q2_bytes
             + kv_scale_bytes
             + kv_q4_recent_and_sink_bytes
             + linear_state_bytes
-            + FOLD_RUNTIME_BUDGET_BYTES;
+            + runtime_bytes;
 
         Ok(Self {
             context_tokens,
@@ -79,7 +151,8 @@ impl FoldMemoryPlan {
             kv_scale_bytes,
             kv_q4_recent_and_sink_bytes,
             linear_state_bytes,
-            runtime_bytes: FOLD_RUNTIME_BUDGET_BYTES,
+            runtime_budget,
+            runtime_bytes,
             total_bytes,
             target_bytes: FOLD_TARGET_BYTES,
             hard_limit_bytes: FOLD_HARD_LIMIT_BYTES,
@@ -131,5 +204,24 @@ mod tests {
             FOLD_WEIGHT_LIMIT_BYTES + 1
         )
         .is_err());
+    }
+
+    #[test]
+    fn runtime_budget_includes_engine_and_accelerator_memory() {
+        let runtime = RuntimeMemoryBudget::fold_default();
+        assert_eq!(runtime.total_bytes(), 550 * MIB);
+        assert!(runtime.executable_code_and_rodata_bytes > 0);
+        assert!(runtime.kernel_workspaces_bytes > 0);
+    }
+
+    #[test]
+    fn admission_counts_swap_and_external_accelerator_memory() {
+        let snapshot = ResidentMemorySnapshot {
+            process_pss_bytes: 9 * GIB,
+            process_swap_pss_bytes: 64 * MIB,
+            accelerator_unattributed_bytes: 128 * MIB,
+        };
+        assert!(snapshot.admit(128 * MIB).is_ok());
+        assert!(snapshot.admit(GIB).is_err());
     }
 }
