@@ -10,7 +10,8 @@ use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
 
 pub const MAGIC: &[u8; 8] = b"CTOXQ2Q4";
-pub const FORMAT_VERSION: u32 = 1;
+pub const MIN_FORMAT_VERSION: u32 = 1;
+pub const MAX_FORMAT_VERSION: u32 = 2;
 pub const ENDIAN_MARKER: u32 = 0x0102_0304;
 pub const HEADER_BYTES: usize = 64;
 pub const DEFAULT_ALIGNMENT: u32 = 256;
@@ -20,6 +21,7 @@ pub const DEFAULT_ALIGNMENT: u32 = 256;
 pub enum TensorDType {
     Q2B64,
     Q4B64,
+    MixedQ2Q4B64,
     F16,
     F32,
 }
@@ -33,11 +35,27 @@ impl TensorDType {
             Self::Q4B64 => elements
                 .div_ceil(BLOCK_LEN as u64)
                 .checked_mul(Q4_BLOCK_BYTES as u64),
+            Self::MixedQ2Q4B64 => {
+                return Err(EngineError::InvalidArtifact(
+                    "mixed Q2/Q4 byte length requires row segments".into(),
+                ));
+            }
             Self::F16 => elements.checked_mul(2),
             Self::F32 => elements.checked_mul(4),
         }
         .ok_or_else(|| EngineError::InvalidArtifact("tensor byte length overflows u64".into()))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuantSegment {
+    pub group_index: u32,
+    pub row_start: u64,
+    pub row_end: u64,
+    pub dtype: TensorDType,
+    /// Offset relative to the start of this tensor's packed payload.
+    pub offset: u64,
+    pub length: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +67,8 @@ pub struct TensorEntry {
     pub offset: u64,
     pub length: u64,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<QuantSegment>,
 }
 
 impl TensorEntry {
@@ -65,6 +85,74 @@ impl TensorEntry {
             })
         })
     }
+
+    pub fn expected_bytes(&self) -> Result<u64> {
+        if self.dtype != TensorDType::MixedQ2Q4B64 {
+            if !self.segments.is_empty() {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "non-mixed tensor {} declares quantization segments",
+                    self.name
+                )));
+            }
+            return self.dtype.expected_bytes(self.elements()?);
+        }
+        if self.shape.len() != 2 || self.shape[1] % BLOCK_LEN as u64 != 0 {
+            return Err(EngineError::Shape(format!(
+                "mixed tensor {} must be a block-aligned matrix",
+                self.name
+            )));
+        }
+        if self.segments.is_empty() {
+            return Err(EngineError::InvalidArtifact(format!(
+                "mixed tensor {} has no row segments",
+                self.name
+            )));
+        }
+        let rows = self.shape[0];
+        let columns = self.shape[1];
+        let mut expected_row = 0_u64;
+        let mut expected_offset = 0_u64;
+        for (expected_group, segment) in self.segments.iter().enumerate() {
+            if segment.group_index as usize != expected_group
+                || segment.row_start != expected_row
+                || segment.row_end <= segment.row_start
+                || segment.row_end > rows
+                || segment.offset != expected_offset
+            {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "mixed tensor {} has non-contiguous segment {}",
+                    self.name, segment.group_index
+                )));
+            }
+            if !matches!(segment.dtype, TensorDType::Q2B64 | TensorDType::Q4B64) {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "mixed tensor {} segment {} has invalid dtype {:?}",
+                    self.name, segment.group_index, segment.dtype
+                )));
+            }
+            let elements = (segment.row_end - segment.row_start)
+                .checked_mul(columns)
+                .ok_or_else(|| EngineError::Shape("mixed segment shape overflows".into()))?;
+            let expected = segment.dtype.expected_bytes(elements)?;
+            if segment.length != expected {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "mixed tensor {} segment {} has {} bytes, expected {}",
+                    self.name, segment.group_index, segment.length, expected
+                )));
+            }
+            expected_row = segment.row_end;
+            expected_offset = expected_offset.checked_add(expected).ok_or_else(|| {
+                EngineError::InvalidArtifact("mixed tensor length overflows".into())
+            })?;
+        }
+        if expected_row != rows {
+            return Err(EngineError::InvalidArtifact(format!(
+                "mixed tensor {} segments cover {} of {} rows",
+                self.name, expected_row, rows
+            )));
+        }
+        Ok(expected_offset)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,7 +167,7 @@ pub struct ModelManifest {
 
 impl ModelManifest {
     pub fn validate(&self, data_len: u64) -> Result<()> {
-        if self.format != "ctox.q2q4.v1" {
+        if self.format != "ctox.q2q4.v1" && self.format != "ctox.q2q4.v2" {
             return Err(EngineError::InvalidArtifact(format!(
                 "unsupported manifest format {}",
                 self.format
@@ -95,6 +183,16 @@ impl ModelManifest {
                 "alignment {} must be a power of two >= 64",
                 self.alignment
             )));
+        }
+        if self.format == "ctox.q2q4.v1"
+            && self
+                .tensors
+                .iter()
+                .any(|tensor| tensor.dtype == TensorDType::MixedQ2Q4B64)
+        {
+            return Err(EngineError::InvalidArtifact(
+                "mixed Q2/Q4 tensors require manifest v2".into(),
+            ));
         }
 
         let mut names = HashSet::with_capacity(self.tensors.len());
@@ -120,7 +218,7 @@ impl ModelManifest {
                     tensor.name
                 )));
             }
-            let expected = tensor.dtype.expected_bytes(tensor.elements()?)?;
+            let expected = tensor.expected_bytes()?;
             if tensor.length != expected {
                 return Err(EngineError::InvalidArtifact(format!(
                     "tensor {} has {} bytes, {:?} shape requires {}",
@@ -154,6 +252,7 @@ impl ModelManifest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileHeader {
+    pub version: u32,
     pub manifest_len: u64,
     pub data_offset: u64,
     pub tensor_count: u32,
@@ -178,7 +277,7 @@ impl FileHeader {
             u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("header bounds"))
         };
         let version = u32_at(8);
-        if version != FORMAT_VERSION {
+        if !(MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION).contains(&version) {
             return Err(EngineError::InvalidArtifact(format!(
                 "format version {version} is unsupported"
             )));
@@ -189,6 +288,7 @@ impl FileHeader {
             ));
         }
         Ok(Self {
+            version,
             manifest_len: u64_at(16),
             data_offset: u64_at(24),
             tensor_count: u32_at(32),
@@ -199,7 +299,7 @@ impl FileHeader {
     pub fn encode(self) -> [u8; HEADER_BYTES] {
         let mut bytes = [0_u8; HEADER_BYTES];
         bytes[..8].copy_from_slice(MAGIC);
-        bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.version.to_le_bytes());
         bytes[12..16].copy_from_slice(&ENDIAN_MARKER.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.manifest_len.to_le_bytes());
         bytes[24..32].copy_from_slice(&self.data_offset.to_le_bytes());
@@ -270,6 +370,7 @@ impl ArtifactBuilder {
                 offset: data_offset,
                 length: expected,
                 sha256: format!("{:x}", Sha256::digest(&tensor.bytes)),
+                segments: Vec::new(),
             });
             data_offset = data_offset.checked_add(expected).ok_or_else(|| {
                 EngineError::InvalidArtifact("tensor data length overflows".into())
@@ -291,6 +392,7 @@ impl ArtifactBuilder {
             self.alignment as u64,
         )?;
         let header = FileHeader {
+            version: 1,
             manifest_len: manifest_bytes.len() as u64,
             data_offset: file_data_offset,
             tensor_count: manifest.tensors.len() as u32,
@@ -335,6 +437,7 @@ mod tests {
     #[test]
     fn header_round_trip() {
         let header = FileHeader {
+            version: 1,
             manifest_len: 1234,
             data_offset: 1536,
             tensor_count: 42,
@@ -353,6 +456,55 @@ mod tests {
           }]}
         "#;
         assert!(serde_json::from_str::<ModelManifest>(json).is_err());
+    }
+
+    fn mixed_manifest() -> ModelManifest {
+        ModelManifest {
+            format: "ctox.q2q4.v2".into(),
+            model: "test/qwen".into(),
+            revision: "0123456789abcdef".into(),
+            alignment: DEFAULT_ALIGNMENT,
+            target: "canonical-b64".into(),
+            tensors: vec![TensorEntry {
+                name: "lm_head.weight".into(),
+                dtype: TensorDType::MixedQ2Q4B64,
+                shape: vec![2, BLOCK_LEN as u64],
+                offset: 0,
+                length: (Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64,
+                sha256: "a".repeat(64),
+                segments: vec![
+                    QuantSegment {
+                        group_index: 0,
+                        row_start: 0,
+                        row_end: 1,
+                        dtype: TensorDType::Q2B64,
+                        offset: 0,
+                        length: Q2_BLOCK_BYTES as u64,
+                    },
+                    QuantSegment {
+                        group_index: 1,
+                        row_start: 1,
+                        row_end: 2,
+                        dtype: TensorDType::Q4B64,
+                        offset: Q2_BLOCK_BYTES as u64,
+                        length: Q4_BLOCK_BYTES as u64,
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn mixed_q2_q4_segments_validate_exact_coverage() {
+        let manifest = mixed_manifest();
+        assert!(manifest
+            .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
+            .is_ok());
+        let mut invalid = manifest;
+        invalid.tensors[0].segments[1].row_start = 0;
+        assert!(invalid
+            .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
+            .is_err());
     }
 
     #[test]

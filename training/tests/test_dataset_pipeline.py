@@ -14,7 +14,7 @@ from build_manifest import canonical_text, category_for, recovery_payload  # noq
 from collect_activation_stats import checkpoint_weight_name  # noqa: E402
 from materialize_prompts import load_manifests  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
-from optimize_q4_budget import layout_bytes  # noqa: E402
+from optimize_q4_budget import layout_bytes, mixed_tensor_bytes  # noqa: E402
 from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
 from score_quant_sensitivity import row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
@@ -161,6 +161,43 @@ class DatasetPipelineTests(unittest.TestCase):
         }
         self.assertEqual(layout_bytes(plan, set()), 2560)
         self.assertEqual(layout_bytes(plan, {"matrix.weight"}), 2816)
+
+    def test_mixed_row_groups_change_exact_layout(self) -> None:
+        groups = [
+            {
+                "group_index": 0,
+                "q2_bytes": 576,
+                "q4_bytes": 1088,
+            },
+            {
+                "group_index": 1,
+                "q2_bytes": 576,
+                "q4_bytes": 1088,
+            },
+        ]
+        plan = {
+            "alignment": 256,
+            "tensors": [
+                {
+                    "name": "embedding.weight",
+                    "source_shard": "model.safetensors",
+                    "dtype": "q2_b64",
+                    "shape": [64, 64],
+                    "length": 1152,
+                }
+            ],
+        }
+        self.assertEqual(mixed_tensor_bytes(groups, set()), 1152)
+        self.assertEqual(mixed_tensor_bytes(groups, {1}), 1664)
+        self.assertEqual(
+            layout_bytes(
+                plan,
+                set(),
+                {"embedding.weight": groups},
+                {"embedding.weight": {1}},
+            ),
+            1792,
+        )
 
     def test_vendor_manifest_detects_digest_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -42,6 +42,13 @@ impl ModelArtifact {
             ));
         }
         let manifest: ModelManifest = serde_json::from_slice(&mmap[manifest_start..manifest_end])?;
+        let expected_format = format!("ctox.q2q4.v{}", header.version);
+        if manifest.format != expected_format {
+            return Err(EngineError::InvalidArtifact(format!(
+                "header version {} requires manifest {}, got {}",
+                header.version, expected_format, manifest.format
+            )));
+        }
         if manifest.tensors.len() != header.tensor_count as usize {
             return Err(EngineError::InvalidArtifact(format!(
                 "header declares {} tensors, manifest has {}",

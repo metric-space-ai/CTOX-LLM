@@ -25,7 +25,6 @@ from run_ledger import GpuRun, require_budget
 
 
 MAGIC = b"CTOXQ2Q4"
-VERSION = 1
 ENDIAN_MARKER = 0x01020304
 HEADER_BYTES = 64
 Q2_BLOCK_BYTES = 18
@@ -83,7 +82,33 @@ def write_source_tensor(
     dtype = entry["dtype"]
     shape = entry["shape"]
     name = entry["name"]
-    if dtype in {"q2_b64", "q4_b64"}:
+    if dtype == "mixed_q2_q4_b64":
+        if len(shape) != 2 or shape[1] % 64:
+            raise RuntimeError(f"mixed tensor {name} is not a block-aligned matrix")
+        tensor_slice = source.get_slice(name)
+        expected_row = 0
+        for segment in entry.get("segments", []):
+            if segment["row_start"] != expected_row or segment["row_end"] <= expected_row:
+                raise RuntimeError(f"mixed tensor {name} has non-contiguous row segments")
+            segment_written = 0
+            for row_start in range(segment["row_start"], segment["row_end"], rows_per_chunk):
+                row_end = min(segment["row_end"], row_start + rows_per_chunk)
+                values = tensor_slice[row_start:row_end].to(device=device, dtype=torch.float32)
+                payload = quantize_blocks(values, segment["dtype"])
+                output.write(payload)
+                digest.update(payload)
+                written += len(payload)
+                segment_written += len(payload)
+                del values
+            if segment_written != segment["length"]:
+                raise RuntimeError(
+                    f"mixed tensor {name} segment {segment['group_index']} wrote "
+                    f"{segment_written} bytes, expected {segment['length']}"
+                )
+            expected_row = segment["row_end"]
+        if expected_row != shape[0]:
+            raise RuntimeError(f"mixed tensor {name} segments do not cover every row")
+    elif dtype in {"q2_b64", "q4_b64"}:
         if len(shape) != 2 or shape[1] % 64:
             raise RuntimeError(f"quantized tensor {name} is not a block-aligned matrix")
         tensor_slice = source.get_slice(name)
@@ -119,8 +144,9 @@ def write_recovery_tensor(output: BinaryIO, entry: dict) -> str:
 
 
 def assemble_artifact(output_path: Path, data_path: Path, plan: dict, tensor_hashes: dict[str, str]) -> None:
-    manifest_tensors = [
-        {
+    manifest_tensors = []
+    for entry in plan["tensors"]:
+        tensor = {
             "name": entry["name"],
             "dtype": entry["dtype"],
             "shape": entry["shape"],
@@ -128,10 +154,12 @@ def assemble_artifact(output_path: Path, data_path: Path, plan: dict, tensor_has
             "length": entry["length"],
             "sha256": tensor_hashes[entry["name"]],
         }
-        for entry in plan["tensors"]
-    ]
+        if "segments" in entry:
+            tensor["segments"] = entry["segments"]
+        manifest_tensors.append(tensor)
+    version = 2 if plan["format"] == "ctox.q2q4.quant-plan.v2" else 1
     manifest = {
-        "format": "ctox.q2q4.v1",
+        "format": f"ctox.q2q4.v{version}",
         "model": plan["model"],
         "revision": plan["revision"],
         "alignment": plan["alignment"],
@@ -143,7 +171,7 @@ def assemble_artifact(output_path: Path, data_path: Path, plan: dict, tensor_has
     header = struct.pack(
         "<8sIIQQII24x",
         MAGIC,
-        VERSION,
+        version,
         ENDIAN_MARKER,
         len(manifest_bytes),
         data_offset,
@@ -174,7 +202,10 @@ def main() -> None:
     if args.rows_per_chunk < 1:
         raise SystemExit("rows-per-chunk must be positive")
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
-    if plan["format"] != "ctox.q2q4.quant-plan.v1" or not plan["fits_fold_limit"]:
+    if plan["format"] not in {
+        "ctox.q2q4.quant-plan.v1",
+        "ctox.q2q4.quant-plan.v2",
+    } or not plan["fits_fold_limit"]:
         raise SystemExit("plan is unsupported or exceeds the Fold limit")
 
     try:
