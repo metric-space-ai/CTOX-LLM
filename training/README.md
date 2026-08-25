@@ -87,6 +87,10 @@ structured-output, and tool-schema distributions before GPU work is admitted.
 families have independent train/evaluation minima. Source split names are not
 accepted as domain evidence; underfilled labels must be replenished before the
 release-size teacher cache begins.
+`classify_domains.py` applies that rubric with a revision-pinned multilingual
+NLI classifier. Threshold labels are supplemented only by deterministic source
+facts (for example, an actual tool schema or the pinned code/math split). Its
+tags guide cohort selection and are never used as target labels during recovery.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized
@@ -121,8 +125,10 @@ against the pinned Hugging Face commit; a merely supplied revision string is
 not accepted as provenance.
 For long-context records, `cache_teacher.py --target-mode assistant` stores
 logits only for the final supervised assistant response. Hidden-state targets
-cover that response, bounded windows around recorded retrieval markers, and a
-uniform sequence sample. Hooks slice and move those positions immediately;
+cover a bounded uniform sample of that response, bounded windows around
+recorded retrieval markers, and a uniform full-sequence sample. MTP sparse
+logits still cover every verifiable draft while MTP hidden-state storage uses
+the same bounded positions. Hooks slice and move those positions immediately;
 they never persist five full 128K hidden-state tensors. Teacher and activation
 inputs fail rather than silently truncating a record above `--max-length`.
 On memory-constrained teacher hosts, `--gpu-weight-memory-gib` reserves GPU

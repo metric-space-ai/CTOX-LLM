@@ -122,6 +122,7 @@ def position_sets(
     marker_offsets: list[int],
     marker_window: int,
     uniform_hidden_positions: int,
+    assistant_hidden_positions: int = 64,
 ) -> tuple[list[int], list[int]]:
     if sequence_length <= 0:
         raise ValueError("sequence_length must be positive")
@@ -137,7 +138,23 @@ def position_sets(
     # token so the first assistant token is supervised; exclude the final
     # sequence position because it has no next-token target in this record.
     logit_positions = list(range(assistant_prefix_tokens - 1, sequence_length - 1))
-    hidden_positions = set(logit_positions)
+    if assistant_hidden_positions <= 0:
+        raise ValueError("assistant_hidden_positions must be positive")
+    if len(logit_positions) <= assistant_hidden_positions:
+        hidden_positions = set(logit_positions)
+    elif assistant_hidden_positions == 1:
+        hidden_positions = {logit_positions[len(logit_positions) // 2]}
+    else:
+        hidden_positions = {
+            logit_positions[
+                round(
+                    index
+                    * (len(logit_positions) - 1)
+                    / (assistant_hidden_positions - 1)
+                )
+            ]
+            for index in range(assistant_hidden_positions)
+        }
     for offset in marker_offsets:
         if not 0 <= offset < sequence_length:
             raise ValueError(f"marker offset {offset} is outside sequence")
@@ -275,6 +292,7 @@ def cache(
         "target_mode": args.target_mode,
         "marker_window": args.marker_window,
         "uniform_hidden_positions": args.uniform_hidden_positions,
+        "assistant_hidden_positions": args.assistant_hidden_positions,
         "fla_kernel": kernel_evidence,
         "gpu_weight_memory_gib": args.gpu_weight_memory_gib,
         "cpu_offload_memory_gib": args.cpu_offload_memory_gib,
@@ -329,6 +347,7 @@ def cache(
                 [int(offset) for offset in record.get("marker_token_offsets", [])],
                 args.marker_window,
                 args.uniform_hidden_positions,
+                args.assistant_hidden_positions,
             )
             if not logit_position_list:
                 raise RuntimeError(f"sample {sample_id} has no teacher logit positions")
@@ -339,6 +358,12 @@ def cache(
             )
             if mtp_model is not None and not mtp_position_list:
                 raise RuntimeError(f"sample {sample_id} has no MTP teacher positions")
+            mtp_position_set = set(mtp_position_list)
+            mtp_hidden_position_list = [
+                position
+                for position in hidden_position_list
+                if position in mtp_position_set
+            ]
             input_ids = encoded.input_ids.to(model.device)
             attention_mask = encoded.attention_mask.to(model.device)
             logit_positions = torch.tensor(logit_position_list, dtype=torch.long)
@@ -440,6 +465,8 @@ def cache(
                 mtp_top_indices = None
                 mtp_top_values = None
                 mtp_residual = None
+                mtp_position_indices = None
+                selected_mtp_hidden_positions = None
                 if mtp_model is not None:
                     if not selected_mtp_chunks:
                         raise RuntimeError(
@@ -451,7 +478,20 @@ def cache(
                             f"sample {sample_id} produced {selected_mtp_hidden.shape[1]} MTP "
                             f"targets, expected {len(mtp_position_list)}"
                         )
-                    mtp_hidden_targets = selected_mtp_hidden.detach().cpu().to(torch.bfloat16)
+                    mtp_position_indices = {
+                        position: index for index, position in enumerate(mtp_position_list)
+                    }
+                    selected_mtp_hidden_positions = torch.tensor(
+                        [mtp_position_indices[position] for position in mtp_hidden_position_list],
+                        dtype=torch.long,
+                        device=selected_mtp_hidden.device,
+                    )
+                    mtp_hidden_targets = (
+                        selected_mtp_hidden.index_select(1, selected_mtp_hidden_positions)
+                        .detach()
+                        .cpu()
+                        .to(torch.bfloat16)
+                    )
                     # Invoke the Accelerate-wrapped shared head directly.  An
                     # offloaded head deliberately exposes meta parameters
                     # between calls; moving the hidden state to that apparent
@@ -478,6 +518,10 @@ def cache(
                 tensors.update(
                     {
                         "mtp_positions": mtp_positions.to(torch.int32),
+                        "mtp_hidden_positions": torch.tensor(
+                            mtp_hidden_position_list,
+                            dtype=torch.int32,
+                        ),
                         "mtp_hidden": mtp_hidden_targets,
                         "mtp_topk_indices": mtp_top_indices,
                         "mtp_topk_logprobs": mtp_top_values,
@@ -509,6 +553,7 @@ def cache(
                     "logit_target_count": str(len(logit_position_list)),
                     "hidden_target_count": str(len(hidden_position_list)),
                     "mtp_target_count": str(len(mtp_position_list)),
+                    "mtp_hidden_target_count": str(len(mtp_hidden_position_list)),
                     "mtp_position_semantics": "base_hidden_p_drafts_token_p_plus_2",
                     "prefill_chunk_tokens": str(chunk_tokens),
                 },
@@ -522,6 +567,7 @@ def cache(
                         "logit_targets": len(logit_position_list),
                         "hidden_targets": len(hidden_position_list),
                         "mtp_targets": len(mtp_position_list),
+                        "mtp_hidden_targets": len(mtp_hidden_position_list),
                         "source_line": line_number,
                         "source_payload_sha256": record["prompt_sha256"],
                     },
@@ -543,6 +589,8 @@ def cache(
                 mtp_top_indices,
                 mtp_top_values,
                 mtp_residual,
+                mtp_position_indices,
+                selected_mtp_hidden_positions,
             )
             active_hidden_positions = None
             written_samples += 1
@@ -572,6 +620,7 @@ def main() -> None:
     parser.add_argument("--target-mode", choices=("all", "assistant"), default="all")
     parser.add_argument("--marker-window", type=int, default=32)
     parser.add_argument("--uniform-hidden-positions", type=int, default=64)
+    parser.add_argument("--assistant-hidden-positions", type=int, default=64)
     parser.add_argument("--start-sample", type=int, default=0)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--use-fla-kernel", action="store_true")
@@ -592,6 +641,8 @@ def main() -> None:
         raise SystemExit("--logit-chunk must be positive")
     if args.marker_window < 0 or args.uniform_hidden_positions < 0:
         raise SystemExit("--marker-window and --uniform-hidden-positions must be non-negative")
+    if args.assistant_hidden_positions <= 0:
+        raise SystemExit("--assistant-hidden-positions must be positive")
     if args.start_sample < 0:
         raise SystemExit("--start-sample must be non-negative")
     if args.max_samples is not None and args.max_samples <= 0:

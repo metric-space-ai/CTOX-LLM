@@ -87,5 +87,7 @@ It balances ordinary chat, coding, mathematics/STEM, Agentic/tool use, German,
 twelve equal-weight additional languages, and genuine 32K/64K/128K retrieval.
 Every payload hash and all 2,596 final Assistant targets pass the tokenizer
 audit. The BF16 teacher is now byte-verified against the pinned Hub commit and
-the provenance-bound MTP target smoke passes. Semantic domain tagging and
-quota replenishment remain a gate before the release-size teacher cache starts.
+the provenance-bound MTP target smoke passes. A revision-pinned multilingual
+NLI audit also places every sample against the frozen 16-family domain rubric;
+all independent train/evaluation minima pass. The release-size teacher cache
+and end-to-end recovery remain pending.

@@ -1,7 +1,7 @@
 {
   "format": "ctox.qwen38.recovery-corpus-evidence.v3",
   "date": "2026-08-25",
-  "status": "materialized_pre_domain_gate",
+  "status": "materialized_domain_gate_passed",
   "model": "Qwen/Qwen3.8-27B",
   "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
   "teacher_provenance": {
@@ -94,6 +94,40 @@
       "nvidia/Nemotron-SFT-Agentic-v2": 192
     }
   },
+  "domain_gate": {
+    "status": "passed_no_quota_gaps",
+    "rubric": "training/DOMAIN_RUBRIC.json",
+    "rubric_sha256": "bc30063c072c04ff5cbfc127bec6fcdeec84dbc00038a1ce92dd77d976708c6a",
+    "classifier": "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+    "classifier_revision": "8adb042d524ecd5c26d3e3ba0e3fbcf7e2d0864c",
+    "classifier_license": "MIT",
+    "threshold": 0.7,
+    "train": {
+      "tag_artifact": "release-recovery-train-2072-v2.jsonl",
+      "tag_bytes": 1928000,
+      "tag_sha256": "d158e6f4cacf347e64c600693514a5f0717b1a8d0aec374d2fce1f361bc8643e",
+      "summary_sha256": "f87bca9b087ad2a2a4b9939027bb7c10fcdf7db9f3cdcc1128a53f849fb901c8",
+      "below_threshold_fallback_records": 470,
+      "minimum_domain_count": 507,
+      "maximum_domain_count": 1056,
+      "minimum_primary_domain_count": 18,
+      "maximum_primary_domain_count": 360,
+      "quota_gaps": 0
+    },
+    "evaluation": {
+      "tag_artifact": "release-recovery-evaluation-524-v2.jsonl",
+      "tag_bytes": 482832,
+      "tag_sha256": "d57b3d9369b6aba6d5f708a973cd9d9204922550afec956d40e79ddaf2ed05f0",
+      "summary_sha256": "cbdb5dcc4fbe5fcc373afde845c408bf4d98c0e5aec3a96de31df116abd5f815",
+      "below_threshold_fallback_records": 121,
+      "minimum_domain_count": 113,
+      "maximum_domain_count": 264,
+      "minimum_primary_domain_count": 1,
+      "maximum_primary_domain_count": 81,
+      "quota_gaps": 0
+    },
+    "interpretation": "multi-label selection audit only; tags are not recovery targets"
+  },
   "mtp_teacher_smoke": {
     "status": "passed_with_verified_teacher_provenance",
     "artifact": "release-agentic-mtp-smoke-1-v2",
@@ -106,16 +140,30 @@
     "run_sha256": "81432db45ce9ee99c3980830d89c13589c2c93485d188e3e21c4887eb52c3dbb",
     "index_sha256": "248e31421590f4766bab8c63f4df2176d4ba3034d0b4c726b4cb2b976f077110",
     "non_finite_values": 0,
-    "gpu_hours": 0.018635303179423014
+    "gpu_hours": 0.018635303179423014,
+    "bounded_hidden_storage_smoke": {
+      "artifact": "release-agentic-mtp-bounded-hidden-smoke-1-v1",
+      "assistant_hidden_position_limit": 8,
+      "uniform_full_sequence_positions": 4,
+      "base_logit_targets": 22,
+      "stored_base_hidden_targets": 12,
+      "mtp_logit_targets": 21,
+      "stored_mtp_hidden_targets": 7,
+      "safetensors_bytes": 720447,
+      "safetensors_sha256": "daa7c3bbd42d0321743bd0a947bf4a04b1eb884042d0441185ef763bc4d8b3cb",
+      "run_sha256": "da743874b4e1e938354280278f04fbe89fd345105916d402e649bcf81f7c7175",
+      "index_sha256": "1e0fa1bc4b177a00a9df57f7e885774c546d3ecb568b8174db9a699c60fcca6a",
+      "storage_reduction_vs_all_response_hidden": 0.8451579666122692,
+      "all_base_and_mtp_sparse_logits_retained": true
+    }
   },
   "gpu_ledger": {
     "budget_gpu_hours": 240,
-    "successful_gpu_hours": 4.774933096832698,
+    "successful_gpu_hours": 4.793267286883459,
     "failed_gpu_hours": 0.4376394565900167,
-    "total_gpu_hours": 5.212572553422715
+    "total_gpu_hours": 5.230906743473477
   },
   "gates_still_open": [
-    "Apply the frozen multi-label DOMAIN_RUBRIC.json and replenish any domain below its train/evaluation minimum.",
     "Cache release-size BF16 top-64 logits, residual mass, selected hidden states, and MTP draft targets.",
     "Recompute full-corpus activation statistics and confirm or replace the provisional Q2/Q4 assignment.",
     "Run end-to-end KL, cross-entropy, hidden-state, activation, and MTP recovery.",
@@ -124,6 +172,7 @@
   "notes": [
     "The 384/96 Agentic release cohorts exclude 963 identities from all earlier Agentic materializations before ranking.",
     "Aya uses human-curated Apache-2.0 inputs/targets from twelve equal-weight language strata; inputs and targets are both part of the payload hash.",
+    "All 16 semantic domain families exceed their independent train and evaluation minima; low-confidence records retain a transparent best-label fallback flag.",
     "A prior technical MTP smoke with an unverified typed revision was quarantined and is not release evidence."
   ]
 }

@@ -31,6 +31,7 @@ from cache_teacher import (  # noqa: E402
     position_sets,
     validate_local_model_provenance,
 )
+from classify_domains import classification_text, deterministic_labels  # noqa: E402
 from collect_activation_stats import (  # noqa: E402
     checkpoint_weight_name,
     prefill_ranges,
@@ -84,6 +85,25 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(percentile([9, 1, 5, 3], 0.0), 1)
         self.assertEqual(percentile([9, 1, 5, 3], 0.5), 5)
         self.assertEqual(percentile([9, 1, 5, 3], 1.0), 9)
+
+    def test_domain_classifier_preserves_hard_capability_signals(self) -> None:
+        record = {
+            "category": "code",
+            "tools": [{"type": "function"}],
+            "messages": [
+                {"role": "user", "content": "Debug this program"},
+                {"role": "assistant", "content": "```rust\nfn main() {}\n```"},
+            ],
+        }
+        self.assertEqual(
+            deterministic_labels(record, record["messages"][-1]["content"]),
+            {
+                "agentic_tools_search",
+                "data_structured_outputs",
+                "software_cybersecurity",
+            },
+        )
+        self.assertIn("user: Debug this program", classification_text(record))
 
     def test_hash_covers_reference_answer(self) -> None:
         first = {"input": "2+2?", "output": "4"}
@@ -196,6 +216,22 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertTrue(set(logits).issubset(hidden))
         self.assertIn(0, hidden)
         self.assertIn(999, hidden)
+
+    def test_assistant_hidden_targets_are_bounded_without_dropping_logits(self) -> None:
+        logits, hidden = position_sets(
+            sequence_length=1000,
+            target_mode="assistant",
+            assistant_prefix_tokens=100,
+            marker_offsets=[500],
+            marker_window=2,
+            uniform_hidden_positions=5,
+            assistant_hidden_positions=8,
+        )
+        self.assertEqual(len(logits), 900)
+        self.assertLessEqual(len(hidden), 8 + 5 + 5)
+        self.assertEqual(logits[0], 99)
+        self.assertEqual(logits[-1], 998)
+        self.assertIn(500, hidden)
 
     def test_teacher_all_mode_preserves_full_sequence_targets(self) -> None:
         logits, hidden = position_sets(8, "all", None, [], 0, 0)
