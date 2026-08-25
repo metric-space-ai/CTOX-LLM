@@ -18,6 +18,9 @@ recorded in the manifest.
 Sample identities cover the complete recovery payload, including reference
 answers. Changing an answer therefore changes both the payload hash and sample
 identity; stale source coordinates cannot silently enter a teacher cache.
+`select_manifest.py` produces reproducible hash-ranked samples per input
+manifest, preventing source order from biasing smoke tests and calibration
+cohorts.
 
 The 240 GPU-hour ceiling is cumulative across teacher generation, sensitivity
 runs, ablations, final recovery, and evaluation. Every command appends its GPU
