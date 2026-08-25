@@ -17,3 +17,8 @@ recorded in the manifest.
 The 240 GPU-hour ceiling is cumulative across teacher generation, sensitivity
 runs, ablations, final recovery, and evaluation. Every command appends its GPU
 count and elapsed time to `run-ledger.jsonl`.
+
+`build_quant_plan.py` reads only safetensor metadata and calculates exact packed
+bytes, including alignment and recovery scales. It excludes vision, includes
+resident MTP, rejects a plan above 7.8 GiB, and emits the immutable assignment
+consumed by target packers.

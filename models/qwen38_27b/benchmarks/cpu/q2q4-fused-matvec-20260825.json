@@ -1,0 +1,46 @@
+{
+  "format": "ctox.kernel-benchmark.v1",
+  "shape": {
+    "rows": 256,
+    "columns": 512,
+    "iterations": 10
+  },
+  "systems": [
+    {
+      "hardware": "Apple M5",
+      "os": "macOS 26.2",
+      "profile": "aarch64-neon",
+      "q2_b64": {
+        "scalar_milliseconds": 0.631292,
+        "simd_milliseconds": 0.465125,
+        "speedup": 1.3572523515,
+        "maximum_absolute_error": 0.00000667572
+      },
+      "q4_b64": {
+        "scalar_milliseconds": 0.80025,
+        "simd_milliseconds": 0.55975,
+        "speedup": 1.4296560965,
+        "maximum_absolute_error": 0.000008106232
+      }
+    },
+    {
+      "hardware": "Intel Core i5-13400F",
+      "os": "Linux gpu3-a4500",
+      "profile": "x86_64-avx2",
+      "q2_b64": {
+        "scalar_milliseconds": 2.4459,
+        "simd_milliseconds": 2.226672,
+        "speedup": 1.0984554528,
+        "maximum_absolute_error": 0.0000071525574
+      },
+      "q4_b64": {
+        "scalar_milliseconds": 2.848628,
+        "simd_milliseconds": 2.433087,
+        "speedup": 1.1707875633,
+        "maximum_absolute_error": 0.000007867813
+      }
+    }
+  ],
+  "promotion": "experimental",
+  "note": "Per-op evidence only; this does not promote the complete CPU backend."
+}

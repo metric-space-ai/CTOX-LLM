@@ -7,11 +7,13 @@
     },
     "cpu_avx2": {
       "state": "experimental",
-      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec"]
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec"],
+      "evidence": "../benchmarks/cpu/q2q4-fused-matvec-20260825.json"
     },
     "cpu_neon": {
       "state": "experimental",
-      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec"]
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec"],
+      "evidence": "../benchmarks/cpu/q2q4-fused-matvec-20260825.json"
     },
     "cuda": {
       "state": "contract",
