@@ -201,6 +201,53 @@ def resolve_mtp_device(args: argparse.Namespace, torch: Any, base_model: Any) ->
     return device
 
 
+def resume_prefix(
+    output: Path,
+    input_path: Path,
+    start_sample: int,
+    selected_samples: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    run_path = output / "run.json"
+    index_path = output / "index.jsonl"
+    if not run_path.is_file() or not index_path.is_file():
+        raise ValueError("resume output lacks run.json or index.jsonl")
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    if int(run.get("start_sample", -1)) != start_sample:
+        raise ValueError("resume start sample differs from existing run")
+    if int(run.get("selected_samples", -1)) != selected_samples:
+        raise ValueError("resume selected sample count differs from existing run")
+    entries = [
+        json.loads(line)
+        for line in index_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not 0 < len(entries) < selected_samples:
+        raise ValueError("resume requires a non-empty strict prefix of the selected samples")
+    source_records = [
+        json.loads(line)
+        for line in input_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ][start_sample : start_sample + len(entries)]
+    if len(source_records) != len(entries):
+        raise ValueError("resume prefix extends beyond source records")
+    expected_ids = [str(record["id"]) for record in source_records]
+    if [str(entry.get("id")) for entry in entries] != expected_ids:
+        raise ValueError("resume index is not the exact ordered source prefix")
+    indexed_files = set()
+    for entry in entries:
+        sample_id = str(entry["id"])
+        filename = str(entry.get("file"))
+        if filename != f"{sample_id}.safetensors" or Path(filename).name != filename:
+            raise ValueError(f"resume index has unsafe cache filename {filename}")
+        if not (output / filename).is_file():
+            raise ValueError(f"resume cache lacks indexed artifact {filename}")
+        indexed_files.add(filename)
+    actual_files = {path.name for path in output.glob("*.safetensors")}
+    if actual_files != indexed_files:
+        raise ValueError("resume cache contains unindexed or missing safetensors artifacts")
+    return run, entries
+
+
 def cache(
     args: argparse.Namespace,
     torch: Any,
@@ -210,8 +257,10 @@ def cache(
     auto_tokenizer: Any,
     mtp_cache_type: Any,
 ) -> None:
-    if args.output.exists():
+    if args.output.exists() and not args.resume:
         raise SystemExit(f"refusing to overwrite {args.output}")
+    if args.resume and not args.output.is_dir():
+        raise SystemExit("--resume requires an existing cache directory")
     try:
         local_provenance, local_provenance_sha256 = validate_local_model_provenance(
             Path(args.model), args.revision, args.local_model_provenance
@@ -227,7 +276,17 @@ def cache(
         args.max_samples or available_samples,
         available_samples - args.start_sample,
     )
-    args.output.mkdir(parents=True)
+    existing_run = None
+    existing_entries: list[dict[str, Any]] = []
+    if args.resume:
+        try:
+            existing_run, existing_entries = resume_prefix(
+                args.output, args.input, args.start_sample, selected_samples
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            raise SystemExit(str(error)) from error
+    else:
+        args.output.mkdir(parents=True)
     hidden_layers = [int(layer) for layer in args.hidden_layers.split(",") if layer]
     tokenizer = auto_tokenizer.from_pretrained(args.model, revision=args.revision)
     kernel_evidence = install_pinned_fla_kernel() if args.use_fla_kernel else None
@@ -305,16 +364,63 @@ def cache(
         "torch_cuda_version": str(torch.version.cuda),
         "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
     }
-    write_json_atomic(args.output / "run.json", run_manifest)
+    semantic_fields = (
+        "teacher_revision",
+        "local_model_provenance_sha256",
+        "top_k",
+        "max_length",
+        "hidden_layers",
+        "target_mode",
+        "marker_window",
+        "uniform_hidden_positions",
+        "assistant_hidden_positions",
+        "start_sample",
+        "selected_samples",
+        "prefill_chunk_tokens",
+        "mtp_targets",
+    )
+    if existing_run is not None:
+        mismatches = [
+            field
+            for field in semantic_fields
+            if existing_run.get(field) != run_manifest.get(field)
+        ]
+        if mismatches:
+            raise SystemExit(f"resume runtime changes semantic fields: {mismatches}")
+        prior_profiles = list(existing_run.get("runtime_profiles", []))
+        if not prior_profiles:
+            prior_profiles.append(
+                {
+                    "device_map": existing_run.get("device_map"),
+                    "gpu_weight_memory_gib": existing_run.get("gpu_weight_memory_gib"),
+                    "cpu_offload_memory_gib": existing_run.get("cpu_offload_memory_gib"),
+                    "mtp_device": existing_run.get("mtp_device"),
+                    "status": "incomplete_prefix_preserved",
+                }
+            )
+        run_manifest["runtime_profiles"] = prior_profiles + [
+            {
+                "device_map": run_manifest.get("device_map"),
+                "gpu_weight_memory_gib": run_manifest.get("gpu_weight_memory_gib"),
+                "cpu_offload_memory_gib": run_manifest.get("cpu_offload_memory_gib"),
+                "mtp_device": run_manifest.get("mtp_device"),
+                "status": "resume",
+            }
+        ]
+        run_manifest["resumed_prefix_samples"] = len(existing_entries)
+    else:
+        write_json_atomic(args.output / "run.json", run_manifest)
     reset_cuda_memory_peaks(torch, args.gpus)
     index_path = args.output / "index.jsonl"
     seen_samples = 0
-    written_samples = 0
-    with index_path.open("x", encoding="utf-8") as index, args.input.open(encoding="utf-8") as source:
+    written_samples = len(existing_entries)
+    resume_start = args.start_sample + len(existing_entries)
+    index_mode = "a" if existing_entries else "x"
+    with index_path.open(index_mode, encoding="utf-8") as index, args.input.open(encoding="utf-8") as source:
         for line_number, line in enumerate(source, 1):
             if not line.strip():
                 continue
-            if seen_samples < args.start_sample:
+            if seen_samples < resume_start:
                 seen_samples += 1
                 continue
             if written_samples >= selected_samples:
@@ -631,6 +737,11 @@ def main() -> None:
         help="cache resident-MTP hidden and sparse-logit targets on this device (for example cuda:2)",
     )
     parser.add_argument("--prefill-chunk-tokens", type=int, default=0)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an exact validated prefix in an incomplete cache directory",
+    )
     args = parser.parse_args()
     require_budget(args.ledger, args.reserved_gpu_hours)
     if args.top_k <= 0:

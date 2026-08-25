@@ -30,6 +30,7 @@ from build_quant_plan import (  # noqa: E402
 from cache_teacher import (  # noqa: E402
     mtp_target_positions,
     position_sets,
+    resume_prefix,
     validate_local_model_provenance,
 )
 from classify_domains import (  # noqa: E402
@@ -136,6 +137,37 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(percentile([9, 1, 5, 3], 0.0), 1)
         self.assertEqual(percentile([9, 1, 5, 3], 0.5), 5)
         self.assertEqual(percentile([9, 1, 5, 3], 1.0), 9)
+
+    def test_teacher_cache_resume_accepts_only_exact_source_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text(
+                "".join(
+                    json.dumps({"id": sample_id}) + "\n"
+                    for sample_id in ("a", "b", "c")
+                )
+            )
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "run.json").write_text(
+                json.dumps({"start_sample": 0, "selected_samples": 3})
+            )
+            (cache / "index.jsonl").write_text(
+                "".join(
+                    json.dumps({"id": sample_id, "file": f"{sample_id}.safetensors"})
+                    + "\n"
+                    for sample_id in ("a", "b")
+                )
+            )
+            for sample_id in ("a", "b"):
+                (cache / f"{sample_id}.safetensors").write_bytes(b"sealed")
+            run, entries = resume_prefix(cache, source, 0, 3)
+            self.assertEqual(run["selected_samples"], 3)
+            self.assertEqual([entry["id"] for entry in entries], ["a", "b"])
+            (cache / "unindexed.safetensors").write_bytes(b"bad")
+            with self.assertRaisesRegex(ValueError, "unindexed"):
+                resume_prefix(cache, source, 0, 3)
 
     def test_domain_classifier_preserves_hard_capability_signals(self) -> None:
         record = {

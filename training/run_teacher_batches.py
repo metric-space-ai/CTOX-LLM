@@ -52,6 +52,11 @@ def main() -> None:
     parser.add_argument("--prefill-chunk-tokens", type=int, default=512)
     parser.add_argument("--start-batch", type=int, default=0)
     parser.add_argument("--end-batch", type=int)
+    parser.add_argument(
+        "--resume-incomplete",
+        action="store_true",
+        help="resume an exact incomplete cache prefix instead of rejecting it",
+    )
     args = parser.parse_args()
 
     batch_document = json.loads(args.batch_plan.read_text(encoding="utf-8"))
@@ -87,7 +92,8 @@ def main() -> None:
                 print(f"batch={index} status=verified-skip", flush=True)
                 continue
             raise SystemExit(f"batch {index} has non-matching existing evidence")
-        if cache.exists() or verification_path.exists():
+        resume = cache.exists() and not verification_path.exists() and args.resume_incomplete
+        if (cache.exists() or verification_path.exists()) and not resume:
             raise SystemExit(f"batch {index} has incomplete existing output; preserve and inspect it")
 
         cache_command = [
@@ -116,8 +122,10 @@ def main() -> None:
             "--mtp-device", args.mtp_device,
             "--prefill-chunk-tokens", str(args.prefill_chunk_tokens),
         ]
+        if resume:
+            cache_command.append("--resume")
         print(
-            f"batch={index} status=cache-start samples={batch['samples']} "
+            f"batch={index} status={'cache-resume' if resume else 'cache-start'} samples={batch['samples']} "
             f"tokens={batch['sequence_tokens']}",
             flush=True,
         )

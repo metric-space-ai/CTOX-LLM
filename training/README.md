@@ -147,6 +147,13 @@ not invalidate earlier teacher work.
 runs the content verifier. It skips existing work only when the completed run,
 source slice, teacher revision, provenance hash, and verification sample count
 all agree; partial directories stop the orchestrator for inspection.
+An inspected OOM prefix can be continued only with the explicit
+`--resume-incomplete` path. `cache_teacher.py --resume` requires the existing
+index to be a non-empty exact prefix of the same source slice, rejects missing
+or unindexed artifacts, keeps all semantic teacher/cache settings fixed, and
+records differing memory/device layouts as runtime profiles. The normal path
+continues to reject every pre-existing output directory, and full content
+verification still runs after the resumed suffix completes.
 
 The end-to-end loss contract uses the teacher's exact top-k probabilities plus
 one residual-vocabulary mass bucket; dropping the residual would not be a valid
