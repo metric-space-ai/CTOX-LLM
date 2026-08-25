@@ -476,6 +476,12 @@ class DatasetPipelineTests(unittest.TestCase):
             dataset = VerifiedTeacherCache([verification], "r", "p")
             self.assertEqual(dataset.verified_artifact_path(0), artifact.resolve())
             self.assertEqual(dataset.manifest()["samples"], 1)
+            manifest = dataset.manifest()
+            manifest_path = root / "set.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            loaded = VerifiedTeacherCache.from_manifest(manifest_path, manifest_sha256)
+            self.assertEqual(loaded.manifest()["artifact_root_sha256"], manifest["artifact_root_sha256"])
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 VerifiedTeacherCache([verification, verification], "r", "p")
             artifact.write_bytes(b"other")

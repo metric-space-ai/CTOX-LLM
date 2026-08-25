@@ -73,6 +73,36 @@ class VerifiedTeacherCache:
         if not self.artifacts:
             raise ValueError("verified teacher cache is empty")
 
+    @classmethod
+    def from_manifest(
+        cls,
+        path: Path,
+        expected_sha256: str,
+    ) -> "VerifiedTeacherCache":
+        encoded = path.read_bytes()
+        if sha256_bytes(encoded) != expected_sha256:
+            raise ValueError("teacher cache-set manifest hash differs from contract")
+        document = json.loads(encoded)
+        if document.get("format") != "ctox.teacher-cache-set.v1":
+            raise ValueError("unsupported teacher cache-set manifest")
+        verification_paths = [Path(batch["verification"]) for batch in document["batches"]]
+        result = cls(
+            verification_paths,
+            str(document["teacher_revision"]),
+            str(document["teacher_provenance_sha256"]),
+        )
+        rebuilt = result.manifest()
+        for key in ("samples", "artifact_bytes", "artifact_root_sha256"):
+            if rebuilt[key] != document.get(key):
+                raise ValueError(f"teacher cache-set {key} differs from verified batches")
+        recorded_batches = document["batches"]
+        if len(recorded_batches) != len(result.batches):
+            raise ValueError("teacher cache-set batch count differs")
+        for recorded, actual in zip(recorded_batches, result.batches):
+            if recorded.get("verification_sha256") != actual["verification_sha256"]:
+                raise ValueError("teacher cache-set verification hash differs")
+        return result
+
     def verified_artifact_path(self, index: int) -> Path:
         artifact = self.artifacts[index]
         path = Path(artifact["path"])

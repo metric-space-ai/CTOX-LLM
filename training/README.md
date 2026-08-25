@@ -137,6 +137,9 @@ After the final batch, `build_teacher_cache_set.py` resolves the batch plan to
 the exact ordered verification documents, rehashes every artifact by default,
 and emits the single content-addressed cache-set manifest accepted by the
 end-to-end trainer. Missing batches or a different sample count fail closed.
+The trainer reopens that set only with its expected manifest SHA-256, then
+reconstructs and compares the sample count, artifact bytes, content root, and
+every underlying batch-verification hash before the first optimization step.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized
