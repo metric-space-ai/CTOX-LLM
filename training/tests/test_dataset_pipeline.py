@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from collections import Counter
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from build_manifest import (  # noqa: E402
     source_id_for,
     source_uses_raw_jsonl,
 )
+from build_teacher_cache_set import batch_group, main as build_teacher_cache_set_main  # noqa: E402
 from audit_corpus import percentile  # noqa: E402
 from audit_service_coverage import service_coverage_report  # noqa: E402
 from build_quant_plan import (  # noqa: E402
@@ -133,6 +135,133 @@ class DatasetPipelineTests(unittest.TestCase):
             canonical_text(record).encode("utf-8")
         ).hexdigest()
         return record
+
+    def test_teacher_cache_batch_group_binds_plan_and_contiguous_verifications(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = root / "plan.json"
+            encoded = json.dumps(
+                {
+                    "summary": {"batches": 2, "samples": 3},
+                    "batches": [
+                        {"batch_index": 0},
+                        {"batch_index": 1},
+                    ],
+                },
+                sort_keys=True,
+            ).encode()
+            plan.write_bytes(encoded)
+            paths, record, samples = batch_group(plan, root, "teacher")
+            self.assertEqual(samples, 3)
+            self.assertEqual(record["batches"], 2)
+            self.assertEqual(record["samples"], 3)
+            self.assertEqual(record["batch_plan_sha256"], hashlib.sha256(encoded).hexdigest())
+            self.assertEqual(
+                [path.name for path in paths],
+                [
+                    "teacher-batch-000-v1-verification-v1.json",
+                    "teacher-batch-001-v1-verification-v1.json",
+                ],
+            )
+
+            plan.write_text(
+                json.dumps(
+                    {
+                        "summary": {"batches": 2, "samples": 3},
+                        "batches": [
+                            {"batch_index": 0},
+                            {"batch_index": 2},
+                        ],
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "not contiguous"):
+                batch_group(plan, root, "teacher")
+
+    def test_teacher_cache_set_combines_reused_verification_and_new_batch_group(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            revision = "revision"
+            provenance = "a" * 64
+
+            def verification(path: Path, sample_id: str, cache: Path) -> None:
+                path.write_text(
+                    json.dumps(
+                        {
+                            "format": "ctox.teacher-cache-verification.v1",
+                            "status": "passed",
+                            "teacher_revision": revision,
+                            "teacher_provenance_sha256": provenance,
+                            "hidden_layers": [0],
+                            "hidden_size": 8,
+                            "top_k": 4,
+                            "mtp_targets": True,
+                            "cache": str(cache),
+                            "samples": 1,
+                            "artifact_bytes": 3,
+                            "artifact_root_sha256": "b" * 64,
+                            "artifacts": [
+                                {
+                                    "id": sample_id,
+                                    "file": f"{sample_id}.safetensors",
+                                    "bytes": 3,
+                                    "sha256": "c" * 64,
+                                }
+                            ],
+                        }
+                    )
+                )
+
+            reused = root / "reused.json"
+            verification(reused, "1" * 64, root / "old-cache")
+            plan = root / "plan.json"
+            plan.write_text(
+                json.dumps(
+                    {
+                        "summary": {"batches": 1, "samples": 1},
+                        "batches": [{"batch_index": 0}],
+                    }
+                )
+            )
+            grouped = root / "new-batch-000-v1-verification-v1.json"
+            verification(grouped, "2" * 64, root / "new-cache")
+            expected = root / "expected.jsonl"
+            expected.write_text(
+                "\n".join(
+                    json.dumps({"id": sample_id})
+                    for sample_id in ("1" * 64, "2" * 64)
+                )
+                + "\n"
+            )
+            output = root / "set.json"
+            arguments = [
+                "build_teacher_cache_set.py",
+                "--verification",
+                str(reused),
+                "--batch-group",
+                str(plan),
+                str(root),
+                "new",
+                "--expected-input",
+                str(expected),
+                "--teacher-revision",
+                revision,
+                "--teacher-provenance-sha256",
+                provenance,
+                "--output",
+                str(output),
+                "--skip-artifact-rehash",
+            ]
+            with patch.object(sys, "argv", arguments):
+                build_teacher_cache_set_main()
+            document = json.loads(output.read_text())
+            self.assertEqual(document["samples"], 2)
+            self.assertEqual(document["expected_input"]["records"], 2)
+            self.assertEqual(document["batch_groups"][0]["samples"], 1)
 
     def test_committed_general_purpose_evidence_covers_every_declared_domain(
         self,

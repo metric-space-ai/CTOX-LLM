@@ -226,12 +226,15 @@ collapse multilingual/domain selection into a target label.
 only passed verification documents with one teacher revision and provenance,
 rejects duplicate sample identities and unsafe paths, and rechecks each
 artifact's exact byte length and SHA-256 when that sample is opened.
-After the final batch, `build_teacher_cache_set.py` resolves either one batch
-plan or an explicit list of verification documents, rehashes every artifact by
-default, and emits the single content-addressed cache-set manifest accepted by
-the end-to-end trainer. With `--expected-input`, its cached identity union must
-equal the final cohort exactly. Missing, extra, or settings-incompatible
-batches fail closed.
+After the final batch, `build_teacher_cache_set.py` resolves explicit reused
+verification documents plus any number of repeatable
+`--batch-group PLAN VERIFICATION_ROOT PREFIX` groups. Each group binds its
+contiguous verification names, batch count, sample count, plan bytes, and plan
+SHA-256. The builder rehashes every artifact by default and emits the single
+content-addressed cache-set manifest accepted by the end-to-end trainer. With
+`--expected-input`, its cached identity union must equal the final cohort
+exactly. Missing, extra, duplicate, or settings-incompatible batches fail
+closed.
 The trainer reopens that set only with its expected manifest SHA-256, then
 reconstructs and compares the sample count, artifact bytes, content root, and
 every underlying batch-verification hash before the first optimization step.

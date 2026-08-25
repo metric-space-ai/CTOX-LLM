@@ -11,11 +11,56 @@ from pathlib import Path
 from teacher_cache_dataset import VerifiedTeacherCache
 
 
+def batch_group(
+    plan_path: Path,
+    verification_root: Path,
+    prefix: str,
+) -> tuple[list[Path], dict[str, object], int]:
+    """Resolve and bind one immutable batch plan to its verification files."""
+
+    encoded = plan_path.read_bytes()
+    plan = json.loads(encoded)
+    batches = plan["batches"]
+    expected_batches = int(plan["summary"]["batches"])
+    expected_samples = int(plan["summary"]["samples"])
+    if len(batches) != expected_batches:
+        raise ValueError(f"batch count differs from summary in {plan_path}")
+    paths = [
+        verification_root
+        / f"{prefix}-batch-{int(batch['batch_index']):03d}-v1-verification-v1.json"
+        for batch in batches
+    ]
+    indices = [int(batch["batch_index"]) for batch in batches]
+    if indices != list(range(len(indices))):
+        raise ValueError(f"batch indices are not contiguous from zero in {plan_path}")
+    return (
+        paths,
+        {
+            "batch_plan": str(plan_path.resolve()),
+            "batch_plan_bytes": len(encoded),
+            "batch_plan_sha256": hashlib.sha256(encoded).hexdigest(),
+            "verification_root": str(verification_root.resolve()),
+            "prefix": prefix,
+            "batches": expected_batches,
+            "samples": expected_samples,
+        },
+        expected_samples,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-plan", type=Path)
     parser.add_argument("--verification-root", type=Path)
     parser.add_argument("--prefix")
+    parser.add_argument(
+        "--batch-group",
+        nargs=3,
+        action="append",
+        default=[],
+        metavar=("PLAN", "VERIFICATION_ROOT", "PREFIX"),
+        help="repeatable batch-plan/root/prefix group for a combined final cache set",
+    )
     parser.add_argument("--verification", type=Path, action="append", default=[])
     parser.add_argument("--expected-input", type=Path)
     parser.add_argument("--teacher-revision", required=True)
@@ -31,34 +76,49 @@ def main() -> None:
         raise SystemExit(f"refusing to overwrite {args.output}")
     try:
         plan_arguments = (args.batch_plan, args.verification_root, args.prefix)
-        if args.verification:
-            if any(value is not None for value in plan_arguments):
-                raise ValueError("explicit verifications cannot be combined with a batch plan")
-            verification_paths = args.verification
-            batch_plan_bytes = None
-            batch_plan = None
+        has_legacy_group = any(value is not None for value in plan_arguments)
+        if has_legacy_group and (
+            any(value is None for value in plan_arguments)
+            or args.verification
+            or args.batch_group
+        ):
+            raise ValueError(
+                "legacy batch-plan arguments must be complete and cannot be combined"
+            )
+        if not has_legacy_group and not args.verification and not args.batch_group:
+            raise ValueError(
+                "provide verifications, batch groups, or batch plan, root, and prefix"
+            )
+        if has_legacy_group:
+            raw_groups = [(str(args.batch_plan), str(args.verification_root), args.prefix)]
         else:
-            if any(value is None for value in plan_arguments):
-                raise ValueError(
-                    "provide either --verification entries or batch plan, root, and prefix"
-                )
-            batch_plan_bytes = args.batch_plan.read_bytes()
-            batch_plan = json.loads(batch_plan_bytes)
-            verification_paths = [
-                args.verification_root
-                / f"{args.prefix}-batch-{int(batch['batch_index']):03d}-v1-verification-v1.json"
-                for batch in batch_plan["batches"]
-            ]
+            raw_groups = args.batch_group
+        verification_paths = list(args.verification)
+        explicit_batch_count = len(verification_paths)
+        if raw_groups:
+            batch_groups = []
+            group_ranges = []
+            batch_offset = explicit_batch_count
+            for raw_plan, raw_root, prefix in raw_groups:
+                paths, record, samples = batch_group(Path(raw_plan), Path(raw_root), prefix)
+                verification_paths.extend(paths)
+                batch_groups.append(record)
+                group_ranges.append((batch_offset, len(paths), samples))
+                batch_offset += len(paths)
+        else:
+            batch_groups = None
+            group_ranges = []
         cache = VerifiedTeacherCache(
             verification_paths,
             args.teacher_revision,
             args.teacher_provenance_sha256,
         )
-        if batch_plan is not None:
-            if len(cache.batches) != int(batch_plan["summary"]["batches"]):
-                raise ValueError("verified cache batch count differs from plan")
-            if len(cache.artifacts) != int(batch_plan["summary"]["samples"]):
-                raise ValueError("verified cache sample count differs from plan")
+        if batch_groups is not None:
+            for offset, batches, samples in group_ranges:
+                actual = cache.batches[offset : offset + batches]
+                actual_samples = sum(int(batch["samples"]) for batch in actual)
+                if len(actual) != batches or actual_samples != samples:
+                    raise ValueError("verified cache group differs from its batch plan")
         expected_input = None
         if args.expected_input is not None:
             expected_bytes = args.expected_input.read_bytes()
@@ -93,8 +153,8 @@ def main() -> None:
                     str(args.batch_plan.resolve()) if args.batch_plan is not None else None
                 ),
                 "batch_plan_sha256": (
-                    hashlib.sha256(batch_plan_bytes).hexdigest()
-                    if batch_plan_bytes is not None
+                    batch_groups[0]["batch_plan_sha256"]
+                    if batch_groups is not None and len(batch_groups) == 1
                     else None
                 ),
                 "verification_root": (
@@ -103,6 +163,7 @@ def main() -> None:
                     else None
                 ),
                 "prefix": args.prefix,
+                "batch_groups": batch_groups,
                 "expected_input": expected_input,
                 "all_artifacts_rehashed": not args.skip_artifact_rehash,
             }
