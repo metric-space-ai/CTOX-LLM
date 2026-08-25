@@ -6,12 +6,14 @@ this same type; it must not grow a second inference implementation.
 
 ## Loading and admission
 
-`Engine::load_signed` requires a trusted Ed25519 key, validates the complete
-release manifest, opens the selected CTOXQ pack with all tensor checksums,
-binds its original embedded-manifest digest to the selected backend pack, and
-checks the selected memory profile before calling the executor. A development
-entry point exists only for a release already authenticated by a containing
-trusted bundle.
+`Engine::load_signed` requires the release installation root and a trusted
+Ed25519 key. It validates the complete release manifest, resolves both the
+selected CTOXQ pack and restricted MTP vocabulary beneath that root, rehashes
+the complete token-ID file and every declared chunk, opens the pack with all
+tensor checksums, binds its original embedded-manifest digest to the selected
+backend pack, and checks the selected memory profile before calling the
+executor. A development entry point exists only for a release already
+authenticated by a containing trusted bundle.
 
 Production admission additionally requires:
 
@@ -20,9 +22,9 @@ Production admission additionally requires:
 - an explicit guarantee of no hidden fallbacks;
 - executor context capacity at least as large as the selected memory profile.
 
-Progress events distinguish signature verification, artifact opening,
-artifact admission, and backend loading. Cold-load and warmup times are
-reported separately.
+Progress events distinguish signature verification, draft-vocabulary
+verification, artifact opening, artifact admission, and backend loading.
+Cold-load and warmup times are reported separately.
 
 ## Session contract
 

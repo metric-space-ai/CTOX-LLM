@@ -30,6 +30,9 @@ be strictly increasing at runtime and their file is signed as part of the
 canonical model identity. `training/build_mtp_draft_vocab.py` constructs that
 file only from the exact, fully rehashed teacher-cache recovery cohort and
 fails closed on coding, domain, language, or overall coverage gaps.
+At engine load, the signed relative path is resolved below the installation
+root; symlink escape, byte-size drift, whole-file digest drift, chunk drift,
+non-increasing IDs, and out-of-vocabulary IDs all fail before backend loading.
 The validator rejects backend requantization, more than one resident full-model
 copy, a retained full CPU copy, unsafe paths, chunk gaps, duplicate IDs,
 unprofiled packs, or a calculated peak above the declared hard limit.

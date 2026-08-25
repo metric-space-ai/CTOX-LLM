@@ -33,6 +33,7 @@ fn softplus(value: f32) -> f32 {
     }
 }
 
+#[cfg(test)]
 fn greedy_token(logits: &[f32]) -> Result<u32> {
     logits
         .iter()
@@ -298,6 +299,12 @@ pub struct TargetStep {
     pub logits: Vec<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestrictedDraftStep {
+    pub final_hidden: Vec<f32>,
+    pub distribution: DraftDistribution,
+}
+
 impl DecoderState {
     pub fn new(config: &Qwen38Config, maximum_tokens: usize) -> Result<Self> {
         if maximum_tokens == 0 || maximum_tokens > config.max_position_embeddings {
@@ -368,6 +375,7 @@ pub struct CpuCorrectnessExecutor {
     mtp_state: Option<MtpState>,
     last_final_hidden: Option<Vec<f32>>,
     pending_speculative: Option<PendingSpeculativeBranch>,
+    mtp_draft_token_ids: Vec<u32>,
     admitted_context: usize,
     admitted_draft_tokens: usize,
     warmed: bool,
@@ -384,6 +392,7 @@ impl CpuCorrectnessExecutor {
             mtp_state: None,
             last_final_hidden: None,
             pending_speculative: None,
+            mtp_draft_token_ids: Vec::new(),
             admitted_context: 0,
             admitted_draft_tokens: 0,
             warmed: false,
@@ -400,6 +409,7 @@ impl CpuCorrectnessExecutor {
             mtp_state: None,
             last_final_hidden: None,
             pending_speculative: None,
+            mtp_draft_token_ids: Vec::new(),
             admitted_context: 0,
             admitted_draft_tokens: 0,
             warmed: false,
@@ -874,18 +884,14 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
         Ok(self.decode_target_step(token_id, state, config)?.logits)
     }
 
-    /// Execute the native Qwen3.8 one-layer MTP graph for base hidden state
-    /// `p` and the already target-selected token `p+1`. The result drafts
-    /// token `p+2`; acceptance is deliberately outside this method because a
-    /// target-model transition must verify every proposal.
-    pub fn mtp_draft(
+    fn mtp_final_hidden(
         &self,
         next_token_id: u32,
         previous_final_hidden: &[f32],
         absolute_position: usize,
         state: &mut MtpState,
         config: &Qwen38Config,
-    ) -> Result<TargetStep> {
+    ) -> Result<Vec<f32>> {
         if previous_final_hidden.len() != config.hidden_size
             || absolute_position != state.tokens + 1
             || absolute_position >= state.maximum_tokens
@@ -913,12 +919,75 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
         )?;
         draft_hidden = self.decoder_mlp_residual("mtp.layers.0", &draft_hidden)?;
         let final_hidden = self.rms_norm("mtp.norm.weight", &draft_hidden)?;
-        let logits = self.logits_from_final_hidden(&final_hidden)?;
         state.tokens += 1;
+        Ok(final_hidden)
+    }
+
+    /// Execute the native Qwen3.8 one-layer MTP graph for base hidden state
+    /// `p` and the already target-selected token `p+1`. The result drafts
+    /// token `p+2`; acceptance is deliberately outside this method because a
+    /// target-model transition must verify every proposal.
+    pub fn mtp_draft(
+        &self,
+        next_token_id: u32,
+        previous_final_hidden: &[f32],
+        absolute_position: usize,
+        state: &mut MtpState,
+        config: &Qwen38Config,
+    ) -> Result<TargetStep> {
+        let final_hidden = self.mtp_final_hidden(
+            next_token_id,
+            previous_final_hidden,
+            absolute_position,
+            state,
+            config,
+        )?;
+        let logits = self.logits_from_final_hidden(&final_hidden)?;
         Ok(TargetStep {
             final_hidden,
             logits,
         })
+    }
+
+    pub fn mtp_restricted_draft(
+        &self,
+        next_token_id: u32,
+        previous_final_hidden: &[f32],
+        absolute_position: usize,
+        state: &mut MtpState,
+        config: &Qwen38Config,
+        token_ids: &[u32],
+    ) -> Result<RestrictedDraftStep> {
+        let final_hidden = self.mtp_final_hidden(
+            next_token_id,
+            previous_final_hidden,
+            absolute_position,
+            state,
+            config,
+        )?;
+        let distribution = self.restricted_logits_from_final_hidden(&final_hidden, token_ids)?;
+        Ok(RestrictedDraftStep {
+            final_hidden,
+            distribution,
+        })
+    }
+
+    fn mtp_advance(
+        &self,
+        next_token_id: u32,
+        previous_final_hidden: &[f32],
+        absolute_position: usize,
+        state: &mut MtpState,
+        config: &Qwen38Config,
+    ) -> Result<()> {
+        self.mtp_final_hidden(
+            next_token_id,
+            previous_final_hidden,
+            absolute_position,
+            state,
+            config,
+        )?;
+        Ok(())
     }
 }
 
@@ -953,12 +1022,18 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         }
     }
 
-    fn load(&mut self, artifact: &ModelArtifact, profile: &MemoryProfile) -> Result<()> {
+    fn load(
+        &mut self,
+        artifact: &ModelArtifact,
+        profile: &MemoryProfile,
+        mtp_draft_token_ids: &[u32],
+    ) -> Result<()> {
         if self.artifact.is_some()
             || self.state.is_some()
             || self.mtp_state.is_some()
             || self.last_final_hidden.is_some()
             || self.pending_speculative.is_some()
+            || !self.mtp_draft_token_ids.is_empty()
         {
             return Err(EngineError::InvalidState(
                 "CPU correctness executor is already loaded".into(),
@@ -981,7 +1056,20 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                 "CPU memory profile context exceeds model capacity".into(),
             ));
         }
+        if mtp_draft_token_ids.is_empty()
+            || mtp_draft_token_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || mtp_draft_token_ids
+                .iter()
+                .any(|token| *token as usize >= self.config.vocab_size)
+        {
+            return Err(EngineError::InvalidArtifact(
+                "CPU executor received a noncanonical MTP draft vocabulary".into(),
+            ));
+        }
         self.artifact = Some(artifact.clone());
+        self.mtp_draft_token_ids = mtp_draft_token_ids.to_vec();
         self.admitted_context = admitted_context;
         self.admitted_draft_tokens = profile.mtp_draft_tokens as usize;
         self.warmed = false;
@@ -1040,7 +1128,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                 let previous = self.last_final_hidden.as_ref().ok_or_else(|| {
                     EngineError::InvalidState("MTP prefill lost target final hidden state".into())
                 })?;
-                decoder.mtp_draft(
+                decoder.mtp_advance(
                     *token,
                     previous,
                     position,
@@ -1099,7 +1187,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                 EngineError::InvalidState("MTP decode has no previous target hidden state".into())
             })?;
             let absolute_position = state.position();
-            let draft = decoder.mtp_draft(
+            let draft = decoder.mtp_restricted_draft(
                 token,
                 previous,
                 absolute_position,
@@ -1107,8 +1195,9 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                     .as_mut()
                     .ok_or_else(|| EngineError::InvalidState("MTP decode has no cache".into()))?,
                 &self.config,
+                &self.mtp_draft_token_ids,
             )?;
-            Some(draft.logits)
+            Some(draft.distribution)
         } else {
             None
         };
@@ -1134,17 +1223,18 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                 let draft = current_draft.take().ok_or_else(|| {
                     EngineError::InvalidState("MTP draft chain ended early".into())
                 })?;
-                let candidate = greedy_token(&draft)?;
-                draft_logits.push(draft.into());
+                let candidate = draft.greedy_token()?;
+                draft_logits.push(draft);
                 candidate_tokens.push(candidate);
                 let absolute_position = target_branch.position();
                 let next_draft = if depth + 1 < self.admitted_draft_tokens {
-                    Some(decoder.mtp_draft(
+                    Some(decoder.mtp_restricted_draft(
                         candidate,
                         &current_target_hidden,
                         absolute_position,
                         &mut mtp_branch,
                         &self.config,
+                        &self.mtp_draft_token_ids,
                     )?)
                 } else {
                     None
@@ -1154,7 +1244,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                 current_target_hidden = next_target.final_hidden;
                 current_target_logits = next_target.logits;
                 if let Some(next_draft) = next_draft {
-                    current_draft = Some(next_draft.logits);
+                    current_draft = Some(next_draft.distribution);
                 }
             }
             self.pending_speculative = Some(PendingSpeculativeBranch { candidate_tokens });
@@ -1217,7 +1307,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                     EngineError::InvalidState("CPU speculative commit has no target state".into())
                 })?
                 .position();
-            decoder.mtp_draft(
+            decoder.mtp_advance(
                 candidate,
                 previous_final_hidden,
                 absolute_position,
@@ -1253,6 +1343,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         self.mtp_state = None;
         self.last_final_hidden = None;
         self.pending_speculative = None;
+        self.mtp_draft_token_ids.clear();
         self.artifact = None;
         self.admitted_context = 0;
         self.admitted_draft_tokens = 0;
@@ -1728,7 +1819,7 @@ mod tests {
             hard_limit_bytes: 1 << 30,
         };
         let mut executor = CpuCorrectnessExecutor::scalar(executor_config);
-        executor.load(&artifact, &profile).unwrap();
+        executor.load(&artifact, &profile, &[0, 1]).unwrap();
         executor.warmup().unwrap();
         let cancellation = CancellationToken::default();
         let prefill = executor.prefill(&[0], false, &cancellation).unwrap();
@@ -1746,7 +1837,7 @@ mod tests {
         assert!(mtp_decode
             .draft_logits
             .iter()
-            .all(|logits| logits.len() == 2));
+            .all(|logits| logits.is_restricted() && logits.len() == 2));
         assert_eq!(mtp_decode.target_verification_logits.len(), 4);
         assert_eq!(mtp_decode.bonus_logits.as_ref().unwrap().len(), 2);
         assert!(executor.pending_speculative.is_some());
@@ -1791,5 +1882,6 @@ mod tests {
         executor.reset_session().unwrap();
         executor.unload().unwrap();
         assert!(executor.allocations().is_zero());
+        assert!(executor.mtp_draft_token_ids.is_empty());
     }
 }

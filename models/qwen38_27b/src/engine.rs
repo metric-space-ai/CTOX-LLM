@@ -205,7 +205,12 @@ pub trait ModelExecutor {
     fn hardware_profile(&self) -> &str;
     fn promotion_state(&self) -> PromotionState;
     fn capabilities(&self) -> ExecutorCapabilities;
-    fn load(&mut self, artifact: &ModelArtifact, profile: &MemoryProfile) -> Result<()>;
+    fn load(
+        &mut self,
+        artifact: &ModelArtifact,
+        profile: &MemoryProfile,
+        mtp_draft_token_ids: &[u32],
+    ) -> Result<()>;
     fn warmup(&mut self) -> Result<()>;
     fn prefill(
         &mut self,
@@ -287,6 +292,7 @@ pub struct EngineHealth {
 #[serde(rename_all = "snake_case")]
 pub enum LoadProgress {
     SignatureVerified,
+    DraftVocabularyVerified,
     ArtifactOpened,
     ArtifactAdmitted,
     BackendLoaded,
@@ -311,7 +317,7 @@ pub struct Engine<E: ModelExecutor> {
 impl<E: ModelExecutor> Engine<E> {
     #[allow(clippy::too_many_arguments)]
     pub fn load_signed(
-        artifact_path: impl AsRef<Path>,
+        release_root: impl AsRef<Path>,
         release: &ReleaseManifest,
         pack_id: &str,
         memory_profile_id: &str,
@@ -324,7 +330,7 @@ impl<E: ModelExecutor> Engine<E> {
         release.verify_signature(expected_key_id, trusted_public_key)?;
         progress(LoadProgress::SignatureVerified);
         Self::load_preverified_release(
-            artifact_path,
+            release_root,
             release,
             pack_id,
             memory_profile_id,
@@ -337,7 +343,7 @@ impl<E: ModelExecutor> Engine<E> {
     /// Development entry point for a manifest authenticated by a containing
     /// trusted bundle. Production download activation uses `load_signed`.
     pub fn load_preverified_release(
-        artifact_path: impl AsRef<Path>,
+        release_root: impl AsRef<Path>,
         release: &ReleaseManifest,
         pack_id: &str,
         memory_profile_id: &str,
@@ -349,6 +355,9 @@ impl<E: ModelExecutor> Engine<E> {
         release.validate()?;
         let pack = release.backend_pack(pack_id)?;
         let memory_profile = release.memory_profile(memory_profile_id)?.clone();
+        let release_root = release_root.as_ref();
+        let mtp_draft_token_ids = release.load_mtp_draft_token_ids(release_root)?;
+        progress(LoadProgress::DraftVocabularyVerified);
         if memory_profile.pack_id != pack_id {
             return Err(EngineError::InvalidArtifact(format!(
                 "memory profile {memory_profile_id} belongs to {}, not {pack_id}",
@@ -364,12 +373,13 @@ impl<E: ModelExecutor> Engine<E> {
             &executor,
         )?;
 
+        let artifact_path = release_root.join(&pack.artifact.relative_path);
         let artifact = ModelArtifact::open(artifact_path, ChecksumPolicy::AllTensors)?;
         progress(LoadProgress::ArtifactOpened);
         validate_tensor_contract(artifact.manifest(), &crate::Qwen38Config::default())?;
         release.admit_artifact(pack_id, &artifact)?;
         progress(LoadProgress::ArtifactAdmitted);
-        if let Err(error) = executor.load(&artifact, &memory_profile) {
+        if let Err(error) = executor.load(&artifact, &memory_profile, &mtp_draft_token_ids) {
             let _ = executor.unload();
             return Err(error);
         }
@@ -832,7 +842,12 @@ mod tests {
             }
         }
 
-        fn load(&mut self, _artifact: &ModelArtifact, _profile: &MemoryProfile) -> Result<()> {
+        fn load(
+            &mut self,
+            _artifact: &ModelArtifact,
+            _profile: &MemoryProfile,
+            _mtp_draft_token_ids: &[u32],
+        ) -> Result<()> {
             self.allocations.model_bytes = 10;
             Ok(())
         }

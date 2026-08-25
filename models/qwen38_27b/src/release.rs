@@ -1,6 +1,7 @@
 //! Signed release and backend-pack contract for one canonical logical model.
 
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Component, Path};
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -254,6 +255,44 @@ impl ReleaseFile {
         }
         Ok(())
     }
+
+    pub fn read_verified(&self, release_root: &Path) -> Result<Vec<u8>> {
+        self.validate()?;
+        let canonical_root = release_root.canonicalize()?;
+        let path = canonical_root.join(&self.relative_path);
+        let canonical_path = path.canonicalize()?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return invalid(format!(
+                "release file escapes installation root: {}",
+                self.relative_path
+            ));
+        }
+        let encoded = fs::read(&canonical_path)?;
+        if encoded.len() as u64 != self.bytes
+            || format!("{:x}", Sha256::digest(&encoded)) != self.sha256
+        {
+            return invalid(format!(
+                "release file size or SHA-256 differs: {}",
+                self.relative_path
+            ));
+        }
+        for chunk in &self.chunks {
+            let start = usize::try_from(chunk.offset)
+                .map_err(|_| EngineError::InvalidArtifact("chunk offset exceeds usize".into()))?;
+            let length = usize::try_from(chunk.length)
+                .map_err(|_| EngineError::InvalidArtifact("chunk length exceeds usize".into()))?;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| EngineError::InvalidArtifact("chunk range overflows".into()))?;
+            if format!("{:x}", Sha256::digest(&encoded[start..end])) != chunk.sha256 {
+                return invalid(format!(
+                    "release chunk {} differs: {}",
+                    chunk.index, self.relative_path
+                ));
+            }
+        }
+        Ok(encoded)
+    }
 }
 
 impl KvMemoryFormula {
@@ -339,6 +378,25 @@ impl MemoryProfile {
 }
 
 impl ReleaseManifest {
+    pub fn load_mtp_draft_token_ids(&self, release_root: &Path) -> Result<Vec<u32>> {
+        self.validate()?;
+        let identity = &self.model.mtp.draft_vocabulary;
+        let encoded = identity.token_ids.read_verified(release_root)?;
+        let token_ids = encoded
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("u32 chunk")))
+            .collect::<Vec<_>>();
+        if token_ids.len() != identity.token_count as usize
+            || token_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || token_ids
+                .iter()
+                .any(|token| *token as usize >= Qwen38Config::default().vocab_size)
+        {
+            return invalid("MTP draft token file is not canonical for this model");
+        }
+        Ok(token_ids)
+    }
+
     pub fn backend_pack(&self, pack_id: &str) -> Result<&BackendPack> {
         self.packages
             .iter()
@@ -926,6 +984,40 @@ mod tests {
         unverified.model.mtp.draft_vocabulary.target_verified_only = false;
         unverified.seal_unsigned().unwrap();
         assert!(unverified.validate().is_err());
+    }
+
+    #[test]
+    fn release_loads_and_rehashes_canonical_mtp_token_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model/mtp-draft-token-ids.u32le");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let encoded = [1_u32, 7, 42]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        fs::write(&path, &encoded).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&encoded));
+        let mut manifest = manifest();
+        manifest.model.mtp.draft_vocabulary.token_count = 3;
+        manifest.model.mtp.draft_vocabulary.token_ids = ReleaseFile {
+            relative_path: "model/mtp-draft-token-ids.u32le".into(),
+            bytes: encoded.len() as u64,
+            sha256: digest.clone(),
+            chunks: vec![FileChunk {
+                index: 0,
+                offset: 0,
+                length: encoded.len() as u64,
+                sha256: digest,
+            }],
+        };
+        manifest.seal_unsigned().unwrap();
+        assert_eq!(
+            manifest.load_mtp_draft_token_ids(directory.path()).unwrap(),
+            vec![1, 7, 42]
+        );
+
+        fs::write(&path, [0_u8; 12]).unwrap();
+        assert!(manifest.load_mtp_draft_token_ids(directory.path()).is_err());
     }
 
     #[test]
