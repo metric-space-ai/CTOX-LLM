@@ -3,8 +3,8 @@
 
 The packer keeps safetensor files memory-mapped, slices matrices by rows, and
 quantizes chunks on one GPU. It never materializes the full checkpoint or full
-output in RAM. Recovery tensors are initialized to one and replaced by the
-trained scales in the final pack.
+output in RAM. Direct baselines use explicit identity recovery; release
+candidates consume a complete, plan-bound recovery safetensors artifact.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import sys
 import tempfile
 from contextlib import ExitStack
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 from quantization import quantize_components
 from run_ledger import GpuRun, require_budget
@@ -39,6 +39,71 @@ def tensor_bytes(tensor) -> bytes:
     import torch
 
     return tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+
+
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def recovery_entries(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    return [entry for entry in plan["tensors"] if entry.get("group") == "recovery"]
+
+
+def validate_recovery_source(
+    plan: dict[str, Any],
+    plan_sha256: str,
+    recovery: Any,
+) -> dict[str, Any]:
+    """Validate a complete trained scale file before expensive model packing."""
+
+    metadata = recovery.metadata() or {}
+    required_metadata = {
+        "format": "ctox.recovery.channel-scales.v2",
+        "status": "complete",
+        "model": plan["model"],
+        "revision": plan["revision"],
+        "plan_sha256": plan_sha256,
+        "fixed_logical_qcodes": "true",
+    }
+    for key, expected in required_metadata.items():
+        actual = metadata.get(key)
+        if actual != expected:
+            raise RuntimeError(
+                f"recovery metadata {key} is {actual!r}, expected {expected!r}"
+            )
+
+    expected = {entry["name"]: entry for entry in recovery_entries(plan)}
+    actual = set(recovery.keys())
+    if actual != set(expected):
+        missing = sorted(set(expected) - actual)
+        extra = sorted(actual - set(expected))
+        raise RuntimeError(
+            f"recovery tensor set mismatch: {len(missing)} missing, {len(extra)} extra"
+        )
+    for name, entry in expected.items():
+        tensor = recovery.get_tensor(name)
+        if tuple(tensor.shape) != tuple(entry["shape"]):
+            raise RuntimeError(f"recovery tensor {name} shape mismatch")
+        if str(tensor.dtype) != "torch.float16":
+            raise RuntimeError(f"recovery tensor {name} must be FP16")
+
+    descriptor = {
+        "mode": "trained",
+        "format": metadata["format"],
+        "plan_sha256": metadata["plan_sha256"],
+        "activation_stats_sha256": metadata.get("activation_stats_sha256", ""),
+        "report_sha256": metadata.get("report_sha256", ""),
+        "fixed_logical_qcodes": True,
+    }
+    for key in ("activation_stats_sha256", "report_sha256"):
+        value = descriptor[key]
+        if len(value) != 64 or not all(character in "0123456789abcdef" for character in value):
+            raise RuntimeError(f"recovery metadata {key} is not a lowercase SHA-256")
+    return descriptor
 
 
 def quantize_blocks(values, dtype: str) -> bytes:
@@ -131,19 +196,32 @@ def write_source_tensor(
     return digest.hexdigest()
 
 
-def write_recovery_tensor(output: BinaryIO, entry: dict) -> str:
+def write_recovery_tensor(output: BinaryIO, entry: dict, recovery: Any | None) -> str:
     import torch
 
     if entry["dtype"] != "f16" or len(entry["shape"]) != 1:
         raise RuntimeError(f"invalid generated recovery tensor {entry['name']}")
-    payload = tensor_bytes(torch.ones(entry["shape"], dtype=torch.float16))
+    tensor = (
+        torch.ones(entry["shape"], dtype=torch.float16)
+        if recovery is None
+        else recovery.get_tensor(entry["name"])
+    )
+    if not bool(torch.isfinite(tensor).all()) or not bool((tensor > 0).all()):
+        raise RuntimeError(f"recovery tensor {entry['name']} must be finite and positive")
+    payload = tensor_bytes(tensor)
     if len(payload) != entry["length"]:
         raise RuntimeError(f"recovery tensor {entry['name']} length mismatch")
     output.write(payload)
     return hashlib.sha256(payload).hexdigest()
 
 
-def assemble_artifact(output_path: Path, data_path: Path, plan: dict, tensor_hashes: dict[str, str]) -> None:
+def assemble_artifact(
+    output_path: Path,
+    data_path: Path,
+    plan: dict,
+    tensor_hashes: dict[str, str],
+    recovery_descriptor: dict[str, Any],
+) -> None:
     manifest_tensors = []
     for entry in plan["tensors"]:
         tensor = {
@@ -164,6 +242,7 @@ def assemble_artifact(output_path: Path, data_path: Path, plan: dict, tensor_has
         "revision": plan["revision"],
         "alignment": plan["alignment"],
         "target": "canonical-b64",
+        "recovery": recovery_descriptor,
         "tensors": manifest_tensors,
     }
     manifest_bytes = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -191,6 +270,11 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--recovery-scales",
+        type=Path,
+        help="complete plan-bound FP16 s_in/s_out safetensors; omission creates an identity baseline",
+    )
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--reserved-gpu-hours", type=float, required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -216,6 +300,8 @@ def main() -> None:
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("CUDA device requested but unavailable")
 
+    plan_digest = sha256_path(args.plan)
+
     shards = sorted(
         {entry["source_shard"] for entry in plan["tensors"] if entry["source_shard"] is not None}
     )
@@ -229,13 +315,32 @@ def main() -> None:
             )
             for shard in shards
         }
+        recovery = (
+            stack.enter_context(safe_open(args.recovery_scales, framework="pt", device="cpu"))
+            if args.recovery_scales is not None
+            else None
+        )
+        if recovery is None:
+            recovery_descriptor = {
+                "mode": "identity",
+                "format": "ctox.recovery.identity.v1",
+                "plan_sha256": plan_digest,
+                "fixed_logical_qcodes": True,
+            }
+        else:
+            recovery_descriptor = validate_recovery_source(plan, plan_digest, recovery)
+            recovery_descriptor["artifact_sha256"] = sha256_path(args.recovery_scales)
         data_path = Path(temporary) / "tensor-data.bin"
         tensor_hashes: dict[str, str] = {}
         with data_path.open("xb") as data:
             for index, entry in enumerate(plan["tensors"], 1):
                 data.seek(entry["offset"])
                 if entry["source_shard"] is None:
-                    digest = write_recovery_tensor(data, entry)
+                    if entry.get("group") != "recovery":
+                        raise RuntimeError(
+                            f"generated tensor {entry['name']} is not a recovery scale"
+                        )
+                    digest = write_recovery_tensor(data, entry, recovery)
                 else:
                     digest = write_source_tensor(
                         data,
@@ -248,7 +353,13 @@ def main() -> None:
                 print(f"[{index}/{len(plan['tensors'])}] {entry['dtype']} {entry['name']}", flush=True)
             data.truncate(plan["total_bytes"])
             data.flush()
-        assemble_artifact(args.output, data_path, plan, tensor_hashes)
+        assemble_artifact(
+            args.output,
+            data_path,
+            plan,
+            tensor_hashes,
+            recovery_descriptor,
+        )
     package_limit = plan.get("fold_package_limit_bytes")
     if package_limit is not None and args.output.stat().st_size > package_limit:
         raise RuntimeError(
@@ -264,6 +375,7 @@ def main() -> None:
                 "artifact": str(args.output),
                 "bytes": args.output.stat().st_size,
                 "sha256": artifact_hash.hexdigest(),
+                "recovery": recovery_descriptor,
             },
             indent=2,
         )

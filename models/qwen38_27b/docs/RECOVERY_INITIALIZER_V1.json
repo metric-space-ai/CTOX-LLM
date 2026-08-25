@@ -1,0 +1,93 @@
+{
+  "format": "ctox.qwen38.recovery-initializer-evidence.v1",
+  "date": "2026-08-25",
+  "status": "smoke_only_initializer_checkpoint",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "scope": {
+    "planned_quantized_matrices": 506,
+    "fitted_quantized_matrices": 506,
+    "logical_qcodes": "fixed",
+    "correction_dtype": "float16",
+    "correction_tensors": 1012,
+    "correction_values": 7926272,
+    "algorithm": "activation-weighted-positive-alternating-least-squares",
+    "iterations": 6,
+    "scale_min": 0.25,
+    "scale_max": 4.0
+  },
+  "inputs": {
+    "quant_plan_sha256": "5957c07ed90c8e70bd353e897b17315efe0a9e77e6d3a27032e2e04d9ff83272",
+    "activation_stats_sha256": "ad6d15c29044965d244d08a8a911dc1547c62fb51b618722a5bbf308bc8944c9",
+    "activation_text_tokens": 228859,
+    "activation_mtp_token_pairs": 228856,
+    "activation_context_bands": [
+      "32K",
+      "64K",
+      "128K"
+    ]
+  },
+  "scale_fit": {
+    "artifact": "long-context-all506-scale-fit-v1.safetensors",
+    "artifact_bytes": 15982336,
+    "artifact_sha256": "f75c6c53602944b4678c59f33f0e71e0fdbc278a0cff04d0c75c1a1052ee9cbf",
+    "report": "long-context-all506-scale-fit-v1.json",
+    "report_bytes": 710086,
+    "report_sha256": "94ea4acb5ee63f291d0d2868ecb161ff2a64c234a69cddf0556469bda25c1880",
+    "elapsed_seconds": 210.07557153701782,
+    "gpu_hours": 0.0583543254269494,
+    "mean_matrix_error_ratio": 0.589400798274839,
+    "minimum_matrix_error_ratio": 0.04326800721609849,
+    "maximum_matrix_error_ratio": 0.98661713750893,
+    "non_improved_matrices": 0,
+    "baseline_weighted_squared_error": 510592.9277545263,
+    "recovered_weighted_squared_error": 243471.53167021062,
+    "global_weighted_error_ratio": 0.4768407834024338,
+    "global_weighted_error_reduction": 0.5231592165975662,
+    "observed_scale_min": 0.25,
+    "observed_scale_max": 3.25390625,
+    "lower_clamped_values": 33658,
+    "upper_clamped_values": 0,
+    "nonfinite_values": 0
+  },
+  "packed_checkpoint": {
+    "artifact": "long-context-all506-scale-fit-v1.ctoxq",
+    "artifact_bytes": 8373637632,
+    "artifact_gib": 7.798557758331299,
+    "artifact_sha256": "1441444f378e4593d347964e147792e56c6ceeb08ab1c5d1df9fff5f68cd29d6",
+    "resident_weights_bytes": 8373031936,
+    "resident_weights_gib": 7.7979936599731445,
+    "package_limit_bytes": 8375186227,
+    "package_headroom_bytes": 1548595,
+    "tensors": 1878,
+    "manifest_bytes": 605411,
+    "data_offset": 605696,
+    "alignment": 256,
+    "mtp": "resident",
+    "vision": "separate",
+    "packing_seconds": 36.40237212181091,
+    "packing_gpu_hours": 0.010111770033836365
+  },
+  "verification": {
+    "rust_loader_all_tensor_sha256": "passed",
+    "rust_manifest_recovery_provenance": "passed",
+    "recovery_tensor_names_shapes_dtypes": "1012_of_1012_exact",
+    "embedded_recovery_bytes_compared": 15852544,
+    "embedded_recovery_byte_mismatches": 0,
+    "gpu_memory_after_pack_mib": [
+      91,
+      15,
+      15
+    ],
+    "fold_128k_calculated_total_bytes": 10311848960,
+    "fold_128k_calculated_total_gib": 9.603657722473145,
+    "fold_128k_target_gib": 9.7,
+    "fold_128k_hard_limit_gib": 10.0
+  },
+  "limitations": [
+    "The fitted objective uses one English activation sample per 32K, 64K, and 128K band; this is not the release-size multilingual recovery corpus.",
+    "The fit is a deterministic channel-scale initializer and has not consumed the cached logit-KL, cross-entropy, hidden-state, or MTP distillation targets.",
+    "The 9.6037-GiB Fold value is a calculated residency plan, not a measured Android peak.",
+    "No end-to-end generation quality, Agentic, tool-calling, code, German, or 128K retrieval gate has passed for this checkpoint."
+  ]
+}

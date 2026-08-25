@@ -35,6 +35,8 @@ from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noq
 from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_bytes  # noqa: E402
 from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
+from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
+from pack_checkpoint import validate_recovery_source  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from teacher_runtime import FLA_KERNEL_REVISION, weight_max_memory  # noqa: E402
@@ -42,6 +44,25 @@ from verify_vendor_manifest import verify  # noqa: E402
 
 
 class DatasetPipelineTests(unittest.TestCase):
+    class FakeRecoveryTensor:
+        def __init__(self, shape, dtype="torch.float16"):
+            self.shape = shape
+            self.dtype = dtype
+
+    class FakeRecovery:
+        def __init__(self, metadata, tensors):
+            self._metadata = metadata
+            self._tensors = tensors
+
+        def metadata(self):
+            return self._metadata
+
+        def keys(self):
+            return self._tensors.keys()
+
+        def get_tensor(self, name):
+            return self._tensors[name]
+
     class WordTokenizer:
         def apply_chat_template(self, messages, **_kwargs):
             return "\n".join(f"{message['role']}: {message['content']}" for message in messages)
@@ -407,6 +428,79 @@ class DatasetPipelineTests(unittest.TestCase):
         )
         self.assertEqual(selected, set())
         self.assertEqual(selected_groups, {"lm_head.weight": {0, 1}})
+
+    def test_recovery_mixed_ranges_preserve_planned_qcodes(self) -> None:
+        entry = {
+            "name": "embedding.weight",
+            "dtype": "mixed_q2_q4_b64",
+            "shape": [12, 64],
+            "segments": [
+                {"row_start": 0, "row_end": 4, "dtype": "q4_b64"},
+                {"row_start": 4, "row_end": 8, "dtype": "q2_b64"},
+                {"row_start": 8, "row_end": 12, "dtype": "q4_b64"},
+            ],
+        }
+        self.assertEqual(
+            quant_dtype_ranges(entry, 2, 10),
+            [(2, 4, "q4_b64"), (4, 8, "q2_b64"), (8, 10, "q4_b64")],
+        )
+
+    def test_packer_accepts_only_complete_plan_bound_recovery(self) -> None:
+        plan_hash = "a" * 64
+        plan = {
+            "model": "Qwen/Qwen3.8-27B",
+            "revision": "b" * 40,
+            "tensors": [
+                {
+                    "name": "matrix.weight.s_in",
+                    "shape": [64],
+                    "group": "recovery",
+                },
+                {
+                    "name": "matrix.weight.s_out",
+                    "shape": [8],
+                    "group": "recovery",
+                },
+            ],
+        }
+        metadata = {
+            "format": "ctox.recovery.channel-scales.v2",
+            "status": "complete",
+            "model": plan["model"],
+            "revision": plan["revision"],
+            "plan_sha256": plan_hash,
+            "activation_stats_sha256": "c" * 64,
+            "report_sha256": "d" * 64,
+            "fixed_logical_qcodes": "true",
+        }
+        tensors = {
+            "matrix.weight.s_in": self.FakeRecoveryTensor((64,)),
+            "matrix.weight.s_out": self.FakeRecoveryTensor((8,)),
+        }
+        descriptor = validate_recovery_source(
+            plan,
+            plan_hash,
+            self.FakeRecovery(metadata, tensors),
+        )
+        self.assertEqual(descriptor["mode"], "trained")
+        self.assertEqual(descriptor["activation_stats_sha256"], "c" * 64)
+
+        incomplete = dict(tensors)
+        incomplete.pop("matrix.weight.s_out")
+        with self.assertRaisesRegex(RuntimeError, "1 missing"):
+            validate_recovery_source(
+                plan,
+                plan_hash,
+                self.FakeRecovery(metadata, incomplete),
+            )
+
+        wrong_plan = dict(metadata, plan_sha256="e" * 64)
+        with self.assertRaisesRegex(RuntimeError, "plan_sha256"):
+            validate_recovery_source(
+                plan,
+                plan_hash,
+                self.FakeRecovery(wrong_plan, tensors),
+            )
 
     def test_fold_package_budget_reserves_manifest_bytes(self) -> None:
         self.assertEqual(CONTAINER_MANIFEST_RESERVE, 2 * 1024 * 1024)

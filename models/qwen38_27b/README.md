@@ -61,3 +61,11 @@ includes count-weighted 32K/64K/128K activation bands, a 506-matrix
 sensitivity pass, and an exact 7.797994-GiB budget candidate. Those are
 single-sample-per-band smoke results; release-size multilingual teacher and
 activation cohorts plus recovery training are still pending.
+
+[`docs/RECOVERY_INITIALIZER_V1.json`](docs/RECOVERY_INITIALIZER_V1.json)
+records the first complete 506-matrix positive channel-scale fit and a native
+checkpoint carrying those exact FP16 corrections. All matrices improve on its
+activation-weighted objective, the packed text+MTP artifact remains below 7.8
+GiB, and the Rust loader verifies every tensor checksum. It remains a smoke
+initializer: end-to-end KL/CE/hidden/MTP recovery and the release-size
+multilingual quality gates have not run.

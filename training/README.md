@@ -11,6 +11,16 @@ pipeline has four immutable stages:
    residual probability mass, and selected hidden states.
 4. `train_recovery.py` freezes Q2/Q4 codes and trains channel correction scales.
 
+Before end-to-end distillation, `fit_recovery_scales.py` creates a complete
+deterministic initializer for every planned matrix. It regenerates the exact
+logical Q2/Q4 codes (including mixed row layouts) from the pinned BF16 source,
+keeps those codes fixed, and fits only positive `s_in`/`s_out` with
+activation-weighted alternating least squares. Final error metrics use the
+FP16-rounded scales that will actually be packed. The output tensor names must
+match every recovery placeholder in the plan or a complete run fails closed.
+This initializer does not substitute for the later logit-KL, cross-entropy,
+hidden-state, and MTP end-to-end recovery stage.
+
 Before assigning scarce Q4 capacity, `collect_activation_stats.py` hooks the
 real BF16 text graph and stores only per-channel input/output mean squares for
 quantized linear modules. These diagonal statistics support activation-weighted
@@ -109,8 +119,13 @@ alone is not accepted as evidence.
 `pack_checkpoint.py` performs the direct BF16 conversion. It memory-maps all
 source shards, slices matrices by rows, quantizes those chunks on one GPU,
 writes an aligned temporary data region, then creates the final manifest and
-checksummed `.ctoxq` artifact. It refuses to overwrite files and refuses plans
-above the Fold limit.
+checksummed `.ctoxq` artifact. Passing `--recovery-scales` requires a complete
+`ctox.recovery.channel-scales.v2` file whose model, revision, plan hash, tensor
+names, shapes, dtypes, and fixed-code declaration match exactly. The manifest
+records the scale artifact, plan, activation-statistics, and report hashes.
+Omitting the option remains available only for explicitly marked identity
+baselines. The packer refuses to overwrite files and refuses plans above the
+Fold limit.
 
 Vision remains a separate phase-resident package. `build_vision_plan.py`
 zero-pads matrix columns to 64-value storage blocks so non-aligned vision MLPs

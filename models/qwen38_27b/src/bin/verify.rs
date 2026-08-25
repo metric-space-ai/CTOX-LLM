@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
+use ctox_qwen38_27b::format::RecoveryProvenance;
 use ctox_qwen38_27b::loader::{ChecksumPolicy, ModelArtifact};
 use ctox_qwen38_27b::memory::FoldMemoryPlan;
 use ctox_qwen38_27b::Qwen38Config;
@@ -28,6 +29,7 @@ struct Report<'a> {
     model: &'a str,
     revision: &'a str,
     target: &'a str,
+    recovery: Option<&'a RecoveryProvenance>,
     tensors: usize,
     artifact_bytes: u64,
     resident_weights_bytes: u64,
@@ -65,6 +67,7 @@ fn main() -> anyhow::Result<()> {
             model: &manifest.model,
             revision: &manifest.revision,
             target: &manifest.target,
+            recovery: manifest.recovery.as_ref(),
             tensors: manifest.tensors.len(),
             artifact_bytes,
             resident_weights_bytes,

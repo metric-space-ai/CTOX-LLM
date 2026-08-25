@@ -218,6 +218,6 @@
     "These are one-sample smoke artifacts per context band, not the release-size teacher cache.",
     "Only decoder layer 0 hidden targets are cached in this memory-validation pass.",
     "Only one English activation-statistics sample per 32K/64K/128K band is materialized; this is not the release-size multilingual cohort.",
-    "No recovery corrections have been trained from these targets yet."
+    "A deterministic channel-scale initializer has been fitted from the merged activation statistics, but end-to-end logit-KL, cross-entropy, hidden-state, and MTP recovery has not run."
   ]
 }

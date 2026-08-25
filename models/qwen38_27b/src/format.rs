@@ -71,6 +71,72 @@ pub struct TensorEntry {
     pub segments: Vec<QuantSegment>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryMode {
+    Identity,
+    Trained,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryProvenance {
+    pub mode: RecoveryMode,
+    pub format: String,
+    pub plan_sha256: String,
+    pub fixed_logical_qcodes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_stats_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_sha256: Option<String>,
+}
+
+impl RecoveryProvenance {
+    fn validate(&self) -> Result<()> {
+        if !self.fixed_logical_qcodes || !valid_sha256(&self.plan_sha256) {
+            return Err(EngineError::InvalidArtifact(
+                "recovery provenance requires fixed logical qcodes and a plan SHA-256".into(),
+            ));
+        }
+        match self.mode {
+            RecoveryMode::Identity => {
+                if self.format != "ctox.recovery.identity.v1"
+                    || self.artifact_sha256.is_some()
+                    || self.activation_stats_sha256.is_some()
+                    || self.report_sha256.is_some()
+                {
+                    return Err(EngineError::InvalidArtifact(
+                        "identity recovery provenance contains trained-scale fields".into(),
+                    ));
+                }
+            }
+            RecoveryMode::Trained => {
+                if self.format != "ctox.recovery.channel-scales.v2"
+                    || !self.artifact_sha256.as_deref().is_some_and(valid_sha256)
+                    || !self
+                        .activation_stats_sha256
+                        .as_deref()
+                        .is_some_and(valid_sha256)
+                    || !self.report_sha256.as_deref().is_some_and(valid_sha256)
+                {
+                    return Err(EngineError::InvalidArtifact(
+                        "trained recovery provenance is incomplete or invalid".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 impl TensorEntry {
     pub fn elements(&self) -> Result<u64> {
         if self.shape.is_empty() || self.shape.contains(&0) {
@@ -162,6 +228,8 @@ pub struct ModelManifest {
     pub revision: String,
     pub alignment: u32,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryProvenance>,
     pub tensors: Vec<TensorEntry>,
 }
 
@@ -193,6 +261,9 @@ impl ModelManifest {
             return Err(EngineError::InvalidArtifact(
                 "mixed Q2/Q4 tensors require manifest v2".into(),
             ));
+        }
+        if let Some(recovery) = &self.recovery {
+            recovery.validate()?;
         }
 
         let mut names = HashSet::with_capacity(self.tensors.len());
@@ -383,6 +454,7 @@ impl ArtifactBuilder {
             revision: self.revision,
             alignment: self.alignment,
             target: self.target,
+            recovery: None,
             tensors: entries,
         };
         manifest.validate(data_offset)?;
@@ -465,6 +537,7 @@ mod tests {
             revision: "0123456789abcdef".into(),
             alignment: DEFAULT_ALIGNMENT,
             target: "canonical-b64".into(),
+            recovery: None,
             tensors: vec![TensorEntry {
                 name: "lm_head.weight".into(),
                 dtype: TensorDType::MixedQ2Q4B64,
@@ -503,6 +576,27 @@ mod tests {
         let mut invalid = manifest;
         invalid.tensors[0].segments[1].row_start = 0;
         assert!(invalid
+            .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
+            .is_err());
+    }
+
+    #[test]
+    fn trained_recovery_provenance_requires_all_hashes() {
+        let mut manifest = mixed_manifest();
+        manifest.recovery = Some(RecoveryProvenance {
+            mode: RecoveryMode::Trained,
+            format: "ctox.recovery.channel-scales.v2".into(),
+            plan_sha256: "a".repeat(64),
+            fixed_logical_qcodes: true,
+            artifact_sha256: Some("b".repeat(64)),
+            activation_stats_sha256: Some("c".repeat(64)),
+            report_sha256: Some("d".repeat(64)),
+        });
+        assert!(manifest
+            .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
+            .is_ok());
+        manifest.recovery.as_mut().unwrap().report_sha256 = None;
+        assert!(manifest
             .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
             .is_err());
     }
