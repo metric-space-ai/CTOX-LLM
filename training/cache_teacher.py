@@ -14,8 +14,40 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
+from prompt_format import render_record
 from run_ledger import GpuRun, require_budget
+
+
+def transformer_layers(model: Any) -> Any:
+    base = getattr(model, "model", None)
+    layers = getattr(base, "layers", None)
+    if base is None or layers is None or not hasattr(model, "lm_head"):
+        raise RuntimeError("teacher model does not expose model.layers and lm_head")
+    return base, layers
+
+
+def sparse_targets(torch: Any, model: Any, hidden: Any, top_k: int, chunk_size: int) -> tuple[Any, Any, Any]:
+    indices = []
+    log_probabilities = []
+    residuals = []
+    for start in range(0, hidden.shape[1], chunk_size):
+        stop = min(start + chunk_size, hidden.shape[1])
+        logits = model.lm_head(hidden[:, start:stop]).float()
+        log_normalizer = torch.logsumexp(logits, dim=-1)
+        top_values, top_indices = torch.topk(logits, top_k, dim=-1)
+        top_log_probabilities = top_values - log_normalizer.unsqueeze(-1)
+        residual = (1.0 - top_log_probabilities.exp().sum(dim=-1)).clamp_min(0.0)
+        indices.append(top_indices.cpu().to(torch.int32))
+        log_probabilities.append(top_log_probabilities.cpu().to(torch.bfloat16))
+        residuals.append(residual.cpu().to(torch.float32))
+        del logits, log_normalizer, top_values, top_indices, top_log_probabilities, residual
+    return (
+        torch.cat(indices, dim=1),
+        torch.cat(log_probabilities, dim=1),
+        torch.cat(residuals, dim=1),
+    )
 
 
 def main() -> None:
@@ -30,6 +62,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--hidden-layers", default="0,15,31,47,63")
+    parser.add_argument("--logit-chunk", type=int, default=64)
     args = parser.parse_args()
     require_budget(args.ledger, args.reserved_gpu_hours)
     if args.output.exists():
@@ -44,6 +77,8 @@ def main() -> None:
         raise SystemExit("install training/requirements.in before caching teacher targets") from error
 
     hidden_layers = [int(layer) for layer in args.hidden_layers.split(",") if layer]
+    if args.logit_chunk <= 0:
+        raise SystemExit("--logit-chunk must be positive")
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -52,6 +87,16 @@ def main() -> None:
         device_map="balanced",
         low_cpu_mem_usage=True,
     ).eval()
+    base_model, layers = transformer_layers(model)
+    if any(layer < 0 or layer >= len(layers) for layer in hidden_layers):
+        raise SystemExit(f"hidden layer indices must be in [0, {len(layers) - 1}]")
+    captured: dict[int, Any] = {}
+    hooks = []
+    for layer_index in hidden_layers:
+        def capture(_module: Any, _inputs: Any, output: Any, index: int = layer_index) -> None:
+            captured[index] = output[0] if isinstance(output, tuple) else output
+
+        hooks.append(layers[layer_index].register_forward_hook(capture))
     resolved_revision = getattr(model.config, "_commit_hash", None) or args.revision
     index_path = args.output / "index.jsonl"
     with GpuRun(args.ledger, "teacher-cache", args.gpus, sys.argv), index_path.open(
@@ -62,12 +107,7 @@ def main() -> None:
                 continue
             record = json.loads(line)
             sample_id = str(record["id"])
-            if "messages" in record:
-                prompt = tokenizer.apply_chat_template(
-                    record["messages"], tokenize=False, add_generation_prompt=False
-                )
-            else:
-                prompt = str(record["prompt"])
+            prompt = render_record(tokenizer, record)
             encoded = tokenizer(
                 prompt,
                 return_tensors="pt",
@@ -76,30 +116,28 @@ def main() -> None:
             )
             input_ids = encoded.input_ids.to(model.device)
             attention_mask = encoded.attention_mask.to(model.device)
+            captured.clear()
             with torch.inference_mode():
-                output = model(
+                output = base_model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     use_cache=False,
-                    output_hidden_states=True,
                     return_dict=True,
                 )
-                log_probs = output.logits.float().log_softmax(dim=-1)
-                top_values, top_indices = torch.topk(log_probs, args.top_k, dim=-1)
-                residual = (1.0 - top_values.exp().sum(dim=-1)).clamp_min(0.0)
+                top_indices, top_values, residual = sparse_targets(
+                    torch, model, output.last_hidden_state, args.top_k, args.logit_chunk
+                )
             tensors = {
                 "input_ids": input_ids.cpu().to(torch.int32),
                 "attention_mask": attention_mask.cpu().to(torch.uint8),
-                "topk_indices": top_indices.cpu().to(torch.int32),
-                "topk_logprobs": top_values.cpu().to(torch.bfloat16),
-                "residual_probability": residual.cpu().to(torch.float32),
+                "topk_indices": top_indices,
+                "topk_logprobs": top_values,
+                "residual_probability": residual,
             }
             for layer in hidden_layers:
-                if layer >= len(output.hidden_states):
-                    raise RuntimeError(
-                        f"hidden layer {layer} unavailable; model returned {len(output.hidden_states)} states"
-                    )
-                tensors[f"hidden_{layer}"] = output.hidden_states[layer].cpu().to(torch.bfloat16)
+                if layer not in captured:
+                    raise RuntimeError(f"hidden layer hook {layer} did not run")
+                tensors[f"hidden_{layer}"] = captured[layer].cpu().to(torch.bfloat16)
             filename = f"{sample_id}.safetensors"
             save_file(
                 tensors,
@@ -108,7 +146,8 @@ def main() -> None:
                     "sample_id": sample_id,
                     "teacher_model": args.model,
                     "teacher_revision": str(resolved_revision),
-                    "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                    "source_payload_sha256": str(record["prompt_sha256"]),
+                    "rendered_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
                     "top_k": str(args.top_k),
                 },
             )
@@ -119,11 +158,15 @@ def main() -> None:
                         "file": filename,
                         "tokens": int(input_ids.shape[-1]),
                         "source_line": line_number,
+                        "source_payload_sha256": record["prompt_sha256"],
                     },
                     sort_keys=True,
                 )
                 + "\n"
             )
+            del output, tensors, top_indices, top_values, residual
+    for hook in hooks:
+        hook.remove()
 
 
 if __name__ == "__main__":

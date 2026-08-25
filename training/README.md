@@ -22,6 +22,12 @@ identity; stale source coordinates cannot silently enter a teacher cache.
 manifest, preventing source order from biasing smoke tests and calibration
 cohorts.
 
+Teacher caching renders a normalized copy of source messages. OpenAI-shaped
+tool calls are converted to Qwen's flat chat-template form without changing the
+hashed source payload. Only requested transformer layers are captured, and the
+LM head is evaluated in bounded token chunks so full-vocabulary FP32 logits are
+never resident for an entire sequence.
+
 The 240 GPU-hour ceiling is cumulative across teacher generation, sensitivity
 runs, ablations, final recovery, and evaluation. Every command appends its GPU
 count and elapsed time to `run-ledger.jsonl`.
