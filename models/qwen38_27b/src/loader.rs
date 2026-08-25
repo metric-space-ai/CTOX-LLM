@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
 use memmap2::{Mmap, MmapOptions};
 use sha2::{Digest, Sha256};
 
-use crate::format::{FileHeader, ModelManifest, HEADER_BYTES};
+use crate::format::{
+    FileHeader, ModelManifest, QuantSegment, TensorDType, TensorEntry, HEADER_BYTES,
+};
 use crate::{EngineError, Result};
+use half::f16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecksumPolicy {
@@ -18,6 +22,81 @@ pub struct ModelArtifact {
     header: FileHeader,
     manifest: ModelManifest,
     manifest_sha256: String,
+    tensor_indices: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TensorView<'a> {
+    pub entry: &'a TensorEntry,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QuantizedMatrixView<'a> {
+    pub dtype: TensorDType,
+    pub weights: &'a [u8],
+    pub segments: &'a [QuantSegment],
+    pub rows: usize,
+    pub columns: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FloatTensorView<'a> {
+    F16Le(&'a [u8]),
+    F32Le(&'a [u8]),
+}
+
+impl FloatTensorView<'_> {
+    pub fn len(self) -> usize {
+        match self {
+            Self::F16Le(bytes) => bytes.len() / 2,
+            Self::F32Le(bytes) => bytes.len() / 4,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn value(self, index: usize) -> Result<f32> {
+        if index >= self.len() {
+            return Err(EngineError::Shape(format!(
+                "float tensor index {index} exceeds {} values",
+                self.len()
+            )));
+        }
+        let value = match self {
+            Self::F16Le(bytes) => {
+                let offset = index * 2;
+                f16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32()
+            }
+            Self::F32Le(bytes) => {
+                let offset = index * 4;
+                f32::from_le_bytes(
+                    bytes[offset..offset + 4]
+                        .try_into()
+                        .expect("checked bounds"),
+                )
+            }
+        };
+        if !value.is_finite() {
+            return Err(EngineError::InvalidArtifact(format!(
+                "float tensor value {index} is non-finite"
+            )));
+        }
+        Ok(value)
+    }
+
+    pub fn to_f32_vec(self) -> Result<Vec<f32>> {
+        (0..self.len()).map(|index| self.value(index)).collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveredMatrixView<'a> {
+    pub matrix: QuantizedMatrixView<'a>,
+    pub s_in: FloatTensorView<'a>,
+    pub s_out: FloatTensorView<'a>,
 }
 
 impl ModelArtifact {
@@ -65,12 +144,19 @@ impl ModelArtifact {
             ));
         }
         manifest.validate(mmap.len() as u64 - header.data_offset)?;
+        let tensor_indices = manifest
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(index, tensor)| (tensor.name.clone(), index))
+            .collect();
 
         let artifact = Self {
             mmap,
             header,
             manifest,
             manifest_sha256,
+            tensor_indices,
         };
         if checksum_policy == ChecksumPolicy::AllTensors {
             artifact.verify_checksums()?;
@@ -91,20 +177,83 @@ impl ModelArtifact {
     }
 
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
-        let tensor = self
-            .manifest
-            .tensors
-            .iter()
-            .find(|tensor| tensor.name == name)
+        Ok(self.tensor(name)?.bytes)
+    }
+
+    pub fn tensor(&self, name: &str) -> Result<TensorView<'_>> {
+        let index = self
+            .tensor_indices
+            .get(name)
             .ok_or_else(|| EngineError::InvalidArtifact(format!("tensor {name} not found")))?;
+        let tensor = &self.manifest.tensors[*index];
         let start = self.header.data_offset as usize + tensor.offset as usize;
         let end = start + tensor.length as usize;
-        Ok(&self.mmap[start..end])
+        Ok(TensorView {
+            entry: tensor,
+            bytes: &self.mmap[start..end],
+        })
+    }
+
+    pub fn float_tensor(&self, name: &str) -> Result<FloatTensorView<'_>> {
+        let tensor = self.tensor(name)?;
+        match tensor.entry.dtype {
+            TensorDType::F16 => Ok(FloatTensorView::F16Le(tensor.bytes)),
+            TensorDType::F32 => Ok(FloatTensorView::F32Le(tensor.bytes)),
+            other => Err(EngineError::UnsupportedDType(format!(
+                "tensor {name} is {other:?}, expected F16/F32"
+            ))),
+        }
+    }
+
+    pub fn quantized_matrix(&self, name: &str) -> Result<QuantizedMatrixView<'_>> {
+        let tensor = self.tensor(name)?;
+        if tensor.entry.shape.len() != 2 {
+            return Err(EngineError::Shape(format!(
+                "quantized tensor {name} is not a matrix"
+            )));
+        }
+        if !matches!(
+            tensor.entry.dtype,
+            TensorDType::Q2B64 | TensorDType::Q4B64 | TensorDType::MixedQ2Q4B64
+        ) {
+            return Err(EngineError::UnsupportedDType(format!(
+                "tensor {name} is {:?}, expected quantized matrix",
+                tensor.entry.dtype
+            )));
+        }
+        let rows = usize::try_from(tensor.entry.shape[0])
+            .map_err(|_| EngineError::Shape(format!("tensor {name} rows overflow usize")))?;
+        let columns = usize::try_from(tensor.entry.shape[1])
+            .map_err(|_| EngineError::Shape(format!("tensor {name} columns overflow usize")))?;
+        Ok(QuantizedMatrixView {
+            dtype: tensor.entry.dtype,
+            weights: tensor.bytes,
+            segments: &tensor.entry.segments,
+            rows,
+            columns,
+        })
+    }
+
+    pub fn recovered_matrix(&self, name: &str) -> Result<RecoveredMatrixView<'_>> {
+        let matrix = self.quantized_matrix(name)?;
+        let s_in = self.float_tensor(&format!("{name}.s_in"))?;
+        let s_out = self.float_tensor(&format!("{name}.s_out"))?;
+        if s_in.len() != matrix.columns || s_out.len() != matrix.rows {
+            return Err(EngineError::Shape(format!(
+                "recovery scales for {name} differ from {}x{} matrix",
+                matrix.rows, matrix.columns
+            )));
+        }
+        Ok(RecoveredMatrixView {
+            matrix,
+            s_in,
+            s_out,
+        })
     }
 
     pub fn verify_checksums(&self) -> Result<()> {
         for tensor in &self.manifest.tensors {
-            let digest = Sha256::digest(self.tensor_bytes(&tensor.name)?);
+            let digest = Sha256::digest(self.tensor(&tensor.name)?.bytes);
             let actual = format!("{digest:x}");
             if actual != tensor.sha256.to_ascii_lowercase() {
                 return Err(EngineError::InvalidArtifact(format!(
@@ -114,5 +263,98 @@ impl ModelArtifact {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{ArtifactBuilder, PackedTensor, DEFAULT_ALIGNMENT};
+    use crate::quant::{Q2Block64, BLOCK_LEN};
+
+    fn f16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn indexed_views_bind_matrix_and_recovery_without_repacking() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("views.ctoxq");
+        let source = [0.5_f32; BLOCK_LEN];
+        let weights = Q2Block64::quantize(&source).unwrap().encode().to_vec();
+        let f32_values = [0.25_f32, -0.75_f32];
+        ArtifactBuilder {
+            model: "test/qwen".into(),
+            revision: "0123456789abcdef".into(),
+            target: "test".into(),
+            alignment: DEFAULT_ALIGNMENT,
+            tensors: vec![
+                PackedTensor {
+                    name: "linear.weight".into(),
+                    dtype: TensorDType::Q2B64,
+                    shape: vec![1, BLOCK_LEN as u64],
+                    bytes: weights,
+                },
+                PackedTensor {
+                    name: "linear.weight.s_in".into(),
+                    dtype: TensorDType::F16,
+                    shape: vec![BLOCK_LEN as u64],
+                    bytes: f16_bytes(&vec![1.0; BLOCK_LEN]),
+                },
+                PackedTensor {
+                    name: "linear.weight.s_out".into(),
+                    dtype: TensorDType::F16,
+                    shape: vec![1],
+                    bytes: f16_bytes(&[1.5]),
+                },
+                PackedTensor {
+                    name: "A_log".into(),
+                    dtype: TensorDType::F32,
+                    shape: vec![2],
+                    bytes: f32_values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect(),
+                },
+            ],
+        }
+        .write_new(&path)
+        .unwrap();
+
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors).unwrap();
+        let recovered = artifact.recovered_matrix("linear.weight").unwrap();
+        assert_eq!(
+            (recovered.matrix.rows, recovered.matrix.columns),
+            (1, BLOCK_LEN)
+        );
+        assert_eq!(recovered.matrix.dtype, TensorDType::Q2B64);
+        assert!(recovered.matrix.segments.is_empty());
+        assert_eq!(recovered.s_in.len(), BLOCK_LEN);
+        assert_eq!(recovered.s_in.value(BLOCK_LEN - 1).unwrap(), 1.0);
+        assert_eq!(recovered.s_out.value(0).unwrap(), 1.5);
+        assert_eq!(
+            artifact
+                .float_tensor("A_log")
+                .unwrap()
+                .to_f32_vec()
+                .unwrap(),
+            f32_values
+        );
+        assert!(artifact.tensor("missing").is_err());
+        assert!(artifact.quantized_matrix("A_log").is_err());
+        assert!(artifact.float_tensor("linear.weight").is_err());
+    }
+
+    #[test]
+    fn float_view_rejects_bounds_and_nonfinite_values() {
+        let finite = 1.0_f32.to_le_bytes();
+        let view = FloatTensorView::F32Le(&finite);
+        assert_eq!(view.value(0).unwrap(), 1.0);
+        assert!(view.value(1).is_err());
+        let nonfinite = f32::NAN.to_le_bytes();
+        assert!(FloatTensorView::F32Le(&nonfinite).value(0).is_err());
     }
 }
