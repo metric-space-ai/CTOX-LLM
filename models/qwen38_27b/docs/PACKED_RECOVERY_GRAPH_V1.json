@@ -1,7 +1,7 @@
 {
   "format": "ctox.qwen38.packed-recovery-graph-evidence.v1",
   "date": "2026-08-25",
-  "status": "base_graph_installed_no_end_to_end_forward_yet",
+  "status": "base_and_mtp_graphs_installed_no_end_to_end_forward_yet",
   "model": "Qwen/Qwen3.8-27B",
   "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
   "native_artifact": {
@@ -30,16 +30,26 @@
     "device_for_installation_smoke": "cpu",
     "compute_dtype": "bfloat16"
   },
+  "mtp_graph": {
+    "installed_packed_weights": 8,
+    "loaded_frozen_float_parameters": 7,
+    "trainable_scale_values": 123904,
+    "remaining_owned_meta_parameters": 0,
+    "device_for_installation_smoke": "cpu",
+    "compute_dtype": "float16",
+    "shares_base_embedding_and_lm_head": true
+  },
   "verified_components": [
     "native header, endianness, alignment, range, dtype and checksum contracts",
     "canonical Q2 and Q4 row decoding including mixed-row tensors",
     "bounded packed-linear forward and analytic backward against dense gradients",
     "bounded unique-row embedding with scale gradients",
     "exact checkpoint-to-Transformers runtime-name mapping",
-    "complete meta-parameter replacement for the base text graph"
+    "complete meta-parameter replacement for the base text graph",
+    "all eight native MTP matrices and seven frozen MTP float parameters installed without owned meta tensors"
   ],
   "open_gates": [
-    "Install and execute the separate resident MTP graph from the same artifact.",
+    "Execute the separate resident MTP graph from the same artifact on a real cached sample.",
     "Run a packed base-graph forward on cached teacher input and compare selected hidden states and logits.",
     "Connect the six-family end-to-end recovery objective and optimizer.",
     "Replace the Python correctness operator with verified fused CUDA kernels before performance acceptance."
