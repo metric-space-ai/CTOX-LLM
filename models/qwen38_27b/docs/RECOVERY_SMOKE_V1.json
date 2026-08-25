@@ -1,0 +1,60 @@
+{
+  "format": "ctox.qwen38.recovery-smoke.v1",
+  "status": "smoke_only_not_production_assignment",
+  "teacher": {
+    "architecture": "Qwen3_5ForCausalLM",
+    "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "run_manifest_sha256": "176052f79945680de2a8d4d2be086300a22fb86d2d2a72f73872807d693a1a9a",
+    "samples": 10,
+    "cached_tokens": 1221,
+    "max_tokens_per_sample": 128,
+    "top_k": 64,
+    "hidden_layers": [0, 15, 31, 47, 63]
+  },
+  "dataset": {
+    "repository": "nvidia/Nemotron-Post-Training-Dataset-v1",
+    "revision": "74e23eb6f830fef4a9e96a92f6f6262214cbb9a8",
+    "cohort": {"chat": 2, "code": 2, "math": 2, "stem": 2, "tool_calling": 2},
+    "selection": "deterministic SHA-256 ranking per source manifest",
+    "materialized_prompts_committed": false
+  },
+  "activation_statistics": {
+    "observed_linear_matrices": 496,
+    "tokens": 1221,
+    "sha256": "ba2e856a7db62280bfdddc0d5428b18abef9e1d996f0e05a2a812fc99a2d8ccf"
+  },
+  "sensitivity": {
+    "planned_matrices": 506,
+    "observed_matrices": 496,
+    "estimator": "diagonal-input-covariance",
+    "sha256": "2c021700dc6c461ac5705630484b0fee20e88c7dcd1b39bcb1e6ab330ce093e8"
+  },
+  "assignment": {
+    "q4_matrices": 154,
+    "q2_matrices": 352,
+    "fixed_q4_matrices": 37,
+    "sha256": "4fc6f91cf0e9e8e4bc6d60fcdfb7408dccab6b29af7f68b6c536c09edbb41ab7"
+  },
+  "native_layout": {
+    "bytes": 8372888576,
+    "gib": 7.797860145568848,
+    "fold_weight_limit_bytes": 8375186227,
+    "headroom_bytes": 2297651,
+    "sha256": "e5dbdca7412ae1f87d2a8eaf3a6ef828f66253374afd368ae5b6c60f9e8ed846"
+  },
+  "fold_128k_memory": {
+    "total_bytes": 10311705600,
+    "target_bytes": 10415295693,
+    "hard_limit_bytes": 10737418240
+  },
+  "gpu_budget": {
+    "ledger_entries": 4,
+    "measured_gpu_hours": 0.03454233003987206,
+    "ceiling_gpu_hours": 240.0
+  },
+  "limitations": [
+    "The cohort is deliberately too small and too short for a production Q2/Q4 assignment.",
+    "Embedding, LM head, and resident MTP lack activation-weighted scores in this smoke.",
+    "The assignment has not been packed, recovery-trained, or benchmarked for model quality."
+  ]
+}

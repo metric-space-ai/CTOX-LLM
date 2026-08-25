@@ -28,3 +28,9 @@ including its manifest. It contains text plus resident MTP and produces a
 9.5748 GiB calculated 128K Fold plan. Its recovery scales are still identity
 values; it is a format/memory baseline, not the final quality checkpoint. Exact
 hashes and counts are recorded in [`docs/NATIVE_ARTIFACT_V1.json`](docs/NATIVE_ARTIFACT_V1.json).
+
+The first activation-weighted recovery smoke is recorded in
+[`docs/RECOVERY_SMOKE_V1.json`](docs/RECOVERY_SMOKE_V1.json). It proves the
+BF16 teacher cache, real-graph activation statistics, exact Q2/Q4 sensitivity
+simulation, and byte-exact assignment path. The 10-sample/128-token assignment
+is pipeline evidence only and is deliberately not promoted as a model artifact.
