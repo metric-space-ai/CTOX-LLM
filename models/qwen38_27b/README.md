@@ -113,6 +113,15 @@ cancellation, reset, health/capabilities, metrics, and fail-closed zero-residue
 unload. The backend table remains unchanged: no complete decoder executor has
 yet passed the production promotion gates.
 
+The loader now validates the complete model-specific tensor topology before a
+backend receives the artifact: exactly 506 quantized text+MTP matrices, 1,012
+paired recovery-scale tensors, and 360 frozen float tensors. Missing, extra,
+wrongly shaped, or wrongly typed graph inputs fail closed. The scalar oracle
+also covers the pinned Qwen normalization, RoPE, grouped-query attention,
+GatedDeltaNet decode/prefill recurrence, convolution state, and SwiGLU
+equations; quantized block composition and end-to-end decoder execution remain
+unfinished.
+
 [`docs/WIRE_PROTOCOL_V1.md`](docs/WIRE_PROTOCOL_V1.md) defines the matching
 versioned Unix-socket/named-pipe control and token-stream contract. The bring-up
 server negotiates and reports health but remains fail-closed with

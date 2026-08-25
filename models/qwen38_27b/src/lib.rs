@@ -19,6 +19,7 @@ pub mod release;
 pub mod roofline;
 pub mod sampler;
 pub mod server;
+pub mod tensor_contract;
 pub mod wire;
 
 #[cfg(feature = "android-jni")]

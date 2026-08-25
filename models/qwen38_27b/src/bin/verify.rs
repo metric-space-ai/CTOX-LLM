@@ -4,6 +4,7 @@ use clap::{Parser, ValueEnum};
 use ctox_qwen38_27b::format::RecoveryProvenance;
 use ctox_qwen38_27b::loader::{ChecksumPolicy, ModelArtifact};
 use ctox_qwen38_27b::memory::FoldMemoryPlan;
+use ctox_qwen38_27b::tensor_contract::validate_tensor_contract;
 use ctox_qwen38_27b::Qwen38Config;
 use serde::Serialize;
 
@@ -46,6 +47,7 @@ fn main() -> anyhow::Result<()> {
         },
     )?;
     let artifact_bytes = std::fs::metadata(&args.artifact)?.len();
+    validate_tensor_contract(artifact.manifest(), &Qwen38Config::default())?;
     let resident_weights_bytes = artifact
         .manifest()
         .tensors

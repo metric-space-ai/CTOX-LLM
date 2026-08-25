@@ -11,6 +11,7 @@ use crate::backend::{BackendKind, ExecutionPolicy, PromotionState};
 use crate::loader::{ChecksumPolicy, ModelArtifact};
 use crate::release::{MemoryProfile, ReleaseManifest};
 use crate::sampler::{Sampler, SamplerConfig};
+use crate::tensor_contract::validate_tensor_contract;
 use crate::{EngineError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +265,7 @@ impl<E: ModelExecutor> Engine<E> {
 
         let artifact = ModelArtifact::open(artifact_path, ChecksumPolicy::AllTensors)?;
         progress(LoadProgress::ArtifactOpened);
+        validate_tensor_contract(artifact.manifest(), &crate::Qwen38Config::default())?;
         release.admit_artifact(pack_id, &artifact)?;
         progress(LoadProgress::ArtifactAdmitted);
         if let Err(error) = executor.load(&artifact, &memory_profile) {
