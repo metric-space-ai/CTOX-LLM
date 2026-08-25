@@ -95,6 +95,12 @@ split names are not accepted as domain evidence.
 NLI classifier. Threshold labels are supplemented only by deterministic source
 facts (for example, an actual tool schema or the pinned code/math split). Its
 tags guide cohort selection and are never used as target labels during recovery.
+Hard source facts also override the primary label for genuine tool/agentic,
+code, math-split, and procedural long-context records. The original classifier
+primary and all 36 scores remain in the tag, while the effective primary records
+`primary_source=source_fact` and confidence 1.0. `apply_primary_overrides.py`
+upgrades already frozen score files without rerunning the NLI model and emits a
+new immutable hash; free-form Chat and STEM records never receive an override.
 The domain gate has two independent views. Multi-label counts prove that a
 domain is present, while `minimum_primary_train`/`minimum_primary_evaluation`
 require enough records whose clearest semantic assignment is that domain.

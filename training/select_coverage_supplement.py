@@ -163,7 +163,9 @@ def select_joint_supplement(
         sample_id = str(record["id"])
         tag = candidate_tags[sample_id]
         primary = str(tag["primary_label"])
-        confidence = float(tag["scores"].get(primary, 0.0))
+        confidence = float(
+            tag.get("primary_confidence", tag["scores"].get(primary, 0.0))
+        )
         if confidence >= minimum_confidence:
             eligible.append((record, tag, confidence))
 

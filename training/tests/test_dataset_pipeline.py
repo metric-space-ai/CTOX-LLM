@@ -36,9 +36,11 @@ from cache_teacher import (  # noqa: E402
 from classify_domains import (  # noqa: E402
     classification_text,
     deterministic_labels,
+    deterministic_primary_label,
     quota_gaps,
     validate_rubric,
 )
+from apply_primary_overrides import apply_overrides  # noqa: E402
 from audit_selection_coverage import coverage_report, validate_language_rubric  # noqa: E402
 from collect_activation_stats import (  # noqa: E402
     checkpoint_weight_name,
@@ -188,6 +190,38 @@ class DatasetPipelineTests(unittest.TestCase):
             },
         )
         self.assertIn("user: Debug this program", classification_text(record))
+        self.assertEqual(deterministic_primary_label(record), "agentic_tools_workflows")
+        self.assertEqual(
+            deterministic_primary_label({"category": "code", "split": "code"}),
+            "software_development",
+        )
+        self.assertEqual(
+            deterministic_primary_label({"category": "math", "split": "stem"}),
+            None,
+        )
+
+    def test_source_primary_override_preserves_classifier_score_evidence(self) -> None:
+        records = [{"id": "code", "category": "code", "split": "code"}]
+        tags = [
+            {
+                "id": "code",
+                "labels": ["politics_civics_institutions"],
+                "primary_label": "politics_civics_institutions",
+                "scores": {
+                    "politics_civics_institutions": 0.91,
+                    "software_development": 0.63,
+                },
+            }
+        ]
+        corrected, counts = apply_overrides(records, tags)
+        self.assertEqual(corrected[0]["primary_label"], "software_development")
+        self.assertEqual(
+            corrected[0]["classifier_primary_label"],
+            "politics_civics_institutions",
+        )
+        self.assertEqual(corrected[0]["primary_confidence"], 1.0)
+        self.assertIn("software_development", corrected[0]["labels"])
+        self.assertEqual(counts, Counter({"software_development": 1}))
 
     def test_release_domain_rubric_covers_every_required_family(self) -> None:
         rubric = json.loads((TRAINING / "DOMAIN_RUBRIC.json").read_text())

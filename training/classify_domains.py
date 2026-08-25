@@ -52,6 +52,20 @@ def deterministic_labels(record: dict[str, Any], final_answer: str) -> set[str]:
     return labels
 
 
+def deterministic_primary_label(record: dict[str, Any]) -> str | None:
+    category = str(record.get("category", "")).lower()
+    split = str(record.get("split", "")).lower()
+    if category == "agentic" or record.get("tools"):
+        return "agentic_tools_workflows"
+    if category == "code" or split == "code":
+        return "software_development"
+    if split == "math":
+        return "mathematics_logic"
+    if category == "long_context":
+        return "data_analysis_statistics_structured"
+    return None
+
+
 def validate_rubric(rubric: dict[str, Any]) -> None:
     policy = rubric["policy"]
     domains = rubric["domains"]
@@ -154,7 +168,9 @@ def classify(
                 name: round(float(score), 8)
                 for name, score in zip(domain_names, scores, strict=True)
             }
-            primary_label = max(score_map, key=score_map.get)
+            classifier_primary_label = max(score_map, key=score_map.get)
+            source_primary_label = deterministic_primary_label(record)
+            primary_label = source_primary_label or classifier_primary_label
             primary_counts[primary_label] += 1
             labels = {name for name, score in score_map.items() if score >= threshold}
             labels.update(deterministic_labels(record, final_answer))
@@ -169,6 +185,13 @@ def classify(
                     "id": record["id"],
                     "labels": sorted(labels),
                     "primary_label": primary_label,
+                    "primary_confidence": (
+                        1.0 if source_primary_label else score_map[primary_label]
+                    ),
+                    "primary_source": (
+                        "source_fact" if source_primary_label else "classifier"
+                    ),
+                    "classifier_primary_label": classifier_primary_label,
                     "scores": score_map,
                     "below_threshold_fallback": used_fallback,
                 }
