@@ -115,6 +115,25 @@ def supervised_next_token_loss(
     )
 
 
+def supervised_mtp_token_loss(
+    student_logits: Tensor,
+    input_ids: Tensor,
+    mtp_positions: Tensor,
+) -> Tensor:
+    """Cross entropy for MTP base-hidden p -> draft token[p+2] positions."""
+
+    positions = mtp_positions.to(device=input_ids.device, dtype=torch.long)
+    if positions.ndim != 1 or student_logits.shape[1] != positions.shape[0]:
+        raise ValueError("student MTP logits and MTP positions differ")
+    if bool((positions < 0).any()) or bool((positions + 2 >= input_ids.shape[1]).any()):
+        raise ValueError("MTP position has no p+2 token target")
+    targets = input_ids.index_select(1, positions + 2)
+    return F.cross_entropy(
+        student_logits.float().reshape(-1, student_logits.shape[-1]),
+        targets.reshape(-1),
+    )
+
+
 def normalized_hidden_loss(student: Tensor, teacher: Tensor) -> Tensor:
     """Scale-stable hidden reconstruction with a directional penalty."""
 
@@ -126,3 +145,61 @@ def normalized_hidden_loss(student: Tensor, teacher: Tensor) -> Tensor:
     normalized_mse = (student_f32 - teacher_f32).square().mean() / signal
     cosine = (1.0 - F.cosine_similarity(student_f32, teacher_f32, dim=-1).mean()).clamp_min(0.0)
     return normalized_mse + 0.1 * cosine
+
+
+def end_to_end_recovery_loss(
+    student: dict[str, Tensor],
+    teacher: dict[str, Tensor],
+    hidden_layers: list[int],
+    weights: dict[str, float] | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Compose base and MTP distillation without weakening any target family."""
+
+    coefficients = {
+        "kl": 1.0,
+        "ce": 0.5,
+        "hidden": 1.0,
+        "mtp_kl": 0.5,
+        "mtp_ce": 0.25,
+        "mtp_hidden": 0.5,
+    }
+    if weights is not None:
+        unknown = set(weights) - set(coefficients)
+        if unknown:
+            raise ValueError(f"unknown recovery loss weights: {sorted(unknown)}")
+        coefficients.update(weights)
+    if any(value < 0 for value in coefficients.values()) or not any(coefficients.values()):
+        raise ValueError("recovery loss weights must be non-negative and non-empty")
+
+    losses = {
+        "kl": sparse_teacher_kl(
+            student["logits"],
+            teacher["topk_indices"],
+            teacher["topk_logprobs"],
+            teacher["residual_probability"],
+        ),
+        "ce": supervised_next_token_loss(
+            student["logits"], teacher["input_ids"], teacher["logit_positions"]
+        ),
+    }
+    hidden_losses = [
+        normalized_hidden_loss(student[f"hidden_{layer}"], teacher[f"hidden_{layer}"])
+        for layer in hidden_layers
+    ]
+    if not hidden_losses:
+        raise ValueError("end-to-end recovery requires hidden-state targets")
+    losses["hidden"] = torch.stack(hidden_losses).mean()
+    losses["mtp_kl"] = sparse_teacher_kl(
+        student["mtp_logits"],
+        teacher["mtp_topk_indices"],
+        teacher["mtp_topk_logprobs"],
+        teacher["mtp_residual_probability"],
+    )
+    losses["mtp_ce"] = supervised_mtp_token_loss(
+        student["mtp_logits"], teacher["input_ids"], teacher["mtp_positions"]
+    )
+    losses["mtp_hidden"] = normalized_hidden_loss(
+        student["mtp_hidden"], teacher["mtp_hidden"]
+    )
+    total = sum(coefficients[name] * loss for name, loss in losses.items())
+    return total, losses

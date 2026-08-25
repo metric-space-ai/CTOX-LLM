@@ -125,6 +125,10 @@ KL approximation. Cross entropy targets the recorded `p -> token[p+1]`
 positions, while hidden reconstruction is signal-normalized and includes a
 directional penalty. The same sparse KL contract applies to every verifiable
 MTP draft target.
+`end_to_end_recovery_loss` composes six explicit, independently reported
+families: base KL, base CE, multi-layer hidden reconstruction, MTP KL, MTP CE,
+and MTP hidden reconstruction. No aggregate loss may silently omit MTP or
+collapse multilingual/domain selection into a target label.
 `teacher_cache_dataset.py` is the training-side content boundary. It accepts
 only passed verification documents with one teacher revision and provenance,
 rejects duplicate sample identities and unsafe paths, and rechecks each

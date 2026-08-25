@@ -51,7 +51,9 @@ try:  # Optional local training dependency; exercised in the pinned GPU venv.
     import torch  # noqa: E402
     from recovery_modules import (  # noqa: E402
         normalized_hidden_loss,
+        end_to_end_recovery_loss,
         sparse_teacher_kl,
+        supervised_mtp_token_loss,
         supervised_next_token_loss,
     )
 except ModuleNotFoundError:
@@ -404,6 +406,41 @@ class DatasetPipelineTests(unittest.TestCase):
         )
         hidden = torch.randn(1, 3, 8)
         self.assertLess(float(normalized_hidden_loss(hidden, hidden)), 1e-6)
+        mtp_logits = torch.full((1, 1, 5), -10.0)
+        mtp_logits[0, 0, 1] = 10.0
+        self.assertLess(
+            float(supervised_mtp_token_loss(mtp_logits, input_ids, torch.tensor([0]))),
+            1e-6,
+        )
+
+    def test_end_to_end_recovery_objective_includes_every_base_and_mtp_family(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+        probabilities = torch.tensor([[[0.5, 0.3, 0.2]]])
+        teacher = {
+            "input_ids": torch.tensor([[2, 0, 1]]),
+            "logit_positions": torch.tensor([0]),
+            "topk_indices": torch.tensor([[[0, 1]]]),
+            "topk_logprobs": probabilities[:, :, :2].log().to(torch.bfloat16),
+            "residual_probability": torch.tensor([[0.2]]),
+            "hidden_0": torch.ones(1, 1, 4),
+            "mtp_positions": torch.tensor([0]),
+            "mtp_topk_indices": torch.tensor([[[0, 1]]]),
+            "mtp_topk_logprobs": probabilities[:, :, :2].log().to(torch.bfloat16),
+            "mtp_residual_probability": torch.tensor([[0.2]]),
+            "mtp_hidden": torch.ones(1, 1, 4),
+        }
+        student = {
+            "logits": probabilities.log(),
+            "hidden_0": teacher["hidden_0"].clone(),
+            "mtp_logits": probabilities.log(),
+            "mtp_hidden": teacher["mtp_hidden"].clone(),
+        }
+        total, losses = end_to_end_recovery_loss(student, teacher, [0])
+        self.assertEqual(
+            set(losses), {"kl", "ce", "hidden", "mtp_kl", "mtp_ce", "mtp_hidden"}
+        )
+        self.assertTrue(torch.isfinite(total))
 
     def test_verified_teacher_cache_rejects_duplicate_or_changed_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
