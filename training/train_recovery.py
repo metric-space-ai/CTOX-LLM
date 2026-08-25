@@ -1,73 +1,458 @@
 #!/usr/bin/env python3
-"""Layerwise channel-scale recovery for a frozen Q2/Q4 matrix.
-
-Inputs are safetensors with `weight`, optional `bias`, and calibration tensors
-`input`/`teacher_output`. This bounded stage is used after sensitivity-driven
-quantization and before end-to-end logit distillation.
-"""
+"""Train every packed Qwen Q2/Q4 recovery scale against verified BF16 targets."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
-from recovery_modules import ChannelScaleRecovery, reconstruction_loss
+from ctox_artifact import CtoxArtifact
+from end_to_end_recovery import (
+    atomic_json,
+    build_packed_student,
+    export_scale_tensors,
+    immutable_run_contract,
+    load_teacher_file,
+    optimizer_parameters,
+    restore_training_checkpoint,
+    save_training_checkpoint,
+    scale_regularization,
+    scale_tensor_root,
+    sha256_path,
+    unique_scale_parameters,
+    validate_scale_parameter_contract,
+)
+from recovery_training_state import (
+    normalize_accumulated_gradients,
+    recovery_training_status,
+    training_order,
+)
 from run_ledger import GpuRun, require_budget
+from teacher_cache_dataset import VerifiedTeacherCache
+from teacher_runtime import install_pinned_fla_kernel
+
+
+def parse_loss_weights(encoded: str) -> dict[str, float]:
+    try:
+        document = json.loads(encoded)
+        if not isinstance(document, dict):
+            raise ValueError("loss weights must be a JSON object")
+        return {str(name): float(value) for name, value in document.items()}
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid --loss-weights: {error}") from error
+
+
+def mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
+    if not metrics:
+        return {}
+    names = set(metrics[0])
+    if any(set(item) != names for item in metrics):
+        raise ValueError("recovery metric families changed during the run")
+    return {
+        name: sum(item[name] for item in metrics) / len(metrics)
+        for name in sorted(names)
+    }
+
+
+def validate_artifact_recovery(artifact: CtoxArtifact) -> dict[str, Any]:
+    recovery = artifact.manifest.get("recovery")
+    if not isinstance(recovery, dict) or not recovery.get("fixed_logical_qcodes"):
+        raise ValueError("input CTOX artifact does not bind fixed logical qcodes")
+    required_hashes = ("plan_sha256", "activation_stats_sha256", "report_sha256")
+    for key in required_hashes:
+        value = str(recovery.get(key, ""))
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError(f"input CTOX recovery {key} is not a lowercase SHA-256")
+    return recovery
+
+
+def write_scales(
+    output: Path,
+    tensors: dict[str, Any],
+    metadata: dict[str, str],
+) -> None:
+    from safetensors.torch import save_file
+
+    if output.exists():
+        raise ValueError(f"refusing to overwrite {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    save_file(tensors, temporary, metadata=metadata)
+    temporary.replace(output)
+
+
+def validate_arguments(args: argparse.Namespace) -> None:
+    for output in (args.output_scales, args.output_report, args.output_evidence):
+        if output.exists():
+            raise ValueError(f"refusing to overwrite {output}")
+    if args.epochs <= 0 or args.gpus <= 0:
+        raise ValueError("--epochs and --gpus must be positive")
+    positive = (
+        args.learning_rate,
+        args.gradient_accumulation,
+        args.gradient_clip,
+        args.rows_per_chunk,
+        args.logit_chunk,
+        args.checkpoint_every,
+    )
+    if any(float(value) <= 0 for value in positive):
+        raise ValueError(
+            "learning, accumulation, clipping, chunk, and checkpoint values must be positive"
+        )
+    if args.scale_regularization < 0 or args.max_sequence_tokens < 0:
+        raise ValueError(
+            "regularization and maximum sequence length must be non-negative"
+        )
+    if args.max_optimizer_steps is not None and args.max_optimizer_steps <= 0:
+        raise ValueError("--max-optimizer-steps must be positive")
+    if args.sample_limit is not None and args.sample_limit <= 0:
+        raise ValueError("--sample-limit must be positive")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--quantized-layer", type=Path, required=True)
-    parser.add_argument("--calibration", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--artifact", type=Path, required=True)
+    parser.add_argument("--model-source", required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--teacher-cache-set", type=Path, required=True)
+    parser.add_argument("--teacher-cache-set-sha256", required=True)
+    parser.add_argument("--output-scales", type=Path, required=True)
+    parser.add_argument("--output-report", type=Path, required=True)
+    parser.add_argument("--output-evidence", type=Path, required=True)
+    parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--reserved-gpu-hours", type=float, required=True)
     parser.add_argument("--gpus", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=1000)
-    parser.add_argument("--learning-rate", type=float, default=2e-3)
-    parser.add_argument("--hadamard", action="store_true")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--compute-dtype",
+        choices=("bfloat16", "float16"),
+        default="bfloat16",
+    )
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--max-optimizer-steps", type=int)
+    parser.add_argument("--sample-limit", type=int)
+    parser.add_argument("--max-sequence-tokens", type=int, default=0)
+    parser.add_argument("--oversize-policy", choices=("fail", "skip"), default="fail")
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--gradient-accumulation", type=int, default=1)
+    parser.add_argument("--gradient-clip", type=float, default=1.0)
+    parser.add_argument("--scale-regularization", type=float, default=1e-4)
+    parser.add_argument("--rows-per-chunk", type=int, default=128)
+    parser.add_argument("--logit-chunk", type=int, default=16)
+    parser.add_argument("--checkpoint-every", type=int, default=25)
+    parser.add_argument("--seed", type=int, default=38)
+    parser.add_argument("--loss-weights", default="{}")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--use-fla-kernel", action="store_true")
     args = parser.parse_args()
     require_budget(args.ledger, args.reserved_gpu_hours)
-    if args.output.exists():
-        raise SystemExit(f"refusing to overwrite {args.output}")
-
     try:
+        validate_arguments(args)
         import torch
-        from safetensors.torch import load_file, save_file
+        from safetensors.torch import save_file  # noqa: F401
     except ImportError as error:
         raise SystemExit("install training/requirements.in before recovery") from error
-
-    device = torch.device("cuda")
-    layer = load_file(args.quantized_layer)
-    calibration = load_file(args.calibration)
-    module = ChannelScaleRecovery(
-        layer["weight"].to(device),
-        layer.get("bias", None).to(device) if "bias" in layer else None,
-        hadamard=args.hadamard,
-    ).to(device)
-    inputs = calibration["input"].to(device)
-    teacher = calibration["teacher_output"].to(device)
-    optimizer = torch.optim.AdamW(module.parameters(), lr=args.learning_rate, weight_decay=0.0)
-
-    with GpuRun(args.ledger, "layer-recovery", args.gpus, sys.argv):
-        for step in range(args.steps):
-            optimizer.zero_grad(set_to_none=True)
-            student = module(inputs)
-            loss = reconstruction_loss(student, teacher)
-            loss.backward()
-            optimizer.step()
-            if step % 50 == 0:
-                print(f"step={step} loss={loss.item():.8f}", flush=True)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        save_file(
-            module.correction_tensors(),
-            args.output,
-            metadata={
-                "format": "ctox.recovery.channel-scales.v1",
-                "hadamard": str(args.hadamard).lower(),
-            },
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise SystemExit("CUDA recovery requested but unavailable")
+    try:
+        loss_weights = parse_loss_weights(args.loss_weights)
+        cache = VerifiedTeacherCache.from_manifest(
+            args.teacher_cache_set,
+            args.teacher_cache_set_sha256,
         )
+        hidden_layers = [int(value) for value in cache.settings["hidden_layers"]]
+        top_k = int(cache.settings["top_k"])
+        if not bool(cache.settings["mtp_targets"]):
+            raise ValueError("end-to-end recovery requires verified MTP targets")
+        artifact_sha256 = sha256_path(args.artifact)
+        with CtoxArtifact(args.artifact, verify_tensors=True) as artifact:
+            if artifact.manifest.get("revision") != args.revision:
+                raise ValueError("native artifact and requested model revision differ")
+            recovery = validate_artifact_recovery(artifact)
+            device = torch.device(args.device)
+            compute_dtype = getattr(torch, args.compute_dtype)
+            kernel_evidence = (
+                install_pinned_fla_kernel() if args.use_fla_kernel else None
+            )
+            runtime, base_evidence, mtp_evidence = build_packed_student(
+                args.model_source,
+                args.revision,
+                artifact,
+                device,
+                compute_dtype,
+                args.rows_per_chunk,
+                hidden_layers,
+                top_k,
+                args.logit_chunk,
+                args.gradient_checkpointing,
+                torch,
+            )
+            parameters = unique_scale_parameters(runtime.main_model, runtime.mtp_model)
+            validate_scale_parameter_contract(parameters, artifact)
+            trainable = optimizer_parameters(parameters)
+            optimizer = torch.optim.AdamW(
+                trainable,
+                lr=args.learning_rate,
+                weight_decay=0.0,
+            )
+            run_contract = {
+                "format": "ctox.recovery.training-run.v1",
+                "model": artifact.manifest["model"],
+                "revision": args.revision,
+                "artifact_sha256": artifact_sha256,
+                "teacher_cache_set_sha256": args.teacher_cache_set_sha256,
+                "teacher_artifact_root_sha256": cache.manifest()[
+                    "artifact_root_sha256"
+                ],
+                "hidden_layers": hidden_layers,
+                "top_k": top_k,
+                "mtp_targets": True,
+                "epochs": args.epochs,
+                "sample_limit": args.sample_limit,
+                "max_sequence_tokens": args.max_sequence_tokens,
+                "oversize_policy": args.oversize_policy,
+                "learning_rate": args.learning_rate,
+                "gradient_accumulation": args.gradient_accumulation,
+                "gradient_clip": args.gradient_clip,
+                "scale_regularization": args.scale_regularization,
+                "rows_per_chunk": args.rows_per_chunk,
+                "logit_chunk": args.logit_chunk,
+                "seed": args.seed,
+                "loss_weights": loss_weights,
+                "gradient_checkpointing": args.gradient_checkpointing,
+                "fixed_logical_qcodes": True,
+            }
+            _contract_json, run_contract_sha256 = immutable_run_contract(run_contract)
+            cursor = {
+                "epoch": 0,
+                "next_position": 0,
+                "optimizer_steps": 0,
+                "samples_seen": 0,
+            }
+            if args.resume_checkpoint is not None:
+                cursor = restore_training_checkpoint(
+                    args.resume_checkpoint,
+                    parameters,
+                    optimizer,
+                    run_contract_sha256,
+                    torch,
+                )
+            args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            optimizer.zero_grad(set_to_none=True)
+            started = time.monotonic()
+            recent_metrics: list[dict[str, float]] = []
+            skipped: list[dict[str, Any]] = []
+            accumulated = 0
+            bounded_stop = False
+            with GpuRun(args.ledger, "end-to-end-recovery", args.gpus, sys.argv):
+
+                def complete_optimizer_step(
+                    epoch: int,
+                    position: int,
+                    sample_id: str,
+                    sequence_tokens: int,
+                ) -> None:
+                    nonlocal accumulated, bounded_stop
+                    accumulation_correction = normalize_accumulated_gradients(
+                        trainable,
+                        accumulated,
+                        args.gradient_accumulation,
+                    )
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        trainable, args.gradient_clip
+                    )
+                    if not bool(torch.isfinite(gradient_norm)):
+                        raise RuntimeError("non-finite recovery gradient norm")
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulated = 0
+                    cursor["optimizer_steps"] += 1
+                    print(
+                        json.dumps(
+                            {
+                                "epoch": epoch,
+                                "position": position,
+                                "sample": sample_id,
+                                "tokens": sequence_tokens,
+                                "optimizer_steps": cursor["optimizer_steps"],
+                                "gradient_norm": float(gradient_norm.detach().cpu()),
+                                "accumulation_correction": accumulation_correction,
+                                **mean_metrics(recent_metrics[-10:]),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    if cursor["optimizer_steps"] % args.checkpoint_every == 0:
+                        checkpoint = args.checkpoint_dir / (
+                            f"recovery-step-{cursor['optimizer_steps']:06d}.safetensors"
+                        )
+                        save_training_checkpoint(
+                            checkpoint,
+                            parameters,
+                            optimizer,
+                            cursor,
+                            run_contract_sha256,
+                            torch,
+                        )
+                    if (
+                        args.max_optimizer_steps is not None
+                        and cursor["optimizer_steps"] >= args.max_optimizer_steps
+                    ):
+                        bounded_stop = True
+
+                for epoch in range(cursor["epoch"], args.epochs):
+                    order = training_order(len(cache.artifacts), epoch, args.seed)
+                    if args.sample_limit is not None:
+                        order = order[: args.sample_limit]
+                    position_start = (
+                        cursor["next_position"] if epoch == cursor["epoch"] else 0
+                    )
+                    if position_start > len(order):
+                        raise ValueError(
+                            "resume cursor exceeds deterministic epoch order"
+                        )
+                    last_trained: tuple[int, str, int] | None = None
+                    for position in range(position_start, len(order)):
+                        artifact_index = order[position]
+                        descriptor = cache.artifacts[artifact_index]
+                        teacher_path = cache.verified_artifact_path(artifact_index)
+                        teacher = load_teacher_file(teacher_path, torch)
+                        sequence_tokens = int(teacher["input_ids"].shape[1])
+                        if (
+                            args.max_sequence_tokens
+                            and sequence_tokens > args.max_sequence_tokens
+                        ):
+                            if args.oversize_policy == "fail":
+                                raise ValueError(
+                                    f"teacher sample {descriptor['id']} has "
+                                    f"{sequence_tokens} tokens, above "
+                                    f"--max-sequence-tokens {args.max_sequence_tokens}"
+                                )
+                            skipped.append(
+                                {"id": descriptor["id"], "tokens": sequence_tokens}
+                            )
+                            cursor.update(
+                                {"epoch": epoch, "next_position": position + 1}
+                            )
+                            continue
+                        total, losses = runtime.losses(teacher, loss_weights)
+                        regularization = scale_regularization(parameters, torch)
+                        objective = total + args.scale_regularization * regularization
+                        if not bool(torch.isfinite(objective)):
+                            raise RuntimeError(
+                                f"non-finite recovery loss for {descriptor['id']}"
+                            )
+                        (objective / args.gradient_accumulation).backward()
+                        accumulated += 1
+                        last_trained = (
+                            position + 1,
+                            str(descriptor["id"]),
+                            sequence_tokens,
+                        )
+                        cursor["samples_seen"] += 1
+                        cursor.update({"epoch": epoch, "next_position": position + 1})
+                        item_metrics = {
+                            name: float(value.detach().float().cpu())
+                            for name, value in losses.items()
+                        }
+                        item_metrics["objective"] = float(
+                            objective.detach().float().cpu()
+                        )
+                        item_metrics["regularization"] = float(
+                            regularization.detach().float().cpu()
+                        )
+                        recent_metrics.append(item_metrics)
+                        if len(recent_metrics) > 100:
+                            recent_metrics.pop(0)
+                        if accumulated == args.gradient_accumulation:
+                            complete_optimizer_step(
+                                epoch,
+                                position + 1,
+                                str(descriptor["id"]),
+                                sequence_tokens,
+                            )
+                            if bounded_stop:
+                                break
+                        del teacher, total, losses, objective, regularization
+                    if bounded_stop:
+                        break
+                    if accumulated:
+                        if last_trained is None:
+                            raise RuntimeError(
+                                "partial gradient group lacks a trained sample"
+                            )
+                        complete_optimizer_step(epoch, *last_trained)
+                        if bounded_stop:
+                            break
+                    cursor.update({"epoch": epoch + 1, "next_position": 0})
+            scale_tensors = export_scale_tensors(parameters, torch)
+            scale_root = scale_tensor_root(scale_tensors)
+            status = recovery_training_status(
+                bounded_stop,
+                args.sample_limit,
+                len(skipped),
+            )
+            report = {
+                **run_contract,
+                "run_contract_sha256": run_contract_sha256,
+                "status": status,
+                "cursor": cursor,
+                "elapsed_seconds": time.monotonic() - started,
+                "trainable_scale_tensors": len(scale_tensors),
+                "trainable_scale_values": sum(
+                    tensor.numel() for tensor in scale_tensors.values()
+                ),
+                "trained_scale_root_sha256": scale_root,
+                "recent_mean_losses": mean_metrics(recent_metrics),
+                "skipped_oversize_samples": skipped,
+                "base_graph": base_evidence,
+                "mtp_graph": mtp_evidence,
+                "fla_kernel": kernel_evidence,
+            }
+            atomic_json(args.output_report, report)
+            report_sha256 = sha256_path(args.output_report)
+            write_scales(
+                args.output_scales,
+                scale_tensors,
+                {
+                    "format": "ctox.recovery.channel-scales.v2",
+                    "status": status,
+                    "model": str(artifact.manifest["model"]),
+                    "revision": args.revision,
+                    "plan_sha256": str(recovery["plan_sha256"]),
+                    "activation_stats_sha256": str(recovery["activation_stats_sha256"]),
+                    "report_sha256": report_sha256,
+                    "teacher_cache_set_sha256": args.teacher_cache_set_sha256,
+                    "input_artifact_sha256": artifact_sha256,
+                    "fixed_logical_qcodes": "true",
+                    "trained_scale_root_sha256": scale_root,
+                },
+            )
+            evidence = {
+                "format": "ctox.recovery.training-evidence.v1",
+                "status": status,
+                "run_contract_sha256": run_contract_sha256,
+                "report_sha256": report_sha256,
+                "scales_sha256": sha256_path(args.output_scales),
+                "trained_scale_root_sha256": scale_root,
+                "cursor": cursor,
+                "skipped_oversize_samples": len(skipped),
+                "fixed_logical_qcodes": True,
+            }
+            atomic_json(args.output_evidence, evidence)
+    except (OSError, ValueError, RuntimeError, KeyError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":

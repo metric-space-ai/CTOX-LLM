@@ -65,12 +65,19 @@ from prompt_format import normalize_content, normalize_messages, normalize_tool_
 from filter_recovery_cohort import filter_records  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
 from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
+from recovery_training_state import (  # noqa: E402
+    normalize_accumulated_gradients,
+    recovery_training_status,
+    training_order,
+)
+
 try:  # Optional local training dependency; exercised in the pinned GPU venv.
     import torch  # noqa: E402
     from recovery_modules import (  # noqa: E402
         normalized_hidden_loss,
         end_to_end_recovery_loss,
         sparse_teacher_kl,
+        streamed_sparse_target_losses,
         supervised_mtp_token_loss,
         supervised_next_token_loss,
     )
@@ -127,13 +134,14 @@ class DatasetPipelineTests(unittest.TestCase):
         ).hexdigest()
         return record
 
-    def test_committed_general_purpose_evidence_covers_every_declared_domain(self) -> None:
+    def test_committed_general_purpose_evidence_covers_every_declared_domain(
+        self,
+    ) -> None:
         domain_rubric = json.loads((TRAINING / "DOMAIN_RUBRIC.json").read_text())
         language_rubric = json.loads((TRAINING / "LANGUAGE_RUBRIC.json").read_text())
         evidence = json.loads(
             (
-                TRAINING.parent
-                / "models/qwen38_27b/docs/DOMAIN_COVERAGE_V2.json"
+                TRAINING.parent / "models/qwen38_27b/docs/DOMAIN_COVERAGE_V2.json"
             ).read_text()
         )
         expected_domains = set(domain_rubric["domains"])
@@ -171,14 +179,14 @@ class DatasetPipelineTests(unittest.TestCase):
                 minima["evaluation"],
             )
 
-    def test_cohort_filter_rejects_empty_conditioning_and_duplicate_payloads(self) -> None:
+    def test_cohort_filter_rejects_empty_conditioning_and_duplicate_payloads(
+        self,
+    ) -> None:
         valid = self.recovery_record("valid", "Explain it", "A useful answer")
         duplicate = dict(valid, id="duplicate")
         empty = self.recovery_record("empty", "", "An unconditioned answer")
         tags = [{"id": record["id"]} for record in (valid, duplicate, empty)]
-        kept, kept_tags, removed = filter_records(
-            [valid, duplicate, empty], tags
-        )
+        kept, kept_tags, removed = filter_records([valid, duplicate, empty], tags)
         self.assertEqual([record["id"] for record in kept], ["valid"])
         self.assertEqual([tag["id"] for tag in kept_tags], ["valid"])
         self.assertEqual(
@@ -217,10 +225,14 @@ class DatasetPipelineTests(unittest.TestCase):
 
     class WordTokenizer:
         def apply_chat_template(self, messages, **_kwargs):
-            return "\n".join(f"{message['role']}: {message['content']}" for message in messages)
+            return "\n".join(
+                f"{message['role']}: {message['content']}" for message in messages
+            )
 
         def __call__(self, text, **_kwargs):
-            return type("Encoded", (), {"input_ids": text.replace("\n", " \n ").split()})()
+            return type(
+                "Encoded", (), {"input_ids": text.replace("\n", " \n ").split()}
+            )()
 
     class FakePackedArtifact:
         def __init__(self, torch_module):
@@ -238,6 +250,36 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(percentile([9, 1, 5, 3], 0.0), 1)
         self.assertEqual(percentile([9, 1, 5, 3], 0.5), 5)
         self.assertEqual(percentile([9, 1, 5, 3], 1.0), 9)
+
+    def test_recovery_order_and_completion_status_fail_closed(self) -> None:
+        self.assertEqual(training_order(9, 2, 38), training_order(9, 2, 38))
+        self.assertNotEqual(training_order(9, 2, 38), training_order(9, 3, 38))
+        self.assertEqual(
+            recovery_training_status(False, None, 0),
+            "complete",
+        )
+        self.assertEqual(
+            recovery_training_status(False, 10, 0),
+            "subset_run_complete",
+        )
+        self.assertEqual(
+            recovery_training_status(False, None, 1),
+            "partial_coverage",
+        )
+        self.assertEqual(
+            recovery_training_status(True, None, 0),
+            "bounded_run_complete",
+        )
+
+    def test_partial_accumulation_is_rescaled_to_the_exact_mean(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+        parameter = torch.nn.Parameter(torch.tensor([2.0]))
+        ((parameter.square().sum()) / 4).backward()
+        ((parameter.square().sum()) / 4).backward()
+        factor = normalize_accumulated_gradients([parameter], 2, 4)
+        self.assertEqual(factor, 2.0)
+        self.assertTrue(torch.allclose(parameter.grad, torch.tensor([4.0])))
 
     def test_teacher_cache_resume_accepts_only_exact_source_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -341,9 +383,7 @@ class DatasetPipelineTests(unittest.TestCase):
     def test_service_mode_rubric_is_joint_with_domains_and_languages(self) -> None:
         domain_rubric = json.loads((TRAINING / "DOMAIN_RUBRIC.json").read_text())
         language_rubric = json.loads((TRAINING / "LANGUAGE_RUBRIC.json").read_text())
-        service_rubric = json.loads(
-            (TRAINING / "SERVICE_MODE_RUBRIC.json").read_text()
-        )
+        service_rubric = json.loads((TRAINING / "SERVICE_MODE_RUBRIC.json").read_text())
         validate_service_rubric(service_rubric, domain_rubric, language_rubric)
         self.assertGreaterEqual(len(service_rubric["modes"]), 14)
         self.assertEqual(
@@ -364,7 +404,7 @@ class DatasetPipelineTests(unittest.TestCase):
                     "tool_calls": [{"name": "calculate"}],
                 },
                 {"role": "tool", "content": "4"},
-                {"role": "assistant", "content": "{\"answer\": 4}"},
+                {"role": "assistant", "content": '{"answer": 4}'},
             ],
         }
         self.assertEqual(
@@ -423,9 +463,7 @@ class DatasetPipelineTests(unittest.TestCase):
                     "minimum_evaluation": 1,
                 },
             },
-            "language_minimum_distinct_modes": {
-                "en": {"train": 2, "evaluation": 1}
-            },
+            "language_minimum_distinct_modes": {"en": {"train": 2, "evaluation": 1}},
             "required_domain_mode_pairs": {
                 "software": {"code": {"train": 1, "evaluation": 1}}
             },
@@ -487,9 +525,7 @@ class DatasetPipelineTests(unittest.TestCase):
                     "minimum_evaluation": 1,
                 },
             },
-            "language_minimum_distinct_modes": {
-                "en": {"train": 2, "evaluation": 1}
-            },
+            "language_minimum_distinct_modes": {"en": {"train": 2, "evaluation": 1}},
             "required_domain_mode_pairs": {
                 "software": {"code": {"train": 2, "evaluation": 1}}
             },
@@ -603,9 +639,7 @@ class DatasetPipelineTests(unittest.TestCase):
             "a": {"primary_label": "code"},
             "b": {"primary_label": "translation"},
         }
-        report = coverage_report(
-            records, tags, domain_rubric, language_rubric, "train"
-        )
+        report = coverage_report(records, tags, domain_rubric, language_rubric, "train")
         self.assertEqual(report["status"], "supplement_required")
         self.assertEqual(report["non_translation_gaps"]["de"]["observed"], 0)
         self.assertEqual(
@@ -694,7 +728,9 @@ class DatasetPipelineTests(unittest.TestCase):
         )
         self.assertEqual({record["id"] for record in selected}, {"code-en", "code-de"})
         self.assertEqual({tag["id"] for tag in selected_tags}, {"code-en", "code-de"})
-        self.assertTrue(all(not values for values in evidence["remaining_requirements"].values()))
+        self.assertTrue(
+            all(not values for values in evidence["remaining_requirements"].values())
+        )
 
     def test_near_tie_domain_assignment_is_explicit_and_bounded(self) -> None:
         tag = {
@@ -710,7 +746,9 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(effective["primary_margin_from_classifier_max"], 0.01)
         self.assertIsNone(primary_assignment(tag, requirements, 0.7, 0.005))
 
-    def test_unassigned_candidate_keeps_original_primary_for_language_gate(self) -> None:
+    def test_unassigned_candidate_keeps_original_primary_for_language_gate(
+        self,
+    ) -> None:
         requirements = {
             name: Counter()
             for name in (
@@ -734,7 +772,9 @@ class DatasetPipelineTests(unittest.TestCase):
         )
         self.assertEqual(coverage, [("non_english_family", "science")])
 
-    def test_domain_gate_requires_clear_primary_examples_not_only_multilabel_hits(self) -> None:
+    def test_domain_gate_requires_clear_primary_examples_not_only_multilabel_hits(
+        self,
+    ) -> None:
         rubric = {
             "policy": {"minimum_primary_train": 2},
             "domains": {
@@ -751,7 +791,9 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(gaps, {})
         self.assertEqual(primary_gaps, {"b": {"observed": 1, "required": 2}})
 
-    def test_primary_supplement_closes_each_gap_with_margin_and_confidence(self) -> None:
+    def test_primary_supplement_closes_each_gap_with_margin_and_confidence(
+        self,
+    ) -> None:
         records = [{"id": value} for value in ("a", "b", "c", "d", "e")]
         tags = {
             "a": {"primary_label": "safety", "scores": {"safety": 0.95}},
@@ -870,7 +912,9 @@ class DatasetPipelineTests(unittest.TestCase):
             ["apache-2.0", "cc-by-4.0"],
         )
 
-    def test_long_context_generator_is_sized_and_requires_two_retrieval_positions(self) -> None:
+    def test_long_context_generator_is_sized_and_requires_two_retrieval_positions(
+        self,
+    ) -> None:
         manifest, materialized = generated_record(
             self.WordTokenizer(),
             seed="calibration-v1",
@@ -977,7 +1021,9 @@ class DatasetPipelineTests(unittest.TestCase):
             },
         )
 
-    def test_teacher_cache_verifier_contract_includes_mtp_and_hidden_layers(self) -> None:
+    def test_teacher_cache_verifier_contract_includes_mtp_and_hidden_layers(
+        self,
+    ) -> None:
         specs = expected_tensor_specs(100, 20, 10, 19, 7, 64, 5120, [0, 63], True)
         self.assertEqual(specs["input_ids"], ("I32", [1, 100]))
         self.assertEqual(specs["topk_logprobs"], ("BF16", [1, 20, 64]))
@@ -985,7 +1031,9 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(specs["mtp_hidden"], ("BF16", [1, 7, 5120]))
         self.assertEqual(specs["mtp_topk_indices"], ("I32", [1, 19, 64]))
 
-    def test_teacher_smoke_selects_every_domain_and_language_deterministically(self) -> None:
+    def test_teacher_smoke_selects_every_domain_and_language_deterministically(
+        self,
+    ) -> None:
         records = [
             {"id": "a", "language": "de"},
             {"id": "b", "language": "en"},
@@ -1088,7 +1136,9 @@ class DatasetPipelineTests(unittest.TestCase):
             1e-6,
         )
 
-    def test_end_to_end_recovery_objective_includes_every_base_and_mtp_family(self) -> None:
+    def test_end_to_end_recovery_objective_includes_every_base_and_mtp_family(
+        self,
+    ) -> None:
         if torch is None:
             self.skipTest("torch is not installed in the host-only test environment")
         probabilities = torch.tensor([[[0.5, 0.3, 0.2]]])
@@ -1117,7 +1167,46 @@ class DatasetPipelineTests(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(total))
 
-    def test_verified_teacher_cache_rejects_duplicate_or_changed_artifacts(self) -> None:
+    def test_streamed_sparse_projection_matches_dense_losses_and_gradients(
+        self,
+    ) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+        torch.manual_seed(7)
+        hidden = torch.randn(1, 5, 4, requires_grad=True)
+        head = torch.nn.Linear(4, 7, bias=False)
+        input_ids = torch.tensor([[0, 2, 4, 1, 3, 5]])
+        positions = torch.tensor([0, 1, 2, 3, 4])
+        with torch.no_grad():
+            teacher_logits = head(hidden.detach())
+            teacher_logprobs = teacher_logits.log_softmax(dim=-1)
+            values, indices = teacher_logprobs.topk(3, dim=-1)
+            residual = 1.0 - values.exp().sum(dim=-1)
+        streamed_kl, streamed_ce = streamed_sparse_target_losses(
+            head,
+            hidden,
+            indices,
+            values,
+            residual,
+            input_ids,
+            positions,
+            target_offset=1,
+            chunk_size=2,
+        )
+        dense_logits = head(hidden)
+        dense_kl = sparse_teacher_kl(dense_logits, indices, values, residual)
+        dense_ce = supervised_next_token_loss(dense_logits, input_ids, positions)
+        self.assertTrue(torch.allclose(streamed_kl, dense_kl, atol=1e-6))
+        self.assertTrue(torch.allclose(streamed_ce, dense_ce, atol=1e-6))
+        (streamed_kl + streamed_ce).backward()
+        streamed_gradient = hidden.grad.clone()
+        hidden.grad = None
+        (dense_kl + dense_ce).backward()
+        self.assertTrue(torch.allclose(streamed_gradient, hidden.grad, atol=1e-6))
+
+    def test_verified_teacher_cache_rejects_duplicate_or_changed_artifacts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             cache = root / "cache"
@@ -1160,7 +1249,10 @@ class DatasetPipelineTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
             loaded = VerifiedTeacherCache.from_manifest(manifest_path, manifest_sha256)
-            self.assertEqual(loaded.manifest()["artifact_root_sha256"], manifest["artifact_root_sha256"])
+            self.assertEqual(
+                loaded.manifest()["artifact_root_sha256"],
+                manifest["artifact_root_sha256"],
+            )
             mismatched = root / "mismatched.json"
             mismatched_document = json.loads(verification.read_text())
             mismatched_document["top_k"] = 32
@@ -1192,9 +1284,7 @@ class DatasetPipelineTests(unittest.TestCase):
             inherited = {"HF_HOME": "/stale/cache", "UNCHANGED": "yes"}
             environment = cache_environment(inherited, cache)
             self.assertEqual(environment["HF_HOME"], str(cache.resolve()))
-            self.assertEqual(
-                environment["HF_HUB_CACHE"], str(cache.resolve() / "hub")
-            )
+            self.assertEqual(environment["HF_HUB_CACHE"], str(cache.resolve() / "hub"))
             self.assertEqual(environment["UNCHANGED"], "yes")
             self.assertEqual(inherited["HF_HOME"], "/stale/cache")
             with self.assertRaisesRegex(ValueError, "not a directory"):
@@ -1224,7 +1314,9 @@ class DatasetPipelineTests(unittest.TestCase):
             manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
             data_offset = (HEADER.size + len(manifest_bytes) + 63) & ~63
             path.write_bytes(
-                HEADER.pack(MAGIC, 1, ENDIAN_MARKER, len(manifest_bytes), data_offset, 1, 64)
+                HEADER.pack(
+                    MAGIC, 1, ENDIAN_MARKER, len(manifest_bytes), data_offset, 1, 64
+                )
                 + manifest_bytes
                 + b"\0" * (data_offset - HEADER.size - len(manifest_bytes))
                 + payload
@@ -1233,7 +1325,11 @@ class DatasetPipelineTests(unittest.TestCase):
                 view = artifact.tensor_bytes("scale")
                 self.assertEqual(bytes(view), payload)
                 view.release()
-                values = artifact.decode_float_tensor("scale", torch, "cpu") if torch else None
+                values = (
+                    artifact.decode_float_tensor("scale", torch, "cpu")
+                    if torch
+                    else None
+                )
                 if values is not None:
                     self.assertEqual(tuple(values.shape), (2,))
 
@@ -1243,7 +1339,12 @@ class DatasetPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "q2.ctoxq"
             packed_code = bytes([0 | (1 << 2) | (2 << 4) | (3 << 6)])
-            payload = torch.tensor([1.0], dtype=torch.float16).view(torch.uint8).numpy().tobytes()
+            payload = (
+                torch.tensor([1.0], dtype=torch.float16)
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+            )
             payload += packed_code * 16
             manifest = {
                 "format": "ctox.q2q4.v1",
@@ -1265,7 +1366,9 @@ class DatasetPipelineTests(unittest.TestCase):
             manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
             data_offset = (HEADER.size + len(manifest_bytes) + 63) & ~63
             path.write_bytes(
-                HEADER.pack(MAGIC, 1, ENDIAN_MARKER, len(manifest_bytes), data_offset, 1, 64)
+                HEADER.pack(
+                    MAGIC, 1, ENDIAN_MARKER, len(manifest_bytes), data_offset, 1, 64
+                )
                 + manifest_bytes
                 + b"\0" * (data_offset - HEADER.size - len(manifest_bytes))
                 + payload
@@ -1282,7 +1385,12 @@ class DatasetPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "linear.ctoxq"
             packed_code = bytes([0 | (1 << 2) | (2 << 4) | (3 << 6)])
-            scale_bytes = torch.tensor([1.0], dtype=torch.float16).view(torch.uint8).numpy().tobytes()
+            scale_bytes = (
+                torch.tensor([1.0], dtype=torch.float16)
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+            )
             payload = scale_bytes + packed_code * 16
             payload += scale_bytes + packed_code * 16
             manifest = {
@@ -1305,7 +1413,9 @@ class DatasetPipelineTests(unittest.TestCase):
             manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
             data_offset = (HEADER.size + len(manifest_bytes) + 63) & ~63
             path.write_bytes(
-                HEADER.pack(MAGIC, 1, ENDIAN_MARKER, len(manifest_bytes), data_offset, 1, 64)
+                HEADER.pack(
+                    MAGIC, 1, ENDIAN_MARKER, len(manifest_bytes), data_offset, 1, 64
+                )
                 + manifest_bytes
                 + b"\0" * (data_offset - HEADER.size - len(manifest_bytes))
                 + payload
@@ -1318,23 +1428,37 @@ class DatasetPipelineTests(unittest.TestCase):
                 s_out = torch.tensor([0.9, 1.2], requires_grad=True)
                 bias = torch.tensor([0.1, -0.2], requires_grad=True)
                 output = packed_linear(
-                    torch, artifact, "weight", inputs, s_in, s_out, bias, rows_per_chunk=1
+                    torch,
+                    artifact,
+                    "weight",
+                    inputs,
+                    s_in,
+                    s_out,
+                    bias,
+                    rows_per_chunk=1,
                 )
                 output.square().sum().backward()
-                packed_grads = [value.grad.clone() for value in (inputs, s_in, s_out, bias)]
+                packed_grads = [
+                    value.grad.clone() for value in (inputs, s_in, s_out, bias)
+                ]
 
                 dense_inputs = inputs.detach().clone().requires_grad_()
                 dense_s_in = s_in.detach().clone().requires_grad_()
                 dense_s_out = s_out.detach().clone().requires_grad_()
                 dense_bias = bias.detach().clone().requires_grad_()
-                dense_output = torch.nn.functional.linear(
-                    dense_inputs * dense_s_in, dense_weight, dense_bias
-                ) * dense_s_out
+                dense_output = (
+                    torch.nn.functional.linear(
+                        dense_inputs * dense_s_in, dense_weight, dense_bias
+                    )
+                    * dense_s_out
+                )
                 dense_output.square().sum().backward()
                 for packed_grad, value in zip(
                     packed_grads, (dense_inputs, dense_s_in, dense_s_out, dense_bias)
                 ):
-                    self.assertTrue(torch.allclose(packed_grad, value.grad, atol=1e-4, rtol=1e-4))
+                    self.assertTrue(
+                        torch.allclose(packed_grad, value.grad, atol=1e-4, rtol=1e-4)
+                    )
                 module_class = packed_recovery_linear_class(torch)
                 module = module_class(
                     artifact,
@@ -1362,13 +1486,17 @@ class DatasetPipelineTests(unittest.TestCase):
                 )
                 ids = torch.tensor([[1, 0, 1]])
                 embedded = embedding(ids)
-                expected_embedding = dense_weight.index_select(0, ids.reshape(-1)).reshape(1, 3, 64)
+                expected_embedding = dense_weight.index_select(
+                    0, ids.reshape(-1)
+                ).reshape(1, 3, 64)
                 self.assertTrue(torch.allclose(embedded, expected_embedding))
                 embedded.sum().backward()
                 self.assertIsNotNone(embedding.log_s_in.grad)
                 self.assertIsNotNone(embedding.log_s_out.grad)
 
-    def test_packed_recovery_registry_requires_and_loads_exact_scale_pairs(self) -> None:
+    def test_packed_recovery_registry_requires_and_loads_exact_scale_pairs(
+        self,
+    ) -> None:
         if torch is None:
             self.skipTest("torch is not installed in the host-only test environment")
         artifact = self.FakePackedArtifact(torch)
@@ -1379,7 +1507,9 @@ class DatasetPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lacks"):
             PackedRecoveryRegistry(artifact, torch)
 
-    def test_packed_student_assignment_replaces_only_exact_qualified_target(self) -> None:
+    def test_packed_student_assignment_replaces_only_exact_qualified_target(
+        self,
+    ) -> None:
         if torch is None:
             self.skipTest("torch is not installed in the host-only test environment")
         root = torch.nn.Module()
@@ -1439,13 +1569,21 @@ class DatasetPipelineTests(unittest.TestCase):
 
     def test_german_rag_context_is_part_of_hashed_payload(self) -> None:
         repo = "Beko2210/German-Instruct-Dataset"
-        row = {"input": "Fasse zusammen", "context": "Nur dieser Text", "output": "Kurzfassung"}
+        row = {
+            "input": "Fasse zusammen",
+            "context": "Nur dieser Text",
+            "output": "Kurzfassung",
+        }
         payload = recovery_payload(row, repo)
         self.assertIn("Kontext:\nNur dieser Text", payload["messages"][0]["content"])
         changed = dict(row, context="Ein anderer Text")
         self.assertNotEqual(canonical_text(row, repo), canonical_text(changed, repo))
-        self.assertEqual(category_for("default", "train", {"category": "coding"}), "code")
-        self.assertEqual(category_for("default", "train", {"category": "rag"}), "long_context")
+        self.assertEqual(
+            category_for("default", "train", {"category": "coding"}), "code"
+        )
+        self.assertEqual(
+            category_for("default", "train", {"category": "rag"}), "long_context"
+        )
 
     def test_paired_sample_becomes_conversation(self) -> None:
         self.assertEqual(
@@ -1505,10 +1643,18 @@ class DatasetPipelineTests(unittest.TestCase):
             for category in ("code", "math"):
                 path = Path(directory) / f"{category}.jsonl"
                 records = [
-                    {"id": hashlib.sha256(f"{category}-{index}".encode()).hexdigest(), "category": category}
+                    {
+                        "id": hashlib.sha256(
+                            f"{category}-{index}".encode()
+                        ).hexdigest(),
+                        "category": category,
+                    }
                     for index in range(10)
                 ]
-                path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+                path.write_text(
+                    "".join(json.dumps(record) + "\n" for record in records),
+                    encoding="utf-8",
+                )
                 paths.append(path)
             first = select(paths, per_manifest=3, seed="fixed")
             second = select(paths, per_manifest=3, seed="fixed")
@@ -1516,7 +1662,9 @@ class DatasetPipelineTests(unittest.TestCase):
             self.assertEqual([record["category"] for record in first].count("code"), 3)
             self.assertEqual([record["category"] for record in first].count("math"), 3)
 
-    def test_recovery_split_is_deterministic_disjoint_and_release_eligible(self) -> None:
+    def test_recovery_split_is_deterministic_disjoint_and_release_eligible(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = []
             for source_index in range(2):
@@ -1573,7 +1721,9 @@ class DatasetPipelineTests(unittest.TestCase):
                 for index in range(8):
                     records.append(
                         {
-                            "id": hashlib.sha256(f"{language}-{index}".encode()).hexdigest(),
+                            "id": hashlib.sha256(
+                                f"{language}-{index}".encode()
+                            ).hexdigest(),
                             "category": "chat",
                             "language": language,
                             "source_repo": "example/aya",
@@ -1655,7 +1805,9 @@ class DatasetPipelineTests(unittest.TestCase):
         )
 
     def test_empty_tool_calls_are_removed(self) -> None:
-        messages = normalize_messages([{"role": "user", "content": "hello", "tool_calls": []}])
+        messages = normalize_messages(
+            [{"role": "user", "content": "hello", "tool_calls": []}]
+        )
         self.assertEqual(messages, [{"role": "user", "content": "hello"}])
 
     def test_structured_tool_result_content_is_canonical_json(self) -> None:
@@ -1679,7 +1831,11 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(prefill_ranges(10, 4), [(0, 4), (4, 8), (8, 10)])
         self.assertEqual(prefill_ranges(10, 0), [(0, 10)])
         self.assertEqual(prefill_ranges(10, 10), [(0, 10)])
-        flattened = [position for start, stop in prefill_ranges(17, 5) for position in range(start, stop)]
+        flattened = [
+            position
+            for start, stop in prefill_ranges(17, 5)
+            for position in range(start, stop)
+        ]
         self.assertEqual(flattened, list(range(17)))
 
     def test_mixed_q2_q4_tensors_remain_calibration_targets(self) -> None:
@@ -1711,7 +1867,9 @@ class DatasetPipelineTests(unittest.TestCase):
             ["lm_head.weight", "matrix.weight"],
         )
 
-    def test_merged_activation_metadata_does_not_claim_one_runtime_profile(self) -> None:
+    def test_merged_activation_metadata_does_not_claim_one_runtime_profile(
+        self,
+    ) -> None:
         reference = {
             "model": "model",
             "revision": "revision",
@@ -1736,7 +1894,10 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertNotIn("gpu_weight_memory_gib", metadata)
         self.assertEqual(metadata["merged_batches"], "2")
         self.assertEqual(
-            [profile["gpu_weight_memory_gib"] for profile in json.loads(metadata["source_runtime_profiles"])],
+            [
+                profile["gpu_weight_memory_gib"]
+                for profile in json.loads(metadata["source_runtime_profiles"])
+            ],
             ["16", "9"],
         )
         self.assertEqual(
@@ -1975,7 +2136,9 @@ class DatasetPipelineTests(unittest.TestCase):
                         "files": [
                             {
                                 "path": source.name,
-                                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                                "sha256": hashlib.sha256(
+                                    source.read_bytes()
+                                ).hexdigest(),
                             }
                         ]
                     }
