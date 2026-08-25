@@ -133,6 +133,13 @@ three-linear/one-full pattern for all configured layers. It remains a
 correctness executor: production paged-Q2/Q4 KV, fused token-mixer kernels,
 chunked prefill, MTP draft/verify, and optimized backend integration remain.
 
+`CpuCorrectnessExecutor` connects that target graph to the stable embeddable
+`ModelExecutor` lifecycle: shared-`Arc<Mmap>` load, warmup, sequential prefill,
+incremental decode, cancellation, reset, allocation reporting, and zero-residue
+unload are exercised together. Its promotion state is permanently `Verifier`,
+MTP is disabled, and production admission rejects it because attention and
+GatedDeltaNet still use scalar oracle composition.
+
 [`docs/MEMORY_PLAN_CORRECTION_V2.json`](docs/MEMORY_PLAN_CORRECTION_V2.json)
 records the 7.5-MiB causal-convolution state that the earlier calculated Fold
 figures omitted. The corrected initializer plan remains admitted below 9.7

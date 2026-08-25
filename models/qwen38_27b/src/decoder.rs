@@ -6,13 +6,18 @@
 //! LM head. Token mixers are added separately and must pass the pinned Qwen
 //! oracle before a complete executor can be promoted.
 
-use crate::backend::{Activation, Backend};
+use crate::backend::cpu::CpuBackend;
+use crate::backend::{Activation, Backend, BackendKind, ExecutionPolicy, PromotionState};
 use crate::config::LayerKind;
+use crate::engine::{
+    AllocationSnapshot, CancellationToken, ExecutorCapabilities, ExecutorStep, ModelExecutor,
+};
 use crate::loader::ModelArtifact;
 use crate::reference::{
     apply_partial_rope, causal_conv_silu_update, grouped_query_attention,
     recurrent_gated_delta_step, rms_norm_1p_weight, rms_norm_gated, sigmoid_gate, swiglu,
 };
+use crate::release::MemoryProfile;
 use crate::{EngineError, Qwen38Config, Result};
 
 fn softplus(value: f32) -> f32 {
@@ -275,6 +280,53 @@ pub struct ArtifactDecoder<'a, B: Backend> {
     artifact: &'a ModelArtifact,
     backend: &'a B,
     rms_epsilon: f32,
+}
+
+pub struct CpuCorrectnessExecutor {
+    config: Qwen38Config,
+    backend: CpuBackend,
+    artifact: Option<ModelArtifact>,
+    state: Option<DecoderState>,
+    admitted_context: usize,
+    warmed: bool,
+    allocations: AllocationSnapshot,
+}
+
+impl CpuCorrectnessExecutor {
+    pub fn scalar(config: Qwen38Config) -> Self {
+        Self {
+            config,
+            backend: CpuBackend::scalar_verifier(),
+            artifact: None,
+            state: None,
+            admitted_context: 0,
+            warmed: false,
+            allocations: AllocationSnapshot::default(),
+        }
+    }
+
+    pub fn detected(config: Qwen38Config) -> Result<Self> {
+        Ok(Self {
+            config,
+            backend: CpuBackend::detect(ExecutionPolicy::Verifier)?,
+            artifact: None,
+            state: None,
+            admitted_context: 0,
+            warmed: false,
+            allocations: AllocationSnapshot::default(),
+        })
+    }
+
+    fn update_session_allocation(&mut self) -> Result<()> {
+        self.allocations.session_bytes = self
+            .state
+            .as_ref()
+            .map(DecoderState::allocated_bytes)
+            .unwrap_or(0)
+            .try_into()
+            .map_err(|_| EngineError::MemoryBudget("CPU decoder state exceeds u64".into()))?;
+        Ok(())
+    }
 }
 
 impl<'a, B: Backend> ArtifactDecoder<'a, B> {
@@ -636,6 +688,150 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
     }
 }
 
+impl ModelExecutor for CpuCorrectnessExecutor {
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Cpu
+    }
+
+    fn hardware_profile(&self) -> &str {
+        self.backend.profile()
+    }
+
+    fn promotion_state(&self) -> PromotionState {
+        // Quantized projections may use AVX2/NEON, but token mixers in this
+        // executor deliberately remain the scalar correctness composition.
+        PromotionState::Verifier
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        ExecutorCapabilities {
+            vocab_size: self.config.vocab_size,
+            maximum_context_tokens: self.config.max_position_embeddings as u64,
+            mtp: false,
+            cancellation: true,
+            session_reset: true,
+            no_hidden_fallbacks: false,
+        }
+    }
+
+    fn load(&mut self, artifact: &ModelArtifact, profile: &MemoryProfile) -> Result<()> {
+        if self.artifact.is_some() || self.state.is_some() {
+            return Err(EngineError::InvalidState(
+                "CPU correctness executor is already loaded".into(),
+            ));
+        }
+        let admitted_context = usize::try_from(profile.context_tokens)
+            .map_err(|_| EngineError::MemoryBudget("CPU context capacity exceeds usize".into()))?;
+        if admitted_context == 0 || admitted_context > self.config.max_position_embeddings {
+            return Err(EngineError::MemoryBudget(
+                "CPU memory profile context exceeds model capacity".into(),
+            ));
+        }
+        self.artifact = Some(artifact.clone());
+        self.admitted_context = admitted_context;
+        self.warmed = false;
+        self.allocations = AllocationSnapshot {
+            model_bytes: profile.resident_model_bytes,
+            ..AllocationSnapshot::default()
+        };
+        Ok(())
+    }
+
+    fn warmup(&mut self) -> Result<()> {
+        if self.artifact.is_none() {
+            return Err(EngineError::InvalidState(
+                "CPU correctness executor is not loaded".into(),
+            ));
+        }
+        self.warmed = true;
+        Ok(())
+    }
+
+    fn prefill(
+        &mut self,
+        tokens: &[u32],
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutorStep> {
+        if !self.warmed || tokens.is_empty() || tokens.len() > self.admitted_context {
+            return Err(EngineError::InvalidState(
+                "CPU prefill requires a warm executor and admitted non-empty tokens".into(),
+            ));
+        }
+        self.state = Some(DecoderState::new(&self.config, self.admitted_context)?);
+        let artifact = self.artifact.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("CPU prefill has no loaded artifact".into())
+        })?;
+        let decoder = ArtifactDecoder::new(artifact, &self.backend, self.config.rms_norm_epsilon)?;
+        let state = self.state.as_mut().expect("state created above");
+        let mut target_logits = Vec::new();
+        for token in tokens {
+            if cancellation.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            target_logits = decoder.decode_target_token(*token, state, &self.config)?;
+        }
+        self.update_session_allocation()?;
+        Ok(ExecutorStep {
+            target_logits,
+            draft_tokens_proposed: 0,
+            draft_tokens_verified: 0,
+            accepted_draft_tokens: Vec::new(),
+        })
+    }
+
+    fn decode(
+        &mut self,
+        token: u32,
+        mtp_enabled: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutorStep> {
+        if !self.warmed || mtp_enabled || cancellation.is_cancelled() {
+            return if cancellation.is_cancelled() {
+                Err(EngineError::Cancelled)
+            } else {
+                Err(EngineError::InvalidState(
+                    "CPU correctness decode is not warm or MTP was requested".into(),
+                ))
+            };
+        }
+        let artifact = self
+            .artifact
+            .as_ref()
+            .ok_or_else(|| EngineError::InvalidState("CPU decode has no loaded artifact".into()))?;
+        let decoder = ArtifactDecoder::new(artifact, &self.backend, self.config.rms_norm_epsilon)?;
+        let state = self.state.as_mut().ok_or_else(|| {
+            EngineError::InvalidState("CPU decode requires a prefilled state".into())
+        })?;
+        let target_logits = decoder.decode_target_token(token, state, &self.config)?;
+        self.update_session_allocation()?;
+        Ok(ExecutorStep {
+            target_logits,
+            draft_tokens_proposed: 0,
+            draft_tokens_verified: 0,
+            accepted_draft_tokens: Vec::new(),
+        })
+    }
+
+    fn reset_session(&mut self) -> Result<()> {
+        self.state = None;
+        self.allocations.session_bytes = 0;
+        Ok(())
+    }
+
+    fn unload(&mut self) -> Result<()> {
+        self.state = None;
+        self.artifact = None;
+        self.admitted_context = 0;
+        self.warmed = false;
+        self.allocations = AllocationSnapshot::default();
+        Ok(())
+    }
+
+    fn allocations(&self) -> AllocationSnapshot {
+        self.allocations
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +839,7 @@ mod tests {
     use crate::format::{ArtifactBuilder, PackedTensor, TensorDType, DEFAULT_ALIGNMENT};
     use crate::loader::ChecksumPolicy;
     use crate::quant::{Q2Block64, BLOCK_LEN};
+    use crate::release::KvMemoryFormula;
     use half::f16;
 
     fn f16_bytes(values: &[f32]) -> Vec<u8> {
@@ -912,6 +1109,7 @@ mod tests {
         assert!((logits[0] - logits[1]).abs() < 1e-6);
 
         let linear_decode_config = Qwen38Config {
+            vocab_size: 2,
             num_hidden_layers: 1,
             full_attention_interval: 4,
             max_position_embeddings: 2,
@@ -934,6 +1132,7 @@ mod tests {
         );
 
         let full_decode_config = Qwen38Config {
+            vocab_size: 2,
             num_hidden_layers: 1,
             full_attention_interval: 1,
             max_position_embeddings: 2,
@@ -946,5 +1145,47 @@ mod tests {
         assert_eq!(full_logits.len(), 2);
         assert!(full_logits.iter().all(|value| value.is_finite()));
         assert_eq!(full_target_state.position(), 1);
+
+        let profile = MemoryProfile {
+            profile_id: "cpu-correctness-2".into(),
+            pack_id: "test".into(),
+            context_tokens: 2,
+            sessions: 1,
+            resident_model_bytes: artifact.file_bytes(),
+            persistent_backend_graph_bytes: 0,
+            persistent_runtime_bytes: 0,
+            linear_state_bytes_per_session: 9_216,
+            kv: KvMemoryFormula {
+                fixed_bytes_per_session: 0,
+                bytes_per_token_per_session: 0,
+                retained_q4_tokens_per_session: 0,
+                q4_delta_bytes_per_token: 0,
+            },
+            prefill_scratch_peak_bytes: 0,
+            decode_scratch_peak_bytes: 0,
+            loader_transient_peak_bytes: 0,
+            accelerator_unattributed_reserve_bytes: 0,
+            hard_limit_bytes: 1 << 30,
+        };
+        let mut executor = CpuCorrectnessExecutor::scalar(linear_decode_config.clone());
+        executor.load(&artifact, &profile).unwrap();
+        executor.warmup().unwrap();
+        let cancellation = CancellationToken::default();
+        let prefill = executor.prefill(&[0], &cancellation).unwrap();
+        assert_eq!(prefill.target_logits.len(), 2);
+        assert!(executor.allocations().session_bytes > 0);
+        let decode = executor.decode(0, false, &cancellation).unwrap();
+        assert_eq!(decode.target_logits.len(), 2);
+        executor.reset_session().unwrap();
+        assert_eq!(executor.allocations().session_bytes, 0);
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(matches!(
+            executor.prefill(&[0], &cancelled),
+            Err(EngineError::Cancelled)
+        ));
+        executor.reset_session().unwrap();
+        executor.unload().unwrap();
+        assert!(executor.allocations().is_zero());
     }
 }

@@ -3,7 +3,9 @@
   "backends": {
     "cpu_scalar": {
       "state": "verifier",
-      "production_allowed": false
+      "production_allowed": false,
+      "operations": ["complete_target_decode_composition", "sequential_prefill", "incremental_decode", "reset", "zero_residue_unload"],
+      "mtp": false
     },
     "cpu_avx2": {
       "state": "experimental",

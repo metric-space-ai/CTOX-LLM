@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use memmap2::{Mmap, MmapOptions};
 use sha2::{Digest, Sha256};
@@ -18,8 +19,9 @@ pub enum ChecksumPolicy {
     AllTensors,
 }
 
+#[derive(Clone)]
 pub struct ModelArtifact {
-    mmap: Mmap,
+    mmap: Arc<Mmap>,
     header: FileHeader,
     manifest: ModelManifest,
     manifest_sha256: String,
@@ -279,7 +281,7 @@ impl ModelArtifact {
             .collect();
 
         let artifact = Self {
-            mmap,
+            mmap: Arc::new(mmap),
             header,
             manifest,
             manifest_sha256,
