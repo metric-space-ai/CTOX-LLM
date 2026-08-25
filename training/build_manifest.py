@@ -137,6 +137,8 @@ def source_id_for(row: dict[str, Any], index: int) -> str:
 
 def category_for(subset: str, split: str, row: dict[str, Any]) -> str:
     explicit = str(row.get("category", "")).lower()
+    if explicit == "coding":
+        return "code"
     if explicit == "rag":
         return "long_context"
     if explicit in {"business", "german_pro", "bureaucracy", "hard_prompts", "safety"}:

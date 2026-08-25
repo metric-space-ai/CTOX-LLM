@@ -10,7 +10,7 @@ from pathlib import Path
 TRAINING = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TRAINING))
 
-from build_manifest import canonical_text, recovery_payload  # noqa: E402
+from build_manifest import canonical_text, category_for, recovery_payload  # noqa: E402
 from collect_activation_stats import checkpoint_weight_name  # noqa: E402
 from materialize_prompts import load_manifests  # noqa: E402
 from optimize_q4_budget import layout_bytes  # noqa: E402
@@ -31,6 +31,8 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertIn("Kontext:\nNur dieser Text", payload["messages"][0]["content"])
         changed = dict(row, context="Ein anderer Text")
         self.assertNotEqual(canonical_text(row, repo), canonical_text(changed, repo))
+        self.assertEqual(category_for("default", "train", {"category": "coding"}), "code")
+        self.assertEqual(category_for("default", "train", {"category": "rag"}), "long_context")
 
     def test_paired_sample_becomes_conversation(self) -> None:
         self.assertEqual(
