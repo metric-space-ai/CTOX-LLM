@@ -23,14 +23,20 @@ from build_quant_plan import (  # noqa: E402
     FOLD_PACKAGE_LIMIT,
     FOLD_RESIDENT_LIMIT,
 )
-from collect_activation_stats import checkpoint_weight_name  # noqa: E402
+from cache_teacher import position_sets  # noqa: E402
+from collect_activation_stats import (  # noqa: E402
+    checkpoint_weight_name,
+    prefill_ranges,
+    quantized_source_names,
+)
 from materialize_prompts import load_manifests  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
 from optimize_q4_budget import layout_bytes, mixed_tensor_bytes  # noqa: E402
 from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
-from score_quant_sensitivity import row_group_document  # noqa: E402
+from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
+from teacher_runtime import FLA_KERNEL_REVISION, weight_max_memory  # noqa: E402
 from verify_vendor_manifest import verify  # noqa: E402
 
 
@@ -107,6 +113,36 @@ class DatasetPipelineTests(unittest.TestCase):
             hashlib.sha256(canonical_text(materialized).encode()).hexdigest(),
             manifest["prompt_sha256"],
         )
+
+    def test_sparse_teacher_positions_cover_answer_needles_and_sequence(self) -> None:
+        logits, hidden = position_sets(
+            sequence_length=1000,
+            target_mode="assistant",
+            assistant_prefix_tokens=950,
+            marker_offsets=[100, 800],
+            marker_window=2,
+            uniform_hidden_positions=5,
+        )
+        self.assertEqual(logits[0], 949)
+        self.assertEqual(logits[-1], 998)
+        self.assertTrue({98, 99, 100, 101, 102}.issubset(hidden))
+        self.assertTrue({798, 799, 800, 801, 802}.issubset(hidden))
+        self.assertTrue(set(logits).issubset(hidden))
+        self.assertIn(0, hidden)
+        self.assertIn(999, hidden)
+
+    def test_teacher_all_mode_preserves_full_sequence_targets(self) -> None:
+        logits, hidden = position_sets(8, "all", None, [], 0, 0)
+        self.assertEqual(logits, list(range(8)))
+        self.assertEqual(hidden, list(range(8)))
+
+    def test_teacher_runtime_pins_fla_and_reserves_gpu_headroom(self) -> None:
+        self.assertEqual(len(FLA_KERNEL_REVISION), 40)
+        self.assertEqual(
+            weight_max_memory(3, 16, 96),
+            {0: "16GiB", 1: "16GiB", 2: "16GiB", "cpu": "96GiB"},
+        )
+        self.assertIsNone(weight_max_memory(3, None, 96))
 
     def test_german_rag_context_is_part_of_hashed_payload(self) -> None:
         repo = "Beko2210/German-Instruct-Dataset"
@@ -185,6 +221,42 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(
             checkpoint_weight_name("model.layers.12.mlp.down_proj"),
             "model.language_model.layers.12.mlp.down_proj.weight",
+        )
+
+    def test_prefill_ranges_cover_sequence_exactly(self) -> None:
+        self.assertEqual(prefill_ranges(10, 4), [(0, 4), (4, 8), (8, 10)])
+        self.assertEqual(prefill_ranges(10, 0), [(0, 10)])
+        self.assertEqual(prefill_ranges(10, 10), [(0, 10)])
+        flattened = [position for start, stop in prefill_ranges(17, 5) for position in range(start, stop)]
+        self.assertEqual(flattened, list(range(17)))
+
+    def test_mixed_q2_q4_tensors_remain_calibration_targets(self) -> None:
+        plan = {
+            "tensors": [
+                {
+                    "name": "lm_head.weight",
+                    "source_shard": "model.safetensors",
+                    "dtype": "mixed_q2_q4_b64",
+                },
+                {
+                    "name": "matrix.weight",
+                    "source_shard": "model.safetensors",
+                    "dtype": "q2_b64",
+                },
+                {
+                    "name": "matrix.weight.s_in",
+                    "source_shard": None,
+                    "dtype": "f16",
+                },
+            ]
+        }
+        self.assertEqual(
+            quantized_source_names(plan),
+            {"lm_head.weight", "matrix.weight"},
+        )
+        self.assertEqual(
+            [entry["name"] for entry in quantized_entries(plan)],
+            ["lm_head.weight", "matrix.weight"],
         )
 
     def test_mtp_names_map_to_frozen_checkpoint(self) -> None:

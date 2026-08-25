@@ -1,5 +1,6 @@
 datasets>=4.4,<5
 huggingface-hub>=0.34
+kernels==0.16.0
 numpy>=2.0
 safetensors>=0.5
 torch>=2.7

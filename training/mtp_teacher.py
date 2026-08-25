@@ -116,3 +116,57 @@ def load_mtp_teacher(main_model: Any, checkpoint: Path, device: Any, safe_open: 
                 parameter.data.copy_(value)
     mtp.eval()
     return mtp
+
+
+def forward_mtp_activations(
+    mtp_model: Any,
+    input_ids: Any,
+    last_hidden_states: Any,
+    position_ids: Any,
+    mtp_cache: Any,
+) -> Any:
+    """Execute the frozen MTP block without materializing vocabulary logits.
+
+    ``transformers.MtpModel.forward`` always projects the final token through
+    the shared LM head and samples a draft. Activation collection needs the
+    block inputs/outputs only. Replaying the single supported MTP layer here
+    avoids that large, irrelevant projection and permits the MTP block to live
+    on a different device from an offloaded LM head.
+    """
+
+    if len(mtp_model.layers) != 1:
+        raise RuntimeError(
+            f"Qwen3.8 activation collection requires one MTP layer, got {len(mtp_model.layers)}"
+        )
+    layer = mtp_model.layers[0]
+    inputs_embeds = mtp_model.embed_tokens(input_ids).to(last_hidden_states.device)
+    position_embeddings = (
+        mtp_model.rotary_emb(inputs_embeds, position_ids=position_ids)
+        if mtp_model.rotary_emb is not None
+        else None
+    )
+    if position_embeddings is not None:
+        # The rotary module is tied to the main decoder and may retain its
+        # non-persistent buffers on the embedding GPU. MTP can intentionally
+        # live elsewhere, so move the derived cos/sin tensors, not the shared
+        # module or its ownership.
+        position_embeddings = tuple(
+            value.to(last_hidden_states.device) for value in position_embeddings
+        )
+    masks = mtp_model.create_masks_for_mtp_layer(
+        0,
+        inputs_embeds,
+        mtp_cache,
+        position_ids,
+    )
+    hidden_states = layer(
+        inputs_embeds,
+        last_hidden_states,
+        position_embeddings=position_embeddings,
+        position_ids=position_ids,
+        past_key_values=mtp_cache,
+        **masks,
+    )
+    if mtp_model.use_shared_post_norm:
+        hidden_states = mtp_model.shared_post_norm(hidden_states)
+    return hidden_states

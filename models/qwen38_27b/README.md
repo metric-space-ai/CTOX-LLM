@@ -49,3 +49,12 @@ statistics use their correct weighting modes, and the resident MTP checkpoint
 is loaded and executed fail-closed. It also verifies mixed 256-row Q2/Q4
 segments through the packer and Rust loader. Its ten short samples and identity
 recovery scales make it pipeline evidence only, not a model-quality candidate.
+
+The recovery corpus v2 evidence in
+[`docs/RECOVERY_CORPUS_V2.json`](docs/RECOVERY_CORPUS_V2.json) records the first
+tool-schema-complete NVIDIA Agentic samples plus disjoint bilingual 32K, 64K,
+and 128K calibration/evaluation cohorts. These samples are generated and hash
+verified. [`docs/TEACHER_CACHE_SMOKE_V1.json`](docs/TEACHER_CACHE_SMOKE_V1.json)
+adds real stateful BF16 teacher passes at 32K, 64K, and 128K and complete 32K
+activation coverage for all 506 quantized matrices. Release-size teacher and
+activation cohorts plus recovery training are still pending.

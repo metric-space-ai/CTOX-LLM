@@ -64,6 +64,30 @@ tool calls are converted to Qwen's flat chat-template form without changing the
 hashed source payload. Only requested transformer layers are captured, and the
 LM head is evaluated in bounded token chunks so full-vocabulary FP32 logits are
 never resident for an entire sequence.
+For long-context records, `cache_teacher.py --target-mode assistant` stores
+logits only for the final supervised assistant response. Hidden-state targets
+cover that response, bounded windows around recorded retrieval markers, and a
+uniform sequence sample. Hooks slice and move those positions immediately;
+they never persist five full 128K hidden-state tensors. Teacher and activation
+inputs fail rather than silently truncating a record above `--max-length`.
+On memory-constrained teacher hosts, `--gpu-weight-memory-gib` reserves GPU
+headroom and allows Accelerate to place the remaining frozen BF16 layers in
+host RAM. `--use-fla-kernel` selects only the FLA Gated-Delta implementation at
+the immutable revision in `teacher_runtime.py`. It deliberately does not use
+Transformers' generic kernel switch: that switch also requests a hub
+causal-convolution build unavailable for GPU3's pinned Torch/CUDA pair. The
+selected FLA revision and exact device map are stored in the teacher artifact.
+`--prefill-chunk-tokens` executes a long prompt as a stateful causal prefill:
+GatedDelta carries its recurrent state and full-attention layers carry their KV
+pages, while QKV and FLA workspaces are bounded by the current chunk. Selected
+hidden/logit positions are reassembled in global token order and verified
+before writing the sample.
+The same option on `collect_activation_stats.py` accumulates diagonal base and
+MTP statistics chunk by chunk. `--mtp-device cuda:N` can keep the frozen MTP
+block on a GPU when the last text layers and shared LM head are deliberately
+offloaded to CPU; activation collection bypasses the unused MTP vocabulary
+projection but executes every frozen MTP matrix and its persistent attention
+cache.
 
 The 240 GPU-hour ceiling is cumulative across teacher generation, sensitivity
 runs, ablations, final recovery, and evaluation. Every command appends its GPU

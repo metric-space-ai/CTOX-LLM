@@ -1,0 +1,132 @@
+{
+  "format": "ctox.qwen38.sparse-teacher-smoke.v1",
+  "date": "2026-08-25",
+  "status": "32k_64k_128k_sparse_teacher_passed",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "teacher_dtype": "bfloat16",
+  "target_policy": {
+    "top_k": 64,
+    "hidden_layers": [
+      0
+    ],
+    "marker_window": 32,
+    "uniform_hidden_positions": 64,
+    "assistant_only_logits": true,
+    "prefill_chunk_tokens": 512,
+    "full_sequence_hidden_states_persisted": false
+  },
+  "kernel": {
+    "repository": "kernels-community/fla",
+    "revision": "398dfa8cde0c51ff3c1770800d60ddd85cafcff7",
+    "selection": "Qwen GatedDelta chunk and recurrent functions only",
+    "random_bf16_reference_max_abs": 0.001953125,
+    "random_bf16_reference_mean_abs": 0.0001431839
+  },
+  "chunk_equivalence": {
+    "sample_tokens": 3148,
+    "top1_agreement": 0.990990990990991,
+    "top5_set_overlap": 0.9945945945945946,
+    "top1_logprob_max_abs": 0.09375,
+    "hidden_0_mean_abs": 0.0000611,
+    "hidden_0_max_abs": 0.125,
+    "note": "The compared chunk artifact predated the global-position metadata fix; tensor ordering was correct, but only the later 32K/64K/128K artifacts are retained as position-metadata evidence."
+  },
+  "long_context": [
+    {
+      "band": "32K",
+      "sample_id": "d8833c8bfad80631f73990fcfc498edca89a849a7b1b0b69aa28cdd242acd02d",
+      "sequence_tokens": 32584,
+      "hidden_targets": 251,
+      "logit_targets": 57,
+      "gpu_weight_memory_gib": 16,
+      "cpu_offload_memory_gib": 96,
+      "artifact_bytes": 2757692,
+      "artifact_sha256": "71e8bad9a312b48e127e9d606a75e77c46393c589556e073fe6a042690f1f23b",
+      "elapsed_seconds": 80.77688765525818,
+      "gpu_hours": 0.06731407304604849,
+      "global_position_metadata": "passed"
+    },
+    {
+      "band": "64K",
+      "sample_id": "8b9cbca229d8ca14eb363399535adbbf4885cb8b9fb1cf906220519a2bc974c0",
+      "sequence_tokens": 65350,
+      "hidden_targets": 251,
+      "logit_targets": 57,
+      "gpu_weight_memory_gib": 14,
+      "cpu_offload_memory_gib": 96,
+      "artifact_bytes": 2921522,
+      "artifact_sha256": "7c5221852a2b073d043561a0802fb0c1049e4ac88d8156ee7c4609697b663b77",
+      "elapsed_seconds": 272.06920075416565,
+      "gpu_hours": 0.22672433396180472,
+      "global_position_metadata": "passed"
+    },
+    {
+      "band": "128K",
+      "sample_id": "2ba87a004ce16802f079d426fb0e91d422ed02ac91aacf41862c0960ae095bb2",
+      "sequence_tokens": 130925,
+      "hidden_targets": 250,
+      "logit_targets": 56,
+      "gpu_weight_memory_gib": 12,
+      "cpu_offload_memory_gib": 96,
+      "artifact_bytes": 3238761,
+      "artifact_sha256": "42674daa1511f66a16f5c3b7698c2ad81df536bcf3c16497f7794e97fec4a6a1",
+      "elapsed_seconds": 894.7653594017029,
+      "gpu_hours": 0.7456377995014191,
+      "torch": "2.8.0+cu128",
+      "cuda": "12.8",
+      "cuda_allocator": "expandable_segments:True",
+      "cuda_memory": [
+        {
+          "gpu": 0,
+          "peak_allocated_bytes": 18019261440,
+          "peak_reserved_bytes": 19545456640
+        },
+        {
+          "gpu": 1,
+          "peak_allocated_bytes": 17842034688,
+          "peak_reserved_bytes": 19774046208
+        },
+        {
+          "gpu": 2,
+          "peak_allocated_bytes": 17842034688,
+          "peak_reserved_bytes": 19774046208
+        }
+      ],
+      "global_position_metadata": "passed"
+    }
+  ],
+  "activation_smoke": {
+    "sample_id": "d8833c8bfad80631f73990fcfc498edca89a849a7b1b0b69aa28cdd242acd02d",
+    "sequence_tokens": 32584,
+    "observed_quantized_matrices": 506,
+    "unobserved_quantized_matrices": 0,
+    "embedding_row_hits": 32584,
+    "lm_head_weighting": "diagonal input covariance",
+    "mtp_token_pairs": 32583,
+    "artifact_bytes": 31894304,
+    "artifact_sha256": "c00a81eb559cf28c8b45f9f014d2bd042ffa31b0bb5642d1264fa415449c5197",
+    "elapsed_seconds": 92.3914361000061,
+    "gpu_hours": 0.07699286341667175
+  },
+  "known_failed_attempts": [
+    {
+      "stage": "generic_transformers_kernel_switch",
+      "reason": "The unpinned mamba-ssm hub kernel had no Torch 2.8/CUDA 12.8 variant; selective pinned FLA replacement is used instead."
+    },
+    {
+      "stage": "32K_full_sequence_forward",
+      "reason": "Full-sequence BF16 QKV/attention workspaces exceeded GPU memory at both 16 and 14 GiB weight placement; stateful 512-token prefill passed."
+    },
+    {
+      "stage": "64K_chunked_16GiB_weights",
+      "reason": "SDPA repeat_kv requested 714 MiB with only 485 MiB free on GPU1; 14 GiB weight placement passed."
+    }
+  ],
+  "limitations": [
+    "These are one-sample smoke artifacts per context band, not the release-size teacher cache.",
+    "Only decoder layer 0 hidden targets are cached in this memory-validation pass.",
+    "The 64K and 128K activation-statistics cohorts are not yet materialized.",
+    "No recovery corrections have been trained from these targets yet."
+  ]
+}

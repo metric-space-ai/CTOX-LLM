@@ -1,0 +1,140 @@
+{
+  "format": "ctox.recovery-corpus-evidence.v2",
+  "date": "2026-08-25",
+  "status": "corpus_generated_sparse_teacher_long_context_smoke_passed",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "source_policy": "training/SOURCE_POLICY.md",
+  "agentic_schema_smoke": {
+    "samples": 4,
+    "sources": [
+      {
+        "repository": "nvidia/Nemotron-Agentic-v1",
+        "revision": "650d590978ca35c8f1ecea2faf136e5fac421b62",
+        "split": "interactive_agent",
+        "samples": 2,
+        "license": "cc-by-4.0",
+        "manifest_sha256": "ec43f96286e285ea497eb404fe0c2bea4e11e4d27751a1ce867bcac4070e497a",
+        "materialized_sha256": "a9102de395bc6ca30a2e3a787745ecc147be183e768341fde6bbb2e6068776dc"
+      },
+      {
+        "repository": "nvidia/Nemotron-SFT-Agentic-v2",
+        "revision": "7c804833427f633ccd53b582dbf02525fd680f78",
+        "split": "interactive_agent",
+        "samples": 2,
+        "dataset_card_licenses": [
+          "apache-2.0",
+          "cc-by-4.0",
+          "mit"
+        ],
+        "manifest_sha256": "ee556da5500dbefac20ca0f9863c10d44092e4a9cfc80ce2addc5378ae83cb7b",
+        "materialized_sha256": "48303883f6d7b7dc13ee71a0b7f89508fc49b0e33b12e68c4e17200cae436b1c"
+      }
+    ],
+    "rendered_token_counts": [
+      3148,
+      5064,
+      3647,
+      4259
+    ],
+    "tool_counts": [
+      14,
+      14,
+      18,
+      15
+    ],
+    "complete_tool_schema_in_payload_hash": true,
+    "materialize_hash_roundtrip": "passed"
+  },
+  "long_context": {
+    "format": "ctox.synthetic-long-context.v1",
+    "generator_revision": "aad00017be40b8656dd211587bdf93cab262a28a",
+    "license": "apache-2.0",
+    "languages": [
+      "de",
+      "en"
+    ],
+    "calibration": {
+      "seed": "ctox-qwen38-calibration-v2",
+      "samples": 24,
+      "total_rendered_tokens": 1830916,
+      "manifest_bytes": 19405,
+      "materialized_bytes": 5028292,
+      "manifest_sha256": "75d0da970d5aa76c850990f962f6c2f046277ff25d04bd31f7aa4008ae64fefa",
+      "materialized_sha256": "30240974746cae9bb53ecc8cbcc515e5cd91ee135ff11c8ee0bbc86b063110cd",
+      "bands": [
+        {
+          "target_tokens": 32768,
+          "samples": 8,
+          "minimum_tokens": 32584,
+          "maximum_tokens": 32645
+        },
+        {
+          "target_tokens": 65536,
+          "samples": 8,
+          "minimum_tokens": 65288,
+          "maximum_tokens": 65400
+        },
+        {
+          "target_tokens": 131072,
+          "samples": 8,
+          "minimum_tokens": 130850,
+          "maximum_tokens": 130930
+        }
+      ],
+      "retrieval_position_profiles": [
+        "5/95",
+        "25/75",
+        "50/90",
+        "90/10"
+      ]
+    },
+    "evaluation": {
+      "seed": "ctox-qwen38-heldout-v1",
+      "sample_index_start": 5,
+      "samples": 12,
+      "total_rendered_tokens": 915165,
+      "manifest_bytes": 9586,
+      "materialized_bytes": 2512968,
+      "manifest_sha256": "f8744d6260c8ba387777e424a923586e7c026bd6494ddd31f7b3550496ecc750",
+      "materialized_sha256": "b2614a711020e042691d92878b916d1124f27200abff1b1a08fca605186f7eda",
+      "bands": [
+        {
+          "target_tokens": 32768,
+          "samples": 4,
+          "minimum_tokens": 32547,
+          "maximum_tokens": 32647
+        },
+        {
+          "target_tokens": 65536,
+          "samples": 4,
+          "minimum_tokens": 65296,
+          "maximum_tokens": 65379
+        },
+        {
+          "target_tokens": 131072,
+          "samples": 4,
+          "minimum_tokens": 130834,
+          "maximum_tokens": 130873
+        }
+      ],
+      "retrieval_position_profiles": [
+        "25/75",
+        "50/90"
+      ]
+    },
+    "payload_hash_roundtrips": 36,
+    "calibration_evaluation_ids_disjoint": true,
+    "repeated_padding": false,
+    "materialized_payloads_committed": false,
+    "excluded_noncommercial_reference": "nvidia/ChatQA2-Long-SFT-data"
+  },
+  "teacher_cache_smoke_evidence": "models/qwen38_27b/docs/TEACHER_CACHE_SMOKE_V1.json",
+  "pending": [
+    "build the release-size agentic/tool-calling cohort across all reviewed splits",
+    "cache the release-size sparse BF16 teacher cohort",
+    "collect and merge the full 32K/64K/128K activation-statistics cohort",
+    "train recovery corrections",
+    "evaluate the recovered checkpoint on held-out long-context samples"
+  ]
+}

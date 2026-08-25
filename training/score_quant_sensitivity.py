@@ -16,6 +16,9 @@ from quantization import quantize_dequantize
 from run_ledger import GpuRun, require_budget
 
 
+QUANTIZED_DTYPES = frozenset({"q2_b64", "q4_b64", "mixed_q2_q4_b64"})
+
+
 def packed_bytes(dtype: str, elements: int) -> int:
     block_bytes = 18 if dtype == "q2_b64" else 34
     return math.ceil(elements / 64) * block_bytes
@@ -28,6 +31,14 @@ def fixed_q4(name: str) -> bool:
         or name.endswith(".self_attn.k_proj.weight")
         or name.endswith(".self_attn.v_proj.weight")
     )
+
+
+def quantized_entries(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        entry
+        for entry in plan["tensors"]
+        if entry["source_shard"] is not None and entry["dtype"] in QUANTIZED_DTYPES
+    ]
 
 
 def file_sha256(path: Path) -> str:
@@ -173,11 +184,7 @@ def run(args: argparse.Namespace, torch: Any, safe_open: Any) -> None:
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
-    quantized = [
-        entry
-        for entry in plan["tensors"]
-        if entry["source_shard"] is not None and entry["dtype"] in {"q2_b64", "q4_b64"}
-    ]
+    quantized = quantized_entries(plan)
     shards = sorted({entry["source_shard"] for entry in quantized})
     candidates = []
     with ExitStack() as stack:
