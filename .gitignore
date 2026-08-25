@@ -14,6 +14,8 @@ target
 **/mutants.out*/
 
 # Model and training artifacts
+__pycache__/
+*.py[cod]
 *.gguf
 *.safetensors
 *.ctoxq
