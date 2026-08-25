@@ -18,7 +18,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from build_manifest import canonical_text, recovery_payload, source_id_for
+from build_manifest import (
+    canonical_text,
+    raw_jsonl_rows,
+    recovery_payload,
+    source_id_for,
+    source_uses_raw_jsonl,
+)
 
 
 SourceKey = tuple[str, str, str, str]
@@ -60,16 +66,61 @@ def load_manifests(
     return groups
 
 
-def materialize(groups: dict[SourceKey, dict[RecordKey, dict[str, Any]]], output: Any) -> int:
+def load_local_materialized(paths: list[Path]) -> dict[SourceKey, list[dict[str, Any]]]:
+    groups: dict[SourceKey, list[dict[str, Any]]] = defaultdict(list)
+    seen_ids: set[str] = set()
+    for path in paths:
+        with path.open(encoding="utf-8") as source:
+            for line_number, line in enumerate(source, 1):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                required = ("id", "source_repo", "source_revision", "subset", "split")
+                missing = [key for key in required if key not in record]
+                if missing:
+                    raise ValueError(f"{path}:{line_number} lacks {', '.join(missing)}")
+                if record["id"] in seen_ids:
+                    raise ValueError(f"duplicate local materialized id {record['id']}")
+                seen_ids.add(record["id"])
+                key = (
+                    record["source_repo"],
+                    record["source_revision"],
+                    record["subset"],
+                    record["split"],
+                )
+                groups[key].append(record)
+    return groups
+
+
+def materialize(
+    groups: dict[SourceKey, dict[RecordKey, dict[str, Any]]],
+    output: Any,
+    local_groups: dict[SourceKey, list[dict[str, Any]]] | None = None,
+) -> int:
     try:
         from datasets import load_dataset
     except ImportError as error:
         raise SystemExit("install training/requirements.in before materializing prompts") from error
 
+    local_groups = local_groups or {}
     written = 0
-    for (repo, revision, subset, split), wanted in sorted(groups.items()):
+    for source_key, wanted in sorted(groups.items()):
+        repo, revision, subset, split = source_key
         remaining = dict(wanted)
-        dataset = load_dataset(repo, subset, split=split, revision=revision, streaming=True)
+        if source_key in local_groups:
+            dataset = local_groups[source_key]
+        else:
+            dataset = (
+                raw_jsonl_rows(repo, revision, split)
+                if source_uses_raw_jsonl(repo)
+                else load_dataset(
+                    repo,
+                    subset,
+                    split=split,
+                    revision=revision,
+                    streaming=True,
+                )
+            )
         for index, row in enumerate(dataset):
             source_id = source_id_for(row, index)
             payload_sha = hashlib.sha256(canonical_text(row, repo).encode("utf-8")).hexdigest()
@@ -96,11 +147,19 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--allow-quarantined", action="store_true")
+    parser.add_argument(
+        "--local-materialized",
+        type=Path,
+        action="append",
+        default=[],
+        help="trusted generated payload JSONL used instead of an external dataset source",
+    )
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     groups = load_manifests(args.manifest, args.allow_quarantined)
+    local_groups = load_local_materialized(args.local_materialized)
     if not groups:
         raise SystemExit("manifests contain no records")
 
@@ -115,7 +174,7 @@ def main() -> None:
             delete=False,
         ) as temporary:
             temporary_path = Path(temporary.name)
-            count = materialize(groups, temporary)
+            count = materialize(groups, temporary, local_groups)
             temporary.flush()
             os.fsync(temporary.fileno())
         if args.output.exists():

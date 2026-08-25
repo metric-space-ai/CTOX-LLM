@@ -14,33 +14,43 @@ from build_manifest import (  # noqa: E402
     SOURCES,
     canonical_text,
     category_for,
+    language_for,
     license_ids,
     recovery_payload,
     source_id_for,
+    source_uses_raw_jsonl,
 )
+from audit_corpus import percentile  # noqa: E402
 from build_quant_plan import (  # noqa: E402
     CONTAINER_MANIFEST_RESERVE,
     FOLD_PACKAGE_LIMIT,
     FOLD_RESIDENT_LIMIT,
 )
-from cache_teacher import position_sets  # noqa: E402
+from cache_teacher import (  # noqa: E402
+    mtp_target_positions,
+    position_sets,
+    validate_local_model_provenance,
+)
 from collect_activation_stats import (  # noqa: E402
     checkpoint_weight_name,
     prefill_ranges,
     quantized_source_names,
 )
-from materialize_prompts import load_manifests  # noqa: E402
+from materialize_prompts import load_local_materialized, load_manifests  # noqa: E402
+from merge_manifests import merge  # noqa: E402
 from merge_activation_stats import merged_metadata, source_runtime_profiles  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
 from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_bytes  # noqa: E402
-from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
+from prompt_format import normalize_content, normalize_messages, normalize_tool_call  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
 from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
 from pack_checkpoint import validate_recovery_source  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
+from split_manifests import split  # noqa: E402
 from teacher_runtime import FLA_KERNEL_REVISION, weight_max_memory  # noqa: E402
 from verify_vendor_manifest import verify  # noqa: E402
+from verify_local_model import root_digest  # noqa: E402
 
 
 class DatasetPipelineTests(unittest.TestCase):
@@ -69,6 +79,11 @@ class DatasetPipelineTests(unittest.TestCase):
 
         def __call__(self, text, **_kwargs):
             return type("Encoded", (), {"input_ids": text.replace("\n", " \n ").split()})()
+
+    def test_corpus_percentiles_are_deterministic(self) -> None:
+        self.assertEqual(percentile([9, 1, 5, 3], 0.0), 1)
+        self.assertEqual(percentile([9, 1, 5, 3], 0.5), 5)
+        self.assertEqual(percentile([9, 1, 5, 3], 1.0), 9)
 
     def test_hash_covers_reference_answer(self) -> None:
         first = {"input": "2+2?", "output": "4"}
@@ -101,12 +116,41 @@ class DatasetPipelineTests(unittest.TestCase):
             ("interactive_agent", "search", "tool_calling"),
         )
         self.assertIn("cc-by-4.0", source["allowed_licenses"])
+        self.assertTrue(source["raw_jsonl"])
+        self.assertTrue(source_uses_raw_jsonl(source["repo"]))
+        self.assertFalse(source_uses_raw_jsonl(SOURCES["nemotron-v1"]["repo"]))
+
+    def test_aya_source_and_language_code_are_pinned(self) -> None:
+        source = SOURCES["aya"]
+        self.assertEqual(source["repo"], "CohereLabs/aya_dataset")
+        self.assertEqual(len(source["reviewed_revision"]), 40)
+        self.assertEqual(source["default_subsets"], ("default",))
+        self.assertEqual(source["allowed_licenses"], ("apache-2.0",))
+        self.assertEqual(
+            language_for({"language": "French", "language_code": "FRA"}, "und"),
+            "fra",
+        )
+        self.assertEqual(language_for({}, "und"), "und")
+        self.assertEqual(language_for({"language": "und"}, "en"), "en")
+        self.assertEqual(
+            recovery_payload({"inputs": "Bonjour", "targets": "Salut"}),
+            {
+                "messages": [
+                    {"role": "user", "content": "Bonjour"},
+                    {"role": "assistant", "content": "Salut"},
+                ]
+            },
+        )
 
     def test_nested_metadata_supplies_stable_source_id(self) -> None:
         row = {"metadata": {"uuid": "stable-row-id"}}
         self.assertEqual(source_id_for(row, 17), "stable-row-id")
         encoded = {"metadata": json.dumps({"uuid": "encoded-row-id"})}
         self.assertEqual(source_id_for(encoded, 17), "encoded-row-id")
+        self.assertEqual(
+            source_id_for({"id": "sample-id", "source_id": "source-coordinate"}, 17),
+            "source-coordinate",
+        )
 
     def test_license_ids_normalize_and_drop_placeholders(self) -> None:
         self.assertEqual(
@@ -158,6 +202,43 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(logits, list(range(8)))
         self.assertEqual(hidden, list(range(8)))
 
+    def test_mtp_targets_exclude_only_unverifiable_final_draft(self) -> None:
+        self.assertEqual(mtp_target_positions(8, [2, 3, 4, 5, 6]), [2, 3, 4, 5])
+        with self.assertRaisesRegex(ValueError, "sorted and unique"):
+            mtp_target_positions(8, [3, 2])
+        with self.assertRaisesRegex(ValueError, "outside"):
+            mtp_target_positions(8, [7])
+
+    def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text("{}", encoding="utf-8")
+            document = {
+                "format": "ctox.verified-local-model.v1",
+                "revision": "a" * 40,
+                "local_root": str(model.resolve()),
+                "root_sha256": "b" * 64,
+                "files": [{"name": "config.json", "bytes": 2, "sha256": "c" * 64}],
+            }
+            provenance = root / "provenance.json"
+            provenance.write_text(json.dumps(document), encoding="utf-8")
+            loaded, digest = validate_local_model_provenance(
+                model, "a" * 40, provenance
+            )
+            self.assertEqual(loaded, document)
+            self.assertEqual(len(digest), 64)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                validate_local_model_provenance(model, "d" * 40, provenance)
+
+    def test_verified_model_root_digest_is_order_independent(self) -> None:
+        files = [
+            {"name": "b", "bytes": 2, "sha256": "2" * 64},
+            {"name": "a", "bytes": 1, "sha256": "1" * 64},
+        ]
+        self.assertEqual(root_digest(files), root_digest(list(reversed(files))))
+
     def test_teacher_runtime_pins_fla_and_reserves_gpu_headroom(self) -> None:
         self.assertEqual(len(FLA_KERNEL_REVISION), 40)
         self.assertEqual(
@@ -207,6 +288,27 @@ class DatasetPipelineTests(unittest.TestCase):
             groups = load_manifests([manifest], allow_quarantined=True)
             self.assertEqual(sum(map(len, groups.values())), 1)
 
+    def test_local_generated_payloads_are_grouped_by_source_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "generated.jsonl"
+            record = {
+                "id": "a" * 64,
+                "source_repo": "metric-space-ai/CTOX-LLM",
+                "source_revision": "b" * 40,
+                "subset": "ctox.long-context.v1",
+                "split": "calibration",
+                "messages": [{"role": "user", "content": "payload"}],
+            }
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            groups = load_local_materialized([path])
+            key = (
+                record["source_repo"],
+                record["source_revision"],
+                record["subset"],
+                record["split"],
+            )
+            self.assertEqual(groups[key], [record])
+
     def test_selection_is_balanced_and_order_independent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = []
@@ -224,6 +326,133 @@ class DatasetPipelineTests(unittest.TestCase):
             self.assertEqual([record["category"] for record in first].count("code"), 3)
             self.assertEqual([record["category"] for record in first].count("math"), 3)
 
+    def test_recovery_split_is_deterministic_disjoint_and_release_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = []
+            for source_index in range(2):
+                path = Path(temporary) / f"source-{source_index}.jsonl"
+                with path.open("w", encoding="utf-8") as output:
+                    for record_index in range(8):
+                        sample_id = hashlib.sha256(
+                            f"{source_index}-{record_index}".encode()
+                        ).hexdigest()
+                        output.write(
+                            json.dumps(
+                                {
+                                    "id": sample_id,
+                                    "category": "agentic",
+                                    "source_repo": f"source-{source_index}",
+                                    "release_eligible": True,
+                                }
+                            )
+                            + "\n"
+                        )
+                paths.append(path)
+            train, evaluation = split(paths, 4, 2, "fixed-seed")
+            repeated_train, repeated_evaluation = split(paths, 4, 2, "fixed-seed")
+            self.assertEqual(train, repeated_train)
+            self.assertEqual(evaluation, repeated_evaluation)
+            self.assertEqual(len(train), 8)
+            self.assertEqual(len(evaluation), 4)
+            self.assertFalse(
+                {record["id"] for record in train}
+                & {record["id"] for record in evaluation}
+            )
+
+            quarantined = Path(temporary) / "quarantined.jsonl"
+            quarantined.write_text(
+                json.dumps(
+                    {
+                        "id": "f" * 64,
+                        "category": "agentic",
+                        "source_repo": "quarantined",
+                        "release_eligible": False,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "release-ineligible"):
+                split([quarantined], 1, 1, "fixed-seed")
+
+    def test_recovery_split_enforces_each_language_stratum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "languages.jsonl"
+            records = []
+            for language in ("fra", "jpn"):
+                for index in range(8):
+                    records.append(
+                        {
+                            "id": hashlib.sha256(f"{language}-{index}".encode()).hexdigest(),
+                            "category": "chat",
+                            "language": language,
+                            "source_repo": "example/aya",
+                            "release_eligible": True,
+                        }
+                    )
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            train, evaluation = split(
+                [path], 3, 2, "language-seed", stratify_field="language"
+            )
+            for language in ("fra", "jpn"):
+                self.assertEqual(sum(r["language"] == language for r in train), 3)
+                self.assertEqual(sum(r["language"] == language for r in evaluation), 2)
+            self.assertFalse(
+                {record["id"] for record in train}
+                & {record["id"] for record in evaluation}
+            )
+
+    def test_recovery_split_excludes_prior_materialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "source.jsonl"
+            records = [
+                {
+                    "id": hashlib.sha256(str(index).encode()).hexdigest(),
+                    "category": "chat",
+                    "source_repo": "example/source",
+                    "release_eligible": True,
+                }
+                for index in range(10)
+            ]
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            excluded = {records[0]["id"], records[1]["id"]}
+            train, evaluation = split(
+                [path], 4, 2, "exclusion-seed", excluded_ids=excluded
+            )
+            self.assertFalse(excluded & {record["id"] for record in train})
+            self.assertFalse(excluded & {record["id"] for record in evaluation})
+
+    def test_manifest_merge_rejects_conflicts_and_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(temporary) / "first.jsonl"
+            second = Path(temporary) / "second.jsonl"
+            record = {
+                "id": "a" * 64,
+                "category": "chat",
+                "language": "eng",
+                "source_repo": "example/source",
+                "release_eligible": True,
+            }
+            first.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            second.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            self.assertEqual(merge([first, second]), [record])
+            changed = dict(record, category="code")
+            second.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "conflicting duplicate"):
+                merge([first, second])
+            second.write_text(
+                json.dumps(dict(record, id="b" * 64, release_eligible=False)) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "release-ineligible"):
+                merge([first, second])
+
     def test_openai_tool_call_is_flattened_for_qwen_template(self) -> None:
         call = {
             "id": "call-1",
@@ -238,6 +467,17 @@ class DatasetPipelineTests(unittest.TestCase):
     def test_empty_tool_calls_are_removed(self) -> None:
         messages = normalize_messages([{"role": "user", "content": "hello", "tool_calls": []}])
         self.assertEqual(messages, [{"role": "user", "content": "hello"}])
+
+    def test_structured_tool_result_content_is_canonical_json(self) -> None:
+        messages = normalize_messages(
+            [
+                {"role": "user", "content": "look it up"},
+                {"role": "tool", "content": {"z": 1, "a": ["x", "y"]}},
+            ]
+        )
+        self.assertEqual(messages[1]["content"], '{"a":["x","y"],"z":1}')
+        with self.assertRaisesRegex(ValueError, "unsupported type"):
+            normalize_content(object(), 0, "content")
 
     def test_runtime_linear_name_maps_to_checkpoint(self) -> None:
         self.assertEqual(

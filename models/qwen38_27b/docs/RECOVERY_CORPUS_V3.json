@@ -1,0 +1,129 @@
+{
+  "format": "ctox.qwen38.recovery-corpus-evidence.v3",
+  "date": "2026-08-25",
+  "status": "materialized_pre_domain_gate",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "teacher_provenance": {
+    "artifact": "qwen38-27b-bf16-1d4bf0f-v1.json",
+    "artifact_bytes": 4226,
+    "artifact_sha256": "d930966047fee2be4a3e1f70e55d0b507231bc5d9ead935bd166879d8bdc81d0",
+    "verified_files": 23,
+    "verified_bytes": 55575959504,
+    "root_sha256": "c63bc259cd8d18b0a701983a226867927b4ec19b376a684b218c3fa572754524",
+    "verification": "every BF16 shard plus the index, config, tokenizer, tokenizer config, and chat template matched the pinned Hugging Face commit byte-for-byte"
+  },
+  "cohorts": {
+    "train": {
+      "manifest": "release-recovery-train-2072-v4.jsonl",
+      "manifest_bytes": 1137181,
+      "manifest_sha256": "d36184af8695664107d27c075cb80437a978dc5472e2e3150477fd13072733ca",
+      "materialized": "release-recovery-train-2072-v4.jsonl",
+      "materialized_bytes": 40451525,
+      "materialized_sha256": "37a6e6e496d3db6b5355c6663570806820c943cc5a8f0c7bc28bdbdd0c566e44",
+      "records": 2072,
+      "payload_hashes_verified": 2072,
+      "assistant_target_ready": 2072,
+      "prompt_tokens": 11959046,
+      "assistant_target_tokens": 7109783,
+      "median_prompt_tokens": 1609,
+      "p95_prompt_tokens": 24185,
+      "maximum_prompt_tokens": 130930,
+      "multi_turn_records": 384,
+      "tool_records": 319,
+      "tool_definitions": 2758,
+      "structured_final_answers": 824
+    },
+    "evaluation": {
+      "manifest": "release-recovery-evaluation-524-v4.jsonl",
+      "manifest_bytes": 288970,
+      "manifest_sha256": "2b10c2195031fe0d23cc8f6d3d4b27ade7d18d1affe732e7feb9cbe99d6d3f52",
+      "materialized": "release-recovery-evaluation-524-v4.jsonl",
+      "materialized_bytes": 12053030,
+      "materialized_sha256": "93d48f54747717760ae949cff3264298ae950ad448312a3b462a2d7088c3f3e5",
+      "records": 524,
+      "payload_hashes_verified": 524,
+      "assistant_target_ready": 524,
+      "prompt_tokens": 3623527,
+      "assistant_target_tokens": 1805797,
+      "median_prompt_tokens": 1567,
+      "p95_prompt_tokens": 25947,
+      "maximum_prompt_tokens": 130873,
+      "multi_turn_records": 96,
+      "tool_records": 80,
+      "tool_definitions": 732,
+      "structured_final_answers": 209
+    },
+    "train_evaluation_overlap": 0,
+    "evaluation_overlap_with_prior_materialized_calibration": 0,
+    "audit_artifact": "release-recovery-2072-524-v2.json",
+    "audit_bytes": 3106,
+    "audit_sha256": "1c8b5cf4c15278d14c6f2e342fe889dcfb04d44873214403090ba0174492c951"
+  },
+  "train_mix": {
+    "capability_categories": {
+      "agentic": 384,
+      "chat": 880,
+      "code": 376,
+      "long_context": 48,
+      "math": 384
+    },
+    "languages": {
+      "arb": 32,
+      "de": 136,
+      "de-en-mixed": 68,
+      "en": 1484,
+      "fra": 32,
+      "hin": 32,
+      "ita": 32,
+      "jpn": 32,
+      "kor": 32,
+      "nld": 32,
+      "pol": 32,
+      "por": 32,
+      "rus": 32,
+      "spa": 32,
+      "zho": 32
+    },
+    "sources": {
+      "Beko2210/German-Instruct-Dataset": 192,
+      "CohereLabs/aya_dataset": 384,
+      "metric-space-ai/CTOX-LLM": 24,
+      "nvidia/Nemotron-Agentic-v1": 128,
+      "nvidia/Nemotron-Post-Training-Dataset-v1": 1152,
+      "nvidia/Nemotron-SFT-Agentic-v2": 192
+    }
+  },
+  "mtp_teacher_smoke": {
+    "status": "passed_with_verified_teacher_provenance",
+    "artifact": "release-agentic-mtp-smoke-1-v2",
+    "sample_tokens": 3071,
+    "base_logit_targets": 22,
+    "mtp_targets": 21,
+    "mtp_position_semantics": "base_hidden_p_drafts_token_p_plus_2",
+    "safetensors_bytes": 4652787,
+    "safetensors_sha256": "ba652e3b13a7d887cf38dd71985a65595d58765a8142e12fd61ba08468efc469",
+    "run_sha256": "81432db45ce9ee99c3980830d89c13589c2c93485d188e3e21c4887eb52c3dbb",
+    "index_sha256": "248e31421590f4766bab8c63f4df2176d4ba3034d0b4c726b4cb2b976f077110",
+    "non_finite_values": 0,
+    "gpu_hours": 0.018635303179423014
+  },
+  "gpu_ledger": {
+    "budget_gpu_hours": 240,
+    "successful_gpu_hours": 4.774933096832698,
+    "failed_gpu_hours": 0.4376394565900167,
+    "total_gpu_hours": 5.212572553422715
+  },
+  "gates_still_open": [
+    "Apply the frozen multi-label DOMAIN_RUBRIC.json and replenish any domain below its train/evaluation minimum.",
+    "Cache release-size BF16 top-64 logits, residual mass, selected hidden states, and MTP draft targets.",
+    "Recompute full-corpus activation statistics and confirm or replace the provisional Q2/Q4 assignment.",
+    "Run end-to-end KL, cross-entropy, hidden-state, activation, and MTP recovery.",
+    "Pass held-out multilingual, domain, coding, agentic/tool, long-context, and BF16 quality gates."
+  ],
+  "notes": [
+    "The 384/96 Agentic release cohorts exclude 963 identities from all earlier Agentic materializations before ranking.",
+    "Aya uses human-curated Apache-2.0 inputs/targets from twelve equal-weight language strata; inputs and targets are both part of the payload hash.",
+    "A prior technical MTP smoke with an unverified typed revision was quarantined and is not release evidence."
+  ]
+}

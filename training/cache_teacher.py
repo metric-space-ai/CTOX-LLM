@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from mtp_teacher import forward_mtp_activations, load_mtp_teacher
 from prompt_format import normalize_messages, render_record
 from run_ledger import GpuRun, require_budget
 from teacher_runtime import (
@@ -34,6 +35,38 @@ def write_json_atomic(path: Path, document: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def validate_local_model_provenance(
+    model_path: Path,
+    requested_revision: str,
+    provenance_path: Path | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not model_path.is_dir():
+        if provenance_path is not None:
+            raise ValueError("--local-model-provenance requires a local --model directory")
+        return None, None
+    if provenance_path is None:
+        raise ValueError("local teacher paths require --local-model-provenance")
+    encoded = provenance_path.read_bytes()
+    document = json.loads(encoded)
+    if document.get("format") != "ctox.verified-local-model.v1":
+        raise ValueError("unsupported local model provenance format")
+    if document.get("revision") != requested_revision:
+        raise ValueError(
+            f"local model provenance revision {document.get('revision')} does not match "
+            f"requested {requested_revision}"
+        )
+    if Path(document.get("local_root", "")).resolve() != model_path.resolve():
+        raise ValueError("local model provenance root does not match --model")
+    files = document.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("local model provenance contains no verified files")
+    for entry in files:
+        path = model_path / entry["name"]
+        if not path.is_file() or path.stat().st_size != entry["bytes"]:
+            raise ValueError(f"verified local model file changed size: {entry['name']}")
+    return document, hashlib.sha256(encoded).hexdigest()
 
 
 def transformer_layers(model: Any) -> Any:
@@ -121,9 +154,53 @@ def position_sets(
     return logit_positions, sorted(hidden_positions)
 
 
-def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any, auto_tokenizer: Any) -> None:
+def mtp_target_positions(sequence_length: int, logit_positions: list[int]) -> list[int]:
+    """Return base-hidden positions whose MTP draft predicts a recorded token."""
+
+    if sequence_length < 3:
+        raise ValueError("MTP targets require at least three sequence tokens")
+    if logit_positions != sorted(set(logit_positions)):
+        raise ValueError("logit positions must be sorted and unique")
+    if any(position < 0 or position >= sequence_length - 1 for position in logit_positions):
+        raise ValueError("logit position is outside the next-token prediction range")
+    # Base hidden p predicts token p+1. MTP consumes that hidden plus token p+1
+    # and drafts token p+2, so the final next-token position has no MTP target.
+    return [position for position in logit_positions if position < sequence_length - 2]
+
+
+def resolve_mtp_device(args: argparse.Namespace, torch: Any, base_model: Any) -> Any | None:
+    if args.mtp_device is None:
+        return None
+    if args.mtp_device == "auto":
+        return next(base_model.layers[-1].parameters()).device
+    device = torch.device(args.mtp_device)
+    if device.type == "cuda":
+        if device.index is None or device.index >= args.gpus:
+            raise RuntimeError(
+                f"--mtp-device {args.mtp_device} is outside configured GPU count {args.gpus}"
+            )
+        if not torch.cuda.is_available() or device.index >= torch.cuda.device_count():
+            raise RuntimeError(f"--mtp-device {args.mtp_device} is unavailable")
+    return device
+
+
+def cache(
+    args: argparse.Namespace,
+    torch: Any,
+    safe_open: Any,
+    save_file: Any,
+    auto_model: Any,
+    auto_tokenizer: Any,
+    mtp_cache_type: Any,
+) -> None:
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
+    try:
+        local_provenance, local_provenance_sha256 = validate_local_model_provenance(
+            Path(args.model), args.revision, args.local_model_provenance
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
     available_samples = sum(1 for line in args.input.open(encoding="utf-8") if line.strip())
     if args.start_sample >= available_samples:
         raise SystemExit(
@@ -151,6 +228,12 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
         low_cpu_mem_usage=True,
     ).eval()
     base_model, layers = transformer_layers(model)
+    mtp_device = resolve_mtp_device(args, torch, base_model)
+    mtp_model = (
+        load_mtp_teacher(model, Path(args.model), mtp_device, safe_open)
+        if mtp_device is not None
+        else None
+    )
     if any(layer < 0 or layer >= len(layers) for layer in hidden_layers):
         raise SystemExit(f"hidden layer indices must be in [0, {len(layers) - 1}]")
     captured: dict[int, list[Any]] = {}
@@ -169,11 +252,19 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
                 )
 
         hooks.append(layers[layer_index].register_forward_hook(capture))
-    resolved_revision = getattr(model.config, "_commit_hash", None) or args.revision
+    resolved_revision = (
+        local_provenance["revision"]
+        if local_provenance is not None
+        else getattr(model.config, "_commit_hash", None) or args.revision
+    )
     run_manifest = {
         "schema_version": 1,
         "teacher_model": args.model,
         "teacher_revision": str(resolved_revision),
+        "local_model_provenance_sha256": local_provenance_sha256,
+        "local_model_root_sha256": (
+            local_provenance["root_sha256"] if local_provenance is not None else None
+        ),
         "architecture": type(model).__name__,
         "dtype": "bfloat16",
         "device_map": {name: str(device) for name, device in model.hf_device_map.items()},
@@ -190,6 +281,8 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
         "start_sample": args.start_sample,
         "selected_samples": selected_samples,
         "prefill_chunk_tokens": args.prefill_chunk_tokens,
+        "mtp_device": str(mtp_device) if mtp_device is not None else None,
+        "mtp_targets": mtp_model is not None,
         "torch_version": str(torch.__version__),
         "torch_cuda_version": str(torch.version.cuda),
         "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
@@ -239,16 +332,26 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
             )
             if not logit_position_list:
                 raise RuntimeError(f"sample {sample_id} has no teacher logit positions")
+            mtp_position_list = (
+                mtp_target_positions(sequence_length, logit_position_list)
+                if mtp_model is not None
+                else []
+            )
+            if mtp_model is not None and not mtp_position_list:
+                raise RuntimeError(f"sample {sample_id} has no MTP teacher positions")
             input_ids = encoded.input_ids.to(model.device)
             attention_mask = encoded.attention_mask.to(model.device)
             logit_positions = torch.tensor(logit_position_list, dtype=torch.long)
             hidden_positions = torch.tensor(hidden_position_list, dtype=torch.long)
+            mtp_positions = torch.tensor(mtp_position_list, dtype=torch.long)
             active_hidden_positions = hidden_positions
             captured.clear()
             selected_final_chunks = []
+            selected_mtp_chunks = []
             use_chunk_cache = 0 < args.prefill_chunk_tokens < sequence_length
             chunk_tokens = args.prefill_chunk_tokens if use_chunk_cache else sequence_length
             past_key_values = None
+            mtp_cache = mtp_cache_type(config=mtp_model.config) if mtp_model is not None else None
             with torch.inference_mode():
                 for chunk_start in range(0, sequence_length, chunk_tokens):
                     chunk_stop = min(sequence_length, chunk_start + chunk_tokens)
@@ -286,6 +389,46 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
                         selected_final_chunks.append(
                             output.last_hidden_state.index_select(1, local_positions)
                         )
+                    if mtp_model is not None:
+                        mtp_hidden_stop = min(chunk_stop, sequence_length - 1)
+                        if chunk_start < mtp_hidden_stop:
+                            mtp_length = mtp_hidden_stop - chunk_start
+                            mtp_input_ids = input_ids[
+                                :, chunk_start + 1 : mtp_hidden_stop + 1
+                            ]
+                            mtp_hidden = output.last_hidden_state[:, :mtp_length, :].to(
+                                mtp_device
+                            )
+                            mtp_position_ids = torch.arange(
+                                chunk_start + 1,
+                                mtp_hidden_stop + 1,
+                                device=mtp_device,
+                                dtype=torch.long,
+                            ).unsqueeze(0)
+                            mtp_output = forward_mtp_activations(
+                                mtp_model,
+                                mtp_input_ids,
+                                mtp_hidden,
+                                mtp_position_ids,
+                                mtp_cache,
+                            )
+                            local_mtp_positions = [
+                                position - chunk_start
+                                for position in mtp_position_list
+                                if chunk_start <= position < mtp_hidden_stop
+                            ]
+                            if local_mtp_positions:
+                                selected_mtp_chunks.append(
+                                    mtp_output.index_select(
+                                        1,
+                                        torch.tensor(
+                                            local_mtp_positions,
+                                            dtype=torch.long,
+                                            device=mtp_output.device,
+                                        ),
+                                    )
+                                )
+                            del mtp_input_ids, mtp_hidden, mtp_position_ids, mtp_output
                     del output
                 if not selected_final_chunks:
                     raise RuntimeError(f"sample {sample_id} produced no selected final hidden states")
@@ -293,6 +436,35 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
                 top_indices, top_values, residual = sparse_targets(
                     torch, model, selected_final_hidden, args.top_k, args.logit_chunk
                 )
+                mtp_hidden_targets = None
+                mtp_top_indices = None
+                mtp_top_values = None
+                mtp_residual = None
+                if mtp_model is not None:
+                    if not selected_mtp_chunks:
+                        raise RuntimeError(
+                            f"sample {sample_id} produced no selected MTP hidden states"
+                        )
+                    selected_mtp_hidden = torch.cat(selected_mtp_chunks, dim=1)
+                    if selected_mtp_hidden.shape[1] != len(mtp_position_list):
+                        raise RuntimeError(
+                            f"sample {sample_id} produced {selected_mtp_hidden.shape[1]} MTP "
+                            f"targets, expected {len(mtp_position_list)}"
+                        )
+                    mtp_hidden_targets = selected_mtp_hidden.detach().cpu().to(torch.bfloat16)
+                    # Invoke the Accelerate-wrapped shared head directly.  An
+                    # offloaded head deliberately exposes meta parameters
+                    # between calls; moving the hidden state to that apparent
+                    # device would erase its data before the hook can restore
+                    # the real weights and select the execution device.
+                    mtp_top_indices, mtp_top_values, mtp_residual = sparse_targets(
+                        torch,
+                        model,
+                        selected_mtp_hidden,
+                        args.top_k,
+                        args.logit_chunk,
+                    )
+                    del selected_mtp_hidden
             tensors = {
                 "input_ids": input_ids.cpu().to(torch.int32),
                 "attention_mask": attention_mask.cpu().to(torch.uint8),
@@ -302,6 +474,16 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
                 "topk_logprobs": top_values,
                 "residual_probability": residual,
             }
+            if mtp_hidden_targets is not None:
+                tensors.update(
+                    {
+                        "mtp_positions": mtp_positions.to(torch.int32),
+                        "mtp_hidden": mtp_hidden_targets,
+                        "mtp_topk_indices": mtp_top_indices,
+                        "mtp_topk_logprobs": mtp_top_values,
+                        "mtp_residual_probability": mtp_residual,
+                    }
+                )
             for layer in hidden_layers:
                 if layer not in captured or not captured[layer]:
                     raise RuntimeError(f"hidden layer hook {layer} did not run")
@@ -326,6 +508,8 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
                     "sequence_tokens": str(sequence_length),
                     "logit_target_count": str(len(logit_position_list)),
                     "hidden_target_count": str(len(hidden_position_list)),
+                    "mtp_target_count": str(len(mtp_position_list)),
+                    "mtp_position_semantics": "base_hidden_p_drafts_token_p_plus_2",
                     "prefill_chunk_tokens": str(chunk_tokens),
                 },
             )
@@ -337,6 +521,7 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
                         "tokens": sequence_length,
                         "logit_targets": len(logit_position_list),
                         "hidden_targets": len(hidden_position_list),
+                        "mtp_targets": len(mtp_position_list),
                         "source_line": line_number,
                         "source_payload_sha256": record["prompt_sha256"],
                     },
@@ -352,6 +537,12 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
                 top_values,
                 residual,
                 past_key_values,
+                mtp_cache,
+                selected_mtp_chunks,
+                mtp_hidden_targets,
+                mtp_top_indices,
+                mtp_top_values,
+                mtp_residual,
             )
             active_hidden_positions = None
             written_samples += 1
@@ -368,6 +559,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--local-model-provenance", type=Path)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ledger", type=Path, required=True)
@@ -385,6 +577,10 @@ def main() -> None:
     parser.add_argument("--use-fla-kernel", action="store_true")
     parser.add_argument("--gpu-weight-memory-gib", type=int)
     parser.add_argument("--cpu-offload-memory-gib", type=int, default=96)
+    parser.add_argument(
+        "--mtp-device",
+        help="cache resident-MTP hidden and sparse-logit targets on this device (for example cuda:2)",
+    )
     parser.add_argument("--prefill-chunk-tokens", type=int, default=0)
     args = parser.parse_args()
     require_budget(args.ledger, args.reserved_gpu_hours)
@@ -409,13 +605,23 @@ def main() -> None:
 
     try:
         import torch
+        from safetensors import safe_open
         from safetensors.torch import save_file
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers.cache_utils import MtpCache
     except ImportError as error:
         raise SystemExit("install training/requirements.in before caching teacher targets") from error
 
     with GpuRun(args.ledger, "teacher-cache", args.gpus, sys.argv):
-        cache(args, torch, save_file, AutoModelForCausalLM, AutoTokenizer)
+        cache(
+            args,
+            torch,
+            safe_open,
+            save_file,
+            AutoModelForCausalLM,
+            AutoTokenizer,
+            MtpCache,
+        )
 
 
 if __name__ == "__main__":

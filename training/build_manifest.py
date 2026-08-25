@@ -16,6 +16,8 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 
 SOURCES = {
@@ -51,6 +53,7 @@ SOURCES = {
         "allowed_licenses": ("cc-by-4.0",),
         "release_eligible": True,
         "quarantine_reason": None,
+        "raw_jsonl": True,
     },
     "nemotron-sft-agentic-v2": {
         "repo": "nvidia/Nemotron-SFT-Agentic-v2",
@@ -60,6 +63,7 @@ SOURCES = {
         "allowed_licenses": ("apache-2.0", "cc-by-4.0", "mit"),
         "release_eligible": True,
         "quarantine_reason": None,
+        "raw_jsonl": True,
     },
     "german-instruct": {
         "repo": "Beko2210/German-Instruct-Dataset",
@@ -67,6 +71,16 @@ SOURCES = {
         "default_splits": ("train",),
         "default_language": "de",
         "allowed_licenses": ("cc-by-4.0",),
+        "release_eligible": True,
+        "quarantine_reason": None,
+    },
+    "aya": {
+        "repo": "CohereLabs/aya_dataset",
+        "reviewed_revision": "f9ea04583f02a8f86404ff6c58bf75fe637df8a2",
+        "default_subsets": ("default",),
+        "default_splits": ("train",),
+        "default_language": "und",
+        "allowed_licenses": ("apache-2.0",),
         "release_eligible": True,
         "quarantine_reason": None,
     },
@@ -125,13 +139,17 @@ def recovery_payload(
             return payload
 
     prompt = next(
-        (row[key] for key in ("prompt", "input", "question", "instruction") if row.get(key)),
+        (
+            row[key]
+            for key in ("prompt", "input", "inputs", "question", "instruction")
+            if row.get(key)
+        ),
         None,
     )
     answer = next(
         (
             row[key]
-            for key in ("response", "output", "answer", "completion")
+            for key in ("response", "output", "targets", "answer", "completion")
             if row.get(key)
         ),
         None,
@@ -164,7 +182,10 @@ def canonical_text(row: dict[str, Any], source_repo: str | None = None) -> str:
 
 
 def source_id_for(row: dict[str, Any], index: int) -> str:
-    for candidate in (row.get("id"), row.get("uuid")):
+    # Generated/materialized records retain both their immutable sample `id`
+    # and the source coordinate used to construct that identity. Prefer the
+    # explicit coordinate so re-materialization looks up the same manifest key.
+    for candidate in (row.get("source_id"), row.get("id"), row.get("uuid")):
         if candidate is not None and str(candidate):
             return str(candidate)
     metadata = nested_metadata(row)
@@ -185,6 +206,18 @@ def category_for(subset: str, split: str, row: dict[str, Any]) -> str:
         return "chat"
     lowered = f"{subset} {split} {explicit}".lower()
     return next((category for hint, category in CATEGORY_HINTS.items() if hint in lowered), "chat")
+
+
+def language_for(row: dict[str, Any], default: str) -> str:
+    """Return a stable language identifier, preferring ISO-like source codes."""
+
+    for key in ("language_code", "language", "lang"):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            normalized = str(value).strip().lower()
+            if normalized not in {"und", "unknown", "none", "n/a"}:
+                return normalized
+    return default
 
 
 def nested_metadata(row: dict[str, Any]) -> dict[str, Any]:
@@ -236,6 +269,45 @@ def card_license_ids(info: Any) -> list[str]:
     return license_ids(getattr(card, "license", None))
 
 
+def raw_jsonl_rows(repo: str, revision: str, split: str) -> Iterable[dict[str, Any]]:
+    """Stream a pinned raw split without Arrow schema coercion.
+
+    NVIDIA's Agentic tool schemas are intentionally heterogeneous. The
+    high-level datasets reader attempts to cast those JSON objects into one
+    Arrow struct and can fail before yielding otherwise valid records.
+    """
+
+    url = (
+        "https://huggingface.co/datasets/"
+        f"{quote(repo, safe='/')}/resolve/{quote(revision, safe='')}/"
+        f"data/{quote(split, safe='')}.jsonl"
+    )
+    request = Request(url, headers={"User-Agent": "ctox-llm-recovery-manifest/1"})
+    with urlopen(request, timeout=120) as response:
+        for line_number, line in enumerate(response, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"invalid raw JSONL at {repo}@{revision}/{split}:{line_number}"
+                ) from error
+            if not isinstance(row, dict):
+                raise RuntimeError(
+                    f"raw JSONL row is not an object at "
+                    f"{repo}@{revision}/{split}:{line_number}"
+                )
+            yield row
+
+
+def source_uses_raw_jsonl(repo: str) -> bool:
+    matches = [source for source in SOURCES.values() if source["repo"] == repo]
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one recovery source policy for {repo}")
+    return bool(matches[0].get("raw_jsonl"))
+
+
 def records(args: argparse.Namespace) -> Iterable[Record]:
     try:
         from datasets import get_dataset_config_names, get_dataset_split_names, load_dataset
@@ -258,11 +330,28 @@ def records(args: argparse.Namespace) -> Iterable[Record]:
             f"{repo}@{revision} contains unreviewed dataset-card licenses: "
             + ", ".join(sorted(unexpected_card_licenses))
         )
-    subsets = [args.subset] if args.subset else get_dataset_config_names(repo, revision=revision)
+    raw_jsonl = bool(source.get("raw_jsonl"))
+    if raw_jsonl and args.subset not in {None, "default"}:
+        raise RuntimeError(f"{repo} raw JSONL source supports only the default subset")
+    subsets = (
+        ["default"]
+        if raw_jsonl
+        else [args.subset]
+        if args.subset
+        else list(
+            source.get("default_subsets")
+            or get_dataset_config_names(repo, revision=revision)
+        )
+    )
     requested_splits = tuple(args.split or source["default_splits"])
     emitted = 0
+    language_emitted = {language: 0 for language in (args.language or [])}
     for subset in subsets:
-        available_splits = set(get_dataset_split_names(repo, subset, revision=revision))
+        available_splits = (
+            set(source["default_splits"])
+            if raw_jsonl
+            else set(get_dataset_split_names(repo, subset, revision=revision))
+        )
         unavailable = set(requested_splits) - available_splits
         if unavailable:
             raise RuntimeError(
@@ -270,7 +359,11 @@ def records(args: argparse.Namespace) -> Iterable[Record]:
                 f"available: {', '.join(sorted(available_splits))}"
             )
         for split in requested_splits:
-            dataset = load_dataset(repo, subset, split=split, revision=revision, streaming=True)
+            dataset = (
+                raw_jsonl_rows(repo, revision, split)
+                if raw_jsonl
+                else load_dataset(repo, subset, split=split, revision=revision, streaming=True)
+            )
             for index, row in enumerate(dataset):
                 text = canonical_text(row, repo)
                 prompt_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -289,9 +382,14 @@ def records(args: argparse.Namespace) -> Iterable[Record]:
                         "record contains unreviewed licenses: "
                         + ", ".join(sorted(unexpected_licenses))
                     )
-                language = str(
-                    row.get("language", row.get("lang", source["default_language"]))
-                )
+                language = language_for(row, source["default_language"])
+                if args.language and language not in args.language:
+                    continue
+                if (
+                    args.per_language_limit
+                    and language_emitted[language] >= args.per_language_limit
+                ):
+                    continue
                 generator = (
                     row.get("generator")
                     or row.get("model_name")
@@ -315,7 +413,14 @@ def records(args: argparse.Namespace) -> Iterable[Record]:
                     quarantine_reason=quarantine_reason,
                 )
                 emitted += 1
+                if language in language_emitted:
+                    language_emitted[language] += 1
                 if args.limit and emitted >= args.limit:
+                    return
+                if args.per_language_limit and all(
+                    count >= args.per_language_limit
+                    for count in language_emitted.values()
+                ):
                     return
 
 
@@ -330,8 +435,22 @@ def main() -> None:
     )
     parser.add_argument("--revision")
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--language",
+        action="append",
+        help="emit only this normalized language code; repeat for multiple languages",
+    )
+    parser.add_argument(
+        "--per-language-limit",
+        type=int,
+        help="emit this many records for every --language stratum",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.per_language_limit and not args.language:
+        parser.error("--per-language-limit requires at least one --language")
+    if args.per_language_limit is not None and args.per_language_limit <= 0:
+        parser.error("--per-language-limit must be positive")
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
     args.output.parent.mkdir(parents=True, exist_ok=True)

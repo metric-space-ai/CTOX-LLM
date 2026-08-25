@@ -27,6 +27,21 @@ def normalize_tool_call(call: dict[str, Any]) -> dict[str, Any]:
     return {"name": name, "arguments": arguments}
 
 
+def normalize_content(value: Any, message_index: int, field: str) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list, bool, int, float)):
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    raise ValueError(
+        f"message {message_index} {field} has unsupported type {type(value).__name__}"
+    )
+
+
 def normalize_messages(messages: list[Any]) -> list[dict[str, Any]]:
     normalized = deepcopy(messages)
     for index, message in enumerate(normalized):
@@ -35,6 +50,13 @@ def normalize_messages(messages: list[Any]) -> list[dict[str, Any]]:
         role = message.get("role")
         if not isinstance(role, str) or not role:
             raise ValueError(f"message {index} has no role")
+        if "content" not in message:
+            raise ValueError(f"message {index} has no content field")
+        message["content"] = normalize_content(message["content"], index, "content")
+        if "reasoning_content" in message:
+            message["reasoning_content"] = normalize_content(
+                message["reasoning_content"], index, "reasoning_content"
+            )
         tool_calls = message.get("tool_calls")
         if tool_calls:
             if not isinstance(tool_calls, list):

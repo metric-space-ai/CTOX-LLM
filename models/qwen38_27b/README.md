@@ -79,3 +79,13 @@ assignment and trained channel-scale initializer produce a fully checksummed
 8,373,658,112-byte CTOXQ artifact and a calculated 9.6037-GiB 128K whole-process
 plan. It is still not the release checkpoint: end-to-end KL, cross-entropy,
 hidden-state, and MTP distillation plus held-out quality gates remain pending.
+
+The release-size corpus candidate in
+[`docs/RECOVERY_CORPUS_V3.json`](docs/RECOVERY_CORPUS_V3.json) materializes
+2,072 recovery-training and 524 held-out samples with zero identity overlap.
+It balances ordinary chat, coding, mathematics/STEM, Agentic/tool use, German,
+twelve equal-weight additional languages, and genuine 32K/64K/128K retrieval.
+Every payload hash and all 2,596 final Assistant targets pass the tokenizer
+audit. The BF16 teacher is now byte-verified against the pinned Hub commit and
+the provenance-bound MTP target smoke passes. Semantic domain tagging and
+quota replenishment remain a gate before the release-size teacher cache starts.

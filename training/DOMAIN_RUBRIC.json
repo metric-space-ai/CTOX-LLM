@@ -1,0 +1,92 @@
+{
+  "format": "ctox.recovery-domain-rubric.v1",
+  "classification": "multi_label",
+  "policy": {
+    "evaluation_must_be_disjoint": true,
+    "labels_are_a_selection_gate_not_training_targets": true,
+    "minimum_confidence": 0.7,
+    "unclassified_records_are_rejected": true
+  },
+  "domains": {
+    "agentic_tools_search": {
+      "description": "planning, function calls, tool results, search and multi-step execution",
+      "minimum_evaluation": 64,
+      "minimum_train": 256
+    },
+    "arts_culture_creative": {
+      "description": "literature, arts, media, culture and creative composition",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "business_economics_finance": {
+      "description": "business operations, accounting, economics and personal or corporate finance",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "data_structured_outputs": {
+      "description": "data analysis, extraction, classification, tables, JSON, XML and constrained formats",
+      "minimum_evaluation": 24,
+      "minimum_train": 96
+    },
+    "everyday_practical": {
+      "description": "ordinary assistance, home, food, travel and personal organization",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "hardware_engineering": {
+      "description": "electronics, hardware, manufacturing and engineering practice",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "history_geography_politics": {
+      "description": "history, geography, civics, institutions and political systems",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "law_government_administration": {
+      "description": "law, regulation, government services and public administration",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "life_sciences_medicine": {
+      "description": "biology, health and medicine with uncertainty-aware general assistance",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "mathematics_logic": {
+      "description": "arithmetic, algebra, geometry, probability and formal reasoning",
+      "minimum_evaluation": 32,
+      "minimum_train": 128
+    },
+    "physical_sciences_environment": {
+      "description": "physics, chemistry, earth science, climate and environment",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "safety_uncertainty": {
+      "description": "refusal, uncertainty calibration and safe handling of sensitive requests",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "social_science_education": {
+      "description": "education, psychology, sociology and learning support",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "software_cybersecurity": {
+      "description": "coding, debugging, review, testing, systems, databases and defensive security",
+      "minimum_evaluation": 64,
+      "minimum_train": 256
+    },
+    "translation_languages": {
+      "description": "translation, localization, grammar and cross-lingual communication",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    },
+    "writing_communication": {
+      "description": "explanation, summarization, rewriting and professional communication",
+      "minimum_evaluation": 12,
+      "minimum_train": 48
+    }
+  }
+}
