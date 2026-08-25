@@ -71,8 +71,17 @@ fn main() -> anyhow::Result<()> {
     let input: Vec<f32> = (0..args.columns)
         .map(|index| (index as f32 * 0.031_25).cos())
         .collect();
-    let s_in = vec![1.0_f32; args.columns];
-    let s_out = vec![1.0_f32; args.rows];
+    // Non-identity scales and bias keep the benchmark on the fully fused
+    // production path instead of the degenerate identity case.
+    let s_in: Vec<f32> = (0..args.columns)
+        .map(|index| 0.9 + 0.001 * (index % 11) as f32)
+        .collect();
+    let s_out: Vec<f32> = (0..args.rows)
+        .map(|row| 1.1 - 0.002 * (row % 9) as f32)
+        .collect();
+    let bias: Vec<f32> = (0..args.rows)
+        .map(|row| (row as f32 * 0.77).sin() * 0.05)
+        .collect();
     let operation = FusedMatVec {
         dtype,
         weights: &weights,
@@ -81,7 +90,7 @@ fn main() -> anyhow::Result<()> {
         input: &input,
         s_in: Some(&s_in),
         s_out: Some(&s_out),
-        bias: None,
+        bias: Some(&bias),
         activation: Activation::Silu,
     };
     let scalar = CpuBackend::scalar_verifier();

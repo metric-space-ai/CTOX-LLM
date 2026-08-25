@@ -1,0 +1,45 @@
+{
+  "format": "ctox.kernel-benchmark.v1",
+  "operation": "direct_packed_q2_q4_fused_matvec",
+  "systems": [
+    {
+      "hardware": "Apple M5",
+      "os": "macOS 26.2",
+      "profile": "aarch64-neon",
+      "shape": {"rows": 512, "columns": 512, "iterations": 10},
+      "q2_b64": {
+        "scalar_milliseconds": 1.002708,
+        "simd_milliseconds": 0.359084,
+        "speedup": 2.7924051197,
+        "maximum_absolute_error": 0.0000076293945
+      },
+      "q4_b64": {
+        "scalar_milliseconds": 2.630958,
+        "simd_milliseconds": 1.028042,
+        "speedup": 2.5591931069,
+        "maximum_absolute_error": 0.000008106232
+      }
+    },
+    {
+      "hardware": "Intel Core i5-13400F",
+      "os": "Linux gpu3-a4500",
+      "profile": "x86_64-avx2",
+      "shape": {"rows": 512, "columns": 512, "iterations": 50},
+      "q2_b64": {
+        "scalar_milliseconds": 9.800106,
+        "simd_milliseconds": 2.551677,
+        "speedup": 3.8406530294,
+        "maximum_absolute_error": 0.00000667572
+      },
+      "q4_b64": {
+        "scalar_milliseconds": 15.925062,
+        "simd_milliseconds": 2.718516,
+        "speedup": 5.8579982608,
+        "maximum_absolute_error": 0.0000067949295
+      }
+    }
+  ],
+  "fused_inputs": ["s_in", "s_out", "bias", "silu"],
+  "promotion": "experimental",
+  "note": "Independent per-op evidence on both architectures; a pinned same-hardware framework reference and full model gates remain required."
+}

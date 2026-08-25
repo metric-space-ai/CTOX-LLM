@@ -1,0 +1,41 @@
+{
+  "format": "ctox.qwen38.recovery-cohort.v1",
+  "status": "materialized_not_yet_used_for_assignment",
+  "dataset": {
+    "repository": "Beko2210/German-Instruct-Dataset",
+    "revision": "4456bdf1b82f906a70fb9e5431530d2e9d1c565b",
+    "license": "CC-BY-4.0",
+    "manifest_records": 5000,
+    "manifest_sha256": "46b014bbcccae37809bb232b661e0f0938bba8d9273082da564eec0a5335c93b",
+    "release_eligible": true,
+    "attribution_required": true
+  },
+  "selection": {
+    "algorithm": "deterministic SHA-256 ranking",
+    "seed": "ctox-qwen38-recovery-german-v1",
+    "records": 80,
+    "cohort_sha256": "c430007f4aa2339036c345307c990f1c68c0ca6a61a933e3effa6b5bdaa5b07c"
+  },
+  "materialized": {
+    "committed": false,
+    "sha256": "2b00a4c806512f4f555478f962af9eac42a6e9b846ebc84627b2945f68239ac4",
+    "tokens": 31182,
+    "maximum_tokens": 1697,
+    "median_tokens": 215,
+    "languages": {
+      "de": 57,
+      "de-en-mixed": 22,
+      "en": 1
+    },
+    "categories": {
+      "chat": 45,
+      "code": 22,
+      "long_context_source": 13
+    }
+  },
+  "limitations": [
+    "The cohort is a German recovery supplement and has not yet influenced Q2/Q4 sensitivity scores.",
+    "The selected RAG-source rows contain no non-empty context and therefore do not satisfy the production long-context gate.",
+    "Synthetic source facts are not treated as a factual knowledge benchmark."
+  ]
+}
