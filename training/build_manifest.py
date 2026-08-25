@@ -84,6 +84,15 @@ SOURCES = {
         "release_eligible": True,
         "quarantine_reason": None,
     },
+    "ultrachat": {
+        "repo": "HuggingFaceH4/ultrachat_200k",
+        "reviewed_revision": "8049631c405ae6576f93f445c6b8166f76f5505a",
+        "default_splits": ("train_sft",),
+        "default_language": "en",
+        "allowed_licenses": ("mit",),
+        "release_eligible": True,
+        "quarantine_reason": None,
+    },
 }
 
 GERMAN_INSTRUCT_REPO = "Beko2210/German-Instruct-Dataset"

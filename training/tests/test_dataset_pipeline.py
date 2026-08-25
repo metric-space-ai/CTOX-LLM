@@ -601,6 +601,16 @@ class DatasetPipelineTests(unittest.TestCase):
             },
         )
 
+    def test_ultrachat_source_is_pinned_and_release_eligible(self) -> None:
+        source = SOURCES["ultrachat"]
+        self.assertEqual(source["repo"], "HuggingFaceH4/ultrachat_200k")
+        self.assertEqual(
+            source["reviewed_revision"],
+            "8049631c405ae6576f93f445c6b8166f76f5505a",
+        )
+        self.assertEqual(source["allowed_licenses"], ("mit",))
+        self.assertTrue(source["release_eligible"])
+
     def test_nested_metadata_supplies_stable_source_id(self) -> None:
         row = {"metadata": {"uuid": "stable-row-id"}}
         self.assertEqual(source_id_for(row, 17), "stable-row-id")
