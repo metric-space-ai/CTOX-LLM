@@ -25,7 +25,7 @@ and benchmark artifacts.
 
 The first direct BF16-to-native pack is independently verified at 7.7695 GiB
 including its manifest. It contains text plus resident MTP and produces a
-9.5748 GiB calculated 128K Fold plan. Its recovery scales are still identity
+9.5822 GiB corrected calculated 128K Fold plan. Its recovery scales are still identity
 values; it is a format/memory baseline, not the final quality checkpoint. Exact
 hashes and counts are recorded in [`docs/NATIVE_ARTIFACT_V1.json`](docs/NATIVE_ARTIFACT_V1.json).
 
@@ -76,7 +76,7 @@ The expanded initializer in
 823,996 observed tokens. All 506 matrices, including embedding, LM head, and
 resident MTP, are activation weighted. The resulting 127-Q4/377-Q2/two-mixed
 assignment and trained channel-scale initializer produce a fully checksummed
-8,373,658,112-byte CTOXQ artifact and a calculated 9.6037-GiB 128K whole-process
+8,373,658,112-byte CTOXQ artifact and a corrected calculated 9.6110-GiB 128K whole-process
 plan. It is still not the release checkpoint: end-to-end KL, cross-entropy,
 hidden-state, and MTP distillation plus held-out quality gates remain pending.
 
@@ -119,19 +119,24 @@ paired recovery-scale tensors, and 360 frozen float tensors. Missing, extra,
 wrongly shaped, or wrongly typed graph inputs fail closed. The scalar oracle
 also covers the pinned Qwen normalization, RoPE, grouped-query attention,
 GatedDeltaNet decode/prefill recurrence, convolution state, and SwiGLU
-equations. Direct recovered quantized projections are now composed in the first
-graph slice, while token-mixer composition and end-to-end decoder execution
-remain unfinished.
+equations. Direct recovered quantized projections and both token-mixer types
+are now composed into a stateful target-decoder correctness path.
 
-The first mmap-backed executable graph slice now composes recovered embedding,
-Qwen RMSNorm, gate/up/SwiGLU/down with the residual connection, final norm, and
-the recovered LM head without copying or repacking model tensors. A pinned
-small-shape artifact test exercises the complete slice numerically. Full- and
-attention now has a complete single-token correctness composition including
-the interleaved query/gate projection, head norms, partial RoPE, causal GQA,
-KV state, output gate, projection, and residual. Linear-attention composition,
-all 64-layer iteration, production paged-KV ownership, and MTP verification
-still have to be connected before this becomes an end-to-end decoder.
+The mmap-backed target graph composes recovered embedding, Qwen RMSNorm, both
+attention types, gate/up/SwiGLU/down residual MLPs, final norm, and recovered LM
+head without copying or repacking model tensors. Full attention includes the
+interleaved query/gate projection, head norms, partial RoPE, causal GQA, KV
+state, output gate, projection, and residual. Linear attention includes causal
+convolution, Q/K head repetition, beta/decay, recurrent state, gated RMSNorm,
+projection, and residual. The stateful layer iterator follows the frozen
+three-linear/one-full pattern for all configured layers. It remains a
+correctness executor: production paged-Q2/Q4 KV, fused token-mixer kernels,
+chunked prefill, MTP draft/verify, and optimized backend integration remain.
+
+[`docs/MEMORY_PLAN_CORRECTION_V2.json`](docs/MEMORY_PLAN_CORRECTION_V2.json)
+records the 7.5-MiB causal-convolution state that the earlier calculated Fold
+figures omitted. The corrected initializer plan remains admitted below 9.7
+GiB; historical artifact hashes and byte counts are unchanged.
 
 [`docs/WIRE_PROTOCOL_V1.md`](docs/WIRE_PROTOCOL_V1.md) defines the matching
 versioned Unix-socket/named-pipe control and token-stream contract. The bring-up

@@ -35,8 +35,10 @@ fn main() -> anyhow::Result<()> {
             FoldMemoryPlan::gib(plan.kv_q4_recent_and_sink_bytes)
         );
         println!(
-            "linear state:   {:.3} GiB",
-            FoldMemoryPlan::gib(plan.linear_state_bytes)
+            "linear state:   {:.3} GiB (recurrent {:.3} + conv {:.3})",
+            FoldMemoryPlan::gib(plan.linear_state_bytes),
+            FoldMemoryPlan::gib(plan.linear_recurrent_state_bytes),
+            FoldMemoryPlan::gib(plan.linear_convolution_state_bytes)
         );
         println!(
             "runtime:        {:.3} GiB",

@@ -715,7 +715,7 @@ mod tests {
                 resident_model_bytes: 8_000_000_000,
                 persistent_backend_graph_bytes: 64 << 20,
                 persistent_runtime_bytes: 64 << 20,
-                linear_state_bytes_per_session: 144 << 20,
+                linear_state_bytes_per_session: 303 << 19,
                 kv: KvMemoryFormula {
                     fixed_bytes_per_session: 0,
                     bytes_per_token_per_session: 9_216,

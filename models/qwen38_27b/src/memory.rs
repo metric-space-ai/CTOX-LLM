@@ -84,6 +84,8 @@ pub struct FoldMemoryPlan {
     pub kv_raw_q2_bytes: u64,
     pub kv_scale_bytes: u64,
     pub kv_q4_recent_and_sink_bytes: u64,
+    pub linear_recurrent_state_bytes: u64,
+    pub linear_convolution_state_bytes: u64,
     pub linear_state_bytes: u64,
     pub runtime_budget: RuntimeMemoryBudget,
     pub runtime_bytes: u64,
@@ -128,11 +130,36 @@ impl FoldMemoryPlan {
             * 2;
         let kv_q4_recent_and_sink_bytes = q4_tokens * values_per_token / 4;
 
-        let linear_state_values = config.linear_attention_layers() as u64
-            * config.linear_num_value_heads as u64
-            * config.linear_key_head_dim as u64
-            * config.linear_value_head_dim as u64;
-        let linear_state_bytes = linear_state_values * 4;
+        let linear_layers = config.linear_attention_layers() as u64;
+        let linear_recurrent_state_values = linear_layers
+            .checked_mul(config.linear_num_value_heads as u64)
+            .and_then(|values| values.checked_mul(config.linear_key_head_dim as u64))
+            .and_then(|values| values.checked_mul(config.linear_value_head_dim as u64))
+            .ok_or_else(|| EngineError::MemoryBudget("linear recurrent state overflows".into()))?;
+        let linear_recurrent_state_bytes = linear_recurrent_state_values
+            .checked_mul(4)
+            .ok_or_else(|| EngineError::MemoryBudget("linear recurrent bytes overflow".into()))?;
+        let linear_convolution_channels = (config.linear_num_key_heads as u64)
+            .checked_mul(config.linear_key_head_dim as u64)
+            .and_then(|key_width| key_width.checked_mul(2))
+            .and_then(|two_keys| {
+                (config.linear_num_value_heads as u64)
+                    .checked_mul(config.linear_value_head_dim as u64)
+                    .and_then(|value_width| two_keys.checked_add(value_width))
+            })
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("linear convolution width overflows".into())
+            })?;
+        let linear_convolution_state_bytes = linear_layers
+            .checked_mul(linear_convolution_channels)
+            .and_then(|values| values.checked_mul(config.linear_conv_kernel_dim as u64))
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("linear convolution state overflows".into())
+            })?;
+        let linear_state_bytes = linear_recurrent_state_bytes
+            .checked_add(linear_convolution_state_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("linear state total overflows".into()))?;
 
         let runtime_budget = RuntimeMemoryBudget::fold_default();
         let runtime_bytes = runtime_budget.total_bytes();
@@ -150,6 +177,8 @@ impl FoldMemoryPlan {
             kv_raw_q2_bytes,
             kv_scale_bytes,
             kv_q4_recent_and_sink_bytes,
+            linear_recurrent_state_bytes,
+            linear_convolution_state_bytes,
             linear_state_bytes,
             runtime_budget,
             runtime_bytes,
@@ -191,7 +220,9 @@ mod tests {
                 .unwrap();
         assert_eq!(plan.kv_raw_q2_bytes, GIB);
         assert_eq!(plan.kv_scale_bytes, 128 * MIB);
-        assert_eq!(plan.linear_state_bytes, 144 * MIB);
+        assert_eq!(plan.linear_recurrent_state_bytes, 144 * MIB);
+        assert_eq!(plan.linear_convolution_state_bytes, 15 * MIB / 2);
+        assert_eq!(plan.linear_state_bytes, 303 * MIB / 2);
         plan.verify().unwrap();
         assert!(plan.total_bytes < FOLD_TARGET_BYTES);
     }

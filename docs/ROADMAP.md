@@ -17,14 +17,17 @@ paths needed to build them.
 | Native baseline | 8,342,484,480-byte CTOXQ file; 8,342,086,656 resident bytes; text plus MTP; SHA-256 `02d38cc877ad2ae8bea244bc11d4572ca0a8c84e757bdfbcb27ebbb9ed8c47f6` | Recovery scales are identity values; this is not the quality checkpoint |
 | Expanded initializer | 167 unique samples/823,996 observed tokens; all 506 matrices covered; 127 Q4, 377 Q2, and two mixed matrices; 8,373,052,416 resident bytes; fully checksummed 8,373,658,112-byte CTOXQ pack | Release-size agentic and teacher cohorts, end-to-end KL/CE/hidden/MTP recovery, held-out evaluation, and final logical digest |
 | Recovery data | Final quality-filtered 2,328 training and 642 held-out samples; 36 service domains in ten families; 15 language strata; 503 code, 381 agentic, 523 math, 866 ordinary-chat, and 55 long-context training records; zero ID and complete-payload overlap | Cache the 1,735 training identities not yet covered by the five verified release batches, assemble one 2,328-sample teacher cache set, then run final sensitivity/recovery/evaluation |
-| CPU | Scalar oracle plus experimental packed AVX2/NEON Q2/Q4 matvec | Complete graph operations, ISA profiles, end-to-end correctness, and production benchmark |
+| CPU | Scalar Qwen oracle, mmap-bound recovered target-decoder correctness graph, and experimental packed AVX2/NEON Q2/Q4/mixed projections plus embedding gather | Production token-mixer kernels, chunked prefill, ISA expansion, full-artifact golden run, and roofline/reference benchmark |
 | CUDA | Pinned upstream reference sources and SM86 ABI contract | CTOX Q2_B64/Q4_B64 kernels, graph execution, verifier, and GPU3 benchmark |
 | Metal | Compilable Q2/Q4 MSL candidate | Runtime dispatch, same-device numerical evidence, full graph, and benchmark |
 | Snapdragon | QNN/Vulkan/AHardwareBuffer contract | Exact Fold SoC support, compiled HTP/Vulkan graph, shared-memory proof, and device measurements |
-| Runtime | Checksummed v1/v2 container, memory planner, graph ownership plan, wire types, experimental fused CPU matvec, and bring-up server that deliberately returns `engine_not_ready` | Stable `Engine` ABI, tokenizer, executable full decoder, MTP verification, streaming, cancellation, session reset, and complete unload |
+| Runtime | Checksummed v1/v2 container, corrected memory planner, graph ownership plan, stable lifecycle/wire contracts, target-decoder correctness composition, and bring-up server that deliberately returns `engine_not_ready` | Production `ModelExecutor`, tokenizer/template binding, MTP draft/verify, optimized streaming prefill/decode, and full-artifact unload evidence |
 
-The reported 9.5748-GiB baseline and 9.6037-GiB initializer 128K figures are
-verified calculations, not measured RSS/PSS/VRAM peaks. Likewise, the planned
+The corrected 9.5822-GiB baseline and 9.6110-GiB initializer 128K figures are
+verified calculations, not measured RSS/PSS/VRAM peaks. The correction adds
+the previously omitted 7.5-MiB causal-convolution state to the 144-MiB
+GatedDeltaNet recurrent state and is recorded in
+`models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V2.json`. Likewise, the planned
 9.6976-GiB vision phase is not yet Android device evidence.
 
 The five verified release teacher-cache batches currently cover 593 of the

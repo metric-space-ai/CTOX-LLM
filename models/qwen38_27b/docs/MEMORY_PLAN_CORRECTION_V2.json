@@ -1,0 +1,51 @@
+{
+  "format": "ctox.qwen38.memory-plan-correction.v2",
+  "date": "2026-08-25",
+  "status": "authoritative_calculated_plan_correction",
+  "reason": "The v1 Fold calculation counted the GatedDeltaNet recurrent matrices but omitted the causal-convolution state for all 48 linear-attention layers.",
+  "linear_attention_state": {
+    "layers": 48,
+    "recurrent_bytes": 150994944,
+    "recurrent_mib": 144.0,
+    "convolution_channels_per_layer": 10240,
+    "convolution_kernel": 4,
+    "convolution_bytes": 7864320,
+    "convolution_mib": 7.5,
+    "corrected_total_bytes": 158859264,
+    "corrected_total_mib": 151.5
+  },
+  "fold_128k": {
+    "direct_baseline": {
+      "previous_total_bytes": 10280903680,
+      "corrected_total_bytes": 10288768000,
+      "corrected_total_gib": 9.5821619034
+    },
+    "expanded_initializer": {
+      "previous_total_bytes": 10311869440,
+      "corrected_total_bytes": 10319733760,
+      "corrected_total_gib": 9.6110010147,
+      "headroom_to_9_7_gib_target_bytes": 95561933,
+      "headroom_to_10_gib_hard_limit_bytes": 417684480
+    },
+    "operating_target_bytes": 10415295693,
+    "hard_limit_bytes": 10737418240,
+    "still_admitted": true
+  },
+  "verification": {
+    "authoritative_implementation": "src/memory.rs",
+    "recurrent_formula_test": "144 MiB",
+    "convolution_formula_test": "7.5 MiB",
+    "combined_formula_test": "151.5 MiB"
+  },
+  "supersedes_only": [
+    "The calculated Fold totals in NATIVE_ARTIFACT_V1.json",
+    "The calculated Fold totals in RECOVERY_INITIALIZER_V1.json",
+    "The calculated Fold totals in RECOVERY_INITIALIZER_V2.json"
+  ],
+  "does_not_change": [
+    "artifact bytes",
+    "artifact SHA-256 digests",
+    "logical Q2/Q4 assignments",
+    "recovery-scale bytes"
+  ]
+}
