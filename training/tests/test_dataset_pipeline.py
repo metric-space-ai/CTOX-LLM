@@ -89,6 +89,7 @@ from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa:
 from select_primary_domain_supplement import select_supplement  # noqa: E402
 from select_coverage_supplement import (  # noqa: E402
     assigned_tag,
+    candidate_coverage,
     primary_assignment,
     select_joint_supplement,
 )
@@ -420,6 +421,30 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(effective["primary_source"], "near_tie_coverage_assignment")
         self.assertAlmostEqual(effective["primary_margin_from_classifier_max"], 0.01)
         self.assertIsNone(primary_assignment(tag, requirements, 0.7, 0.005))
+
+    def test_unassigned_candidate_keeps_original_primary_for_language_gate(self) -> None:
+        requirements = {
+            name: Counter()
+            for name in (
+                "domain_label",
+                "domain_primary",
+                "language",
+                "non_translation",
+                "language_diversity",
+                "non_english_family",
+            )
+        }
+        requirements["non_english_family"]["science"] = 1
+        coverage = candidate_coverage(
+            {"language": "de"},
+            {"primary_label": "biology", "labels": ["biology"]},
+            None,
+            requirements,
+            {"de": {"biology"}},
+            {"domains": {"biology": {"family": "science"}}},
+            {"translation_domain": "translation"},
+        )
+        self.assertEqual(coverage, [("non_english_family", "science")])
 
     def test_domain_gate_requires_clear_primary_examples_not_only_multilabel_hits(self) -> None:
         rubric = {

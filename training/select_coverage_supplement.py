@@ -100,7 +100,7 @@ def candidate_coverage(
     domain_rubric: dict[str, Any],
     language_rubric: dict[str, Any],
 ) -> list[tuple[str, str]]:
-    primary = assigned_primary
+    primary = assigned_primary or str(tag["primary_label"])
     language = str(record["language"])
     covered = []
     for label in tag["labels"]:
