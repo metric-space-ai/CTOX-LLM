@@ -4,6 +4,8 @@
 //! pinned Transformers Qwen3.5 implementation used to create BF16 evidence:
 //! <https://github.com/huggingface/transformers/blob/a353632607c59463e6ced86a44c2de3c2cd62d5e/src/transformers/models/qwen3_5/modeling_qwen3_5.py>.
 
+use half::f16;
+
 use crate::{EngineError, Result};
 
 const L2_EPSILON: f32 = 1e-6;
@@ -184,6 +186,44 @@ pub fn causal_conv_silu_update(
     Ok(output)
 }
 
+/// FP16-resident variant of the causal convolution oracle. Arithmetic widens
+/// to f32, while every persistent state write rounds to IEEE binary16.
+pub fn causal_conv_silu_update_f16_state(
+    input: &[f32],
+    state: &mut [f16],
+    weight: &[f32],
+    channels: usize,
+    kernel: usize,
+) -> Result<Vec<f32>> {
+    matrix_contract("causal convolution weight", weight, channels, kernel)?;
+    let expected_state = channels
+        .checked_mul(kernel)
+        .ok_or_else(|| EngineError::Shape("causal convolution state overflows".into()))?;
+    if input.len() != channels
+        || state.len() != expected_state
+        || input.iter().any(|value| !value.is_finite())
+        || state.iter().any(|value| !value.is_finite())
+    {
+        return Err(EngineError::Shape(
+            "FP16 causal convolution state contract differs".into(),
+        ));
+    }
+    let mut output = Vec::with_capacity(channels);
+    for (channel, input_value) in input.iter().enumerate() {
+        let start = channel * kernel;
+        let local_state = &mut state[start..start + kernel];
+        local_state.copy_within(1.., 0);
+        local_state[kernel - 1] = f16::from_f32(*input_value);
+        let sum = local_state
+            .iter()
+            .zip(&weight[start..start + kernel])
+            .map(|(value, weight)| value.to_f32() * weight)
+            .sum::<f32>();
+        output.push(silu(sum));
+    }
+    Ok(output)
+}
+
 /// Exact single-token recurrent GatedDeltaNet rule after Q/K head repetition.
 // ref: modeling_qwen3_5.py:330-380
 #[allow(clippy::too_many_arguments)]
@@ -246,6 +286,82 @@ pub fn recurrent_gated_delta_step(
             output[head * value_dim + value_index] = (0..key_dim)
                 .map(|index| {
                     local_state[index * value_dim + value_index]
+                        * q[index]
+                        * q_inverse
+                        * query_scale
+                })
+                .sum();
+        }
+    }
+    Ok(output)
+}
+
+/// FP16-resident GatedDelta state oracle. Dot products and update arithmetic
+/// remain f32; each persistent state element is rounded only when written.
+#[allow(clippy::too_many_arguments)]
+pub fn recurrent_gated_delta_step_f16_state(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    log_decay: &[f32],
+    beta: &[f32],
+    state: &mut [f16],
+    heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> Result<Vec<f32>> {
+    matrix_contract("FP16 delta query", query, heads, key_dim)?;
+    matrix_contract("FP16 delta key", key, heads, key_dim)?;
+    matrix_contract("FP16 delta value", value, heads, value_dim)?;
+    let expected_state = heads
+        .checked_mul(key_dim)
+        .and_then(|values| values.checked_mul(value_dim))
+        .ok_or_else(|| EngineError::Shape("FP16 delta state shape overflows".into()))?;
+    if state.len() != expected_state
+        || log_decay.len() != heads
+        || beta.len() != heads
+        || state.iter().any(|value| !value.is_finite())
+        || log_decay.iter().chain(beta).any(|value| !value.is_finite())
+    {
+        return Err(EngineError::Shape(
+            "FP16 delta state contract differs".into(),
+        ));
+    }
+    let mut output = vec![0.0; heads * value_dim];
+    let query_scale = (key_dim as f32).sqrt().recip();
+    for head in 0..heads {
+        let q = &query[head * key_dim..(head + 1) * key_dim];
+        let k = &key[head * key_dim..(head + 1) * key_dim];
+        let v = &value[head * value_dim..(head + 1) * value_dim];
+        let q_inverse = (q.iter().map(|x| x * x).sum::<f32>() + L2_EPSILON)
+            .sqrt()
+            .recip();
+        let k_inverse = (k.iter().map(|x| x * x).sum::<f32>() + L2_EPSILON)
+            .sqrt()
+            .recip();
+        let state_start = head * key_dim * value_dim;
+        let local_state = &mut state[state_start..state_start + key_dim * value_dim];
+        let decay = log_decay[head].exp();
+        local_state
+            .iter_mut()
+            .for_each(|item| *item = f16::from_f32(item.to_f32() * decay));
+        for value_index in 0..value_dim {
+            let memory = (0..key_dim)
+                .map(|index| {
+                    local_state[index * value_dim + value_index].to_f32() * k[index] * k_inverse
+                })
+                .sum::<f32>();
+            let delta = (v[value_index] - memory) * beta[head];
+            for (key_index, key_value) in k.iter().take(key_dim).enumerate() {
+                let index = key_index * value_dim + value_index;
+                let updated = local_state[index].to_f32() + key_value * k_inverse * delta;
+                local_state[index] = f16::from_f32(updated);
+            }
+        }
+        for value_index in 0..value_dim {
+            output[head * value_dim + value_index] = (0..key_dim)
+                .map(|index| {
+                    local_state[index * value_dim + value_index].to_f32()
                         * q[index]
                         * q_inverse
                         * query_scale
@@ -508,6 +624,101 @@ mod tests {
             ],
             2e-6,
         );
+    }
+
+    #[test]
+    fn fp16_resident_state_stays_bounded_against_f32_oracle() {
+        let heads = 2;
+        let key_dim = 4;
+        let value_dim = 3;
+        let mut f32_state = vec![0.0; heads * key_dim * value_dim];
+        let mut f16_state = vec![f16::ZERO; f32_state.len()];
+        let mut squared_error = 0.0_f64;
+        let mut squared_signal = 0.0_f64;
+        let mut maximum_error = 0.0_f32;
+        let mut values = 0_usize;
+        for token in 0..512 {
+            let query = (0..heads * key_dim)
+                .map(|index| ((token * 17 + index * 11 + 1) as f32 * 0.013).sin())
+                .collect::<Vec<_>>();
+            let key = (0..heads * key_dim)
+                .map(|index| ((token * 13 + index * 7 + 3) as f32 * 0.017).cos())
+                .collect::<Vec<_>>();
+            let value = (0..heads * value_dim)
+                .map(|index| 0.75 * ((token * 19 + index * 5 + 2) as f32 * 0.011).sin())
+                .collect::<Vec<_>>();
+            let log_decay = (0..heads)
+                .map(|head| -0.01 - 0.04 * ((token + head * 3) % 5) as f32)
+                .collect::<Vec<_>>();
+            let beta = (0..heads)
+                .map(|head| 0.15 + 0.15 * ((token + head) % 5) as f32)
+                .collect::<Vec<_>>();
+            let expected = recurrent_gated_delta_step(
+                &query,
+                &key,
+                &value,
+                &log_decay,
+                &beta,
+                &mut f32_state,
+                heads,
+                key_dim,
+                value_dim,
+            )
+            .unwrap();
+            let actual = recurrent_gated_delta_step_f16_state(
+                &query,
+                &key,
+                &value,
+                &log_decay,
+                &beta,
+                &mut f16_state,
+                heads,
+                key_dim,
+                value_dim,
+            )
+            .unwrap();
+            for (expected, actual) in expected.iter().zip(actual) {
+                let error = (expected - actual).abs();
+                maximum_error = maximum_error.max(error);
+                squared_error += (error as f64).powi(2);
+                squared_signal += (*expected as f64).powi(2);
+                values += 1;
+            }
+        }
+        let normalized_rmse = (squared_error / squared_signal.max(f64::MIN_POSITIVE)).sqrt();
+        assert!(
+            maximum_error < 0.01,
+            "FP16 recurrent max error {maximum_error} over {values} values"
+        );
+        assert!(
+            normalized_rmse < 0.005,
+            "FP16 recurrent normalized RMSE {normalized_rmse}"
+        );
+
+        let channels = 4;
+        let kernel = 4;
+        let weights = (0..channels * kernel)
+            .map(|index| ((index + 1) as f32 * 0.031).cos() * 0.25)
+            .collect::<Vec<_>>();
+        let mut f32_convolution = vec![0.0; channels * kernel];
+        let mut f16_convolution = vec![f16::ZERO; channels * kernel];
+        for token in 0..512 {
+            let input = (0..channels)
+                .map(|channel| ((token * 7 + channel * 3) as f32 * 0.019).sin())
+                .collect::<Vec<_>>();
+            let expected =
+                causal_conv_silu_update(&input, &mut f32_convolution, &weights, channels, kernel)
+                    .unwrap();
+            let actual = causal_conv_silu_update_f16_state(
+                &input,
+                &mut f16_convolution,
+                &weights,
+                channels,
+                kernel,
+            )
+            .unwrap();
+            close(&expected, &actual, 5e-4);
+        }
     }
 
     #[test]

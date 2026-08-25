@@ -22,6 +22,17 @@ as well. A sequential prefill oracle exercises the same recurrence expected
 from future chunked kernels. Tests use golden values emitted by that pinned
 Python implementation, including nonzero recurrent state so decay is exercised.
 
-The optimized chunked prefill implementation, quantized projection composition,
-residual block execution, MTP, and end-to-end logits remain required before
-this becomes a complete decoder oracle.
+The Fold memory profile additionally has explicit FP16-resident convolution
+and recurrent-state oracles. They widen arithmetic to FP32 and round every
+persistent write to IEEE binary16, matching the intended accelerator storage
+boundary. A deterministic 512-step recurrence/conv test compares that storage
+mode with the FP32 oracle and rejects unbounded drift. This is a synthetic
+implementation check only: promotion of the FP16 Fold profile still requires
+captured model activations, full-sequence logits, held-out tokens, and
+long-context state-stability evidence.
+
+The mmap-backed correctness executor now composes quantized projections,
+residual blocks, both token mixers, the target graph, and one native MTP draft.
+Optimized chunked prefill, chained MTP block verification, and full-artifact
+BF16 golden logits remain required before any production backend can be
+promoted.
