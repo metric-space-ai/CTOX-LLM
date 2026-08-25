@@ -15,7 +15,7 @@ profile is 131,072 positions.
 | CPU scalar | verifier | forbidden |
 | CPU AVX2/NEON | experimental dot kernels | none |
 | CUDA | contract | none |
-| Metal | contract | none |
+| Metal | contract plus direct same-device Q2/Q4 verifier | none |
 | Snapdragon HTP/Vulkan | contract | none |
 
 The status table is intentionally conservative. Update it only with verifier

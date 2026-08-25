@@ -1,14 +1,17 @@
 # Metal Q2/Q4 fused matvec candidate notes
 
 Status: **candidate, not promoted**. The backend reports
-`PromotionState::Contract` and `fused_matvec` fails closed with
-`EngineError::UnsupportedOperation` until same-device verifier and benchmark
-evidence exists. No MLX/MPSGraph usage, no scalar fallback.
+`PromotionState::Contract` and its production `fused_matvec` entry point fails
+closed with `EngineError::UnsupportedOperation`. A separately named
+`MetalCandidateRuntime` now performs direct same-device verifier dispatch, but
+it cannot be selected as a production `Backend` until resident-memory and
+benchmark evidence exists. No MLX/MPSGraph usage, no scalar fallback.
 
 ## Files
 
 - Kernel source: `kernels/metal/q2q4_fused_matvec.metal`
 - Rust ABI/dispatch contract: `src/backend/metal.rs`
+- Direct verifier runtime: `src/backend/metal_runtime.rs`
 
 ## Entry points
 
@@ -44,13 +47,19 @@ threadgroup scratch pass; lane 0 applies bias/s_out/activation. Rows and
 columns are bounds-checked; trailing partial blocks contribute only their
 valid prefix.
 
-## Validation evidence (this worktree, Apple Silicon)
+## Validation evidence (this worktree, Apple M5)
 
 - `xcrun -sdk macosx metal -c kernels/metal/q2q4_fused_matvec.metal -o target/fleet-metal.air` — compiles clean.
-- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` — clean.
-- `cargo test` on macOS — complete crate suite passes, including ABI constant checks against
-  `src/quant.rs`, invalid shape/buffer rejection, dispatch-name checks, and an
-  in-test `xcrun metal` compile of the kernel source.
+- The `metal` Cargo feature links only the native `metal-rs` driver binding and
+  compiles the in-crate MSL source with fast math disabled. It does not link an
+  inference framework.
+- `cargo test --features metal q2_and_q4_device_results_match_scalar_oracle`
+  dispatches Q2 and Q4 on the 10-core Apple M5 GPU. Eleven 192-column rows use
+  non-identity packed-FP16 `s_in`/`s_out`, bias, and SiLU, and pass the scalar
+  CPU oracle tolerance for every output row.
+- The complete suite also covers ABI constants against `src/quant.rs`, invalid
+  shape/buffer rejection, dispatch-name checks, and an in-test `xcrun metal`
+  compilation of the source.
 
 Independent review corrected the generated candidate's positive Q2 code order
 to `{+1/3, +1}` for codes `{2, 3}` and removed its per-thread 64-float
@@ -58,8 +67,11 @@ dequantization array before this source was accepted.
 
 ## Not yet done (promotion blockers)
 
-- No same-device numeric comparison against the CPU oracle (no Metal runtime
-  dispatch exists in-crate yet).
-- No benchmark evidence against the pinned CPU reference.
-- Per `docs/PROMOTION_GATES.md`, both are required before any state change;
+- The verifier currently creates shared staging buffers for an isolated
+  operation. It is not evidence for resident model tensors or the required
+  no-duplicate loader ownership contract.
+- No sustained device-resident benchmark or roofline evidence exists yet.
+- No full embedding, attention, GatedDeltaNet, MTP, sampling, or model-graph
+  Metal execution exists yet.
+- Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

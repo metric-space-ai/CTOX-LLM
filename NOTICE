@@ -25,3 +25,10 @@ Vendored third-party source:
   per-file digests are recorded next to the pin in
   models/qwen38_27b/vendor/cuda/LICENSE and
   models/qwen38_27b/vendor/cuda/UPSTREAM.json.
+
+Direct driver binding dependency:
+
+- The optional macOS `metal` feature uses metal-rs 0.33.0
+  (https://github.com/gfx-rs/metal-rs), licensed MIT OR Apache-2.0, as a thin
+  binding to Apple's Metal API. It is not an inference framework. Exact direct
+  and transitive versions are pinned in `models/qwen38_27b/Cargo.lock`.

@@ -1,6 +1,8 @@
 pub mod cpu;
 pub mod cuda;
 pub mod metal;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod metal_runtime;
 pub mod snapdragon;
 
 use serde::{Deserialize, Serialize};
