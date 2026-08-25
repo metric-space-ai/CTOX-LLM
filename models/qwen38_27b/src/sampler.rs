@@ -31,7 +31,7 @@ impl Sampler {
                 "temperature must be finite and non-negative".into(),
             ));
         }
-        if !config.top_p.is_finite() || !(0.0 < config.top_p && config.top_p <= 1.0) {
+        if !(config.top_p.is_finite() && 0.0 < config.top_p && config.top_p <= 1.0) {
             return Err(EngineError::InvalidArtifact(
                 "top_p must be in (0, 1]".into(),
             ));

@@ -70,12 +70,56 @@ class Record:
     quarantine_reason: str | None
 
 
-def canonical_text(row: dict[str, Any]) -> str:
-    for key in ("prompt", "input", "question", "messages", "conversation", "text"):
+def recovery_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Return the complete payload consumed by recovery and teacher caching.
+
+    Hashing only a prompt would leave a changed reference answer undetected.
+    Conversational records therefore retain all turns; paired prompt/answer
+    records are normalized to chat messages.
+    """
+
+    for key in ("messages", "conversation", "conversations"):
         value = row.get(key)
-        if value:
-            return json.dumps(value, ensure_ascii=False, sort_keys=True) if not isinstance(value, str) else value
-    return json.dumps(row, ensure_ascii=False, sort_keys=True)
+        if isinstance(value, list) and value:
+            return {"messages": value}
+
+    prompt = next(
+        (row[key] for key in ("prompt", "input", "question", "instruction") if row.get(key)),
+        None,
+    )
+    answer = next(
+        (
+            row[key]
+            for key in ("response", "output", "answer", "completion")
+            if row.get(key)
+        ),
+        None,
+    )
+    if prompt is not None and answer is not None:
+        return {
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": answer},
+            ]
+        }
+    if prompt is not None:
+        return {"prompt": prompt if isinstance(prompt, str) else stable_json(prompt)}
+    if row.get("text") is not None:
+        text = row["text"]
+        return {"prompt": text if isinstance(text, str) else stable_json(text)}
+    return {"prompt": stable_json(row)}
+
+
+def stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def canonical_text(row: dict[str, Any]) -> str:
+    return stable_json(recovery_payload(row))
+
+
+def source_id_for(row: dict[str, Any], index: int) -> str:
+    return str(row.get("id", row.get("uuid", index)))
 
 
 def category_for(subset: str, split: str, row: dict[str, Any]) -> str:
@@ -101,7 +145,7 @@ def records(args: argparse.Namespace) -> Iterable[Record]:
         for index, row in enumerate(dataset):
             text = canonical_text(row)
             prompt_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            source_id = str(row.get("id", row.get("uuid", index)))
+            source_id = source_id_for(row, index)
             identity = "\0".join((repo, revision, subset, args.split, source_id, prompt_sha))
             license_name = str(row.get("license", row.get("source_license", "dataset-card")))
             language = str(row.get("language", row.get("lang", "und")))

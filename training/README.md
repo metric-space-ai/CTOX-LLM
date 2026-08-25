@@ -4,8 +4,9 @@ Training is offline tooling, not an inference-runtime dependency. The release
 pipeline has four immutable stages:
 
 1. `build_manifest.py` streams source datasets and emits provenance records.
-2. A separate materializer stores prompts referenced by those records in an
-   access-controlled cache; prompts are never committed.
+2. `materialize_prompts.py` re-streams the pinned revisions, verifies each
+   complete prompt/answer or conversation hash, and stores the records in an
+   access-controlled cache; materialized text is never committed.
 3. `cache_teacher.py` runs the pinned BF16 teacher and stores top-64 logits,
    residual probability mass, and selected hidden states.
 4. `train_recovery.py` freezes Q2/Q4 codes and trains channel correction scales.
@@ -13,6 +14,10 @@ pipeline has four immutable stages:
 Nemotron v2 is quarantined by default. Research may opt into the cohort, but a
 public checkpoint cannot claim release eligibility until a legal decision is
 recorded in the manifest.
+
+Sample identities cover the complete recovery payload, including reference
+answers. Changing an answer therefore changes both the payload hash and sample
+identity; stale source coordinates cannot silently enter a teacher cache.
 
 The 240 GPU-hour ceiling is cumulative across teacher generation, sensitivity
 runs, ablations, final recovery, and evaluation. Every command appends its GPU

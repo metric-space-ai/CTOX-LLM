@@ -33,6 +33,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m compileall -q training
+      - run: python -m unittest discover -s training/tests -v
       - run: python -m json.tool schemas/model-manifest-v1.schema.json >/dev/null
       - run: python -m json.tool schemas/recovery-sample-v1.schema.json >/dev/null
       - run: python -m json.tool models/qwen38_27b/docs/BASELINE.json >/dev/null
