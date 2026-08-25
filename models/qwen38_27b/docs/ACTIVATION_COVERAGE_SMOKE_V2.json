@@ -1,0 +1,85 @@
+{
+  "format": "ctox.qwen38.activation-coverage-smoke.v2",
+  "status": "smoke_only_not_release_checkpoint",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "calibration": {
+    "samples": 10,
+    "tokens": 1221,
+    "maximum_tokens_per_sample": 128,
+    "observed_matrices": 506,
+    "unobserved_matrices": 0,
+    "activation_sha256": "1a0a520a6d8576f8f319f7f73ef4f3aa62c1c9722d20f90f9eafd49b13db50a5",
+    "sensitivity_sha256": "913206e72b53cff9b23d0107454c4ed75b5b33e9e83745bb46fbba172af9f38f"
+  },
+  "coverage": {
+    "decoder_linear_matrices": "diagonal input/output activation statistics",
+    "embedding": "token-row-frequency weighting",
+    "lm_head": "diagonal input covariance with analytical output energy",
+    "mtp": "frozen checkpoint weights executed through the one-layer MTP decoder"
+  },
+  "assignment": {
+    "format": "ctox.q2q4.assignment.v2",
+    "sha256": "225c53054d3d0526d569cdda1966aa88a927c007c4cd3b70986a4fa6789d74bb",
+    "full_q4_matrices": 140,
+    "full_q2_matrices": 364,
+    "mixed_tensors": {
+      "lm_head.weight": {
+        "row_group_size": 256,
+        "q4_groups": 970,
+        "total_groups": 970
+      },
+      "model.language_model.embed_tokens.weight": {
+        "row_group_size": 256,
+        "q4_groups": 3,
+        "total_groups": 970
+      }
+    }
+  },
+  "native_plan": {
+    "format": "ctox.q2q4.quant-plan.v2",
+    "sha256": "207192f64fe7bde71e3d96364c7decdd99e6d7bb4e1ab8f3dc0f65148ba88316",
+    "resident_bytes": 8373072896,
+    "resident_gib": 7.798031806945801,
+    "resident_limit_bytes": 8373089075,
+    "resident_headroom_bytes": 16179,
+    "container_manifest_reserve_bytes": 2097152,
+    "package_limit_bytes": 8375186227,
+    "tensor_count": 1878,
+    "dtype_bytes": {
+      "f16": 5334016,
+      "f32": 18432,
+      "q2_b64": 6930961920,
+      "q4_b64": 1420884480,
+      "recovery_f16": 15852544
+    }
+  },
+  "artifact": {
+    "file": "coverage-10-t128-package-v2.ctoxq",
+    "bytes": 8373678080,
+    "gib": 7.798595428466797,
+    "package_headroom_bytes": 1508147,
+    "sha256": "3bdf08bb7bcb1e35c5cd5eeee3310c65796338b6f46c8d6b8eafa9a44f07b89e",
+    "rust_loader_all_tensor_checksums": "passed",
+    "recovery_scales": "identity_not_trained",
+    "mtp": "resident",
+    "vision": "separate"
+  },
+  "fold_128k_plan": {
+    "total_bytes": 10311889920,
+    "total_gib": 9.6036958694458,
+    "target_bytes": 10415295693,
+    "target_headroom_bytes": 103405773,
+    "device_measured": false
+  },
+  "gpu_budget": {
+    "ledger_entries": 31,
+    "measured_gpu_hours": 0.6407491868072086,
+    "ceiling_gpu_hours": 240.0
+  },
+  "limitations": [
+    "The 10-sample cohort is only pipeline and coverage evidence; its Q2/Q4 assignment is not a quality decision.",
+    "Recovery scales are identity values and no recovery optimization has been performed.",
+    "The artifact has not been benchmarked for model quality, inference throughput, or device residency.",
+    "The next assignment must be recomputed from the full multilingual and long-context calibration corpus."
+  ]
+}

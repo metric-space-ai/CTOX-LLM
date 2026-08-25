@@ -41,3 +41,11 @@ Nemotron and 80 German samples (162,176 observed tokens). It keeps exactly the
 same 154-Q4/352-Q2 assignment as the Nemotron-only run. This establishes useful
 assignment stability, but the head/MTP and genuine long-context coverage gaps
 still prevent recovery training from being called final.
+
+The v2 coverage smoke in
+[`docs/ACTIVATION_COVERAGE_SMOKE_V2.json`](docs/ACTIVATION_COVERAGE_SMOKE_V2.json)
+closes the tooling gap for all 506 planned matrices: embedding and LM-head
+statistics use their correct weighting modes, and the resident MTP checkpoint
+is loaded and executed fail-closed. It also verifies mixed 256-row Q2/Q4
+segments through the packer and Rust loader. Its ten short samples and identity
+recovery scales make it pipeline evidence only, not a model-quality candidate.
