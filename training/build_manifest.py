@@ -88,6 +88,11 @@ SOURCES = {
 
 GERMAN_INSTRUCT_REPO = "Beko2210/German-Instruct-Dataset"
 
+LANGUAGE_ALIASES = {
+    "eng": "en",
+    "deu": "de",
+}
+
 CATEGORY_HINTS = {
     "code": "code",
     "math": "math",
@@ -216,8 +221,8 @@ def language_for(row: dict[str, Any], default: str) -> str:
         if value is not None and str(value).strip():
             normalized = str(value).strip().lower()
             if normalized not in {"und", "unknown", "none", "n/a"}:
-                return normalized
-    return default
+                return LANGUAGE_ALIASES.get(normalized, normalized)
+    return LANGUAGE_ALIASES.get(default, default)
 
 
 def nested_metadata(row: dict[str, Any]) -> dict[str, Any]:

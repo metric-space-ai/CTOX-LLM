@@ -268,6 +268,11 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertIn("software_development", corrected[0]["labels"])
         self.assertEqual(counts, Counter({"software_development": 1}))
 
+    def test_language_for_canonicalizes_common_iso_639_3_codes(self) -> None:
+        self.assertEqual(language_for({"language_code": "eng"}, "und"), "en")
+        self.assertEqual(language_for({"language": "deu"}, "und"), "de")
+        self.assertEqual(language_for({}, "eng"), "en")
+
     def test_release_domain_rubric_covers_every_required_family(self) -> None:
         rubric = json.loads((TRAINING / "DOMAIN_RUBRIC.json").read_text())
         language_rubric = json.loads((TRAINING / "LANGUAGE_RUBRIC.json").read_text())
