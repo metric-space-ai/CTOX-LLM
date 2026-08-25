@@ -1,0 +1,179 @@
+{
+  "format": "ctox.qwen38.recovery-initializer-evidence.v2",
+  "date": "2026-08-25",
+  "status": "expanded_corpus_initializer_checkpoint",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "activation_corpus": {
+    "samples": 167,
+    "unique_samples": 167,
+    "observed_tokens": 823996,
+    "planned_quantized_matrices": 506,
+    "observed_quantized_matrices": 506,
+    "unobserved_quantized_matrices": 0,
+    "tensor_fields": 1515,
+    "runtime_profiles": 21,
+    "artifact": "multilingual-agentic-longcontext-167-all506-v2.safetensors",
+    "artifact_bytes": 31923248,
+    "artifact_sha256": "af614820c9d1319456afb57e64aad65e24ff114efe7c8284d6f15dbf297a1424",
+    "sources": [
+      {
+        "cohort": "Nemotron post-training calibration",
+        "samples": 80,
+        "observed_tokens": 547837,
+        "artifact_sha256": "60d23fdf3dd77c2e8ebd363a424d24b9ea75b568da7713d29c07711310f26b7f"
+      },
+      {
+        "cohort": "German instruction calibration",
+        "samples": 80,
+        "observed_tokens": 31182,
+        "artifact_sha256": "0e550f915ca95a512664dbe066f3b34be679985fc87c79968519b79a6d6a3da0"
+      },
+      {
+        "cohort": "Nemotron-Agentic-v1 interactive-agent smoke",
+        "samples": 2,
+        "observed_tokens": 8212,
+        "artifact_sha256": "2e054aa15378df582022fa9904f73803be26ba78a75467ed495cd87302720611"
+      },
+      {
+        "cohort": "Nemotron-SFT-Agentic-v2 interactive-agent smoke",
+        "samples": 2,
+        "observed_tokens": 7906,
+        "artifact_sha256": "a870f0a60dc108285216e26700acd1c439307e4dcb46ba3c68f16cf3a9d347b0"
+      },
+      {
+        "cohort": "procedural English 32K/64K/128K retrieval smoke",
+        "samples": 3,
+        "observed_tokens": 228859,
+        "artifact_sha256": "ad6d15c29044965d244d08a8a911dc1547c62fb51b618722a5bbf308bc8944c9"
+      }
+    ],
+    "embedding_weighting": "row-frequency",
+    "lm_head_weighting": "diagonal-input-covariance",
+    "resident_mtp_matrices_observed": 8,
+    "nested_runtime_provenance_preserved": true
+  },
+  "sensitivity": {
+    "artifact": "multilingual-agentic-longcontext-167-all506-v1.json",
+    "artifact_bytes": 1168505,
+    "artifact_sha256": "9771cfd9efacadff1c37de36da31f3dd753b032634aafcff75266dbd62b73881",
+    "candidates": 506,
+    "observed_candidates": 506,
+    "fixed_q4_candidates": 37,
+    "mixed_row_group_tensors": 2,
+    "row_group_size": 256,
+    "embedding_q2_relative_error": 2.4100229399650117,
+    "embedding_q4_relative_error": 0.0710396233296158,
+    "lm_head_q2_relative_error": 0.1381371280209024,
+    "lm_head_q4_relative_error": 0.005330654842158812,
+    "elapsed_seconds": 51.81443476676941,
+    "gpu_hours": 0.014392898546324836
+  },
+  "assignment": {
+    "format": "ctox.q2q4.assignment.v2",
+    "artifact": "multilingual-agentic-longcontext-167-all506-v1.json",
+    "artifact_bytes": 22485,
+    "artifact_sha256": "c174ba6a9dda41c9024b48ea83d3e95226bd014853a377b3c31fbced79ec834a",
+    "full_q4_matrices": 127,
+    "full_q2_matrices": 377,
+    "mixed_matrices": 2,
+    "lm_head_q4_row_groups": 970,
+    "lm_head_row_groups": 970,
+    "embedding_q4_row_groups": 97,
+    "embedding_row_groups": 970,
+    "all_q2_expected_error": 2815002.1853273055,
+    "selected_expected_error": 590735.3117432153,
+    "all_q4_expected_error": 86914.57135281157,
+    "q2_to_q4_error_gap_closed": 0.815320909119778,
+    "expected_error_reduction_from_all_q2": 0.7901474766796568,
+    "previous_assignment_expected_error": 606765.5757512718
+  },
+  "quant_plan": {
+    "artifact": "multilingual-agentic-longcontext-167-all506-v1.json",
+    "artifact_bytes": 947146,
+    "artifact_sha256": "ff12e1d47dc75ae5961c0d514425bfef06c733e964968a25dbc2f48c80f90589",
+    "resident_weights_bytes": 8373052416,
+    "resident_weights_gib": 7.798012733459473,
+    "resident_limit_bytes": 8373089075,
+    "resident_headroom_bytes": 36659,
+    "container_manifest_reserve_bytes": 2097152,
+    "q2_payload_bytes": 6930984960,
+    "q4_payload_bytes": 1420840960,
+    "recovery_scale_bytes": 15852544,
+    "mtp": "resident",
+    "vision": "separate"
+  },
+  "scale_fit": {
+    "artifact": "multilingual-agentic-longcontext-167-all506-scale-fit-v1.safetensors",
+    "artifact_bytes": 15982336,
+    "artifact_sha256": "693fd950199cbe115edc5ba83d23e0d75aae4ff4039fb4ef3e732b459a461b95",
+    "report": "multilingual-agentic-longcontext-167-all506-scale-fit-v1.json",
+    "report_bytes": 709939,
+    "report_sha256": "2dce3cbf3e86287e6446da9394d4128af53891829ab939ebfdc44724986c9464",
+    "algorithm": "activation-weighted-positive-alternating-least-squares",
+    "logical_qcodes": "fixed",
+    "iterations": 6,
+    "fitted_matrices": 506,
+    "correction_tensors": 1012,
+    "correction_values": 7926272,
+    "correction_dtype": "float16",
+    "mean_matrix_error_ratio": 0.5984636377503126,
+    "minimum_matrix_error_ratio": 0.042652847903931174,
+    "maximum_matrix_error_ratio": 0.9859721447061559,
+    "non_improved_matrices": 0,
+    "baseline_weighted_squared_error": 590735.3120631264,
+    "recovered_weighted_squared_error": 308030.1111616845,
+    "global_weighted_error_ratio": 0.5214350740027679,
+    "global_weighted_error_reduction": 0.4785649259972321,
+    "observed_scale_min": 0.25,
+    "observed_scale_max": 3.2421875,
+    "lower_clamped_values": 18443,
+    "upper_clamped_values": 0,
+    "nonfinite_values": 0,
+    "elapsed_seconds": 295.8658535480499,
+    "gpu_hours": 0.08218495931890275
+  },
+  "packed_checkpoint": {
+    "artifact": "multilingual-agentic-longcontext-167-all506-scale-fit-v1.ctoxq",
+    "artifact_bytes": 8373658112,
+    "artifact_gib": 7.798576831817627,
+    "artifact_sha256": "653b074ad3396c09772a3410fdc754e2e96dedfbfe363de935e84def75e1b69e",
+    "package_limit_bytes": 8375186227,
+    "package_headroom_bytes": 1528115,
+    "manifest_bytes": 605431,
+    "data_offset": 605696,
+    "alignment": 256,
+    "tensors": 1878,
+    "packing_seconds": 50.480854988098145,
+    "packing_gpu_hours": 0.014022459718916152
+  },
+  "verification": {
+    "rust_loader_all_tensor_sha256": "passed",
+    "rust_manifest_recovery_provenance": "passed",
+    "recovery_tensor_names_shapes_dtypes": "1012_of_1012_exact",
+    "embedded_recovery_bytes_compared": 15852544,
+    "embedded_recovery_byte_mismatches": 0,
+    "gpu_memory_after_pack_mib": [
+      91,
+      15,
+      15
+    ],
+    "fold_128k_calculated_total_bytes": 10311869440,
+    "fold_128k_calculated_total_gib": 9.603676795959473,
+    "fold_128k_target_gib": 9.7,
+    "fold_128k_hard_limit_gib": 10.0
+  },
+  "gpu_budget": {
+    "successful_gpu_hours_to_date": 4.737945063776439,
+    "failed_gpu_hours_to_date": 0.4189879898230235,
+    "total_gpu_hours_to_date": 5.156933053599463,
+    "maximum_gpu_hours": 240.0
+  },
+  "limitations": [
+    "This remains a deterministic channel-scale initializer, not the end-to-end recovered release checkpoint.",
+    "Only four agentic/tool-calling activation samples are present; the release-size agentic cohort is not complete.",
+    "The scale fit has not consumed logit-KL, cross-entropy, selected hidden-state, or explicit MTP distillation targets.",
+    "The 9.6037-GiB Fold value is a calculated whole-process plan, not measured Android PSS or accelerator residency.",
+    "No held-out Agentic, tool-calling, German, code, general-quality, or 128K retrieval release gate has passed."
+  ]
+}

@@ -21,6 +21,9 @@ SEMANTIC_METADATA_FIELDS = (
     "fla_kernel",
 )
 RUNTIME_METADATA_FIELDS = (
+    "max_length",
+    "start_sample",
+    "max_samples",
     "gpu_weight_memory_gib",
     "cpu_offload_memory_gib",
     "mtp_device",
@@ -34,6 +37,21 @@ RUNTIME_METADATA_FIELDS = (
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def source_runtime_profiles(metadata: dict[str, str]) -> list[dict[str, str | None]]:
+    nested = metadata.get("source_runtime_profiles")
+    if nested is None:
+        return [{field: metadata.get(field) for field in RUNTIME_METADATA_FIELDS}]
+    profiles = json.loads(nested)
+    if not isinstance(profiles, list) or not all(
+        isinstance(profile, dict) for profile in profiles
+    ):
+        raise ValueError("source_runtime_profiles must be a JSON list of objects")
+    return [
+        {field: profile.get(field) for field in RUNTIME_METADATA_FIELDS}
+        for profile in profiles
+    ]
 
 
 def merged_metadata(
@@ -89,9 +107,7 @@ def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file
             sample_ids.extend(batch_ids)
             total_tokens += int(metadata["tokens"])
             input_hashes.append(sha256(path))
-            runtime_profiles.append(
-                {field: metadata.get(field) for field in RUNTIME_METADATA_FIELDS}
-            )
+            runtime_profiles.extend(source_runtime_profiles(metadata))
             bases = [key.removesuffix(".token_count") for key in keys if key.endswith(".token_count")]
             for base in bases:
                 count = int(source.get_tensor(f"{base}.token_count")[0])

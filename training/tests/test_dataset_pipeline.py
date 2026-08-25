@@ -30,7 +30,7 @@ from collect_activation_stats import (  # noqa: E402
     quantized_source_names,
 )
 from materialize_prompts import load_manifests  # noqa: E402
-from merge_activation_stats import merged_metadata  # noqa: E402
+from merge_activation_stats import merged_metadata, source_runtime_profiles  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
 from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_bytes  # noqa: E402
 from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
@@ -299,8 +299,8 @@ class DatasetPipelineTests(unittest.TestCase):
             12,
             ["1" * 64, "2" * 64],
             [
-                {"gpu_weight_memory_gib": "16"},
-                {"gpu_weight_memory_gib": "9"},
+                {"gpu_weight_memory_gib": "16", "max_length": "2048"},
+                {"gpu_weight_memory_gib": "9", "max_length": "131072"},
             ],
         )
         self.assertNotIn("gpu_weight_memory_gib", metadata)
@@ -309,6 +309,30 @@ class DatasetPipelineTests(unittest.TestCase):
             [profile["gpu_weight_memory_gib"] for profile in json.loads(metadata["source_runtime_profiles"])],
             ["16", "9"],
         )
+        self.assertEqual(
+            [
+                profile["max_length"]
+                for profile in json.loads(metadata["source_runtime_profiles"])
+            ],
+            ["2048", "131072"],
+        )
+
+    def test_nested_activation_merge_preserves_leaf_runtime_profiles(self) -> None:
+        metadata = {
+            "source_runtime_profiles": json.dumps(
+                [
+                    {"max_length": "2048", "gpu_weight_memory_gib": "16"},
+                    {"max_length": "131072", "gpu_weight_memory_gib": "9"},
+                ]
+            )
+        }
+        profiles = source_runtime_profiles(metadata)
+        self.assertEqual(len(profiles), 2)
+        self.assertEqual(
+            [profile["max_length"] for profile in profiles],
+            ["2048", "131072"],
+        )
+        self.assertIn("cuda_memory", profiles[0])
 
     def test_mtp_names_map_to_frozen_checkpoint(self) -> None:
         self.assertEqual(

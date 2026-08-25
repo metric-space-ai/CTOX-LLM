@@ -69,3 +69,13 @@ activation-weighted objective, the packed text+MTP artifact remains below 7.8
 GiB, and the Rust loader verifies every tensor checksum. It remains a smoke
 initializer: end-to-end KL/CE/hidden/MTP recovery and the release-size
 multilingual quality gates have not run.
+
+The expanded initializer in
+[`docs/RECOVERY_INITIALIZER_V2.json`](docs/RECOVERY_INITIALIZER_V2.json) merges
+167 unique Nemotron, German, Agentic, and genuine long-context samples with
+823,996 observed tokens. All 506 matrices, including embedding, LM head, and
+resident MTP, are activation weighted. The resulting 127-Q4/377-Q2/two-mixed
+assignment and trained channel-scale initializer produce a fully checksummed
+8,373,658,112-byte CTOXQ artifact and a calculated 9.6037-GiB 128K whole-process
+plan. It is still not the release checkpoint: end-to-end KL, cross-entropy,
+hidden-state, and MTP distillation plus held-out quality gates remain pending.

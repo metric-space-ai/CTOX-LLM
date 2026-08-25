@@ -15,15 +15,15 @@ paths needed to build them.
 |---|---|---|
 | BF16 origin | `Qwen/Qwen3.8-27B` revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | Frozen tokenizer, template, special-token, and model-file digests in one release manifest |
 | Native baseline | 8,342,484,480-byte CTOXQ file; 8,342,086,656 resident bytes; text plus MTP; SHA-256 `02d38cc877ad2ae8bea244bc11d4572ca0a8c84e757bdfbcb27ebbb9ed8c47f6` | Recovery scales are identity values; this is not the quality checkpoint |
-| Candidate assignment | 154 Q4 and 352 Q2 matrices; exact planned layout 8,372,888,576 bytes (7.797860 GiB) | Pack it, train recovery, evaluate it, and prove the final logical digest |
-| Recovery data | 80 Nemotron samples/130,994 capped tokens plus a materialized 80-sample German supplement | German contribution, real long-context samples, MTP/head coverage, teacher cache, recovery training, and release-quality evaluation |
+| Expanded initializer | 167 unique samples/823,996 observed tokens; all 506 matrices covered; 127 Q4, 377 Q2, and two mixed matrices; 8,373,052,416 resident bytes; fully checksummed 8,373,658,112-byte CTOXQ pack | Release-size agentic and teacher cohorts, end-to-end KL/CE/hidden/MTP recovery, held-out evaluation, and final logical digest |
+| Recovery data | 80 Nemotron, 80 German, four tool-schema-complete Agentic, and three genuine 32K/64K/128K samples; exact nested runtime provenance | Expand Agentic/code/math coverage, cache release-size sparse BF16 teacher targets, split train/evaluation, and run release-quality evaluation |
 | CPU | Scalar oracle plus experimental packed AVX2/NEON Q2/Q4 matvec | Complete graph operations, ISA profiles, end-to-end correctness, and production benchmark |
 | CUDA | Pinned upstream reference sources and SM86 ABI contract | CTOX Q2_B64/Q4_B64 kernels, graph execution, verifier, and GPU3 benchmark |
 | Metal | Compilable Q2/Q4 MSL candidate | Runtime dispatch, same-device numerical evidence, full graph, and benchmark |
 | Snapdragon | QNN/Vulkan/AHardwareBuffer contract | Exact Fold SoC support, compiled HTP/Vulkan graph, shared-memory proof, and device measurements |
 | Runtime | Loader, memory planner, wire types, and bring-up server | Stable `Engine` ABI, tokenizer, full decoder, MTP verification, streaming, cancellation, session reset, and complete unload |
 
-The reported 9.5748-GiB baseline and 9.6035-GiB candidate 128K figures are
+The reported 9.5748-GiB baseline and 9.6037-GiB initializer 128K figures are
 verified calculations, not measured RSS/PSS/VRAM peaks. Likewise, the planned
 9.6976-GiB vision phase is not yet Android device evidence.
 
@@ -257,10 +257,13 @@ logical checkpoint and manifest contract are frozen.
 
 The immediate execution batch is:
 
-1. collect German activation statistics;
-2. merge German and Nemotron statistics;
-3. add genuine long-context and explicit MTP/head calibration coverage;
-4. recompute the byte-exact Q2/Q4 assignment;
-5. begin the first bounded recovery-training ablation;
-6. implement the v2 manifest and `Engine` lifecycle fixtures in parallel with
-   the GPU runs.
+1. expand the release-eligible Agentic, tool-calling, bilingual-code, and
+   mathematics cohorts and freeze disjoint train/evaluation splits;
+2. cache sparse BF16 top-64 logits and selected hidden targets for that cohort,
+   including explicit resident-MTP targets;
+3. replace the layer-only recovery placeholder with a complete fixed-qcode
+   student graph consuming KL, cross-entropy, hidden, activation, and MTP loss;
+4. run bounded recovery ablations from the verified 167-sample initializer;
+5. evaluate held-out quality before freezing the final logical checkpoint;
+6. complete the v2 release manifest and embeddable `Engine` lifecycle while GPU
+   recovery runs proceed.
