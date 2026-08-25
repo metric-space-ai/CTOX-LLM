@@ -47,12 +47,22 @@ from plan_teacher_batches import batches as plan_teacher_batches  # noqa: E402
 from prompt_format import normalize_content, normalize_messages, normalize_tool_call  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
 from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
+try:  # Optional local training dependency; exercised in the pinned GPU venv.
+    import torch  # noqa: E402
+    from recovery_modules import (  # noqa: E402
+        normalized_hidden_loss,
+        sparse_teacher_kl,
+        supervised_next_token_loss,
+    )
+except ModuleNotFoundError:
+    torch = None
 from pack_checkpoint import validate_recovery_source  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
 from split_manifests import split  # noqa: E402
 from teacher_runtime import FLA_KERNEL_REVISION, weight_max_memory  # noqa: E402
+from teacher_cache_dataset import VerifiedTeacherCache  # noqa: E402
 from verify_vendor_manifest import verify  # noqa: E402
 from verify_local_model import root_digest  # noqa: E402
 from verify_teacher_cache import expected_tensor_specs  # noqa: E402
@@ -360,6 +370,80 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertTrue(completed_batch_matches(run, verification, batch, "r", "p"))
         verification["samples"] = 31
         self.assertFalse(completed_batch_matches(run, verification, batch, "r", "p"))
+
+    def test_sparse_teacher_losses_preserve_topk_and_residual_semantics(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+
+        probabilities = torch.tensor([[[0.5, 0.3, 0.2]]])
+        logits = probabilities.log()
+        indices = torch.tensor([[[0, 1]]], dtype=torch.int32)
+        teacher_logprobs = probabilities[:, :, :2].log().to(torch.bfloat16)
+        residual = torch.tensor([[0.2]], dtype=torch.float32)
+        self.assertLess(
+            float(sparse_teacher_kl(logits, indices, teacher_logprobs, residual)),
+            2e-3,
+        )
+        changed = torch.tensor([[[0.2, 0.3, 0.5]]]).log()
+        self.assertGreater(
+            float(sparse_teacher_kl(changed, indices, teacher_logprobs, residual)),
+            0.1,
+        )
+
+    def test_supervised_and_hidden_recovery_losses_use_recorded_positions(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+
+        input_ids = torch.tensor([[4, 2, 1]])
+        logits = torch.full((1, 2, 5), -10.0)
+        logits[0, 0, 2] = 10.0
+        logits[0, 1, 1] = 10.0
+        self.assertLess(
+            float(supervised_next_token_loss(logits, input_ids, torch.tensor([0, 1]))),
+            1e-6,
+        )
+        hidden = torch.randn(1, 3, 8)
+        self.assertLess(float(normalized_hidden_loss(hidden, hidden)), 1e-6)
+
+    def test_verified_teacher_cache_rejects_duplicate_or_changed_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            cache.mkdir()
+            sample_id = "a" * 64
+            artifact = cache / f"{sample_id}.safetensors"
+            artifact.write_bytes(b"fixed")
+            item = {
+                "id": sample_id,
+                "file": artifact.name,
+                "bytes": 5,
+                "sha256": hashlib.sha256(b"fixed").hexdigest(),
+            }
+            verification = root / "verification.json"
+            verification.write_text(
+                json.dumps(
+                    {
+                        "format": "ctox.teacher-cache-verification.v1",
+                        "status": "passed",
+                        "teacher_revision": "r",
+                        "teacher_provenance_sha256": "p",
+                        "cache": str(cache),
+                        "samples": 1,
+                        "artifact_bytes": 5,
+                        "artifact_root_sha256": "z",
+                        "artifacts": [item],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            dataset = VerifiedTeacherCache([verification], "r", "p")
+            self.assertEqual(dataset.verified_artifact_path(0), artifact.resolve())
+            self.assertEqual(dataset.manifest()["samples"], 1)
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                VerifiedTeacherCache([verification, verification], "r", "p")
+            artifact.write_bytes(b"other")
+            with self.assertRaisesRegex(ValueError, "content"):
+                dataset.verified_artifact_path(0)
 
     def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

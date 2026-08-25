@@ -119,6 +119,17 @@ runs the content verifier. It skips existing work only when the completed run,
 source slice, teacher revision, provenance hash, and verification sample count
 all agree; partial directories stop the orchestrator for inspection.
 
+The end-to-end loss contract uses the teacher's exact top-k probabilities plus
+one residual-vocabulary mass bucket; dropping the residual would not be a valid
+KL approximation. Cross entropy targets the recorded `p -> token[p+1]`
+positions, while hidden reconstruction is signal-normalized and includes a
+directional penalty. The same sparse KL contract applies to every verifiable
+MTP draft target.
+`teacher_cache_dataset.py` is the training-side content boundary. It accepts
+only passed verification documents with one teacher revision and provenance,
+rejects duplicate sample identities and unsafe paths, and rechecks each
+artifact's exact byte length and SHA-256 when that sample is opened.
+
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized
 teacher input; changing a function name or JSON schema therefore invalidates
