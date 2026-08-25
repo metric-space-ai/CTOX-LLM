@@ -57,6 +57,23 @@ pub struct MtpIdentity {
     pub layers: u32,
     pub logical_sha256: String,
     pub every_draft_token_verified: bool,
+    pub draft_vocabulary: MtpDraftVocabularyIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MtpDraftVocabularyIdentity {
+    /// Canonical little-endian u32 token IDs in strictly increasing order.
+    pub token_ids: ReleaseFile,
+    pub source_teacher_cache_set_sha256: String,
+    pub token_count: u32,
+    pub observed_output_tokens: u64,
+    pub overall_coverage_ppm: u32,
+    pub code_coverage_ppm: u32,
+    pub minimum_domain_coverage_ppm: u32,
+    pub minimum_language_coverage_ppm: u32,
+    /// Restricted rows may propose tokens only; target verification remains
+    /// full-vocabulary and therefore preserves greedy semantics exactly.
+    pub target_verified_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +469,30 @@ impl ReleaseManifest {
         {
             return invalid("quantization or resident MTP identity is invalid");
         }
+        let draft_vocabulary = &self.model.mtp.draft_vocabulary;
+        let expected_draft_bytes = u64::from(draft_vocabulary.token_count)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .ok_or_else(|| {
+                EngineError::InvalidArtifact("MTP draft vocabulary size overflows".into())
+            })?;
+        draft_vocabulary.token_ids.validate()?;
+        if draft_vocabulary.token_count == 0
+            || draft_vocabulary.token_count as usize >= Qwen38Config::default().vocab_size
+            || draft_vocabulary.token_ids.bytes != expected_draft_bytes
+            || !valid_sha256(&draft_vocabulary.source_teacher_cache_set_sha256)
+            || draft_vocabulary.observed_output_tokens == 0
+            || ![
+                draft_vocabulary.overall_coverage_ppm,
+                draft_vocabulary.code_coverage_ppm,
+                draft_vocabulary.minimum_domain_coverage_ppm,
+                draft_vocabulary.minimum_language_coverage_ppm,
+            ]
+            .into_iter()
+            .all(|coverage| coverage > 0 && coverage <= 1_000_000)
+            || !draft_vocabulary.target_verified_only
+        {
+            return invalid("MTP draft vocabulary identity is invalid");
+        }
         if !valid_sha256(&self.tokenizer.tokenizer_root_sha256)
             || !valid_sha256(&self.tokenizer.chat_template_sha256)
             || self.tokenizer.reasoning_format.is_empty()
@@ -473,6 +514,7 @@ impl ReleaseManifest {
             }
         }
         let mut file_paths = HashSet::new();
+        file_paths.insert(&draft_vocabulary.token_ids.relative_path);
         for file in &self.tokenizer.files {
             file.validate()?;
             if !file_paths.insert(&file.relative_path) {
@@ -714,6 +756,17 @@ mod tests {
                     layers: 1,
                     logical_sha256: digest('1'),
                     every_draft_token_verified: true,
+                    draft_vocabulary: MtpDraftVocabularyIdentity {
+                        token_ids: file("model/mtp-draft-token-ids.u32le", 160_000, '9'),
+                        source_teacher_cache_set_sha256: digest('8'),
+                        token_count: 40_000,
+                        observed_output_tokens: 5_000_000,
+                        overall_coverage_ppm: 975_000,
+                        code_coverage_ppm: 960_000,
+                        minimum_domain_coverage_ppm: 900_000,
+                        minimum_language_coverage_ppm: 900_000,
+                        target_verified_only: true,
+                    },
                 },
             },
             tokenizer: TokenizerContract {
@@ -852,6 +905,27 @@ mod tests {
         let mut changed = decoded;
         changed.tokenizer.chat_template_sha256 = digest('5');
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn release_binds_canonical_restricted_mtp_vocabulary() {
+        let mut wrong_size = manifest();
+        wrong_size.model.mtp.draft_vocabulary.token_ids.bytes -= 4;
+        wrong_size.seal_unsigned().unwrap();
+        assert!(wrong_size.validate().is_err());
+
+        let mut full_vocab = manifest();
+        full_vocab.model.mtp.draft_vocabulary.token_count =
+            Qwen38Config::default().vocab_size as u32;
+        full_vocab.model.mtp.draft_vocabulary.token_ids.bytes =
+            full_vocab.model.mtp.draft_vocabulary.token_count as u64 * 4;
+        full_vocab.seal_unsigned().unwrap();
+        assert!(full_vocab.validate().is_err());
+
+        let mut unverified = manifest();
+        unverified.model.mtp.draft_vocabulary.target_verified_only = false;
+        unverified.seal_unsigned().unwrap();
+        assert!(unverified.validate().is_err());
     }
 
     #[test]

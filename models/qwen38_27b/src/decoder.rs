@@ -1090,7 +1090,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                     EngineError::InvalidState("MTP draft chain ended early".into())
                 })?;
                 let candidate = greedy_token(&draft)?;
-                draft_logits.push(draft);
+                draft_logits.push(draft.into());
                 candidate_tokens.push(candidate);
                 let absolute_position = target_branch.position();
                 let next_draft = if depth + 1 < self.admitted_draft_tokens {
@@ -1699,7 +1699,7 @@ mod tests {
             .iter()
             .zip(&accepted.target_verification_logits)
         {
-            assert_eq!(greedy_token(draft).unwrap(), greedy_token(target).unwrap());
+            assert_eq!(draft.greedy_token().unwrap(), greedy_token(target).unwrap());
         }
         executor
             .commit_speculative(2, &CancellationToken::default())

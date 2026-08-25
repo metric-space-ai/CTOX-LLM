@@ -41,8 +41,14 @@ An executor returns target logits and, when enabled, a candidate block, the
 target verification distribution at every candidate position, and the target
 bonus distribution after the complete block. It cannot claim acceptance
 itself: sampling and causal-prefix verification belong to the engine. The
-executor retains the corresponding speculative state branch until the engine
-calls `commit_speculative(accepted_prefix_len)`. Rejection retains only the
+draft distribution may be complete or a release-bound restricted list of
+global token IDs and scores. Restricted IDs must be strictly increasing,
+unique, in-vocabulary, and paired one-to-one with finite scores. Target and
+bonus distributions always remain full-vocabulary; consequently an omitted
+draft token causes rejection/fallback rather than changing target semantics.
+The signed release binds the exact ID file and multilingual/domain coverage.
+The executor retains the corresponding speculative state branch until the
+engine calls `commit_speculative(accepted_prefix_len)`. Rejection retains only the
 already processed input and discards the branch; acceptance commits exactly
 the accepted target prefix and advances the MTP cache through the same prefix.
 An error or cancellation invalidates the complete session rather than leaving

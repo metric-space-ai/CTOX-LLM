@@ -238,6 +238,15 @@ closed.
 The trainer reopens that set only with its expected manifest SHA-256, then
 reconstructs and compares the sample count, artifact bytes, content root, and
 every underlying batch-verification hash before the first optimization step.
+`build_mtp_draft_vocab.py` consumes that same exact rehashed cache-set contract
+plus the frozen materialized records and domain tags. It counts only the final
+assistant suffix rendered by the pinned Qwen template, scores tokens jointly
+over overall, coding, per-domain, and per-language output distributions, and
+emits strictly increasing little-endian u32 IDs. Overall, coding,
+minimum-domain, and minimum-language coverage are independent fail-closed
+gates. The resulting rows accelerate MTP proposals only; the Rust engine still
+verifies every proposal with the complete target vocabulary, so restricted
+drafting cannot alter greedy target semantics.
 For bounded smoke tests and named ablations, repeatable `train_recovery.py
 --sample-id <verified-id>` restricts the deterministic epoch order to those
 exact cache identities. Every requested ID must exist in the admitted cache

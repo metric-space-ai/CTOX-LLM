@@ -11,6 +11,9 @@ The binding `ctox.model-release.v2` identity includes:
 - the BF16 repository, immutable revision, and verified root digest;
 - the logical Q2/Q4 checkpoint, logical tensor root, fixed-code recovery, and
   resident MTP identity;
+- a canonical restricted MTP draft vocabulary: exact u32-LE token-ID file,
+  teacher-cache-set hash, observed-token count, and overall/code/minimum-domain/
+  minimum-language coverage;
 - tokenizer files, special-token IDs, chat template, reasoning format, and
   tool-call format;
 - separately selectable text+MTP and vision packages;
@@ -20,6 +23,13 @@ The binding `ctox.model-release.v2` identity includes:
 
 Q3 is unrepresentable in the release quantization enum. Every text pack must
 carry MTP and reference the same logical checkpoint and tensor-root digests.
+Restricted MTP rows are proposal-only: every proposed token is compared with
+the full-vocabulary target distribution, so an uncovered token causes a normal
+speculative rejection and cannot change greedy model semantics. Token IDs must
+be strictly increasing at runtime and their file is signed as part of the
+canonical model identity. `training/build_mtp_draft_vocab.py` constructs that
+file only from the exact, fully rehashed teacher-cache recovery cohort and
+fails closed on coding, domain, language, or overall coverage gaps.
 The validator rejects backend requantization, more than one resident full-model
 copy, a retained full CPU copy, unsafe paths, chunk gaps, duplicate IDs,
 unprofiled packs, or a calculated peak above the declared hard limit.

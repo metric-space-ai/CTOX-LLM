@@ -68,14 +68,84 @@ impl AllocationSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorStep {
     pub target_logits: Vec<f32>,
-    /// Unverified chained draft distributions.
-    pub draft_logits: Vec<Vec<f32>>,
+    /// Unverified chained draft distributions. A restricted distribution
+    /// evaluates only release-bound LM-head rows; every proposed token is
+    /// still checked against the complete target distribution below.
+    pub draft_logits: Vec<DraftDistribution>,
     /// Target distributions for the same candidate positions. Element zero
     /// must equal `target_logits`.
     pub target_verification_logits: Vec<Vec<f32>>,
     /// Target distribution after all candidate tokens. The engine consumes it
     /// only when every draft is accepted.
     pub bonus_logits: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DraftDistribution {
+    Full(Vec<f32>),
+    Restricted {
+        /// Strictly increasing canonical token IDs bound by the release.
+        token_ids: Vec<u32>,
+        /// One score for every token ID, in exactly the same order.
+        logits: Vec<f32>,
+    },
+}
+
+impl From<Vec<f32>> for DraftDistribution {
+    fn from(logits: Vec<f32>) -> Self {
+        Self::Full(logits)
+    }
+}
+
+impl DraftDistribution {
+    pub fn evaluated_tokens(&self) -> usize {
+        match self {
+            Self::Full(logits) | Self::Restricted { logits, .. } => logits.len(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.evaluated_tokens()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn is_restricted(&self) -> bool {
+        matches!(self, Self::Restricted { .. })
+    }
+
+    fn validate(&self, vocab_size: usize) -> bool {
+        match self {
+            Self::Full(logits) => {
+                logits.len() == vocab_size && logits.iter().all(|value| value.is_finite())
+            }
+            Self::Restricted { token_ids, logits } => {
+                !token_ids.is_empty()
+                    && token_ids.len() == logits.len()
+                    && token_ids.iter().all(|token| (*token as usize) < vocab_size)
+                    && token_ids.windows(2).all(|pair| pair[0] < pair[1])
+                    && logits.iter().all(|value| value.is_finite())
+            }
+        }
+    }
+
+    pub(crate) fn greedy_token(&self) -> Result<u32> {
+        let (token_ids, logits) = match self {
+            Self::Full(logits) => (None, logits.as_slice()),
+            Self::Restricted { token_ids, logits } => {
+                (Some(token_ids.as_slice()), logits.as_slice())
+            }
+        };
+        let index = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index)
+            .ok_or_else(|| EngineError::InvalidArtifact("MTP draft logits are empty".into()))?;
+        Ok(token_ids.map_or(index as u32, |ids| ids[index]))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,10 +171,10 @@ impl ExecutorStep {
                 || self.draft_logits.len() > capabilities.maximum_draft_tokens as usize
                 || self.target_verification_logits.len() != self.draft_logits.len()
                 || self.target_verification_logits.first() != Some(&self.target_logits)
-                || self.draft_logits.iter().any(|logits| {
-                    logits.len() != capabilities.vocab_size
-                        || logits.iter().any(|value| !value.is_finite())
-                })
+                || self
+                    .draft_logits
+                    .iter()
+                    .any(|distribution| !distribution.validate(capabilities.vocab_size))
                 || self.target_verification_logits.iter().any(|logits| {
                     logits.len() != capabilities.vocab_size
                         || logits.iter().any(|value| !value.is_finite())
@@ -674,7 +744,7 @@ fn verify_greedy_mtp(output: &ExecutorStep) -> Result<(u32, u32, Vec<u32>)> {
         .iter()
         .zip(&output.target_verification_logits)
     {
-        let draft = greedy_token(draft_logits)?;
+        let draft = draft_logits.greedy_token()?;
         let target = greedy_token(target_logits)?;
         verified += 1;
         if draft != target {
@@ -723,11 +793,11 @@ mod tests {
             ExecutorStep {
                 target_logits: target_logits.clone(),
                 draft_logits: if mtp {
-                    vec![if self.reject_draft {
+                    vec![DraftDistribution::Full(if self.reject_draft {
                         vec![0.0, 2.0, 1.0]
                     } else {
                         vec![0.0, 1.0, 2.0]
-                    }]
+                    })]
                 } else {
                     Vec::new()
                 },
@@ -924,10 +994,10 @@ mod tests {
         let output = ExecutorStep {
             target_logits: target.clone(),
             draft_logits: vec![
-                vec![0.0, 1.0, 2.0],
-                vec![0.0, 1.0, 2.0],
-                vec![0.0, 2.0, 1.0],
-                vec![0.0, 1.0, 2.0],
+                vec![0.0, 1.0, 2.0].into(),
+                vec![0.0, 1.0, 2.0].into(),
+                vec![0.0, 2.0, 1.0].into(),
+                vec![0.0, 1.0, 2.0].into(),
             ],
             target_verification_logits: vec![target; 4],
             bonus_logits: Some(vec![0.0, 2.0, 1.0]),
@@ -938,13 +1008,79 @@ mod tests {
         assert_eq!(accepted, vec![2, 2]);
 
         let all_accepted = ExecutorStep {
-            draft_logits: output.target_verification_logits.clone(),
+            draft_logits: output
+                .target_verification_logits
+                .iter()
+                .cloned()
+                .map(DraftDistribution::Full)
+                .collect(),
             ..output
         };
         let (token, verified, accepted) = verify_greedy_mtp(&all_accepted).unwrap();
         assert_eq!(token, 1);
         assert_eq!(verified, 4);
         assert_eq!(accepted, vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn restricted_mtp_vocab_maps_scores_to_global_tokens_and_stays_exact() {
+        let target = vec![0.0, 0.1, 0.2, 0.3, 2.0, 0.4];
+        let output = ExecutorStep {
+            target_logits: target.clone(),
+            draft_logits: vec![DraftDistribution::Restricted {
+                token_ids: vec![1, 4],
+                logits: vec![0.0, 3.0],
+            }],
+            target_verification_logits: vec![target],
+            bonus_logits: Some(vec![0.0, 0.1, 0.2, 3.0, 0.4, 0.5]),
+        };
+        let capabilities = ExecutorCapabilities {
+            vocab_size: 6,
+            maximum_context_tokens: 16,
+            mtp: true,
+            maximum_draft_tokens: 1,
+            cancellation: true,
+            session_reset: true,
+            no_hidden_fallbacks: true,
+        };
+        output.validate(&capabilities, true).unwrap();
+        let (token, verified, accepted) = verify_greedy_mtp(&output).unwrap();
+        assert_eq!(token, 3);
+        assert_eq!(verified, 1);
+        assert_eq!(accepted, vec![4]);
+
+        let mut miss = output;
+        miss.target_logits = vec![0.0, 0.1, 0.2, 0.3, 0.4, 4.0];
+        miss.target_verification_logits = vec![miss.target_logits.clone()];
+        let (token, verified, accepted) = verify_greedy_mtp(&miss).unwrap();
+        assert_eq!(token, 5);
+        assert_eq!(verified, 1);
+        assert!(accepted.is_empty());
+    }
+
+    #[test]
+    fn restricted_mtp_vocab_rejects_noncanonical_or_invalid_ids() {
+        let capabilities = ExecutorCapabilities {
+            vocab_size: 6,
+            maximum_context_tokens: 16,
+            mtp: true,
+            maximum_draft_tokens: 1,
+            cancellation: true,
+            session_reset: true,
+            no_hidden_fallbacks: true,
+        };
+        for token_ids in [vec![4, 1], vec![1, 1], vec![1, 6], Vec::new()] {
+            let output = ExecutorStep {
+                target_logits: vec![0.0; 6],
+                draft_logits: vec![DraftDistribution::Restricted {
+                    logits: vec![0.0; token_ids.len()],
+                    token_ids,
+                }],
+                target_verification_logits: vec![vec![0.0; 6]],
+                bonus_logits: Some(vec![0.0; 6]),
+            };
+            assert!(output.validate(&capabilities, true).is_err());
+        }
     }
 
     #[test]

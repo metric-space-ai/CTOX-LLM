@@ -164,11 +164,15 @@ evidence is 593/2,328 complete.
    LM head, and chained MTP draft/block-target verification. The scalar MTP4
    replay path remains the oracle; production MTP4 must replay the accepted
    prefix from one FP16 target-state checkpoint on the Fold profile.
-3. Implement paged Q2 KV with Q4 sink/recent pages, exact linear-attention
+3. Build the canonical restricted MTP draft vocabulary from the final teacher
+   cohort, require overall/coding/per-domain/per-language coverage, and gather
+   only those LM-head rows for proposals. Full target verification remains
+   mandatory and preserves exact greedy output.
+4. Implement paged Q2 KV with Q4 sink/recent pages, exact linear-attention
    state, bounded prefill/decode arenas, cancellation, and one active session.
-4. Make the scalar path the test oracle only. Production policy fails closed
+5. Make the scalar path the test oracle only. Production policy fails closed
    if any graph operation lacks a promoted backend implementation.
-5. Implement deterministic ownership so `unload` returns allocator usage to
+6. Implement deterministic ownership so `unload` returns allocator usage to
    the pre-load baseline.
 
 **Exit evidence**

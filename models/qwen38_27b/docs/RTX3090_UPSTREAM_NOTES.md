@@ -20,6 +20,11 @@ itself prove that every operation reaches the RTX 3090 roofline.
 - The single native MTP module is chained for several speculative tokens
   (`single-user/start_qwen.sh`, `DRAFT_TOKENS`, default 4). A one-layer
   checkpoint therefore does not imply a one-token production scheduler.
+- The draft vocabulary must be derived from the model's own multilingual,
+  coding, agentic, and ordinary outputs rather than generic web frequency.
+  CTOX now binds a canonical restricted token list and its per-domain/language
+  coverage in the signed release. The restricted LM head proposes only;
+  full-target verification preserves exact greedy output.
 - Multi-query target verification benefits from a split-KV attention path
   because ordinary FlashAttention underutilizes SM86 for the short verify
   block (`docs/optimizations.md`, item 6).
@@ -54,3 +59,6 @@ bytes moved, device bandwidth/compute ceilings, and same-hardware benchmarks.
 4. Benchmark projection, recurrent update, attention, and whole-token traffic
    separately. No aggregate tokens/s result may hide an operation below its
    roofline gate.
+5. Gather only the release-bound LM-head rows during MTP draft steps, while
+   retaining the complete LM head for target and bonus logits. Measure both
+   proposal coverage and the saved bytes per speculative step.
