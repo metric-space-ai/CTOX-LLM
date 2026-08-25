@@ -5,7 +5,7 @@ use std::path::Path;
 use memmap2::{Mmap, MmapOptions};
 use sha2::{Digest, Sha256};
 
-use crate::backend::ScaleSlice;
+use crate::backend::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::{
     FileHeader, ModelManifest, QuantSegment, TensorDType, TensorEntry, HEADER_BYTES,
 };
@@ -110,6 +110,29 @@ pub struct RecoveredMatrixView<'a> {
     pub matrix: QuantizedMatrixView<'a>,
     pub s_in: FloatTensorView<'a>,
     pub s_out: FloatTensorView<'a>,
+}
+
+impl<'a> RecoveredMatrixView<'a> {
+    /// Construct one fused projection directly from mmap-backed quant codes
+    /// and FP16 recovery scales. The input may have a shorter lifetime than
+    /// the artifact; no model tensor is copied or repacked.
+    pub fn operation<'b>(self, input: &'b [f32], activation: Activation) -> Result<FusedMatVec<'b>>
+    where
+        'a: 'b,
+    {
+        Ok(FusedMatVec {
+            dtype: self.matrix.dtype,
+            weights: self.matrix.weights,
+            segments: self.matrix.segments,
+            rows: self.matrix.rows,
+            columns: self.matrix.columns,
+            input,
+            s_in: Some(self.s_in.as_recovery_scales()?),
+            s_out: Some(self.s_out.as_recovery_scales()?),
+            bias: None,
+            activation,
+        })
+    }
 }
 
 impl ModelArtifact {
@@ -282,6 +305,8 @@ impl ModelArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::cpu::CpuBackend;
+    use crate::backend::Backend;
     use crate::format::{ArtifactBuilder, PackedTensor, DEFAULT_ALIGNMENT};
     use crate::quant::{Q2Block64, BLOCK_LEN};
 
@@ -363,6 +388,13 @@ mod tests {
         assert!(artifact.tensor("missing").is_err());
         assert!(artifact.quantized_matrix("A_log").is_err());
         assert!(artifact.float_tensor("linear.weight").is_err());
+
+        let input = [1.0_f32; BLOCK_LEN];
+        let operation = recovered.operation(&input, Activation::Identity).unwrap();
+        let output = CpuBackend::scalar_verifier()
+            .fused_matvec(&operation)
+            .unwrap();
+        assert!((output[0] - 48.0).abs() < 1e-6);
     }
 
     #[test]
