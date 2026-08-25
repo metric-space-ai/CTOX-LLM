@@ -231,6 +231,23 @@ impl MetalCandidateRuntime {
     /// completion remain synchronous so verifier and benchmark callers obtain
     /// an unambiguous interval and completed output.
     pub fn dispatch_prepared(&self, prepared: &PreparedMetalMatVec) -> Result<Vec<f32>> {
+        self.dispatch_prepared_repeated(prepared, 1)
+    }
+
+    /// Records the same resident operation repeatedly into one command
+    /// encoder and pays commit/wait only once. This is a benchmark/graph
+    /// construction primitive; a production decoder will record distinct
+    /// prepared operations with explicit buffer dependencies in the same way.
+    pub fn dispatch_prepared_repeated(
+        &self,
+        prepared: &PreparedMetalMatVec,
+        dispatches: usize,
+    ) -> Result<Vec<f32>> {
+        if dispatches == 0 {
+            return Err(EngineError::Shape(
+                "Metal repeated dispatch count must be positive".into(),
+            ));
+        }
         let pipeline = match prepared.dtype {
             TensorDType::Q2B64 => &self.q2_pipeline,
             TensorDType::Q4B64 => &self.q4_pipeline,
@@ -268,21 +285,22 @@ impl MetalCandidateRuntime {
             Some(&prepared.params_buffer),
             0,
         );
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: prepared
-                    .rows
-                    .div_ceil((prepared.thread_width / 32) * ROWS_PER_SIMDGROUP)
-                    as u64,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: prepared.thread_width as u64,
-                height: 1,
-                depth: 1,
-            },
-        );
+        let grid = MTLSize {
+            width: prepared
+                .rows
+                .div_ceil((prepared.thread_width / 32) * ROWS_PER_SIMDGROUP)
+                as u64,
+            height: 1,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width: prepared.thread_width as u64,
+            height: 1,
+            depth: 1,
+        };
+        for _ in 0..dispatches {
+            encoder.dispatch_thread_groups(grid, threads);
+        }
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -478,6 +496,7 @@ mod tests {
         assert!(runtime
             .prepare_fused_matvec_with_simdgroups(&operation, 3)
             .is_err());
+        assert!(runtime.dispatch_prepared_repeated(&prepared, 0).is_err());
         assert_eq!(prepared.dtype(), TensorDType::Q4B64);
         assert_eq!(prepared.rows(), rows);
         assert_eq!(prepared.columns(), columns);
@@ -501,7 +520,7 @@ mod tests {
             .write_input(&zero_input)
             .expect("update resident input");
         let second = runtime
-            .dispatch_prepared(&prepared)
+            .dispatch_prepared_repeated(&prepared, 3)
             .expect("second resident dispatch");
         assert!(second.iter().all(|value| value.abs() <= f32::EPSILON));
         assert!(prepared.write_input(&[0.0; 3]).is_err());

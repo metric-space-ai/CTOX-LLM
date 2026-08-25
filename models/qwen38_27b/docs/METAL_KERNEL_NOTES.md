@@ -52,7 +52,16 @@ per hardware profile and matrix shape.
 bias, parameters, input, and output once. Repeated dispatches reuse those
 buffers, and `write_input` changes only the decode activation vector. This
 proves resident per-operation ownership but is not yet the final zero-copy
-CTOXQ import or full-graph arena.
+CTOXQ import or full-graph arena. `dispatch_prepared_repeated` additionally
+records multiple resident dispatches in one command encoder, so the benchmark
+can separate kernel work from a commit/wait round trip per operation. The
+production graph must generalize this to distinct dependent operations rather
+than repeating one projection.
+
+Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
+instead of a four-way select. Sixteen lanes each load one unique packed byte
+and decode its four adjacent weights, avoiding redundant packed-byte reads.
+This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
 
 ## Validation evidence (this worktree, Apple M5)
 
@@ -83,12 +92,16 @@ dequantization array before this source was accepted.
 - The verifier currently creates shared staging buffers for an isolated
   operation. It is not evidence for resident model tensors or the required
   no-duplicate loader ownership contract.
-- Exploratory 5120x5120 measurements exposed a large unresolved kernel gap.
-  The best observed intervals reached roughly 5.81 GB/s for Q2 and 11.08 GB/s
-  for Q4, while the earlier CTOX M5 hardware probe measured approximately
-  60.6 GB/s sustained read bandwidth at a large working set. These small-matrix
-  figures are not directly comparable roofline evidence, vary under desktop
-  load, and deliberately fail promotion rather than being presented as wins.
+- Exploratory 17408x5120 FFN measurements with eight dispatches per command
+  reached roughly 26.55 GB/s for Q2 (four simdgroups/threadgroup) and
+  43.95 GB/s for Q4 (two simdgroups/threadgroup). The earlier CTOX M5 hardware
+  probe measured approximately 60.6 GB/s sustained read bandwidth at a large
+  working set, putting those observations near 44% and 73% respectively. Q4
+  is therefore approaching a useful candidate range, while Q2 still has a
+  large decode-efficiency gap. Repetition of the same 25/47 MB projection can
+  benefit from GPU caches, desktop load and thermal state are uncontrolled,
+  and these figures deliberately remain exploratory rather than promotion
+  evidence.
 - No controlled size/residue/thermal sweep or hardware-counter roofline
   evidence exists yet.
 - No full embedding, attention, GatedDeltaNet, MTP, sampling, or model-graph

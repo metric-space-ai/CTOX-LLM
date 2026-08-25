@@ -36,6 +36,8 @@ mod macos {
         /// fuse s_in into the preceding norm/scale stage in one command graph.
         #[arg(long)]
         pre_scaled_input: bool,
+        #[arg(long, default_value_t = 1)]
+        dispatches_per_command: usize,
     }
 
     #[derive(Serialize)]
@@ -50,6 +52,8 @@ mod macos {
         iterations: usize,
         simdgroups: usize,
         pre_scaled_input: bool,
+        dispatches_per_command: usize,
+        total_dispatches: usize,
         packed_weight_bytes: usize,
         requested_resident_buffer_bytes: usize,
         elapsed_milliseconds: f64,
@@ -68,6 +72,10 @@ mod macos {
             "columns must be a positive multiple of {BLOCK_LEN}"
         );
         anyhow::ensure!(args.iterations > 0, "iterations must be positive");
+        anyhow::ensure!(
+            args.dispatches_per_command > 0,
+            "dispatches-per-command must be positive"
+        );
         let dtype = match args.dtype {
             DTypeArg::Q2 => TensorDType::Q2B64,
             DTypeArg::Q4 => TensorDType::Q4B64,
@@ -120,14 +128,22 @@ mod macos {
             "Metal result differs from scalar by {maximum_absolute_error}"
         );
         for _ in 0..args.warmup {
-            std::hint::black_box(runtime.dispatch_prepared(&prepared)?);
+            std::hint::black_box(
+                runtime.dispatch_prepared_repeated(&prepared, args.dispatches_per_command)?,
+            );
         }
         let started = Instant::now();
         for _ in 0..args.iterations {
-            std::hint::black_box(runtime.dispatch_prepared(&prepared)?);
+            std::hint::black_box(
+                runtime.dispatch_prepared_repeated(&prepared, args.dispatches_per_command)?,
+            );
         }
         let elapsed = started.elapsed().as_secs_f64();
-        let mean_seconds = elapsed / args.iterations as f64;
+        let total_dispatches = args
+            .iterations
+            .checked_mul(args.dispatches_per_command)
+            .ok_or_else(|| anyhow::anyhow!("total dispatch count overflows"))?;
+        let mean_seconds = elapsed / total_dispatches as f64;
         println!(
             "{}",
             serde_json::to_string_pretty(&Report {
@@ -145,6 +161,8 @@ mod macos {
                 iterations: args.iterations,
                 simdgroups: args.simdgroups,
                 pre_scaled_input: args.pre_scaled_input,
+                dispatches_per_command: args.dispatches_per_command,
+                total_dispatches,
                 packed_weight_bytes: weights.len(),
                 requested_resident_buffer_bytes: prepared.resident_bytes(),
                 elapsed_milliseconds: elapsed * 1_000.0,

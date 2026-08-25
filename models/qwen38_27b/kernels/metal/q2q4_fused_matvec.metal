@@ -20,10 +20,11 @@
 // absent pointers imply 1.0 for s_in/s_out and 0.0 for bias.
 //
 // Dispatch organization: every 32-wide simdgroup produces four output rows.
-// Each lane owns two values of every 64-value block, loads input/s_in once,
-// and reuses those values across the four rows. This follows the multi-row
-// matvec organization used by upstream ggml Metal while preserving
-// CTOX's distinct Q2_B64/Q4_B64 codes and fused recovery semantics.
+// For Q2, lanes 0..15 each own one packed byte/four values; for Q4, all lanes
+// own two values. Input/s_in values are loaded once and reused across the four
+// rows. This follows the multi-row matvec organization used by upstream ggml
+// Metal while preserving CTOX's distinct Q2_B64/Q4_B64 codes and fused
+// recovery semantics.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -57,11 +58,9 @@ inline float read_scale(device const uchar* block_base) {
 }
 
 inline float q2_normalized(uint code) {
-    // Exact src/quant.rs code order: {-1, -1/3, 1/3, 1}.
-    return code == 0u ? -1.0f
-         : code == 1u ? -(1.0f / 3.0f)
-         : code == 2u ?  (1.0f / 3.0f)
-                      :  1.0f;
+    // Exact src/quant.rs code order: {-1, -1/3, 1/3, 1}. The four values
+    // form an affine sequence, so this avoids a lane-divergent select chain.
+    return fma(float(code), 2.0f / 3.0f, -1.0f);
 }
 
 constant uint ROWS_PER_SIMDGROUP = 4;
@@ -87,23 +86,60 @@ inline void finish_rows(thread float* partial,
     }
 }
 
-template <uint BLOCK_BYTES, bool IS_Q2>
-inline void fused_rows(device const uchar* weights,
-                       device const float* input,
-                       device const half* s_in,
-                       device const half* s_out,
-                       device const float* bias,
-                       device float* output,
-                       constant FusedMatVecParams& params,
-                       uint first_row,
-                       uint simd_lane) {
+inline void fused_q2_rows(device const uchar* weights,
+                          device const float* input,
+                          device const half* s_in,
+                          device const half* s_out,
+                          device const float* bias,
+                          device float* output,
+                          constant FusedMatVecParams& params,
+                          uint first_row,
+                          uint simd_lane) {
+    float partial[ROWS_PER_SIMDGROUP] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (simd_lane < 16u) {
+        for (uint block = 0; block < params.blocks_per_row; ++block) {
+            uint column = block * Q2Q4_BLOCK_LEN + simd_lane * 4u;
+            float4 x(input[column], input[column + 1u],
+                     input[column + 2u], input[column + 3u]);
+            if (params.has_s_in != 0u) {
+                x *= float4(float(s_in[column]), float(s_in[column + 1u]),
+                            float(s_in[column + 2u]), float(s_in[column + 3u]));
+            }
+            for (uint row_offset = 0; row_offset < ROWS_PER_SIMDGROUP; ++row_offset) {
+                uint row = first_row + row_offset;
+                if (row >= params.rows) {
+                    continue;
+                }
+                device const uchar* block_base = weights
+                    + ulong(row) * params.blocks_per_row * Q2_BLOCK_BYTES
+                    + ulong(block) * Q2_BLOCK_BYTES;
+                float scale = read_scale(block_base);
+                uint packed = uint(block_base[2u + simd_lane]);
+                float4 normalized(q2_normalized(packed & 0x3u),
+                                  q2_normalized((packed >> 2u) & 0x3u),
+                                  q2_normalized((packed >> 4u) & 0x3u),
+                                  q2_normalized((packed >> 6u) & 0x3u));
+                partial[row_offset] += scale * dot(normalized, x);
+            }
+        }
+    }
+    finish_rows(partial, s_out, bias, output, params, first_row, simd_lane);
+}
+
+inline void fused_q4_rows(device const uchar* weights,
+                          device const float* input,
+                          device const half* s_in,
+                          device const half* s_out,
+                          device const float* bias,
+                          device float* output,
+                          constant FusedMatVecParams& params,
+                          uint first_row,
+                          uint simd_lane) {
     float partial[ROWS_PER_SIMDGROUP] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (uint block = 0; block < params.blocks_per_row; ++block) {
         uint column_start = block * Q2Q4_BLOCK_LEN;
-        uint value0 = simd_lane;
-        uint value1 = simd_lane + 32u;
-        uint column0 = column_start + value0;
-        uint column1 = column_start + value1;
+        uint column0 = column_start + simd_lane;
+        uint column1 = column0 + 32u;
         float x0 = input[column0];
         float x1 = input[column1];
         if (params.has_s_in != 0u) {
@@ -116,26 +152,19 @@ inline void fused_rows(device const uchar* weights,
                 continue;
             }
             device const uchar* block_base = weights
-                + ulong(row) * params.blocks_per_row * BLOCK_BYTES
-                + ulong(block) * BLOCK_BYTES;
+                + ulong(row) * params.blocks_per_row * Q4_BLOCK_BYTES
+                + ulong(block) * Q4_BLOCK_BYTES;
             float scale = read_scale(block_base);
             device const uchar* codes = block_base + 2;
-            if (IS_Q2) {
-                uint packed0 = uint(codes[value0 / 4u]);
-                uint packed1 = uint(codes[value1 / 4u]);
-                uint code0 = (packed0 >> ((value0 % 4u) * 2u)) & 0x3u;
-                uint code1 = (packed1 >> ((value1 % 4u) * 2u)) & 0x3u;
-                partial[row_offset] += scale
-                    * (q2_normalized(code0) * x0 + q2_normalized(code1) * x1);
-            } else {
-                uint packed0 = uint(codes[value0 / 2u]);
-                uint packed1 = uint(codes[value1 / 2u]);
-                uint code0 = (packed0 >> ((value0 % 2u) * 4u)) & 0xfu;
-                uint code1 = (packed1 >> ((value1 % 2u) * 4u)) & 0xfu;
-                float normalized0 = (float(code0) - 7.5f) * (1.0f / 7.5f);
-                float normalized1 = (float(code1) - 7.5f) * (1.0f / 7.5f);
-                partial[row_offset] += scale * (normalized0 * x0 + normalized1 * x1);
-            }
+            uint byte_index = simd_lane >> 1u;
+            uint shift = (simd_lane & 0x1u) << 2u;
+            uint packed0 = uint(codes[byte_index]);
+            uint packed1 = uint(codes[byte_index + 16u]);
+            uint code0 = (packed0 >> shift) & 0xfu;
+            uint code1 = (packed1 >> shift) & 0xfu;
+            float normalized0 = (float(code0) - 7.5f) * (1.0f / 7.5f);
+            float normalized1 = (float(code1) - 7.5f) * (1.0f / 7.5f);
+            partial[row_offset] += scale * (normalized0 * x0 + normalized1 * x1);
         }
     }
     finish_rows(partial, s_out, bias, output, params, first_row, simd_lane);
@@ -159,8 +188,8 @@ kernel void q2_b64_fused_matvec(
     if (first_row >= params.rows) {
         return;
     }
-    fused_rows<Q2_BLOCK_BYTES, true>(weights, input, s_in, s_out, bias,
-                                     output, params, first_row, simd_lane);
+    fused_q2_rows(weights, input, s_in, s_out, bias, output, params,
+                  first_row, simd_lane);
 }
 
 // Q4_B64 fused matvec candidate entry point.
@@ -181,6 +210,6 @@ kernel void q4_b64_fused_matvec(
     if (first_row >= params.rows) {
         return;
     }
-    fused_rows<Q4_BLOCK_BYTES, false>(weights, input, s_in, s_out, bias,
-                                      output, params, first_row, simd_lane);
+    fused_q4_rows(weights, input, s_in, s_out, bias, output, params,
+                  first_row, simd_lane);
 }
