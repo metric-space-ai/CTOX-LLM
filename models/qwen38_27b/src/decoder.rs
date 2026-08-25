@@ -20,6 +20,8 @@ use crate::reference::{
 use crate::release::MemoryProfile;
 use crate::{EngineError, Qwen38Config, Result};
 
+const MAXIMUM_CHAINED_MTP_DRAFTS: usize = 4;
+
 fn softplus(value: f32) -> f32 {
     if value > 20.0 {
         value
@@ -229,7 +231,7 @@ pub struct DecoderState {
     position: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MtpState {
     attention: FullAttentionState,
     maximum_tokens: usize,
@@ -238,19 +240,15 @@ pub struct MtpState {
 
 #[derive(Debug)]
 struct PendingSpeculativeBranch {
-    accepted_token: u32,
-    target_state: DecoderState,
-    target_final_hidden: Vec<f32>,
+    candidate_tokens: Vec<u32>,
 }
 
 impl PendingSpeculativeBranch {
     fn allocated_bytes(&self) -> Result<usize> {
-        self.target_state
-            .allocated_bytes()
-            .checked_add(self.target_final_hidden.capacity() * std::mem::size_of::<f32>())
-            .ok_or_else(|| {
-                EngineError::MemoryBudget("CPU speculative branch allocation overflows".into())
-            })
+        self.candidate_tokens
+            .capacity()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CPU MTP candidate bytes overflow".into()))
     }
 }
 
@@ -368,6 +366,7 @@ pub struct CpuCorrectnessExecutor {
     last_final_hidden: Option<Vec<f32>>,
     pending_speculative: Option<PendingSpeculativeBranch>,
     admitted_context: usize,
+    admitted_draft_tokens: usize,
     warmed: bool,
     allocations: AllocationSnapshot,
 }
@@ -383,6 +382,7 @@ impl CpuCorrectnessExecutor {
             last_final_hidden: None,
             pending_speculative: None,
             admitted_context: 0,
+            admitted_draft_tokens: 0,
             warmed: false,
             allocations: AllocationSnapshot::default(),
         }
@@ -398,6 +398,7 @@ impl CpuCorrectnessExecutor {
             last_final_hidden: None,
             pending_speculative: None,
             admitted_context: 0,
+            admitted_draft_tokens: 0,
             warmed: false,
             allocations: AllocationSnapshot::default(),
         })
@@ -896,7 +897,11 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             vocab_size: self.config.vocab_size,
             maximum_context_tokens: self.config.max_position_embeddings as u64,
             mtp: self.config.mtp_num_hidden_layers == 1,
-            maximum_draft_tokens: u32::from(self.config.mtp_num_hidden_layers == 1),
+            maximum_draft_tokens: if self.config.mtp_num_hidden_layers == 1 {
+                MAXIMUM_CHAINED_MTP_DRAFTS as u32
+            } else {
+                0
+            },
             cancellation: true,
             session_reset: true,
             no_hidden_fallbacks: false,
@@ -915,12 +920,12 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             ));
         }
         if profile.linear_state_dtype != crate::memory::LinearStateDType::F32
-            || profile.mtp_draft_tokens > 1
+            || profile.mtp_draft_tokens as usize > MAXIMUM_CHAINED_MTP_DRAFTS
         {
             return Err(EngineError::UnsupportedOperation {
                 backend: "cpu",
                 operation: "correctness executor memory profile",
-                reason: "the scalar oracle owns FP32 state and at most one unrolled MTP draft"
+                reason: "the scalar oracle owns FP32 state and at most four chained MTP drafts"
                     .into(),
             });
         }
@@ -933,6 +938,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         }
         self.artifact = Some(artifact.clone());
         self.admitted_context = admitted_context;
+        self.admitted_draft_tokens = profile.mtp_draft_tokens as usize;
         self.warmed = false;
         self.allocations = AllocationSnapshot {
             model_bytes: profile.resident_model_bytes,
@@ -960,6 +966,11 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         if !self.warmed || tokens.is_empty() || tokens.len() > self.admitted_context {
             return Err(EngineError::InvalidState(
                 "CPU prefill requires a warm executor and admitted non-empty tokens".into(),
+            ));
+        }
+        if mtp_enabled && self.admitted_draft_tokens == 0 {
+            return Err(EngineError::InvalidState(
+                "CPU prefill enabled MTP without an admitted draft block".into(),
             ));
         }
         self.state = Some(DecoderState::new(&self.config, self.admitted_context)?);
@@ -1033,7 +1044,12 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         let state = self.state.as_mut().ok_or_else(|| {
             EngineError::InvalidState("CPU decode requires a prefilled state".into())
         })?;
-        let draft_logits = if mtp_enabled {
+        if mtp_enabled && self.admitted_draft_tokens == 0 {
+            return Err(EngineError::InvalidState(
+                "CPU decode enabled MTP without an admitted draft block".into(),
+            ));
+        }
+        let first_draft_logits = if mtp_enabled {
             let previous = self.last_final_hidden.as_ref().ok_or_else(|| {
                 EngineError::InvalidState("MTP decode has no previous target hidden state".into())
             })?;
@@ -1047,30 +1063,63 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                     .ok_or_else(|| EngineError::InvalidState("MTP decode has no cache".into()))?,
                 &self.config,
             )?;
-            vec![draft.logits]
+            Some(draft.logits)
         } else {
-            Vec::new()
+            None
         };
         let target = decoder.decode_target_step(token, state, &self.config)?;
-        let (target_verification_logits, bonus_logits) = if mtp_enabled {
-            if cancellation.is_cancelled() {
-                return Err(EngineError::Cancelled);
-            }
-            let candidate = greedy_token(
-                draft_logits
-                    .first()
-                    .ok_or_else(|| EngineError::InvalidState("MTP produced no draft".into()))?,
-            )?;
+        let (draft_logits, target_verification_logits, bonus_logits) = if mtp_enabled {
+            let mut draft_logits = Vec::with_capacity(self.admitted_draft_tokens);
+            let mut target_verification_logits = Vec::with_capacity(self.admitted_draft_tokens);
+            let mut candidate_tokens = Vec::with_capacity(self.admitted_draft_tokens);
             let mut target_branch = state.clone();
-            let bonus = decoder.decode_target_step(candidate, &mut target_branch, &self.config)?;
-            self.pending_speculative = Some(PendingSpeculativeBranch {
-                accepted_token: candidate,
-                target_state: target_branch,
-                target_final_hidden: bonus.final_hidden,
-            });
-            (vec![target.logits.clone()], Some(bonus.logits))
+            let mut mtp_branch = self
+                .mtp_state
+                .as_ref()
+                .ok_or_else(|| EngineError::InvalidState("MTP decode has no cache".into()))?
+                .clone();
+            let mut current_draft = first_draft_logits;
+            let mut current_target_hidden = target.final_hidden.clone();
+            let mut current_target_logits = target.logits.clone();
+            for depth in 0..self.admitted_draft_tokens {
+                if cancellation.is_cancelled() {
+                    return Err(EngineError::Cancelled);
+                }
+                target_verification_logits.push(current_target_logits);
+                let draft = current_draft.take().ok_or_else(|| {
+                    EngineError::InvalidState("MTP draft chain ended early".into())
+                })?;
+                let candidate = greedy_token(&draft)?;
+                draft_logits.push(draft);
+                candidate_tokens.push(candidate);
+                let absolute_position = target_branch.position();
+                let next_draft = if depth + 1 < self.admitted_draft_tokens {
+                    Some(decoder.mtp_draft(
+                        candidate,
+                        &current_target_hidden,
+                        absolute_position,
+                        &mut mtp_branch,
+                        &self.config,
+                    )?)
+                } else {
+                    None
+                };
+                let next_target =
+                    decoder.decode_target_step(candidate, &mut target_branch, &self.config)?;
+                current_target_hidden = next_target.final_hidden;
+                current_target_logits = next_target.logits;
+                if let Some(next_draft) = next_draft {
+                    current_draft = Some(next_draft.logits);
+                }
+            }
+            self.pending_speculative = Some(PendingSpeculativeBranch { candidate_tokens });
+            (
+                draft_logits,
+                target_verification_logits,
+                Some(current_target_logits),
+            )
         } else {
-            (Vec::new(), None)
+            (Vec::new(), Vec::new(), None)
         };
         self.last_final_hidden = Some(target.final_hidden);
         self.update_session_allocation()?;
@@ -1087,14 +1136,17 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         accepted_drafts: u32,
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        if accepted_drafts > 1 {
-            return Err(EngineError::InvalidState(
-                "CPU correctness executor can commit at most one MTP draft".into(),
-            ));
-        }
         let branch = self.pending_speculative.take().ok_or_else(|| {
             EngineError::InvalidState("CPU executor has no pending speculative branch".into())
         })?;
+        let accepted_drafts = usize::try_from(accepted_drafts).map_err(|_| {
+            EngineError::InvalidState("CPU accepted MTP depth exceeds usize".into())
+        })?;
+        if accepted_drafts > branch.candidate_tokens.len() {
+            return Err(EngineError::InvalidState(
+                "CPU accepted MTP depth exceeds the pending candidate block".into(),
+            ));
+        }
         if accepted_drafts == 0 {
             self.update_session_allocation()?;
             return Ok(());
@@ -1106,30 +1158,38 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             EngineError::InvalidState("CPU speculative commit has no loaded artifact".into())
         })?;
         let decoder = ArtifactDecoder::new(artifact, &self.backend, self.config.rms_norm_epsilon)?;
-        let previous_final_hidden = self.last_final_hidden.as_ref().ok_or_else(|| {
-            EngineError::InvalidState("CPU speculative commit lost target hidden state".into())
-        })?;
-        let absolute_position = self
-            .state
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::InvalidState("CPU speculative commit has no target state".into())
-            })?
-            .position();
-        decoder.mtp_draft(
-            branch.accepted_token,
-            previous_final_hidden,
-            absolute_position,
-            self.mtp_state.as_mut().ok_or_else(|| {
-                EngineError::InvalidState("CPU speculative commit has no MTP state".into())
-            })?,
-            &self.config,
-        )?;
-        if cancellation.is_cancelled() {
-            return Err(EngineError::Cancelled);
+        for candidate in branch.candidate_tokens.into_iter().take(accepted_drafts) {
+            if cancellation.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            let previous_final_hidden = self.last_final_hidden.as_ref().ok_or_else(|| {
+                EngineError::InvalidState("CPU speculative commit lost target hidden state".into())
+            })?;
+            let absolute_position = self
+                .state
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::InvalidState("CPU speculative commit has no target state".into())
+                })?
+                .position();
+            decoder.mtp_draft(
+                candidate,
+                previous_final_hidden,
+                absolute_position,
+                self.mtp_state.as_mut().ok_or_else(|| {
+                    EngineError::InvalidState("CPU speculative commit has no MTP state".into())
+                })?,
+                &self.config,
+            )?;
+            let target = decoder.decode_target_step(
+                candidate,
+                self.state.as_mut().ok_or_else(|| {
+                    EngineError::InvalidState("CPU speculative commit has no target state".into())
+                })?,
+                &self.config,
+            )?;
+            self.last_final_hidden = Some(target.final_hidden);
         }
-        self.state = Some(branch.target_state);
-        self.last_final_hidden = Some(branch.target_final_hidden);
         self.update_session_allocation()?;
         Ok(())
     }
@@ -1150,6 +1210,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         self.pending_speculative = None;
         self.artifact = None;
         self.admitted_context = 0;
+        self.admitted_draft_tokens = 0;
         self.warmed = false;
         self.allocations = AllocationSnapshot::default();
         Ok(())
@@ -1567,20 +1628,20 @@ mod tests {
         );
 
         let executor_config = Qwen38Config {
-            max_position_embeddings: 5,
+            max_position_embeddings: 12,
             ..linear_decode_config.clone()
         };
         let profile = MemoryProfile {
-            profile_id: "cpu-correctness-5".into(),
+            profile_id: "cpu-correctness-mtp4".into(),
             pack_id: "test".into(),
-            context_tokens: 5,
+            context_tokens: 12,
             sessions: 1,
             resident_model_bytes: artifact.file_bytes(),
             persistent_backend_graph_bytes: 0,
             persistent_runtime_bytes: 0,
             linear_state_dtype: crate::memory::LinearStateDType::F32,
             linear_state_bytes_per_session: 9_216,
-            mtp_draft_tokens: 1,
+            mtp_draft_tokens: 4,
             speculative_state_strategy: crate::memory::SpeculativeStateStrategy::ReplayOnReject,
             speculative_linear_state_bytes_per_session: 9_216,
             kv: KvMemoryFormula {
@@ -1616,9 +1677,12 @@ mod tests {
         assert!(mtp_prefill.draft_logits.is_empty());
         let mtp_decode = executor.decode(0, true, &cancellation).unwrap();
         assert_eq!(mtp_decode.target_logits.len(), 2);
-        assert_eq!(mtp_decode.draft_logits.len(), 1);
-        assert_eq!(mtp_decode.draft_logits[0].len(), 2);
-        assert_eq!(mtp_decode.target_verification_logits.len(), 1);
+        assert_eq!(mtp_decode.draft_logits.len(), 4);
+        assert!(mtp_decode
+            .draft_logits
+            .iter()
+            .all(|logits| logits.len() == 2));
+        assert_eq!(mtp_decode.target_verification_logits.len(), 4);
         assert_eq!(mtp_decode.bonus_logits.as_ref().unwrap().len(), 2);
         assert!(executor.pending_speculative.is_some());
         executor
@@ -1630,24 +1694,28 @@ mod tests {
         executor.reset_session().unwrap();
         executor.prefill(&[0], true, &cancellation).unwrap();
         let accepted = executor.decode(0, true, &cancellation).unwrap();
-        let candidate = greedy_token(&accepted.draft_logits[0]).unwrap();
-        assert_eq!(
-            candidate,
-            greedy_token(&accepted.target_verification_logits[0]).unwrap()
-        );
+        for (draft, target) in accepted
+            .draft_logits
+            .iter()
+            .zip(&accepted.target_verification_logits)
+        {
+            assert_eq!(greedy_token(draft).unwrap(), greedy_token(target).unwrap());
+        }
         executor
-            .commit_speculative(1, &CancellationToken::default())
-            .unwrap();
-        assert_eq!(executor.state.as_ref().unwrap().position(), 3);
-        assert_eq!(executor.mtp_state.as_ref().unwrap().tokens(), 2);
-        let bonus_token = greedy_token(accepted.bonus_logits.as_ref().unwrap()).unwrap();
-        let aligned = executor.decode(bonus_token, true, &cancellation).unwrap();
-        assert_eq!(aligned.target_verification_logits.len(), 1);
-        executor
-            .commit_speculative(0, &CancellationToken::default())
+            .commit_speculative(2, &CancellationToken::default())
             .unwrap();
         assert_eq!(executor.state.as_ref().unwrap().position(), 4);
         assert_eq!(executor.mtp_state.as_ref().unwrap().tokens(), 3);
+        let fallback_token = greedy_token(&accepted.target_verification_logits[2]).unwrap();
+        let aligned = executor
+            .decode(fallback_token, true, &cancellation)
+            .unwrap();
+        assert_eq!(aligned.target_verification_logits.len(), 4);
+        executor
+            .commit_speculative(0, &CancellationToken::default())
+            .unwrap();
+        assert_eq!(executor.state.as_ref().unwrap().position(), 5);
+        assert_eq!(executor.mtp_state.as_ref().unwrap().tokens(), 4);
         executor.reset_session().unwrap();
         let cancelled = CancellationToken::default();
         cancelled.cancel();

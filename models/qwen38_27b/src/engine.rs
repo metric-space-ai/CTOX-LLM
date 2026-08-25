@@ -483,29 +483,7 @@ impl<E: ModelExecutor> Engine<E> {
         }
         let draft_tokens_proposed = output.draft_logits.len() as u32;
         let (token_id, draft_tokens_verified, accepted_draft_tokens) = if mtp_enabled {
-            let mut accepted = Vec::new();
-            let mut verified = 0_u32;
-            let mut fallback = None;
-            for (draft_logits, target_logits) in output
-                .draft_logits
-                .iter()
-                .zip(&output.target_verification_logits)
-            {
-                let draft = greedy_token(draft_logits)?;
-                let target = greedy_token(target_logits)?;
-                verified += 1;
-                if draft != target {
-                    fallback = Some(target);
-                    break;
-                }
-                accepted.push(draft);
-            }
-            let token = match fallback {
-                Some(token) => token,
-                None => greedy_token(output.bonus_logits.as_ref().ok_or_else(|| {
-                    EngineError::InvalidArtifact("MTP block has no bonus logits".into())
-                })?)?,
-            };
+            let (token, verified, accepted) = verify_greedy_mtp(&output)?;
             if let Err(error) = self
                 .executor
                 .commit_speculative(accepted.len() as u32, cancellation)
@@ -685,6 +663,33 @@ fn greedy_token(logits: &[f32]) -> Result<u32> {
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
         .map(|(token, _)| token as u32)
         .ok_or_else(|| EngineError::InvalidArtifact("greedy logits are empty".into()))
+}
+
+fn verify_greedy_mtp(output: &ExecutorStep) -> Result<(u32, u32, Vec<u32>)> {
+    let mut accepted = Vec::new();
+    let mut verified = 0_u32;
+    let mut fallback = None;
+    for (draft_logits, target_logits) in output
+        .draft_logits
+        .iter()
+        .zip(&output.target_verification_logits)
+    {
+        let draft = greedy_token(draft_logits)?;
+        let target = greedy_token(target_logits)?;
+        verified += 1;
+        if draft != target {
+            fallback = Some(target);
+            break;
+        }
+        accepted.push(draft);
+    }
+    let token = match fallback {
+        Some(token) => token,
+        None => greedy_token(output.bonus_logits.as_ref().ok_or_else(|| {
+            EngineError::InvalidArtifact("MTP block has no bonus logits".into())
+        })?)?,
+    };
+    Ok((token, verified, accepted))
 }
 
 fn elapsed_micros(started: Instant) -> u64 {
@@ -911,6 +916,35 @@ mod tests {
         engine.unload().unwrap();
         assert_eq!(engine.health().lifecycle, EngineLifecycle::Unloaded);
         assert!(engine.health().allocations.is_zero());
+    }
+
+    #[test]
+    fn greedy_mtp4_accepts_only_the_causal_prefix_and_uses_target_fallback() {
+        let target = vec![0.0, 1.0, 2.0];
+        let output = ExecutorStep {
+            target_logits: target.clone(),
+            draft_logits: vec![
+                vec![0.0, 1.0, 2.0],
+                vec![0.0, 1.0, 2.0],
+                vec![0.0, 2.0, 1.0],
+                vec![0.0, 1.0, 2.0],
+            ],
+            target_verification_logits: vec![target; 4],
+            bonus_logits: Some(vec![0.0, 2.0, 1.0]),
+        };
+        let (token, verified, accepted) = verify_greedy_mtp(&output).unwrap();
+        assert_eq!(token, 2);
+        assert_eq!(verified, 3);
+        assert_eq!(accepted, vec![2, 2]);
+
+        let all_accepted = ExecutorStep {
+            draft_logits: output.target_verification_logits.clone(),
+            ..output
+        };
+        let (token, verified, accepted) = verify_greedy_mtp(&all_accepted).unwrap();
+        assert_eq!(token, 1);
+        assert_eq!(verified, 4);
+        assert_eq!(accepted, vec![2, 2, 2, 2]);
     }
 
     #[test]

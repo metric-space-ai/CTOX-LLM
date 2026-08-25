@@ -32,7 +32,8 @@ captured model activations, full-sequence logits, held-out tokens, and
 long-context state-stability evidence.
 
 The mmap-backed correctness executor now composes quantized projections,
-residual blocks, both token mixers, the target graph, and one native MTP draft.
-Optimized chunked prefill, chained MTP block verification, and full-artifact
-BF16 golden logits remain required before any production backend can be
-promoted.
+residual blocks, both token mixers, the target graph, and up to four drafts by
+chaining the one native MTP layer. Partial acceptance replays the exact prefix
+through both target and MTP state. Optimized chunked prefill, an optimized MTP
+block verifier, and full-artifact BF16 golden logits remain required before any
+production backend can be promoted.

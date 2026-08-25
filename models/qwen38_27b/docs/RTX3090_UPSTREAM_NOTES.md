@@ -44,8 +44,9 @@ bytes moved, device bandwidth/compute ceilings, and same-hardware benchmarks.
 
 ## CUDA work derived from the evidence
 
-1. Implement chained MTP draft scheduling plus block target verification with
-   rollback/replay semantics; retain the current one-draft path as an oracle.
+1. Implement optimized chained MTP draft scheduling plus block target
+   verification with rollback/replay semantics; retain the scalar MTP4 replay
+   path as the oracle.
 2. Add an SM86 split-KV verify-attention candidate with an immutable upstream
    anchor before promotion.
 3. Make recurrent-state dtype and speculative state strategy signed memory

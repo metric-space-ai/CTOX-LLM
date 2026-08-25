@@ -48,14 +48,15 @@ the accepted target prefix and advances the MTP cache through the same prefix.
 An error or cancellation invalidates the complete session rather than leaving
 an ambiguous partially committed state.
 
-The current correctness executor unrolls one draft. When it is accepted, the
+The current correctness executor chains the native MTP layer to the signed
+admitted depth, up to four drafts. When the complete block is accepted, the
 engine emits `accepted_draft_tokens` first and `token_id` as the target bonus;
-when rejected, that list is empty and `token_id` is the target fallback at the
-rejected position. The resident context advances by one input token plus the
-accepted prefix length. The full verification execution span is admitted
-before dispatch, including target work for every reserved draft. MTP output is
-rejected when the session disabled MTP or exceeds the signed memory profile's
-draft depth.
+on rejection, that list contains only the accepted causal prefix and `token_id`
+is the target fallback at the rejected position. The resident context advances
+by one input token plus the accepted prefix length. The full verification
+execution span is admitted before dispatch, including target work for every
+reserved draft. MTP output is rejected when the session disabled MTP or
+exceeds the signed memory profile's draft depth.
 
 Sampling is owned by this shared engine rather than by a particular embedding
 or wire server. `prefill` constructs one sampler from the explicit
@@ -81,10 +82,10 @@ health. This is the contract required by model-TTL and process-TTL owners.
 
 The CPU correctness executor composes the complete target and native MTP
 graphs for sequential prefill/decode, including independent MTP KV state,
-target-final-hidden handoff, one-draft target verification, and tested
-commit/reject state transitions. It remains a scalar verifier rather than a
-production executor. CUDA, Metal, CPU SIMD token mixers, and Snapdragon still
-need optimized full graph implementations before production admission.
+target-final-hidden handoff, chained MTP4 target verification, and tested
+partial-prefix replay/commit transitions. It remains a scalar verifier rather
+than a production executor. CUDA, Metal, CPU SIMD token mixers, and Snapdragon
+still need optimized full graph implementations before production admission.
 
 [`WIRE_PROTOCOL_V1.md`](WIRE_PROTOCOL_V1.md) maps this lifecycle onto versioned
 JSON Lines. It carries distinct request, operation, and session identities so
