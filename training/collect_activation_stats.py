@@ -98,8 +98,9 @@ def collect(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: An
 
     sample_ids = []
     total_tokens = 0
+    total_samples = sum(1 for line in args.input.open(encoding="utf-8") if line.strip())
     with args.input.open(encoding="utf-8") as source, torch.inference_mode():
-        for line in source:
+        for sample_number, line in enumerate(source, 1):
             if not line.strip():
                 continue
             record = json.loads(line)
@@ -120,6 +121,11 @@ def collect(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: An
             )
             sample_ids.append(record["id"])
             total_tokens += int(input_ids.shape[-1])
+            if sample_number % args.progress_every == 0 or sample_number == total_samples:
+                print(
+                    f"[{sample_number}/{total_samples}] activation tokens={total_tokens}",
+                    flush=True,
+                )
 
     tensors = {}
     observed = 0
@@ -132,6 +138,7 @@ def collect(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: An
         tensors[f"{name}.token_count"] = torch.tensor([state["count"]], dtype=torch.int64)
     for hook in hooks:
         hook.remove()
+    unobserved = sorted(targets - {name for name, state in accumulators.items() if state["count"]})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     save_file(
         tensors,
@@ -145,6 +152,7 @@ def collect(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: An
             "tokens": str(total_tokens),
             "observed_modules": str(observed),
             "target_tensors": str(len(targets)),
+            "unobserved_tensors": json.dumps(unobserved, separators=(",", ":")),
         },
     )
     print(
@@ -154,7 +162,7 @@ def collect(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: An
                 "samples": len(sample_ids),
                 "tokens": total_tokens,
                 "observed_modules": observed,
-                "non_linear_targets": len(missing_modules),
+                "unobserved_targets": len(unobserved),
             },
             sort_keys=True,
         )
@@ -172,9 +180,12 @@ def main() -> None:
     parser.add_argument("--gpus", type=int, default=3)
     parser.add_argument("--reserved-gpu-hours", type=float, required=True)
     parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--progress-every", type=int, default=10)
     args = parser.parse_args()
     if args.max_length <= 0:
         raise SystemExit("--max-length must be positive")
+    if args.progress_every <= 0:
+        raise SystemExit("--progress-every must be positive")
     require_budget(args.ledger, args.reserved_gpu_hours)
     try:
         import torch
