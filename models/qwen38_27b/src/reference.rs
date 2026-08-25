@@ -256,6 +256,106 @@ pub fn recurrent_gated_delta_step(
     Ok(output)
 }
 
+/// Causal grouped-query attention, returning token-major `[tokens, heads, dim]`.
+// ref: modeling_qwen3_5.py:593-627
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_query_attention(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    query_heads: usize,
+    key_value_heads: usize,
+    query_tokens: usize,
+    key_value_tokens: usize,
+    head_dim: usize,
+    query_start_position: usize,
+) -> Result<Vec<f32>> {
+    matrix_contract(
+        "attention query",
+        query,
+        query_heads,
+        query_tokens
+            .checked_mul(head_dim)
+            .ok_or_else(|| EngineError::Shape("attention query shape overflows".into()))?,
+    )?;
+    let kv_columns = key_value_tokens
+        .checked_mul(head_dim)
+        .ok_or_else(|| EngineError::Shape("attention KV shape overflows".into()))?;
+    matrix_contract("attention key", key, key_value_heads, kv_columns)?;
+    matrix_contract("attention value", value, key_value_heads, kv_columns)?;
+    if key_value_heads == 0
+        || !query_heads.is_multiple_of(key_value_heads)
+        || query_start_position
+            .checked_add(query_tokens)
+            .is_none_or(|end| end > key_value_tokens)
+    {
+        return Err(EngineError::Shape(
+            "grouped-query attention topology or causal range differs".into(),
+        ));
+    }
+    let groups = query_heads / key_value_heads;
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut output = vec![0.0; query_tokens * query_heads * head_dim];
+    let mut scores = Vec::with_capacity(key_value_tokens);
+    for token in 0..query_tokens {
+        let available = query_start_position + token + 1;
+        for query_head in 0..query_heads {
+            let kv_head = query_head / groups;
+            let query_start = (query_head * query_tokens + token) * head_dim;
+            let query_row = &query[query_start..query_start + head_dim];
+            scores.clear();
+            for kv_token in 0..available {
+                let key_start = (kv_head * key_value_tokens + kv_token) * head_dim;
+                let score = query_row
+                    .iter()
+                    .zip(&key[key_start..key_start + head_dim])
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>()
+                    * scale;
+                scores.push(score);
+            }
+            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator = scores
+                .iter_mut()
+                .map(|score| {
+                    *score = (*score - maximum).exp();
+                    *score
+                })
+                .sum::<f32>();
+            if !denominator.is_finite() || denominator <= 0.0 {
+                return Err(EngineError::InvalidArtifact(
+                    "attention softmax normalization is invalid".into(),
+                ));
+            }
+            let output_start = (token * query_heads + query_head) * head_dim;
+            for (kv_token, probability) in scores.iter().enumerate() {
+                let value_start = (kv_head * key_value_tokens + kv_token) * head_dim;
+                for dimension in 0..head_dim {
+                    output[output_start + dimension] +=
+                        probability / denominator * value[value_start + dimension];
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+// ref: modeling_qwen3_5.py:668-701
+pub fn sigmoid_gate(values: &mut [f32], gate: &[f32]) -> Result<()> {
+    if values.len() != gate.len()
+        || values.is_empty()
+        || values.iter().chain(gate).any(|value| !value.is_finite())
+    {
+        return Err(EngineError::Shape(
+            "attention output and query gate differ".into(),
+        ));
+    }
+    for (value, gate) in values.iter_mut().zip(gate) {
+        *value *= 1.0 / (1.0 + (-gate).exp());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +466,36 @@ mod tests {
             ],
             2e-6,
         );
+    }
+
+    #[test]
+    fn grouped_query_attention_matches_pinned_python_oracle() {
+        let query = [1.0, 0.0, -1.0, 0.5, 1.0, 0.0, 0.0, 1.0, 1.0, -1.0, 0.5, 2.0];
+        let key = [0.2, 0.4, -0.5, 1.0, -0.25, 0.75];
+        let value = [1.0, 2.0, 3.0, -1.0, 0.5, 2.0];
+        let output = grouped_query_attention(&query, &key, &value, 2, 1, 2, 2, 3, 0).unwrap();
+        close(
+            &output,
+            &[
+                1.0,
+                2.0,
+                3.0,
+                1.0,
+                2.0,
+                3.0,
+                0.07204375,
+                1.3040327,
+                2.5360217,
+                -0.37731764,
+                0.9670118,
+                2.3113413,
+            ],
+            2e-6,
+        );
+        let mut gated = output.clone();
+        sigmoid_gate(&mut gated, &[0.0; 12]).unwrap();
+        for (actual, ungated) in gated.iter().zip(output) {
+            assert!((actual - ungated * 0.5).abs() <= 1e-7);
+        }
     }
 }
