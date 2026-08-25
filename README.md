@@ -20,7 +20,9 @@ feature dispatcher are implemented. Accelerator backends are promoted only
 after their per-op verifier and same-hardware benchmark gates pass.
 
 No backend is called production-ready merely because it compiles. See
-[`docs/PROMOTION_GATES.md`](docs/PROMOTION_GATES.md).
+[`docs/PROMOTION_GATES.md`](docs/PROMOTION_GATES.md). The current end-to-end
+execution plan and the evidence still missing for a release are tracked in
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Build
 
