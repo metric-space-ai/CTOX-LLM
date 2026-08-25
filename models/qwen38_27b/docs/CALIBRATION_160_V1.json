@@ -1,0 +1,72 @@
+{
+  "format": "ctox.qwen38.calibration.v1",
+  "status": "provisional_assignment_not_release_checkpoint",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "datasets": [
+    {
+      "repository": "nvidia/Nemotron-Post-Training-Dataset-v1",
+      "revision": "74e23eb6f830fef4a9e96a92f6f6262214cbb9a8",
+      "samples": 80,
+      "capped_tokens": 130994,
+      "maximum_tokens_per_sample": 2048
+    },
+    {
+      "repository": "Beko2210/German-Instruct-Dataset",
+      "revision": "4456bdf1b82f906a70fb9e5431530d2e9d1c565b",
+      "license": "CC-BY-4.0",
+      "samples": 80,
+      "capped_tokens": 31182,
+      "maximum_tokens_per_sample": 2048
+    }
+  ],
+  "activation_statistics": {
+    "samples": 160,
+    "tokens": 162176,
+    "observed_linear_matrices": 496,
+    "unobserved_matrices": 10,
+    "german_sha256": "df6ab06223413d3b69b80665786c188e9714527cbe68a3bcaa1a86489189ea89",
+    "combined_sha256": "82b4dffa457e64e275466bf3ae8d5474e60991be469a0553aed1f5b05d88ce8b"
+  },
+  "sensitivity": {
+    "planned_matrices": 506,
+    "estimator": "diagonal-input-covariance",
+    "sha256": "1aca843b67d83901f5db4d0a9400719d859450d9b05d31eb13ef6d64d4b23b11"
+  },
+  "assignment": {
+    "q4_matrices": 154,
+    "q2_matrices": 352,
+    "sha256": "0886972176580e9261a0282b3a4900cd5d6bee2be2e7393d559a3184b12ccf7a"
+  },
+  "native_layout": {
+    "bytes": 8372888576,
+    "gib": 7.797860145568848,
+    "fold_weight_limit_bytes": 8375186227,
+    "headroom_bytes": 2297651,
+    "sha256": "0c1f59de57b6b5df8e1a61ec4bbc1f73ed89adb0b884bbf8f25e794c606cf96c",
+    "dtype_bytes": {
+      "f16": 5334016,
+      "f32": 18432,
+      "q2_b64": 6931169280,
+      "q4_b64": 1420492800,
+      "recovery_f16": 15852544
+    },
+    "tensor_count": 1878
+  },
+  "stability_against_nemotron_80": {
+    "q4_intersection": 154,
+    "q4_added": 0,
+    "q4_removed": 0,
+    "gain_per_byte_spearman": 0.9999492411294126
+  },
+  "gpu_budget": {
+    "ledger_entries": 24,
+    "measured_gpu_hours": 0.5598529682556789,
+    "ceiling_gpu_hours": 240.0
+  },
+  "limitations": [
+    "The unchanged Q2/Q4 assignment is evidence of stability, not final quality evidence.",
+    "Embedding, LM head, and eight resident MTP matrices still lack activation-weighted observations.",
+    "Genuine 32K, 64K, and 128K calibration and retrieval samples are not represented.",
+    "Recovery scales have not been trained and this assignment has not been packed as a release checkpoint."
+  ]
+}

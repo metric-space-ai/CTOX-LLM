@@ -34,3 +34,10 @@ The first activation-weighted recovery smoke is recorded in
 BF16 teacher cache, real-graph activation statistics, exact Q2/Q4 sensitivity
 simulation, and byte-exact assignment path. The 10-sample/128-token assignment
 is pipeline evidence only and is deliberately not promoted as a model artifact.
+
+The expanded provisional calibration in
+[`docs/CALIBRATION_160_V1.json`](docs/CALIBRATION_160_V1.json) combines 80
+Nemotron and 80 German samples (162,176 observed tokens). It keeps exactly the
+same 154-Q4/352-Q2 assignment as the Nemotron-only run. This establishes useful
+assignment stability, but the head/MTP and genuine long-context coverage gaps
+still prevent recovery training from being called final.
