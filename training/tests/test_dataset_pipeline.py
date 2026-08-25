@@ -16,6 +16,7 @@ from materialize_prompts import load_manifests  # noqa: E402
 from optimize_q4_budget import layout_bytes  # noqa: E402
 from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
 from select_manifest import select  # noqa: E402
+from verify_vendor_manifest import verify  # noqa: E402
 
 
 class DatasetPipelineTests(unittest.TestCase):
@@ -125,6 +126,30 @@ class DatasetPipelineTests(unittest.TestCase):
         }
         self.assertEqual(layout_bytes(plan, set()), 2560)
         self.assertEqual(layout_bytes(plan, {"matrix.weight"}), 2816)
+
+    def test_vendor_manifest_detects_digest_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "kernel.cu"
+            source.write_bytes(b"pinned")
+            manifest = root / "UPSTREAM.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "files": [
+                            {
+                                "path": source.name,
+                                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(verify(manifest), 1)
+            source.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "digest mismatch"):
+                verify(manifest)
 
 
 if __name__ == "__main__":

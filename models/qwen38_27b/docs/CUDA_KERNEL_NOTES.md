@@ -31,7 +31,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 ## SM86 kernel ABI (see `src/backend/cuda.rs`)
 
 - Target compute capability 8.6, warp size 32, LP64 device pointers.
-- Module must export exactly:
+- Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
 - One launch fuses dequant, dot product, `s_in`, `s_out`, bias, and

@@ -44,3 +44,5 @@ jobs:
       - run: python -m json.tool models/qwen38_27b/docs/GERMAN_COHORT_V1.json >/dev/null
       - run: python -m json.tool models/qwen38_27b/docs/VISION_RESIDENCY_V1.json >/dev/null
       - run: python -m json.tool models/qwen38_27b/benchmarks/cpu/q2q4-packed-fused-matvec-20260825.json >/dev/null
+      - run: python -m json.tool models/qwen38_27b/vendor/cuda/UPSTREAM.json >/dev/null
+      - run: python training/verify_vendor_manifest.py models/qwen38_27b/vendor/cuda/UPSTREAM.json

@@ -20,7 +20,9 @@
     "cuda": {
       "state": "contract",
       "production_allowed": false,
-      "required_first_profile": "sm86"
+      "required_first_profile": "sm86",
+      "reference_pin": "../vendor/cuda/UPSTREAM.json",
+      "promotion_blocker": "compiled Q2_B64/Q4_B64 module, same-device verifier, and benchmark"
     },
     "metal": {
       "state": "candidate",

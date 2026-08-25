@@ -47,7 +47,7 @@ pub struct KernelParam {
 /// The kernel must fuse input scale (`s_in`), output scale (`s_out`), bias,
 /// and the activation in one launch; there is no unfused production path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KernelAbiDescriptor {
+pub struct CudaKernelAbi {
     /// Exact `CUfunction` symbol the cubin/fatbin module must export.
     pub symbol: &'static str,
     /// Packed dtype this kernel consumes. Only Q2_B64 and Q4_B64 exist;
@@ -121,7 +121,7 @@ pub const FUSED_MATVEC_PARAM_BYTES: u32 = 60;
 // ref: ggml/src/ggml-cuda/vecdotq.cuh:18-32
 // ref: ggml/src/ggml-cuda/vecdotq.cuh:115-137
 // ref: ggml/src/ggml-cuda/dequantize.cuh:25-38
-pub const Q2_B64_FUSED_MATVEC: KernelAbiDescriptor = KernelAbiDescriptor {
+pub const Q2_B64_FUSED_MATVEC: CudaKernelAbi = CudaKernelAbi {
     symbol: "ctox_q2_b64_fused_matvec_sm86",
     dtype: TensorDType::Q2B64,
     block_len: BLOCK_LEN,
@@ -134,7 +134,7 @@ pub const Q2_B64_FUSED_MATVEC: KernelAbiDescriptor = KernelAbiDescriptor {
 // ref: ggml/src/ggml-cuda/vecdotq.cuh:27-32
 // ref: ggml/src/ggml-cuda/vecdotq.cuh:115-137
 // ref: ggml/src/ggml-cuda/dequantize.cuh:25-38
-pub const Q4_B64_FUSED_MATVEC: KernelAbiDescriptor = KernelAbiDescriptor {
+pub const Q4_B64_FUSED_MATVEC: CudaKernelAbi = CudaKernelAbi {
     symbol: "ctox_q4_b64_fused_matvec_sm86",
     dtype: TensorDType::Q4B64,
     block_len: BLOCK_LEN,
@@ -148,7 +148,7 @@ pub const Q4_B64_FUSED_MATVEC: KernelAbiDescriptor = KernelAbiDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaModuleAbi {
     pub compute_capability: (u32, u32),
-    pub kernels: &'static [KernelAbiDescriptor],
+    pub kernels: &'static [CudaKernelAbi],
 }
 
 /// The single supported module ABI. Additional architectures require their
@@ -166,7 +166,7 @@ impl CudaModuleAbi {
 
     /// Selects the kernel descriptor for a packed dtype, or fails closed for
     /// anything that is not Q2_B64/Q4_B64.
-    pub fn descriptor_for(&self, dtype: TensorDType) -> Result<&'static KernelAbiDescriptor> {
+    pub fn descriptor_for(&self, dtype: TensorDType) -> Result<&'static CudaKernelAbi> {
         self.kernels
             .iter()
             .find(|kernel| kernel.dtype == dtype)
@@ -238,7 +238,7 @@ impl CudaModuleAbi {
 
 /// Parameter buffers must be tightly packed and self-consistent; a sloppy
 /// layout would silently corrupt launches, so it is rejected outright.
-fn validate_param_layout(kernel: &KernelAbiDescriptor) -> Result<()> {
+fn validate_param_layout(kernel: &CudaKernelAbi) -> Result<()> {
     let mut cursor = 0_u32;
     for param in kernel.params {
         if param.offset_bytes != cursor {
