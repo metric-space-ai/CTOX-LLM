@@ -9,11 +9,12 @@ Review date: 2026-08-25
 
 | Source | Reviewed revision | Included splits | Card license | Public checkpoint status |
 |---|---|---|---|---|
-| [Nemotron Post-Training v1](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v1) | `74e23eb6f830fef4a9e96a92f6f6262214cbb9a8` | `chat`, `code`, `math`, `stem`, `tool_calling` | CC-BY-4.0 | eligible with attribution |
+| [Nemotron Post-Training v1](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v1) | `74e23eb6f830fef4a9e96a92f6f6262214cbb9a8` | `code`, `math`, `stem`, `tool_calling`; `chat` candidates are subject to the empty-conditioning filter | CC-BY-4.0 | eligible with attribution; unconditioned `chat` records excluded |
 | [Nemotron Agentic v1](https://huggingface.co/datasets/nvidia/Nemotron-Agentic-v1) | `650d590978ca35c8f1ecea2faf136e5fac421b62` | `interactive_agent`, `tool_calling` | CC-BY-4.0 | eligible with attribution |
 | [Nemotron SFT Agentic v2](https://huggingface.co/datasets/nvidia/Nemotron-SFT-Agentic-v2) | `7c804833427f633ccd53b582dbf02525fd680f78` | `interactive_agent`, `search`, `tool_calling` | CC-BY-4.0 plus listed Apache-2.0/MIT components | eligible with attribution and component notices |
 | [German Instruct Dataset](https://huggingface.co/datasets/Beko2210/German-Instruct-Dataset) | `4456bdf1b82f906a70fb9e5431530d2e9d1c565b` | `train` | CC-BY-4.0 | eligible with attribution |
 | [Aya Dataset](https://huggingface.co/datasets/CohereLabs/aya_dataset) | `f9ea04583f02a8f86404ff6c58bf75fe637df8a2` | `train` (language-stratified) | Apache-2.0 | eligible; human-curated multilingual supplement |
+| [UltraChat 200k](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) | `8049631c405ae6576f93f445c6b8166f76f5505a` | `train_sft`, `test_sft` | MIT | eligible; ordinary English dialogue supplement |
 | [Nemotron Post-Training v2](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2) | `5c89e01dd720ae0f4058445ed49c5fb68a03c76e` | selected English and German splits | CC-BY-4.0; gated access | quarantined pending a documented derivative-use decision |
 
 Tool definitions are training input, not incidental metadata. For Agentic v1

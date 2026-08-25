@@ -1,7 +1,8 @@
 {
   "format": "ctox.qwen38.recovery-corpus-evidence.v3",
   "date": "2026-08-25",
-  "status": "materialized_multilabel_gate_passed_primary_supplement_required",
+  "status": "superseded_after_empty_conditioning_and_payload_dedup_audit",
+  "superseded_by": "RECOVERY_CORPUS_V4.json",
   "model": "Qwen/Qwen3.8-27B",
   "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
   "teacher_provenance": {

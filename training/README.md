@@ -62,6 +62,14 @@ applied; this prevents a high-resource language at the start of a stream from
 silently consuming the multilingual quota. Machine-translated bulk from the
 larger Aya Collection is not part of the initial recovery mix.
 
+Ordinary English dialogue gaps use the MIT-licensed
+`HuggingFaceH4/ultrachat_200k` source at reviewed revision
+`8049631c405ae6576f93f445c6b8166f76f5505a`. Train and held-out candidates
+come from its already separate `train_sft` and `test_sft` splits. This source
+was admitted only after the materialized Nemotron-v1 `chat` selection was found
+to contain empty user turns; those unconditioned records are excluded rather
+than counted as general-domain evidence.
+
 Sample identities cover the complete recovery payload, including reference
 answers. Changing an answer therefore changes both the payload hash and sample
 identity; stale source coordinates cannot silently enter a teacher cache.
@@ -80,7 +88,11 @@ examples already seen during Q2/Q4 assignment or teacher-cache smoke tests.
 `merge_manifests.py` then combines the independently sized strata, deduplicates
 by complete sample identity, rejects release-ineligible records, and can enforce
 the exact total before materialization.
-`audit_corpus.py` re-verifies every materialized payload hash and reports exact
+`filter_recovery_cohort.py` rejects empty conditioning, missing targets,
+duplicate payloads, and payloads already used by a denied partition while
+keeping materialized records and semantic tags in exact lockstep.
+`audit_corpus.py` independently re-verifies every materialized payload hash,
+rejects internal and train/evaluation payload overlap, and reports exact
 language, capability, source, prompt-length, assistant-target, multi-turn,
 structured-output, and tool-schema distributions before GPU work is admitted.
 `DOMAIN_RUBRIC.json` is the subsequent semantic gate. Version 2 expands the
@@ -129,7 +141,9 @@ the combined cohort before writing release evidence.
 Because independent NLI scores can produce unstable argmax choices between
 sibling domains, the selector may assign one candidate to a non-argmax primary
 only when that domain itself exceeds the rubric confidence and lies within the
-declared 0.02 score tolerance of the classifier maximum. The emitted tag keeps
+declared selection-specific score tolerance of the classifier maximum. The
+final quality-filtered selection records tolerances of 0.04 for recovery and
+0.03 for held-out evaluation. The emitted tag keeps
 the pre-assignment primary, target score, exact margin, and
 `primary_source=near_tie_coverage_assignment`; one sample can close only one
 primary cell. The effective supplement tags are a separately hashed output.

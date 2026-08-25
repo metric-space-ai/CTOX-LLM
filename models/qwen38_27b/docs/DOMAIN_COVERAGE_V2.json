@@ -1,7 +1,7 @@
 {
-  "format": "ctox.qwen38.domain-coverage-policy.v2",
+  "format": "ctox.qwen38.domain-coverage-evidence.v3",
   "date": "2026-08-25",
-  "status": "policy_committed_reclassification_and_supplement_selection_pending",
+  "status": "passed_quality_filtered_disjoint_selection",
   "scope": "Qwen3.8-27B Q2/Q4 recovery selection and held-out quality evaluation",
   "policy": {
     "semantic_domains": 36,
@@ -10,25 +10,173 @@
     "joint_language_domain_gate": true,
     "translation_only_language_coverage_rejected": true,
     "domain_labels_are_training_targets": false,
-    "existing_teacher_cache_samples_remain_content_valid": true,
+    "empty_conditioning_rejected": true,
+    "duplicate_payloads_rejected": true,
+    "train_evaluation_payload_overlap_allowed": 0,
     "new_supplements_are_disjoint_additive_batches": true
   },
   "inputs": {
-    "domain_rubric": "training/DOMAIN_RUBRIC.json",
-    "language_rubric": "training/LANGUAGE_RUBRIC.json",
-    "classifier": "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
-    "classifier_revision": "8adb042d524ecd5c26d3e3ba0e3fbcf7e2d0864c"
+    "domain_rubric": {
+      "path": "training/DOMAIN_RUBRIC.json",
+      "sha256": "9adffaac115b24b99f97f53352c0f2cff5362512f4e93c49306149bf3e3762c3"
+    },
+    "language_rubric": {
+      "path": "training/LANGUAGE_RUBRIC.json",
+      "sha256": "22ce547a7a5588a9ccf4dd737663229a4d924655dc4fcf9b2acfa857b683fd49"
+    },
+    "classifier": {
+      "model": "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+      "revision": "8adb042d524ecd5c26d3e3ba0e3fbcf7e2d0864c",
+      "license": "mit"
+    },
+    "normal_prompt_supplements": [
+      {
+        "dataset": "CohereLabs/aya_dataset",
+        "revision": "f9ea04583f02a8f86404ff6c58bf75fe637df8a2",
+        "license": "apache-2.0"
+      },
+      {
+        "dataset": "HuggingFaceH4/ultrachat_200k",
+        "revision": "8049631c405ae6576f93f445c6b8166f76f5505a",
+        "license": "mit"
+      }
+    ]
   },
-  "invalidated_as_final_release_evidence": [
-    "release-recovery-train-2072-v2.jsonl domain tags",
-    "release-recovery-evaluation-524-v2.jsonl domain tags",
-    "16-domain primary-gate summaries"
-  ],
-  "still_valid": [
-    "frozen train and held-out sample identities and payload hashes",
-    "completed BF16 teacher-cache artifacts for unchanged sample identities",
-    "zero train/evaluation overlap evidence",
-    "source revision and license provenance"
-  ],
-  "release_gate": "Reclassify both frozen cohorts and disjoint candidate pools under v2, select only high-confidence gap-closing additions, pass joint language/domain coverage, then cache additions separately."
+  "quality_filter": {
+    "implementation": "training/filter_recovery_cohort.py",
+    "nemotron_v1_chat_empty_conditioning_removed": {
+      "train": 524,
+      "evaluation": 138
+    },
+    "old_train_internal_duplicate_payload_records_removed": 3,
+    "final_empty_conditioning_records": 0,
+    "final_internal_duplicate_payload_records": 0,
+    "final_train_evaluation_id_overlap": 0,
+    "final_train_evaluation_payload_overlap": 0,
+    "empty_text_targets": {
+      "train": 14,
+      "evaluation": 3,
+      "all_are_nonempty_tool_calls": true
+    }
+  },
+  "train": {
+    "records": 2328,
+    "bytes": 48022202,
+    "materialized_sha256": "79d156969ae8846e8befd2406ae9837feb1c32cfc3e278338c3a533254471b4b",
+    "domain_tags_sha256": "ae4ca2a70692fdd0d7c61f108af0ca1b8609a60d1ca05548ddbd89d166488bfc",
+    "joint_audit_sha256": "5884ffb74506dac7790bba8cd6efdcf092b30c6273d489141df6bad7636d75fe",
+    "joint_status": "passed",
+    "selected_quality_supplement": {
+      "records": 311,
+      "tokens": 403463,
+      "primary_tie_tolerance": 0.04
+    },
+    "categories": {
+      "agentic": 381,
+      "chat": 866,
+      "code": 503,
+      "long_context": 55,
+      "math": 523
+    },
+    "languages": {
+      "arb": 34,
+      "de": 198,
+      "de-en-mixed": 77,
+      "en": 1638,
+      "fra": 35,
+      "hin": 33,
+      "ita": 34,
+      "jpn": 33,
+      "kor": 36,
+      "nld": 34,
+      "pol": 32,
+      "por": 33,
+      "rus": 38,
+      "spa": 37,
+      "zho": 36
+    },
+    "primary_domains": {
+      "agentic_tools_workflows": 401,
+      "agriculture_food_systems": 20,
+      "biology_biotechnology": 28,
+      "business_operations_management": 36,
+      "chemistry_materials": 28,
+      "creative_arts_literature": 28,
+      "cybersecurity_privacy": 36,
+      "data_analysis_statistics_structured": 56,
+      "design_architecture": 20,
+      "earth_climate_environment": 28,
+      "economics_accounting_finance": 36,
+      "education_learning": 28,
+      "electrical_hardware_engineering": 28,
+      "everyday_practical": 52,
+      "food_home_travel_lifestyle": 36,
+      "general_knowledge_explanation": 210,
+      "geography_geopolitics": 26,
+      "history_archaeology": 28,
+      "interpersonal_communication": 28,
+      "law_regulation_administration": 36,
+      "mathematics_logic": 240,
+      "mechanical_civil_manufacturing": 28,
+      "media_journalism_entertainment": 20,
+      "medicine_health": 36,
+      "philosophy_ethics_religion": 20,
+      "physics_astronomy": 27,
+      "politics_civics_institutions": 131,
+      "psychology_sociology": 28,
+      "research_search_factchecking": 28,
+      "safety_uncertainty": 33,
+      "software_development": 376,
+      "sports_fitness_recreation": 20,
+      "systems_cloud_databases": 36,
+      "translation_localization_linguistics": 36,
+      "transport_logistics": 28,
+      "writing_editing_summarization": 52
+    }
+  },
+  "evaluation": {
+    "records": 642,
+    "bytes": 14936462,
+    "materialized_sha256": "06f148135c7dfa1a7cf05fdfe8da78bf4cbd49b9d973fe9c3c8287634c16691f",
+    "domain_tags_sha256": "37e43eb0fc724d2825a67ede21814d7725873c27152719d1a4f796410af67787",
+    "joint_audit_sha256": "2b4828b943442d8570e11f6df4bae8d70be7317872e9c3d3146e544d6a11f6d4",
+    "joint_status": "passed",
+    "selected_quality_supplement": {
+      "records": 99,
+      "tokens": 123944,
+      "primary_tie_tolerance": 0.03
+    },
+    "categories": {
+      "agentic": 96,
+      "chat": 247,
+      "code": 142,
+      "long_context": 20,
+      "math": 137
+    },
+    "languages": {
+      "arb": 9,
+      "de": 62,
+      "de-en-mixed": 17,
+      "en": 450,
+      "fra": 12,
+      "hin": 9,
+      "ita": 9,
+      "jpn": 9,
+      "kor": 10,
+      "nld": 8,
+      "pol": 9,
+      "por": 9,
+      "rus": 10,
+      "spa": 8,
+      "zho": 11
+    }
+  },
+  "corpus_audit": {
+    "format": "ctox.recovery-corpus-audit.v1",
+    "sha256": "8bbb502bdd581f4b9889c490980cd83348f77deb81ba3da6c25c89f46e13456c",
+    "payload_hashes_verified": 2970,
+    "train_evaluation_id_overlap": 0,
+    "train_evaluation_payload_overlap": 0
+  },
+  "interpretation": "This gate proves selected recovery and held-out evaluation coverage. It does not claim that 2,328 recovery records teach a base model new comprehensive world knowledge; the BF16 base model remains the knowledge teacher."
 }

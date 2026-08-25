@@ -1,0 +1,85 @@
+{
+  "format": "ctox.qwen38.recovery-corpus-evidence.v4",
+  "date": "2026-08-25",
+  "status": "quality_filtered_domain_language_and_disjointness_gates_passed",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "teacher_provenance": {
+    "artifact": "qwen38-27b-bf16-1d4bf0f-v1.json",
+    "artifact_sha256": "d930966047fee2be4a3e1f70e55d0b507231bc5d9ead935bd166879d8bdc81d0",
+    "verified_files": 23,
+    "verified_bytes": 55575959504,
+    "root_sha256": "c63bc259cd8d18b0a701983a226867927b4ec19b376a684b218c3fa572754524"
+  },
+  "cohorts": {
+    "train": {
+      "materialized": "release-recovery-train-2328-v7.jsonl",
+      "records": 2328,
+      "bytes": 48022202,
+      "sha256": "79d156969ae8846e8befd2406ae9837feb1c32cfc3e278338c3a533254471b4b",
+      "prompt_tokens": 13971665,
+      "assistant_target_tokens": 8898986,
+      "multi_turn_records": 613,
+      "tool_records": 316,
+      "structured_final_answers": 1085
+    },
+    "evaluation": {
+      "materialized": "release-recovery-evaluation-642-v7.jsonl",
+      "records": 642,
+      "bytes": 14936462,
+      "sha256": "06f148135c7dfa1a7cf05fdfe8da78bf4cbd49b9d973fe9c3c8287634c16691f",
+      "prompt_tokens": 4380409,
+      "assistant_target_tokens": 2483242,
+      "multi_turn_records": 169,
+      "tool_records": 80,
+      "structured_final_answers": 303
+    },
+    "audit_artifact": "release-recovery-2328-642-v7.json",
+    "audit_sha256": "8bbb502bdd581f4b9889c490980cd83348f77deb81ba3da6c25c89f46e13456c",
+    "train_evaluation_id_overlap": 0,
+    "train_evaluation_payload_overlap": 0,
+    "internal_duplicate_payloads": 0,
+    "empty_conditioning_records": 0
+  },
+  "train_mix": {
+    "capability_categories": {
+      "agentic": 381,
+      "chat": 866,
+      "code": 503,
+      "long_context": 55,
+      "math": 523
+    },
+    "source_counts": {
+      "Beko2210/German-Instruct-Dataset": 264,
+      "CohereLabs/aya_dataset": 458,
+      "HuggingFaceH4/ultrachat_200k": 232,
+      "metric-space-ai/CTOX-LLM": 24,
+      "nvidia/Nemotron-Agentic-v1": 125,
+      "nvidia/Nemotron-Post-Training-Dataset-v1": 1033,
+      "nvidia/Nemotron-SFT-Agentic-v2": 192
+    },
+    "language_strata": 15,
+    "semantic_domains": 36,
+    "semantic_families": 10
+  },
+  "gates": {
+    "domain_and_language_evidence": "DOMAIN_COVERAGE_V2.json",
+    "domain_multi_label_gaps": 0,
+    "domain_primary_gaps": 0,
+    "language_quota_gaps": 0,
+    "language_primary_diversity_gaps": 0,
+    "non_translation_gaps": 0,
+    "non_english_family_gaps": 0
+  },
+  "rejected_prior_records": {
+    "nemotron_v1_chat_empty_conditioning_train": 524,
+    "nemotron_v1_chat_empty_conditioning_evaluation": 138,
+    "old_train_internal_duplicate_payload_records": 3
+  },
+  "gates_still_open": [
+    "Cache BF16 teacher targets for final new supplement identities and assemble the verified complete cache set.",
+    "Recompute final-corpus activation statistics and confirm or replace the provisional Q2/Q4 assignment.",
+    "Run end-to-end KL, cross-entropy, hidden-state, activation, and MTP recovery.",
+    "Pass held-out BF16-vs-quant quality and backend performance gates."
+  ]
+}

@@ -6,26 +6,44 @@ capability families, application domains, languages, prompt lengths, and output
 shapes. Training and evaluation identities are disjoint before prompt text is
 materialized.
 
-## Fixed cohort quotas
+## Final quality-filtered cohort
 
-| Capability/source stratum | Train | Held-out | Purpose |
+| Capability stratum | Train | Held-out | Purpose |
 |---|---:|---:|---|
-| General conversation and knowledge (Nemotron v1 `chat`) | 384 | 96 | ordinary questions, explanation, writing, summarization, practical help |
-| Coding (Nemotron v1 `code`) | 320 | 80 | generation, debugging, review, tests, multiple programming languages |
-| Mathematics and logic (Nemotron v1 `math`) | 192 | 48 | arithmetic through formal reasoning |
-| STEM and technical (Nemotron v1 `stem`) | 192 | 48 | natural sciences, engineering, computing, data analysis |
-| Agentic/tool/search pool (six pinned Agentic strata) | 384 | 96 | planning, tool schemas, tool results, search, multi-step execution |
-| German general/professional (German Instruct) | 192 | 48 | normal dialogue, business, administration, RAG, technical German |
-| Multilingual human-curated dialogue (Aya; twelve strata) | 384 | 96 | 32/8 each for French, Spanish, Italian, Portuguese, Dutch, Polish, Chinese, Japanese, Arabic, Hindi, Russian, Korean |
-| Procedural long context | 24 | 12 | disjoint 32K/64K/128K retrieval and cross-record linking |
-| **Total** | **2,072** | **524** | one active recovery run and a separate release gate |
+| General dialogue | 866 | 247 | ordinary questions, explanation, writing, summarization, practical help, culture, society, and professional communication |
+| Coding | 503 | 142 | generation, debugging, review, tests, systems, databases, and multiple programming languages |
+| Mathematics and logic | 523 | 137 | arithmetic through formal reasoning plus quantitative problem solving |
+| Agentic/tool/search | 381 | 96 | planning, tool schemas, tool results, search, and multi-step execution |
+| Procedural long context | 55 | 20 | disjoint 32K/64K/128K retrieval and cross-record linking |
+| **Total** | **2,328** | **642** | one active recovery run and a payload-disjoint release gate |
 
-The Agentic 768/192 materialization is a candidate pool. Only a deterministic
-384/96 subset enters the final mix, so tool use cannot dominate normal language
-or coding. English and German remain the highest-weight languages because they
-match the initial CTOX use cases; the other twelve languages are equal-weighted
-across Latin, Cyrillic, Arabic, Devanagari, Han, Kana, and Hangul scripts. This
-avoids defining multilingual as only French and Spanish translation.
+The original Nemotron-v1 `chat` records selected for the fixed cohort were
+rejected after the exact materialized payload audit found 524 training and 138
+evaluation records without any conditioning content. They are not counted as
+normal prompts. Valid pinned Aya and UltraChat records replenish the general,
+writing, creative, interpersonal, and multilingual gaps. UltraChat is pinned at
+revision `8049631c405ae6576f93f445c6b8166f76f5505a` under MIT; Aya remains pinned
+at `f9ea04583f02a8f86404ff6c58bf75fe637df8a2` under Apache-2.0.
+
+The final source counts are:
+
+| Source | Train | Held-out |
+|---|---:|---:|
+| Nemotron Post-Training v1 (valid non-chat strata) | 1,033 | 286 |
+| Nemotron Agentic v1 | 125 | 32 |
+| Nemotron SFT Agentic v2 | 192 | 48 |
+| German Instruct | 264 | 73 |
+| Aya | 458 | 118 |
+| UltraChat 200k | 232 | 73 |
+| CTOX procedural long context | 24 | 12 |
+
+Only deterministic, gap-closing subsets enter the final mix, so tool use,
+coding, or mathematics cannot displace normal language. English and German
+remain the highest-weight languages because they match the initial CTOX use
+cases; twelve additional language strata cover Latin, Cyrillic, Arabic,
+Devanagari, Han, Kana, and Hangul scripts. Exact per-language and per-domain
+counts and artifact hashes are frozen in
+`models/qwen38_27b/docs/DOMAIN_COVERAGE_V2.json`.
 
 ## Application-domain coverage
 
@@ -44,8 +62,8 @@ is a readable summary; `DOMAIN_RUBRIC.json` contains the binding quotas:
 
 No single source is trusted to prove this coverage. A committed audit reports
 counts from source metadata plus the frozen multi-label classifier contract in
-`DOMAIN_RUBRIC.json`, and a stratum that
-misses its minimum is replenished from its source pool before training. Medical,
+`DOMAIN_RUBRIC.json`, and a stratum that misses its minimum is replenished from
+its source pool before training. Medical,
 legal, and financial records preserve general assistance and uncertainty
 behavior; they are not treated as a substitute for expert-reviewed knowledge.
 
