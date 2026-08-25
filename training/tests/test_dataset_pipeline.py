@@ -119,6 +119,50 @@ class DatasetPipelineTests(unittest.TestCase):
         ).hexdigest()
         return record
 
+    def test_committed_general_purpose_evidence_covers_every_declared_domain(self) -> None:
+        domain_rubric = json.loads((TRAINING / "DOMAIN_RUBRIC.json").read_text())
+        language_rubric = json.loads((TRAINING / "LANGUAGE_RUBRIC.json").read_text())
+        evidence = json.loads(
+            (
+                TRAINING.parent
+                / "models/qwen38_27b/docs/DOMAIN_COVERAGE_V2.json"
+            ).read_text()
+        )
+        expected_domains = set(domain_rubric["domains"])
+        expected_languages = set(language_rubric["languages"])
+        for partition in ("train", "evaluation"):
+            observed = evidence[partition]
+            primary = observed["primary_domains"]
+            self.assertEqual(set(primary), expected_domains)
+            self.assertEqual(sum(primary.values()), observed["records"])
+            self.assertEqual(set(observed["languages"]), expected_languages)
+            for domain, policy in domain_rubric["domains"].items():
+                minimum = policy.get(
+                    f"minimum_primary_{partition}",
+                    domain_rubric["policy"][f"minimum_primary_{partition}"],
+                )
+                self.assertGreaterEqual(primary[domain], minimum, domain)
+        family_gate = evidence["multilingual_joint_gate"]
+        expected_families = set(domain_rubric["policy"]["required_families"])
+        self.assertEqual(
+            set(family_gate["train_non_english_family_counts"]), expected_families
+        )
+        self.assertEqual(
+            set(family_gate["evaluation_non_english_family_counts"]),
+            expected_families,
+        )
+        for family, minima in language_rubric[
+            "aggregate_non_english_family_minima"
+        ].items():
+            self.assertGreaterEqual(
+                family_gate["train_non_english_family_counts"][family],
+                minima["train"],
+            )
+            self.assertGreaterEqual(
+                family_gate["evaluation_non_english_family_counts"][family],
+                minima["evaluation"],
+            )
+
     def test_cohort_filter_rejects_empty_conditioning_and_duplicate_payloads(self) -> None:
         valid = self.recovery_record("valid", "Explain it", "A useful answer")
         duplicate = dict(valid, id="duplicate")
