@@ -164,6 +164,9 @@ forward decodes only an output-row chunk at a time; backward re-decodes those
 same immutable codes and analytically accumulates gradients for input,
 `s_in`, `s_out`, and bias. It therefore does not retain a dequantized BF16
 matrix between passes, and its gradients are tested against the dense oracle.
+Native FP16/FP32 tensors, including the initial recovery scales, are decoded by
+the same artifact reader with exact manifest shapes; the trainer never needs a
+parallel scale file after a checkpoint has been packed.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized

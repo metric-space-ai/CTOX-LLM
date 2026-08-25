@@ -565,6 +565,9 @@ class DatasetPipelineTests(unittest.TestCase):
                 view = artifact.tensor_bytes("scale")
                 self.assertEqual(bytes(view), payload)
                 view.release()
+                values = artifact.decode_float_tensor("scale", torch, "cpu") if torch else None
+                if values is not None:
+                    self.assertEqual(tuple(values.shape), (2,))
 
     def test_python_ctox_reader_decodes_canonical_q2_codes(self) -> None:
         if torch is None:

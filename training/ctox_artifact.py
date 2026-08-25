@@ -222,6 +222,19 @@ class CtoxArtifact:
             raise ValueError(f"CTOX mixed tensor {name} row coverage differs")
         return torch.cat(decoded, dim=0) if len(decoded) > 1 else decoded[0]
 
+    def decode_float_tensor(self, name: str, torch: Any, device: str) -> Any:
+        tensor = self.tensors[name]
+        dtype_name = str(tensor["dtype"])
+        if dtype_name not in {"f16", "f32"}:
+            raise ValueError(f"CTOX tensor {name} is not a float tensor")
+        payload = self.tensor_bytes(name)
+        try:
+            dtype = torch.float16 if dtype_name == "f16" else torch.float32
+            values = torch.frombuffer(bytearray(payload), dtype=dtype).clone()
+        finally:
+            payload.release()
+        return values.reshape(tuple(int(value) for value in tensor["shape"])).to(device)
+
     def close(self) -> None:
         if hasattr(self, "_mmap"):
             self._mmap.close()
