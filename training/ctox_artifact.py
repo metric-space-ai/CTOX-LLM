@@ -138,6 +138,90 @@ class CtoxArtifact:
         for name in self.tensors:
             self.verify_tensor(name)
 
+    @staticmethod
+    def _decode_blocks(torch: Any, payload: memoryview, dtype: str, device: str) -> Any:
+        block_bytes = BLOCK_BYTES[dtype]
+        if len(payload) % block_bytes:
+            raise ValueError("packed CTOX block payload is truncated")
+        encoded = torch.frombuffer(bytearray(payload), dtype=torch.uint8).clone().to(device)
+        blocks = encoded.reshape(-1, block_bytes)
+        scales = blocks[:, :2].contiguous().view(torch.float16).reshape(-1).float()
+        packed = blocks[:, 2:]
+        if dtype == "q2_b64":
+            codes = torch.stack(
+                tuple((packed >> shift) & 0x03 for shift in (0, 2, 4, 6)),
+                dim=-1,
+            ).reshape(-1, BLOCK)
+            codebook = torch.tensor(
+                [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0],
+                device=device,
+                dtype=torch.float32,
+            )
+            values = codebook[codes.long()]
+        elif dtype == "q4_b64":
+            codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(-1, BLOCK)
+            values = codes.float() / 7.5 - 1.0
+        else:
+            raise ValueError(f"cannot decode non-quantized dtype {dtype}")
+        return values * scales[:, None]
+
+    def decode_matrix_rows(
+        self,
+        name: str,
+        row_start: int,
+        row_end: int,
+        torch: Any,
+        device: str,
+    ) -> Any:
+        """Decode only requested matrix rows; fixed packed codes remain canonical."""
+
+        tensor = self.tensors[name]
+        shape = [int(value) for value in tensor["shape"]]
+        if len(shape) != 2 or shape[1] % BLOCK:
+            raise ValueError(f"CTOX tensor {name} is not a block-aligned matrix")
+        if not 0 <= row_start < row_end <= shape[0]:
+            raise ValueError(f"invalid row range for CTOX tensor {name}")
+        dtype = str(tensor["dtype"])
+        segments = tensor.get("segments", [])
+        if dtype in BLOCK_BYTES:
+            segments = [
+                {
+                    "row_start": 0,
+                    "row_end": shape[0],
+                    "dtype": dtype,
+                    "offset": 0,
+                }
+            ]
+        elif dtype != "mixed_q2_q4_b64":
+            raise ValueError(f"CTOX tensor {name} is not quantized")
+        tensor_payload = self.tensor_bytes(name)
+        decoded = []
+        try:
+            for segment in segments:
+                start = max(row_start, int(segment["row_start"]))
+                stop = min(row_end, int(segment["row_end"]))
+                if start >= stop:
+                    continue
+                segment_dtype = str(segment["dtype"])
+                blocks_per_row = shape[1] // BLOCK
+                bytes_per_row = blocks_per_row * BLOCK_BYTES[segment_dtype]
+                local_start = start - int(segment["row_start"])
+                local_stop = stop - int(segment["row_start"])
+                byte_start = int(segment["offset"]) + local_start * bytes_per_row
+                byte_stop = int(segment["offset"]) + local_stop * bytes_per_row
+                values = self._decode_blocks(
+                    torch,
+                    tensor_payload[byte_start:byte_stop],
+                    segment_dtype,
+                    device,
+                ).reshape(stop - start, shape[1])
+                decoded.append(values)
+        finally:
+            tensor_payload.release()
+        if sum(value.shape[0] for value in decoded) != row_end - row_start:
+            raise ValueError(f"CTOX mixed tensor {name} row coverage differs")
+        return torch.cat(decoded, dim=0) if len(decoded) > 1 else decoded[0]
+
     def close(self) -> None:
         if hasattr(self, "_mmap"):
             self._mmap.close()

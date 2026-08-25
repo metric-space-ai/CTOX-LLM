@@ -565,6 +565,45 @@ class DatasetPipelineTests(unittest.TestCase):
                 self.assertEqual(bytes(view), payload)
                 view.release()
 
+    def test_python_ctox_reader_decodes_canonical_q2_codes(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "q2.ctoxq"
+            packed_code = bytes([0 | (1 << 2) | (2 << 4) | (3 << 6)])
+            payload = torch.tensor([1.0], dtype=torch.float16).view(torch.uint8).numpy().tobytes()
+            payload += packed_code * 16
+            manifest = {
+                "format": "ctox.q2q4.v1",
+                "model": "test",
+                "revision": "revision",
+                "alignment": 64,
+                "target": "canonical-b64",
+                "tensors": [
+                    {
+                        "name": "weight",
+                        "dtype": "q2_b64",
+                        "shape": [1, 64],
+                        "offset": 0,
+                        "length": 18,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                ],
+            }
+            manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
+            data_offset = (HEADER.size + len(manifest_bytes) + 63) & ~63
+            path.write_bytes(
+                HEADER.pack(MAGIC, 1, ENDIAN_MARKER, len(manifest_bytes), data_offset, 1, 64)
+                + manifest_bytes
+                + b"\0" * (data_offset - HEADER.size - len(manifest_bytes))
+                + payload
+            )
+            with CtoxArtifact(path, verify_tensors=True) as artifact:
+                values = artifact.decode_matrix_rows("weight", 0, 1, torch, "cpu")
+                self.assertEqual(tuple(values.shape), (1, 64))
+                expected = torch.tensor([-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0])
+                self.assertTrue(torch.allclose(values[0, :4], expected))
+
     def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

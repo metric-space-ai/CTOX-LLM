@@ -155,6 +155,10 @@ every underlying batch-verification hash before the first optimization step.
 native Rust container. It validates the 64-byte header, version, endianness,
 manifest bounds, alignment, Q2/Q4 or mixed-row byte formulas, non-overlapping
 ranges, and optional per-tensor SHA-256 before exposing a read-only memoryview.
+Its row decoder reads only the requested Q2/Q4 or mixed-row slice, reconstructs
+the native FP16 block scale and bit ordering exactly, and leaves the canonical
+packed codes immutable. This bounded decoder is the correctness path for the
+future autograd/fused-kernel recovery adapter, not a second quantizer.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized
