@@ -256,6 +256,48 @@ pub fn recurrent_gated_delta_step(
     Ok(output)
 }
 
+/// Sequential prefill oracle for the same recurrence used by chunked kernels.
+#[allow(clippy::too_many_arguments)]
+pub fn recurrent_gated_delta_sequence(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    log_decay: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    tokens: usize,
+    heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> Result<Vec<f32>> {
+    let qk_per_token = heads
+        .checked_mul(key_dim)
+        .ok_or_else(|| EngineError::Shape("delta sequence QK shape overflows".into()))?;
+    let value_per_token = heads
+        .checked_mul(value_dim)
+        .ok_or_else(|| EngineError::Shape("delta sequence value shape overflows".into()))?;
+    matrix_contract("delta sequence query", query, tokens, qk_per_token)?;
+    matrix_contract("delta sequence key", key, tokens, qk_per_token)?;
+    matrix_contract("delta sequence value", value, tokens, value_per_token)?;
+    matrix_contract("delta sequence decay", log_decay, tokens, heads)?;
+    matrix_contract("delta sequence beta", beta, tokens, heads)?;
+    let mut output = Vec::with_capacity(tokens * value_per_token);
+    for token in 0..tokens {
+        output.extend(recurrent_gated_delta_step(
+            &query[token * qk_per_token..(token + 1) * qk_per_token],
+            &key[token * qk_per_token..(token + 1) * qk_per_token],
+            &value[token * value_per_token..(token + 1) * value_per_token],
+            &log_decay[token * heads..(token + 1) * heads],
+            &beta[token * heads..(token + 1) * heads],
+            state,
+            heads,
+            key_dim,
+            value_dim,
+        )?);
+    }
+    Ok(output)
+}
+
 /// Causal grouped-query attention, returning token-major `[tokens, heads, dim]`.
 // ref: modeling_qwen3_5.py:593-627
 #[allow(clippy::too_many_arguments)]
@@ -497,5 +539,51 @@ mod tests {
         for (actual, ungated) in gated.iter().zip(output) {
             assert!((actual - ungated * 0.5).abs() <= 1e-7);
         }
+    }
+
+    #[test]
+    fn delta_prefill_sequence_matches_recurrent_python_oracle() {
+        let mut state: Vec<f32> = (1..=8).map(|value| value as f32 / 100.0).collect();
+        let output = recurrent_gated_delta_sequence(
+            &[1.0, 2.0, 0.5, -1.0, -1.0, 0.25, 2.0, 1.0],
+            &[0.5, -0.25, 1.0, 0.5, 0.75, 1.25, -0.5, 2.0],
+            &[1.0, -1.0, 0.5, 2.0, -2.0, 0.25, 1.5, -0.5],
+            &[-0.2, -0.4, -0.1, -0.3],
+            &[0.6, 0.25, 0.8, 0.4],
+            &mut state,
+            2,
+            2,
+            2,
+            2,
+        )
+        .unwrap();
+        close(
+            &output,
+            &[
+                0.018123373,
+                0.025_890_53,
+                -0.019077633,
+                -0.021197364,
+                -0.0373289,
+                0.32707188,
+                0.17473069,
+                0.24809137,
+            ],
+            2e-6,
+        );
+        close(
+            &state,
+            &[
+                -0.35503477,
+                -0.36432835,
+                -1.6378022,
+                0.44982785,
+                -0.04187046,
+                0.41027403,
+                0.636288,
+                -0.03601411,
+            ],
+            2e-6,
+        );
     }
 }

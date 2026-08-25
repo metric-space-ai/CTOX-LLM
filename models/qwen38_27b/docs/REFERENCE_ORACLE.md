@@ -18,9 +18,10 @@ GatedDeltaNet's directly weighted gated RMSNorm, SwiGLU, 25-percent partial
 RoPE, causal depthwise-convolution decode-state updates, and the exact
 single-token recurrent gated-delta rule with Q/K L2 normalization. Causal
 grouped-query attention and its post-attention sigmoid query gate are covered
-as well. Tests use golden values emitted by that pinned Python implementation,
-including nonzero recurrent state so decay is exercised.
+as well. A sequential prefill oracle exercises the same recurrence expected
+from future chunked kernels. Tests use golden values emitted by that pinned
+Python implementation, including nonzero recurrent state so decay is exercised.
 
-Chunked prefill delta recurrence, quantized projection composition, residual
-block execution, MTP, and end-to-end logits remain required before this becomes
-a complete decoder oracle.
+The optimized chunked prefill implementation, quantized projection composition,
+residual block execution, MTP, and end-to-end logits remain required before
+this becomes a complete decoder oracle.
