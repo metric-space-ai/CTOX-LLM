@@ -48,6 +48,7 @@ from collect_activation_stats import (  # noqa: E402
 from ctox_artifact import CtoxArtifact, ENDIAN_MARKER, HEADER, MAGIC  # noqa: E402
 from materialize_prompts import load_local_materialized, load_manifests  # noqa: E402
 from merge_manifests import merge  # noqa: E402
+from merge_domain_tags import merge_ordered_tags  # noqa: E402
 from merge_activation_stats import merged_metadata, source_runtime_profiles  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
 from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_bytes  # noqa: E402
@@ -409,6 +410,19 @@ class DatasetPipelineTests(unittest.TestCase):
         first = {"input": "2+2?", "output": "4"}
         second = {"input": "2+2?", "output": "5"}
         self.assertNotEqual(canonical_text(first), canonical_text(second))
+
+    def test_domain_tag_shards_follow_materialized_order(self) -> None:
+        records = [{"id": "b"}, {"id": "a"}, {"id": "c"}]
+        shards = [
+            [{"id": "a", "primary_label": "x"}, {"id": "c", "primary_label": "y"}],
+            [{"id": "b", "primary_label": "z"}],
+        ]
+        self.assertEqual(
+            [tag["id"] for tag in merge_ordered_tags(records, shards)],
+            ["b", "a", "c"],
+        )
+        with self.assertRaisesRegex(ValueError, "domain tag a"):
+            merge_ordered_tags(records, shards + [[{"id": "a"}]])
 
     def test_hash_covers_tool_schema(self) -> None:
         first = {

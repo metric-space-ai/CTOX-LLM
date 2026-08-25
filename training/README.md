@@ -120,6 +120,10 @@ per-language diversity, and aggregate non-English-family cells, preferring
 broader coverage and then lower token cost. It fails with the unresolved cells
 when the candidate pool is insufficient and re-runs both complete gates over
 the combined cohort before writing release evidence.
+Large candidate pools may be classified as independent GPU shards.
+`merge_domain_tags.py` accepts them only when their union is an exact,
+duplicate-free match for the materialized candidate IDs, restores materialized
+order, recomputes both quota views, and emits a new content hash.
 
 `plan_teacher_cache.py` tokenizes the complete frozen cohort with the same
 assistant, hidden-state, marker-window, and MTP position rules as the cache
