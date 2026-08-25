@@ -11,6 +11,7 @@ TRAINING = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TRAINING))
 
 from build_manifest import canonical_text, recovery_payload  # noqa: E402
+from collect_activation_stats import checkpoint_weight_name  # noqa: E402
 from materialize_prompts import load_manifests  # noqa: E402
 from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
 from select_manifest import select  # noqa: E402
@@ -84,6 +85,12 @@ class DatasetPipelineTests(unittest.TestCase):
     def test_empty_tool_calls_are_removed(self) -> None:
         messages = normalize_messages([{"role": "user", "content": "hello", "tool_calls": []}])
         self.assertEqual(messages, [{"role": "user", "content": "hello"}])
+
+    def test_runtime_linear_name_maps_to_checkpoint(self) -> None:
+        self.assertEqual(
+            checkpoint_weight_name("model.layers.12.mlp.down_proj"),
+            "model.language_model.layers.12.mlp.down_proj.weight",
+        )
 
 
 if __name__ == "__main__":

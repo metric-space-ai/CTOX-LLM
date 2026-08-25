@@ -11,6 +11,11 @@ pipeline has four immutable stages:
    residual probability mass, and selected hidden states.
 4. `train_recovery.py` freezes Q2/Q4 codes and trains channel correction scales.
 
+Before assigning scarce Q4 capacity, `collect_activation_stats.py` hooks the
+real BF16 text graph and stores only per-channel input/output mean squares for
+quantized linear modules. These diagonal statistics support activation-weighted
+Q2/Q4 error scoring without retaining source prompts or token activations.
+
 Nemotron v2 is quarantined by default. Research may opt into the cohort, but a
 public checkpoint cannot claim release eligibility until a legal decision is
 recorded in the manifest.
