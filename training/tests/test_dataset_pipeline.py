@@ -101,7 +101,7 @@ from teacher_cache_dataset import VerifiedTeacherCache  # noqa: E402
 from verify_vendor_manifest import verify  # noqa: E402
 from verify_local_model import root_digest  # noqa: E402
 from verify_teacher_cache import expected_tensor_specs  # noqa: E402
-from run_teacher_batches import completed_batch_matches  # noqa: E402
+from run_teacher_batches import cache_environment, completed_batch_matches  # noqa: E402
 
 
 class DatasetPipelineTests(unittest.TestCase):
@@ -942,6 +942,21 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual([record["id"] for record in missing], ["b"])
         with self.assertRaisesRegex(ValueError, "outside final cohort"):
             select_missing(records, {"z"})
+
+    def test_teacher_batch_runner_binds_an_explicit_cache_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "hf"
+            cache.mkdir()
+            inherited = {"HF_HOME": "/stale/cache", "UNCHANGED": "yes"}
+            environment = cache_environment(inherited, cache)
+            self.assertEqual(environment["HF_HOME"], str(cache.resolve()))
+            self.assertEqual(
+                environment["HF_HUB_CACHE"], str(cache.resolve() / "hub")
+            )
+            self.assertEqual(environment["UNCHANGED"], "yes")
+            self.assertEqual(inherited["HF_HOME"], "/stale/cache")
+            with self.assertRaisesRegex(ValueError, "not a directory"):
+                cache_environment(inherited, cache / "missing")
 
     def test_python_ctox_reader_matches_native_header_and_tensor_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -184,6 +184,9 @@ identity without treating failed or smoke directories as evidence.
 runs the content verifier. It skips existing work only when the completed run,
 source slice, teacher revision, provenance hash, and verification sample count
 all agree; partial directories stop the orchestrator for inspection.
+`--hf-home` binds the already provisioned Hugging Face cache root explicitly
+for the model and pinned-kernel subprocesses; this prevents a stale host login
+cache or symlink from changing where an admitted run reads and writes.
 An inspected OOM prefix can be continued only with the explicit
 `--resume-incomplete` path. `cache_teacher.py --resume` requires the existing
 index to be a non-empty exact prefix of the same source slice, rejects missing

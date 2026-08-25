@@ -13,6 +13,22 @@ from pathlib import Path
 from typing import Any
 
 
+def cache_environment(
+    inherited: dict[str, str], hf_home: Path | None
+) -> dict[str, str]:
+    environment = inherited.copy()
+    if hf_home is None:
+        return environment
+    resolved = hf_home.expanduser().resolve()
+    if not resolved.is_dir():
+        raise ValueError(f"Hugging Face cache root is not a directory: {resolved}")
+    if not os.access(resolved, os.W_OK | os.X_OK):
+        raise ValueError(f"Hugging Face cache root is not writable: {resolved}")
+    environment["HF_HOME"] = str(resolved)
+    environment["HF_HUB_CACHE"] = str(resolved / "hub")
+    return environment
+
+
 def completed_batch_matches(
     run: dict[str, Any],
     verification: dict[str, Any],
@@ -44,6 +60,11 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--output-prefix", required=True)
     parser.add_argument("--ledger", type=Path, required=True)
+    parser.add_argument(
+        "--hf-home",
+        type=Path,
+        help="validated cache root inherited by the pinned kernel/model loaders",
+    )
     parser.add_argument("--gpus", type=int, default=3)
     parser.add_argument("--reserved-gpu-hours", type=float, default=4.0)
     parser.add_argument("--gpu-weight-memory-gib", type=int, default=16)
@@ -72,7 +93,7 @@ def main() -> None:
         raise SystemExit("invalid batch range")
     args.output_root.mkdir(parents=True, exist_ok=True)
 
-    environment = os.environ.copy()
+    environment = cache_environment(os.environ, args.hf_home)
     environment.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     for batch in batches[args.start_batch:end_batch]:
         index = int(batch["batch_index"])
