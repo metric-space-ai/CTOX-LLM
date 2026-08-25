@@ -63,6 +63,7 @@ from pack_checkpoint import validate_recovery_source  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
+from select_primary_domain_supplement import select_supplement  # noqa: E402
 from split_manifests import split  # noqa: E402
 from teacher_runtime import FLA_KERNEL_REVISION, weight_max_memory  # noqa: E402
 from teacher_cache_dataset import VerifiedTeacherCache  # noqa: E402
@@ -139,6 +140,29 @@ class DatasetPipelineTests(unittest.TestCase):
         )
         self.assertEqual(gaps, {})
         self.assertEqual(primary_gaps, {"b": {"observed": 1, "required": 2}})
+
+    def test_primary_supplement_closes_each_gap_with_margin_and_confidence(self) -> None:
+        records = [{"id": value} for value in ("a", "b", "c", "d", "e")]
+        tags = {
+            "a": {"primary_label": "safety", "scores": {"safety": 0.95}},
+            "b": {"primary_label": "safety", "scores": {"safety": 0.90}},
+            "c": {"primary_label": "safety", "scores": {"safety": 0.79}},
+            "d": {"primary_label": "social", "scores": {"social": 0.99}},
+            "e": {"primary_label": "social", "scores": {"social": 0.90}},
+        }
+        selected, domain_samples = select_supplement(
+            records,
+            tags,
+            {
+                "safety": {"observed": 1, "required": 2},
+                "social": {"observed": 0, "required": 1},
+            },
+            {"a": 20, "b": 10, "c": 1, "d": 10, "e": 5},
+            margin=1,
+            minimum_confidence=0.8,
+        )
+        self.assertEqual({record["id"] for record in selected}, {"a", "b", "d", "e"})
+        self.assertEqual(domain_samples["safety"], ["a", "b"])
 
     def test_hash_covers_reference_answer(self) -> None:
         first = {"input": "2+2?", "output": "4"}

@@ -97,6 +97,11 @@ require enough records whose clearest semantic assignment is that domain.
 `audit_domain_tags.py` can apply a stricter policy to frozen classifier output
 without rerunning the revision-pinned NLI model. A multi-label pass never
 overrides a primary-domain gap.
+`select_primary_domain_supplement.py` closes only those declared gaps from a
+disjoint candidate pool. It requires the target to be the candidate's primary
+label above a configurable confidence floor, adds a safety margin, and ranks
+confidence before token cost; broad low-confidence multi-label matches cannot
+enter merely to satisfy a quota.
 
 `plan_teacher_cache.py` tokenizes the complete frozen cohort with the same
 assistant, hidden-state, marker-window, and MTP position rules as the cache
