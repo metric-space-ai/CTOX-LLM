@@ -38,6 +38,7 @@ from collect_activation_stats import (  # noqa: E402
     prefill_ranges,
     quantized_source_names,
 )
+from ctox_artifact import CtoxArtifact, ENDIAN_MARKER, HEADER, MAGIC  # noqa: E402
 from materialize_prompts import load_local_materialized, load_manifests  # noqa: E402
 from merge_manifests import merge  # noqa: E402
 from merge_activation_stats import merged_metadata, source_runtime_profiles  # noqa: E402
@@ -529,6 +530,40 @@ class DatasetPipelineTests(unittest.TestCase):
             artifact.write_bytes(b"other")
             with self.assertRaisesRegex(ValueError, "content"):
                 dataset.verified_artifact_path(0)
+
+    def test_python_ctox_reader_matches_native_header_and_tensor_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "tiny.ctoxq"
+            payload = b"\x00\x01\x02\x03"
+            manifest = {
+                "format": "ctox.q2q4.v1",
+                "model": "test",
+                "revision": "revision",
+                "alignment": 64,
+                "target": "canonical-b64",
+                "tensors": [
+                    {
+                        "name": "scale",
+                        "dtype": "f16",
+                        "shape": [2],
+                        "offset": 0,
+                        "length": 4,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                ],
+            }
+            manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
+            data_offset = (HEADER.size + len(manifest_bytes) + 63) & ~63
+            path.write_bytes(
+                HEADER.pack(MAGIC, 1, ENDIAN_MARKER, len(manifest_bytes), data_offset, 1, 64)
+                + manifest_bytes
+                + b"\0" * (data_offset - HEADER.size - len(manifest_bytes))
+                + payload
+            )
+            with CtoxArtifact(path, verify_tensors=True) as artifact:
+                view = artifact.tensor_bytes("scale")
+                self.assertEqual(bytes(view), payload)
+                view.release()
 
     def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

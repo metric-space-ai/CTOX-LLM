@@ -151,6 +151,10 @@ end-to-end trainer. Missing batches or a different sample count fail closed.
 The trainer reopens that set only with its expected manifest SHA-256, then
 reconstructs and compares the sample count, artifact bytes, content root, and
 every underlying batch-verification hash before the first optimization step.
+`ctox_artifact.py` provides the corresponding offline Python reader for the
+native Rust container. It validates the 64-byte header, version, endianness,
+manifest bounds, alignment, Q2/Q4 or mixed-row byte formulas, non-overlapping
+ranges, and optional per-tensor SHA-256 before exposing a read-only memoryview.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized
