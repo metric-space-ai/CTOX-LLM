@@ -22,3 +22,9 @@ count and elapsed time to `run-ledger.jsonl`.
 bytes, including alignment and recovery scales. It excludes vision, includes
 resident MTP, rejects a plan above 7.8 GiB, and emits the immutable assignment
 consumed by target packers.
+
+`pack_checkpoint.py` performs the direct BF16 conversion. It memory-maps all
+source shards, slices matrices by rows, quantizes those chunks on one GPU,
+writes an aligned temporary data region, then creates the final manifest and
+checksummed `.ctoxq` artifact. It refuses to overwrite files and refuses plans
+above the Fold limit.

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use ctox_qwen38_27b::loader::{ChecksumPolicy, ModelArtifact};
-use ctox_qwen38_27b::memory::{FoldMemoryPlan, FOLD_WEIGHT_LIMIT_BYTES};
+use ctox_qwen38_27b::memory::FoldMemoryPlan;
 use ctox_qwen38_27b::Qwen38Config;
 use serde::Serialize;
 
@@ -30,6 +30,7 @@ struct Report<'a> {
     target: &'a str,
     tensors: usize,
     artifact_bytes: u64,
+    resident_weights_bytes: u64,
     fold_plan: FoldMemoryPlan,
 }
 
@@ -43,9 +44,18 @@ fn main() -> anyhow::Result<()> {
         },
     )?;
     let artifact_bytes = std::fs::metadata(&args.artifact)?.len();
-    let weights_bytes = artifact_bytes.min(FOLD_WEIGHT_LIMIT_BYTES);
-    let fold_plan =
-        FoldMemoryPlan::for_context(&Qwen38Config::default(), args.context, weights_bytes)?;
+    let resident_weights_bytes = artifact
+        .manifest()
+        .tensors
+        .iter()
+        .map(|tensor| tensor.offset + tensor.length)
+        .max()
+        .unwrap_or(0);
+    let fold_plan = FoldMemoryPlan::for_context(
+        &Qwen38Config::default(),
+        args.context,
+        resident_weights_bytes,
+    )?;
     fold_plan.verify()?;
     let manifest = artifact.manifest();
     println!(
@@ -57,6 +67,7 @@ fn main() -> anyhow::Result<()> {
             target: &manifest.target,
             tensors: manifest.tensors.len(),
             artifact_bytes,
+            resident_weights_bytes,
             fold_plan,
         })?
     );
