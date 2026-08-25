@@ -42,6 +42,7 @@ from merge_manifests import merge  # noqa: E402
 from merge_activation_stats import merged_metadata, source_runtime_profiles  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
 from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_bytes  # noqa: E402
+from plan_teacher_cache import sample_tensor_bytes  # noqa: E402
 from prompt_format import normalize_content, normalize_messages, normalize_tool_call  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
 from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
@@ -52,6 +53,7 @@ from split_manifests import split  # noqa: E402
 from teacher_runtime import FLA_KERNEL_REVISION, weight_max_memory  # noqa: E402
 from verify_vendor_manifest import verify  # noqa: E402
 from verify_local_model import root_digest  # noqa: E402
+from verify_teacher_cache import expected_tensor_specs  # noqa: E402
 
 
 class DatasetPipelineTests(unittest.TestCase):
@@ -244,6 +246,54 @@ class DatasetPipelineTests(unittest.TestCase):
             mtp_target_positions(8, [3, 2])
         with self.assertRaisesRegex(ValueError, "outside"):
             mtp_target_positions(8, [7])
+
+    def test_teacher_cache_plan_counts_every_persisted_tensor_family(self) -> None:
+        values = sample_tensor_bytes(
+            sequence_tokens=100,
+            logit_targets=20,
+            hidden_targets=10,
+            mtp_targets=19,
+            mtp_hidden_targets=7,
+            hidden_size=8,
+            hidden_layer_count=5,
+            top_k=4,
+        )
+        self.assertEqual(values["input_ids"], 400)
+        self.assertEqual(values["attention_mask"], 100)
+        self.assertEqual(values["topk_indices"], 320)
+        self.assertEqual(values["topk_logprobs"], 160)
+        self.assertEqual(values["hidden_layers"], 800)
+        self.assertEqual(values["mtp_hidden"], 112)
+        self.assertEqual(values["mtp_topk_indices"], 304)
+        self.assertEqual(values["mtp_topk_logprobs"], 152)
+        self.assertEqual(values["mtp_residual_probability"], 76)
+        self.assertEqual(
+            set(values),
+            {
+                "input_ids",
+                "attention_mask",
+                "logit_positions",
+                "hidden_positions",
+                "topk_indices",
+                "topk_logprobs",
+                "residual_probability",
+                "hidden_layers",
+                "mtp_positions",
+                "mtp_hidden_positions",
+                "mtp_hidden",
+                "mtp_topk_indices",
+                "mtp_topk_logprobs",
+                "mtp_residual_probability",
+            },
+        )
+
+    def test_teacher_cache_verifier_contract_includes_mtp_and_hidden_layers(self) -> None:
+        specs = expected_tensor_specs(100, 20, 10, 19, 7, 64, 5120, [0, 63], True)
+        self.assertEqual(specs["input_ids"], ("I32", [1, 100]))
+        self.assertEqual(specs["topk_logprobs"], ("BF16", [1, 20, 64]))
+        self.assertEqual(specs["hidden_63"], ("BF16", [1, 10, 5120]))
+        self.assertEqual(specs["mtp_hidden"], ("BF16", [1, 7, 5120]))
+        self.assertEqual(specs["mtp_topk_indices"], ("I32", [1, 19, 64]))
 
     def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

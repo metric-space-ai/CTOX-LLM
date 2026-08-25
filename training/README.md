@@ -92,6 +92,20 @@ NLI classifier. Threshold labels are supplemented only by deterministic source
 facts (for example, an actual tool schema or the pinned code/math split). Its
 tags guide cohort selection and are never used as target labels during recovery.
 
+`plan_teacher_cache.py` tokenizes the complete frozen cohort with the same
+assistant, hidden-state, marker-window, and MTP position rules as the cache
+writer. It accounts for every persisted tensor dtype and adds a conservative
+per-file safetensors/header allowance. A release-size GPU cache run is admitted
+only after this plan fits the target volume while preserving separate recovery
+workspace headroom; raw corpus byte size is not a valid disk estimate.
+When the tokenizer is loaded from a staged local model, the planner requires
+the same verified model-provenance document as the teacher cache itself.
+`verify_teacher_cache.py` is the recovery-side admission gate. It binds the
+cache to its ordered source slice and teacher provenance, checks every tensor
+name, dtype, shape, MTP count, hidden layer, and payload hash, and emits a
+content-addressed artifact inventory. Recovery never consumes an unchecked
+directory merely because it contains safetensors files.
+
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized
 teacher input; changing a function name or JSON schema therefore invalidates

@@ -1,0 +1,90 @@
+{
+  "format": "ctox.qwen38.teacher-cache-plan-evidence.v1",
+  "date": "2026-08-25",
+  "status": "disk_admission_passed_cache_not_yet_complete",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "teacher_provenance_sha256": "d930966047fee2be4a3e1f70e55d0b507231bc5d9ead935bd166879d8bdc81d0",
+  "teacher_root_sha256": "c63bc259cd8d18b0a701983a226867927b4ec19b376a684b218c3fa572754524",
+  "settings": {
+    "target_mode": "assistant",
+    "top_k": 64,
+    "hidden_size": 5120,
+    "hidden_layers": [0, 15, 31, 47, 63],
+    "assistant_hidden_positions": 64,
+    "uniform_hidden_positions": 64,
+    "marker_window": 32,
+    "mtp_sparse_logits_for_all_verifiable_drafts": true,
+    "mtp_hidden_positions_bounded": true,
+    "conservative_file_overhead_bytes": 16384
+  },
+  "cohorts": {
+    "train": {
+      "input": "release-recovery-train-2072-v4.jsonl",
+      "input_sha256": "37a6e6e496d3db6b5355c6663570806820c943cc5a8f0c7bc28bdbdd0c566e44",
+      "plan": "release-teacher-cache-train-2072-v3.json",
+      "plan_bytes": 882203,
+      "plan_sha256": "608773c7a3b9eae16b89e4612f810d0682e8b8f0e20895fe2e49dfcd4a887473",
+      "samples": 2072,
+      "tensor_payload_bytes": 19819114474,
+      "projected_cache_bytes": 19853062122,
+      "projected_cache_gib": 18.489604929462075,
+      "file_bytes_max": 37698505,
+      "sequence_tokens_p50": 1609,
+      "sequence_tokens_p95": 24185,
+      "sequence_tokens_max": 130930,
+      "logit_targets_p50": 546,
+      "logit_targets_p95": 18736,
+      "logit_targets_max": 37829,
+      "hidden_targets_p50": 125,
+      "hidden_targets_p95": 128,
+      "hidden_targets_max": 255
+    },
+    "evaluation": {
+      "input": "release-recovery-evaluation-524-v4.jsonl",
+      "input_sha256": "93d48f54747717760ae949cff3264298ae950ad448312a3b462a2d7088c3f3e5",
+      "plan": "release-teacher-cache-evaluation-524-v3.json",
+      "plan_bytes": 224982,
+      "plan_sha256": "98f8840a7977da68c6ae15e68ae737e4a9f9eee8452bd2c67ac258c2e95593df",
+      "samples": 524,
+      "tensor_payload_bytes": 5044031007,
+      "projected_cache_bytes": 5052616223,
+      "projected_cache_gib": 4.705615549348295,
+      "file_bytes_max": 37629657,
+      "sequence_tokens_p50": 1567,
+      "sequence_tokens_p95": 25947,
+      "sequence_tokens_max": 130873,
+      "logit_targets_p50": 498,
+      "logit_targets_p95": 17913,
+      "logit_targets_max": 37742,
+      "hidden_targets_p50": 125,
+      "hidden_targets_p95": 128,
+      "hidden_targets_max": 253
+    }
+  },
+  "combined": {
+    "samples": 2596,
+    "projected_cache_bytes": 24905678345,
+    "projected_cache_gib": 23.19522047881037,
+    "gpu3_volume_free_bytes_at_admission": 100122525696,
+    "gpu3_volume_free_gib_at_admission": 93.24636840820312,
+    "free_after_projected_cache_bytes": 75216847351,
+    "free_after_projected_cache_gib": 70.05114792939276,
+    "required_recovery_workspace_reserve_gib": 30,
+    "workspace_reserve_gate": "passed"
+  },
+  "corpus_gate": {
+    "evidence": "RECOVERY_CORPUS_V3.json",
+    "languages": 15,
+    "semantic_domain_families": 16,
+    "train_domain_quota_gaps": 0,
+    "evaluation_domain_quota_gaps": 0,
+    "train_evaluation_overlap": 0
+  },
+  "interpretation": [
+    "This is a tokenizer-exact storage projection, not proof that the BF16 cache has completed.",
+    "Every tensor family and persisted dtype emitted by cache_teacher.py is included.",
+    "The 16 KiB per-sample allowance is additional to tensor payload bytes.",
+    "The full run remains gated by a cache-consumer validation and bounded GPU-hour admission."
+  ]
+}
