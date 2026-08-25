@@ -100,14 +100,18 @@ These constraints apply to every phase:
 1. Recompute activation-weighted Q2-vs-Q4 error with the complete corpus.
    Allocate Q4 where measured error reduction per byte is greatest; keep Q2
    elsewhere. Q3 remains absent.
-2. Keep quantization codes fixed and train `s_in`/`s_out`, compatible
+2. Extend assignment granularity for embedding and LM-head storage to
+   independently scored row/block groups. Frequently used or sensitive groups
+   may use Q4 while the remainder stays Q2; neither tensor is forced to INT8 or
+   promoted wholesale to Q4 without measured justification.
+3. Keep quantization codes fixed and train `s_in`/`s_out`, compatible
    Hadamard/incoherence transforms, and recovery parameters using logit KL,
    cross-entropy, hidden-state, and activation reconstruction losses.
-3. Run ablations for correction scales, transforms, layer allocation, LM head,
+4. Run ablations for correction scales, transforms, layer allocation, LM head,
    embedding, and MTP. Reject improvements that only move the calibration set.
-4. Fold inference-time corrections into scales and fused-kernel metadata, then
+5. Fold inference-time corrections into scales and fused-kernel metadata, then
    emit one backend-neutral logical checkpoint.
-5. Produce deterministic CPU, CUDA, Metal, and Snapdragon packs from that
+6. Produce deterministic CPU, CUDA, Metal, and Snapdragon packs from that
    checkpoint without changing logical values.
 
 **Exit evidence**
@@ -258,4 +262,3 @@ The immediate execution batch is:
 5. begin the first bounded recovery-training ablation;
 6. implement the v2 manifest and `Engine` lifecycle fixtures in parallel with
    the GPU runs.
-
