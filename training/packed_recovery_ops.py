@@ -6,6 +6,7 @@ from typing import Any
 
 
 _FUNCTIONS: dict[int, Any] = {}
+_MODULES: dict[int, Any] = {}
 
 
 def packed_linear_function(torch: Any) -> Any:
@@ -127,3 +128,63 @@ def packed_linear(
         bias,
         rows_per_chunk,
     )
+
+
+def packed_recovery_linear_class(torch: Any) -> Any:
+    cached = _MODULES.get(id(torch))
+    if cached is not None:
+        return cached
+
+    class PackedRecoveryLinear(torch.nn.Module):
+        """Train only positive channel corrections over an immutable packed matrix."""
+
+        def __init__(
+            self,
+            artifact: Any,
+            name: str,
+            initial_s_in: Any,
+            initial_s_out: Any,
+            bias: Any | None = None,
+            rows_per_chunk: int = 128,
+        ) -> None:
+            super().__init__()
+            rows, columns = map(int, artifact.tensors[name]["shape"])
+            if tuple(initial_s_in.shape) != (columns,) or tuple(initial_s_out.shape) != (rows,):
+                raise ValueError(f"packed recovery scale shape differs for {name}")
+            if not bool(torch.isfinite(initial_s_in).all()) or not bool(
+                torch.isfinite(initial_s_out).all()
+            ):
+                raise ValueError(f"packed recovery scales are non-finite for {name}")
+            if bool((initial_s_in <= 0).any()) or bool((initial_s_out <= 0).any()):
+                raise ValueError(f"packed recovery scales are not positive for {name}")
+            self.artifact = artifact
+            self.name = name
+            self.rows_per_chunk = rows_per_chunk
+            self.log_s_in = torch.nn.Parameter(initial_s_in.float().log())
+            self.log_s_out = torch.nn.Parameter(initial_s_out.float().log())
+            self.register_buffer(
+                "bias",
+                bias.detach() if bias is not None else None,
+                persistent=False,
+            )
+
+        def forward(self, inputs: Any) -> Any:
+            return packed_linear(
+                torch,
+                self.artifact,
+                self.name,
+                inputs,
+                self.log_s_in.exp(),
+                self.log_s_out.exp(),
+                self.bias,
+                self.rows_per_chunk,
+            )
+
+        def correction_tensors(self) -> dict[str, Any]:
+            return {
+                f"{self.name}.s_in": self.log_s_in.detach().exp().to(torch.float16).cpu(),
+                f"{self.name}.s_out": self.log_s_out.detach().exp().to(torch.float16).cpu(),
+            }
+
+    _MODULES[id(torch)] = PackedRecoveryLinear
+    return PackedRecoveryLinear

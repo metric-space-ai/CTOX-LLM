@@ -167,6 +167,10 @@ matrix between passes, and its gradients are tested against the dense oracle.
 Native FP16/FP32 tensors, including the initial recovery scales, are decoded by
 the same artifact reader with exact manifest shapes; the trainer never needs a
 parallel scale file after a checkpoint has been packed.
+`PackedRecoveryLinear` wraps that primitive as a trainable module whose only
+parameters are logarithmic positive channel corrections. Packed weights and
+bias stay frozen, and export returns the exact `<weight>.s_in`/`.s_out` FP16
+names required by the native manifest.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized

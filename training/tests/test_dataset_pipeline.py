@@ -61,7 +61,7 @@ try:  # Optional local training dependency; exercised in the pinned GPU venv.
 except ModuleNotFoundError:
     torch = None
 from pack_checkpoint import validate_recovery_source  # noqa: E402
-from packed_recovery_ops import packed_linear  # noqa: E402
+from packed_recovery_ops import packed_linear, packed_recovery_linear_class  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
@@ -666,6 +666,24 @@ class DatasetPipelineTests(unittest.TestCase):
                     packed_grads, (dense_inputs, dense_s_in, dense_s_out, dense_bias)
                 ):
                     self.assertTrue(torch.allclose(packed_grad, value.grad, atol=1e-5, rtol=1e-5))
+                module_class = packed_recovery_linear_class(torch)
+                module = module_class(
+                    artifact,
+                    "weight",
+                    torch.ones(64),
+                    torch.ones(2),
+                    bias=torch.zeros(2),
+                    rows_per_chunk=1,
+                )
+                module(torch.randn(1, 64)).sum().backward()
+                self.assertEqual(
+                    {name for name, _parameter in module.named_parameters()},
+                    {"log_s_in", "log_s_out"},
+                )
+                self.assertEqual(
+                    set(module.correction_tensors()),
+                    {"weight.s_in", "weight.s_out"},
+                )
 
     def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
