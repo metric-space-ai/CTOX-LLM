@@ -9,7 +9,7 @@ pub enum LayerKind {
     FullAttention,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qwen38Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
@@ -18,6 +18,9 @@ pub struct Qwen38Config {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
+    pub rotary_dim: usize,
+    pub rope_theta: f32,
+    pub rms_norm_epsilon: f32,
     pub max_position_embeddings: usize,
     pub full_attention_interval: usize,
     pub linear_num_key_heads: usize,
@@ -39,6 +42,9 @@ impl Default for Qwen38Config {
             num_attention_heads: 24,
             num_key_value_heads: 4,
             head_dim: 256,
+            rotary_dim: 64,
+            rope_theta: 10_000_000.0,
+            rms_norm_epsilon: 1e-6,
             max_position_embeddings: 262_144,
             full_attention_interval: 4,
             linear_num_key_heads: 16,
@@ -89,5 +95,8 @@ mod tests {
         assert_eq!(config.layer_kind(0), Some(LayerKind::LinearAttention));
         assert_eq!(config.layer_kind(3), Some(LayerKind::FullAttention));
         assert_eq!(config.layer_kind(63), Some(LayerKind::FullAttention));
+        assert_eq!(config.rotary_dim, config.head_dim / 4);
+        assert_eq!(config.rope_theta, 10_000_000.0);
+        assert_eq!(config.rms_norm_epsilon, 1e-6);
     }
 }

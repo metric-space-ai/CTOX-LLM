@@ -14,6 +14,7 @@ pub mod kv_cache;
 pub mod loader;
 pub mod memory;
 pub mod quant;
+pub mod reference;
 pub mod release;
 pub mod roofline;
 pub mod sampler;

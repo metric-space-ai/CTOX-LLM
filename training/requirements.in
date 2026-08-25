@@ -4,4 +4,4 @@ kernels==0.16.0
 numpy>=2.0
 safetensors>=0.5
 torch>=2.7
-transformers>=5.0.0.dev0
+transformers @ git+https://github.com/huggingface/transformers.git@a353632607c59463e6ced86a44c2de3c2cd62d5e
