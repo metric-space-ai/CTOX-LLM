@@ -1,0 +1,56 @@
+{
+  "format": "ctox.qwen38.vision-residency-evidence.v1",
+  "status": "exact_plan_not_packed_or_device_measured",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "steady_128k": {
+    "bytes": 10311705600,
+    "gib": 9.6035242081
+  },
+  "vision_q4_b64": {
+    "bytes": 249776384,
+    "mib": 238.205322265625,
+    "tensor_count": 555,
+    "zero_padding_values": 1492992,
+    "dtype_bytes": {
+      "f16": 4357600,
+      "q4_b64": 244398528,
+      "recovery_f16": 1007296
+    },
+    "plan_sha256": "58822dc24cc36809d0ec8e213d34da975a658ceac20384618464c362a3aaa473"
+  },
+  "phase_eviction": {
+    "required_bytes": 146186291,
+    "selected_bytes": 148751360,
+    "bundles": [
+      {
+        "name": "resident-mtp-package",
+        "bytes": 145953792
+      },
+      {
+        "name": "model.language_model.layers.11.self_attn.k_proj.weight",
+        "bytes": 2797568
+      }
+    ],
+    "residency_plan_sha256": "de326e2416abf119ee837ffee14ad0462fc20ff3b5e0c9c4d88048a777fee899"
+  },
+  "vision_peak": {
+    "bytes": 10412730624,
+    "gib": 9.6976110935,
+    "operating_target_bytes": 10415295693,
+    "operating_headroom_bytes": 2565069,
+    "hard_limit_bytes": 10737418240,
+    "os_swap_required": false,
+    "workspace_policy": "reuse_decoder_arena"
+  },
+  "phase_sequence": [
+    "unmap MTP and selected text bundle",
+    "map the vision package into the released address/device budget",
+    "encode images and retain only compact language embeddings",
+    "unmap vision and remap the two text packages before decoding"
+  ],
+  "limitations": [
+    "The plan assumes the runtime does not retain file, CPU, and accelerator copies simultaneously.",
+    "The Q4 vision package is not packed yet and the peak has not been measured on Android hardware.",
+    "The 2.45 MiB operating headroom is intentionally narrow and requires fail-closed runtime admission telemetry."
+  ]
+}

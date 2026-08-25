@@ -1,0 +1,50 @@
+{
+  "format": "ctox.qwen38.calibration.v1",
+  "status": "provisional_assignment_not_release_checkpoint",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "dataset": {
+    "repository": "nvidia/Nemotron-Post-Training-Dataset-v1",
+    "revision": "74e23eb6f830fef4a9e96a92f6f6262214cbb9a8",
+    "samples": 80,
+    "sources": {
+      "chat": 16,
+      "code": 16,
+      "math": 16,
+      "stem": 16,
+      "tool_calling": 16
+    },
+    "capped_tokens": 130994,
+    "max_tokens_per_sample": 2048,
+    "truncated_samples": 54
+  },
+  "activation_statistics": {
+    "observed_linear_matrices": 496,
+    "unobserved_matrices": 10,
+    "sha256": "3f1ad6e919ca50183e0abec7577f185f1887c49c34b9e2af08347a1737b45e8d"
+  },
+  "sensitivity": {
+    "planned_matrices": 506,
+    "estimator": "diagonal-input-covariance",
+    "sha256": "ae13720d0dc3b9393d61409e31b018561639c6ec105fe58d88cd482518d2eef2"
+  },
+  "assignment": {
+    "q4_matrices": 154,
+    "q2_matrices": 352,
+    "sha256": "1053a5c32d12f81e4782b08475b1480943f67df69ae38d2ed6728147c90f139b"
+  },
+  "native_layout": {
+    "bytes": 8372888576,
+    "gib": 7.797860145568848,
+    "sha256": "1ecac317350773f818a4d0c527bc9cdfd48c982e6b2c50dcc35dd52c8eee676a"
+  },
+  "stability_against_smoke": {
+    "q4_intersection": 152,
+    "q4_jaccard": 0.9743589744,
+    "gain_per_byte_spearman": 0.997114
+  },
+  "limitations": [
+    "German and production long-context samples are not represented sufficiently.",
+    "Embedding, LM head, and eight MTP matrices do not yet have activation-weighted observations.",
+    "The recovery scales have not been trained and this assignment is not a model release."
+  ]
+}
