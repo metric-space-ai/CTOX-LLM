@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -143,3 +145,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Hugging Face streaming leaves Xet/Arrow worker threads alive on some
+    # Linux builds and may hang or abort during interpreter finalization. At
+    # this point the exclusive output context has closed and flushed its Python
+    # buffers. Bypass only the broken third-party finalizers after a successful
+    # main; exceptions still take the normal non-zero path above.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
