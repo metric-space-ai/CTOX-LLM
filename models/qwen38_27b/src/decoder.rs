@@ -28,6 +28,15 @@ fn softplus(value: f32) -> f32 {
     }
 }
 
+fn greedy_token(logits: &[f32]) -> Result<u32> {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(token, _)| token as u32)
+        .ok_or_else(|| EngineError::Shape("MTP draft logits are empty".into()))
+}
+
 fn repeat_heads(
     values: &[f32],
     heads: usize,
@@ -48,7 +57,7 @@ fn repeat_heads(
     Ok(output)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FullAttentionState {
     key_heads: Vec<Vec<f32>>,
     value_heads: Vec<Vec<f32>>,
@@ -57,7 +66,7 @@ pub struct FullAttentionState {
     tokens: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LinearAttentionState {
     convolution: Vec<f32>,
     recurrent: Vec<f32>,
@@ -207,13 +216,13 @@ impl FullAttentionState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DecoderLayerState {
     Linear(LinearAttentionState),
     Full(FullAttentionState),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DecoderState {
     layers: Vec<DecoderLayerState>,
     maximum_tokens: usize,
@@ -225,6 +234,24 @@ pub struct MtpState {
     attention: FullAttentionState,
     maximum_tokens: usize,
     tokens: usize,
+}
+
+#[derive(Debug)]
+struct PendingSpeculativeBranch {
+    accepted_token: u32,
+    target_state: DecoderState,
+    target_final_hidden: Vec<f32>,
+}
+
+impl PendingSpeculativeBranch {
+    fn allocated_bytes(&self) -> Result<usize> {
+        self.target_state
+            .allocated_bytes()
+            .checked_add(self.target_final_hidden.capacity() * std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CPU speculative branch allocation overflows".into())
+            })
+    }
 }
 
 impl MtpState {
@@ -339,6 +366,7 @@ pub struct CpuCorrectnessExecutor {
     state: Option<DecoderState>,
     mtp_state: Option<MtpState>,
     last_final_hidden: Option<Vec<f32>>,
+    pending_speculative: Option<PendingSpeculativeBranch>,
     admitted_context: usize,
     warmed: bool,
     allocations: AllocationSnapshot,
@@ -353,6 +381,7 @@ impl CpuCorrectnessExecutor {
             state: None,
             mtp_state: None,
             last_final_hidden: None,
+            pending_speculative: None,
             admitted_context: 0,
             warmed: false,
             allocations: AllocationSnapshot::default(),
@@ -367,6 +396,7 @@ impl CpuCorrectnessExecutor {
             state: None,
             mtp_state: None,
             last_final_hidden: None,
+            pending_speculative: None,
             admitted_context: 0,
             warmed: false,
             allocations: AllocationSnapshot::default(),
@@ -374,6 +404,12 @@ impl CpuCorrectnessExecutor {
     }
 
     fn update_session_allocation(&mut self) -> Result<()> {
+        let pending_bytes = self
+            .pending_speculative
+            .as_ref()
+            .map(PendingSpeculativeBranch::allocated_bytes)
+            .transpose()?
+            .unwrap_or(0);
         self.allocations.session_bytes = self
             .state
             .as_ref()
@@ -393,6 +429,7 @@ impl CpuCorrectnessExecutor {
                         .unwrap_or(0),
                 )
             })
+            .and_then(|bytes| bytes.checked_add(pending_bytes))
             .ok_or_else(|| EngineError::MemoryBudget("CPU decoder state overflows".into()))?
             .try_into()
             .map_err(|_| EngineError::MemoryBudget("CPU decoder state exceeds u64".into()))?;
@@ -871,6 +908,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             || self.state.is_some()
             || self.mtp_state.is_some()
             || self.last_final_hidden.is_some()
+            || self.pending_speculative.is_some()
         {
             return Err(EngineError::InvalidState(
                 "CPU correctness executor is already loaded".into(),
@@ -931,6 +969,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             None
         };
         self.last_final_hidden = None;
+        self.pending_speculative = None;
         let artifact = self.artifact.as_ref().ok_or_else(|| {
             EngineError::InvalidState("CPU prefill has no loaded artifact".into())
         })?;
@@ -961,6 +1000,8 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         Ok(ExecutorStep {
             target_logits,
             draft_logits: Vec::new(),
+            target_verification_logits: Vec::new(),
+            bonus_logits: None,
         })
     }
 
@@ -978,6 +1019,11 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                     "CPU correctness decode is not warm".into(),
                 ))
             };
+        }
+        if self.pending_speculative.is_some() {
+            return Err(EngineError::InvalidState(
+                "CPU decode requires the previous speculative branch to be committed".into(),
+            ));
         }
         let artifact = self
             .artifact
@@ -1006,18 +1052,93 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             Vec::new()
         };
         let target = decoder.decode_target_step(token, state, &self.config)?;
+        let (target_verification_logits, bonus_logits) = if mtp_enabled {
+            if cancellation.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            let candidate = greedy_token(
+                draft_logits
+                    .first()
+                    .ok_or_else(|| EngineError::InvalidState("MTP produced no draft".into()))?,
+            )?;
+            let mut target_branch = state.clone();
+            let bonus = decoder.decode_target_step(candidate, &mut target_branch, &self.config)?;
+            self.pending_speculative = Some(PendingSpeculativeBranch {
+                accepted_token: candidate,
+                target_state: target_branch,
+                target_final_hidden: bonus.final_hidden,
+            });
+            (vec![target.logits.clone()], Some(bonus.logits))
+        } else {
+            (Vec::new(), None)
+        };
         self.last_final_hidden = Some(target.final_hidden);
         self.update_session_allocation()?;
         Ok(ExecutorStep {
             target_logits: target.logits,
             draft_logits,
+            target_verification_logits,
+            bonus_logits,
         })
+    }
+
+    fn commit_speculative(
+        &mut self,
+        accepted_drafts: u32,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        if accepted_drafts > 1 {
+            return Err(EngineError::InvalidState(
+                "CPU correctness executor can commit at most one MTP draft".into(),
+            ));
+        }
+        let branch = self.pending_speculative.take().ok_or_else(|| {
+            EngineError::InvalidState("CPU executor has no pending speculative branch".into())
+        })?;
+        if accepted_drafts == 0 {
+            self.update_session_allocation()?;
+            return Ok(());
+        }
+        if cancellation.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        let artifact = self.artifact.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("CPU speculative commit has no loaded artifact".into())
+        })?;
+        let decoder = ArtifactDecoder::new(artifact, &self.backend, self.config.rms_norm_epsilon)?;
+        let previous_final_hidden = self.last_final_hidden.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("CPU speculative commit lost target hidden state".into())
+        })?;
+        let absolute_position = self
+            .state
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::InvalidState("CPU speculative commit has no target state".into())
+            })?
+            .position();
+        decoder.mtp_draft(
+            branch.accepted_token,
+            previous_final_hidden,
+            absolute_position,
+            self.mtp_state.as_mut().ok_or_else(|| {
+                EngineError::InvalidState("CPU speculative commit has no MTP state".into())
+            })?,
+            &self.config,
+        )?;
+        if cancellation.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        self.state = Some(branch.target_state);
+        self.last_final_hidden = Some(branch.target_final_hidden);
+        self.update_session_allocation()?;
+        Ok(())
     }
 
     fn reset_session(&mut self) -> Result<()> {
         self.state = None;
         self.mtp_state = None;
         self.last_final_hidden = None;
+        self.pending_speculative = None;
         self.allocations.session_bytes = 0;
         Ok(())
     }
@@ -1026,6 +1147,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         self.state = None;
         self.mtp_state = None;
         self.last_final_hidden = None;
+        self.pending_speculative = None;
         self.artifact = None;
         self.admitted_context = 0;
         self.warmed = false;
@@ -1444,19 +1566,23 @@ mod tests {
             draft
         );
 
+        let executor_config = Qwen38Config {
+            max_position_embeddings: 5,
+            ..linear_decode_config.clone()
+        };
         let profile = MemoryProfile {
-            profile_id: "cpu-correctness-2".into(),
+            profile_id: "cpu-correctness-5".into(),
             pack_id: "test".into(),
-            context_tokens: 2,
+            context_tokens: 5,
             sessions: 1,
             resident_model_bytes: artifact.file_bytes(),
             persistent_backend_graph_bytes: 0,
             persistent_runtime_bytes: 0,
             linear_state_dtype: crate::memory::LinearStateDType::F32,
             linear_state_bytes_per_session: 9_216,
-            mtp_draft_tokens: 0,
-            speculative_state_strategy: crate::memory::SpeculativeStateStrategy::Disabled,
-            speculative_linear_state_bytes_per_session: 0,
+            mtp_draft_tokens: 1,
+            speculative_state_strategy: crate::memory::SpeculativeStateStrategy::ReplayOnReject,
+            speculative_linear_state_bytes_per_session: 9_216,
             kv: KvMemoryFormula {
                 fixed_bytes_per_session: 0,
                 bytes_per_token_per_session: 0,
@@ -1475,7 +1601,7 @@ mod tests {
             accelerator_unattributed_reserve_bytes: 0,
             hard_limit_bytes: 1 << 30,
         };
-        let mut executor = CpuCorrectnessExecutor::scalar(linear_decode_config.clone());
+        let mut executor = CpuCorrectnessExecutor::scalar(executor_config);
         executor.load(&artifact, &profile).unwrap();
         executor.warmup().unwrap();
         let cancellation = CancellationToken::default();
@@ -1492,6 +1618,36 @@ mod tests {
         assert_eq!(mtp_decode.target_logits.len(), 2);
         assert_eq!(mtp_decode.draft_logits.len(), 1);
         assert_eq!(mtp_decode.draft_logits[0].len(), 2);
+        assert_eq!(mtp_decode.target_verification_logits.len(), 1);
+        assert_eq!(mtp_decode.bonus_logits.as_ref().unwrap().len(), 2);
+        assert!(executor.pending_speculative.is_some());
+        executor
+            .commit_speculative(0, &CancellationToken::default())
+            .unwrap();
+        assert_eq!(executor.state.as_ref().unwrap().position(), 2);
+        assert_eq!(executor.mtp_state.as_ref().unwrap().tokens(), 1);
+
+        executor.reset_session().unwrap();
+        executor.prefill(&[0], true, &cancellation).unwrap();
+        let accepted = executor.decode(0, true, &cancellation).unwrap();
+        let candidate = greedy_token(&accepted.draft_logits[0]).unwrap();
+        assert_eq!(
+            candidate,
+            greedy_token(&accepted.target_verification_logits[0]).unwrap()
+        );
+        executor
+            .commit_speculative(1, &CancellationToken::default())
+            .unwrap();
+        assert_eq!(executor.state.as_ref().unwrap().position(), 3);
+        assert_eq!(executor.mtp_state.as_ref().unwrap().tokens(), 2);
+        let bonus_token = greedy_token(accepted.bonus_logits.as_ref().unwrap()).unwrap();
+        let aligned = executor.decode(bonus_token, true, &cancellation).unwrap();
+        assert_eq!(aligned.target_verification_logits.len(), 1);
+        executor
+            .commit_speculative(0, &CancellationToken::default())
+            .unwrap();
+        assert_eq!(executor.state.as_ref().unwrap().position(), 4);
+        assert_eq!(executor.mtp_state.as_ref().unwrap().tokens(), 3);
         executor.reset_session().unwrap();
         let cancelled = CancellationToken::default();
         cancelled.cancel();

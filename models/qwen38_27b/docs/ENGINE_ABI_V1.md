@@ -37,13 +37,25 @@ operations are:
 - `health`, `capabilities`, and timing metrics;
 - explicit `unload`.
 
-An executor returns target logits and, when enabled, unverified MTP draft
-logits. It cannot claim acceptance itself: sampling belongs to the engine.
-The current v1 correctness executor unrolls at most one draft distribution per
-decode. The engine verifies its argmax against the target-selected token,
-then reports proposed, verified, and accepted counts. The accepted draft is
-the one returned token, not an additional context transition, and is never
-counted twice. MTP output is rejected when the session disabled MTP.
+An executor returns target logits and, when enabled, a candidate block, the
+target verification distribution at every candidate position, and the target
+bonus distribution after the complete block. It cannot claim acceptance
+itself: sampling and causal-prefix verification belong to the engine. The
+executor retains the corresponding speculative state branch until the engine
+calls `commit_speculative(accepted_prefix_len)`. Rejection retains only the
+already processed input and discards the branch; acceptance commits exactly
+the accepted target prefix and advances the MTP cache through the same prefix.
+An error or cancellation invalidates the complete session rather than leaving
+an ambiguous partially committed state.
+
+The current correctness executor unrolls one draft. When it is accepted, the
+engine emits `accepted_draft_tokens` first and `token_id` as the target bonus;
+when rejected, that list is empty and `token_id` is the target fallback at the
+rejected position. The resident context advances by one input token plus the
+accepted prefix length. The full verification execution span is admitted
+before dispatch, including target work for every reserved draft. MTP output is
+rejected when the session disabled MTP or exceeds the signed memory profile's
+draft depth.
 
 Sampling is owned by this shared engine rather than by a particular embedding
 or wire server. `prefill` constructs one sampler from the explicit
@@ -52,9 +64,9 @@ that same state. Native-library and IPC callers therefore use the same seeded
 random stream. The current MTP verifier is deliberately restricted to
 temperature zero, where target/draft argmax equality is exact. Non-greedy MTP
 fails closed until a probability-correct rejection sampler is implemented.
-Production MTP will chain the native module for several drafts and verify the
-whole candidate block with rollback/replay state semantics; the one-layer
-checkpoint does not impose a one-token scheduler limit.
+Production MTP will chain the native module for several drafts using the same
+two-phase ABI; the one-layer checkpoint does not impose a one-token scheduler
+limit.
 
 An executor error, cancellation after partial execution, malformed logits, or
 an invalid MTP contract resets the entire session before another request is
@@ -67,9 +79,10 @@ allocations independently. `unload` succeeds only when every counter is zero;
 otherwise the engine enters `unload_failed` and exposes the residue through
 health. This is the contract required by model-TTL and process-TTL owners.
 
-The CPU correctness executor now composes the complete target and native MTP
-graphs for sequential prefill/decode, including independent MTP KV state and
-target-final-hidden handoff. It remains a scalar verifier rather than a
+The CPU correctness executor composes the complete target and native MTP
+graphs for sequential prefill/decode, including independent MTP KV state,
+target-final-hidden handoff, one-draft target verification, and tested
+commit/reject state transitions. It remains a scalar verifier rather than a
 production executor. CUDA, Metal, CPU SIMD token mixers, and Snapdragon still
 need optimized full graph implementations before production admission.
 

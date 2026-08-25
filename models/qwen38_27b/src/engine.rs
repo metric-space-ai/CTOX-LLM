@@ -68,9 +68,14 @@ impl AllocationSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorStep {
     pub target_logits: Vec<f32>,
-    /// Unverified draft distributions. The engine, which owns sampling, must
-    /// compare these against target distributions before reporting acceptance.
+    /// Unverified chained draft distributions.
     pub draft_logits: Vec<Vec<f32>>,
+    /// Target distributions for the same candidate positions. Element zero
+    /// must equal `target_logits`.
+    pub target_verification_logits: Vec<Vec<f32>>,
+    /// Target distribution after all candidate tokens. The engine consumes it
+    /// only when every draft is accepted.
+    pub bonus_logits: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,8 +99,17 @@ impl ExecutorStep {
             if !capabilities.mtp
                 || self.draft_logits.is_empty()
                 || self.draft_logits.len() > capabilities.maximum_draft_tokens as usize
-                || self.draft_logits.len() > 1
+                || self.target_verification_logits.len() != self.draft_logits.len()
+                || self.target_verification_logits.first() != Some(&self.target_logits)
                 || self.draft_logits.iter().any(|logits| {
+                    logits.len() != capabilities.vocab_size
+                        || logits.iter().any(|value| !value.is_finite())
+                })
+                || self.target_verification_logits.iter().any(|logits| {
+                    logits.len() != capabilities.vocab_size
+                        || logits.iter().any(|value| !value.is_finite())
+                })
+                || self.bonus_logits.as_ref().is_none_or(|logits| {
                     logits.len() != capabilities.vocab_size
                         || logits.iter().any(|value| !value.is_finite())
                 })
@@ -104,7 +118,10 @@ impl ExecutorStep {
                     "MTP output contains an invalid or unverifiable draft distribution".into(),
                 ));
             }
-        } else if !self.draft_logits.is_empty() {
+        } else if !self.draft_logits.is_empty()
+            || !self.target_verification_logits.is_empty()
+            || self.bonus_logits.is_some()
+        {
             return Err(EngineError::InvalidArtifact(
                 "executor returned MTP drafts while MTP is disabled".into(),
             ));
@@ -132,6 +149,13 @@ pub trait ModelExecutor {
         mtp_enabled: bool,
         cancellation: &CancellationToken,
     ) -> Result<ExecutorStep>;
+    /// Resolve the state branch prepared by an MTP decode. `accepted_drafts`
+    /// is the causally verified prefix length selected by the engine.
+    fn commit_speculative(
+        &mut self,
+        accepted_drafts: u32,
+        cancellation: &CancellationToken,
+    ) -> Result<()>;
     fn reset_session(&mut self) -> Result<()>;
     fn unload(&mut self) -> Result<()>;
     fn allocations(&self) -> AllocationSnapshot;
@@ -418,6 +442,22 @@ impl<E: ModelExecutor> Engine<E> {
             ));
         }
         let mtp_enabled = session.mtp_enabled;
+        let execution_tokens = 1_u64
+            .checked_add(if mtp_enabled {
+                u64::from(self.memory_profile.mtp_draft_tokens)
+            } else {
+                0
+            })
+            .ok_or_else(|| EngineError::MemoryBudget("decode execution span overflows".into()))?;
+        if session
+            .context_tokens
+            .checked_add(execution_tokens)
+            .is_none_or(|tokens| tokens > self.memory_profile.context_tokens)
+        {
+            return Err(EngineError::MemoryBudget(
+                "decode verification block would exceed the admitted context capacity".into(),
+            ));
+        }
         cancelled(cancellation)?;
         let started = Instant::now();
         let output = match self.executor.decode(token, mtp_enabled, cancellation) {
@@ -435,28 +475,56 @@ impl<E: ModelExecutor> Engine<E> {
             self.invalidate_session()?;
             return Err(error);
         }
-        let token_id = self
-            .sampler
-            .as_mut()
-            .ok_or_else(|| EngineError::InvalidState("active session has no sampler".into()))?
-            .sample(&output.target_logits)? as u32;
+        if output.draft_logits.len() > self.memory_profile.mtp_draft_tokens as usize {
+            self.invalidate_session()?;
+            return Err(EngineError::MemoryBudget(
+                "executor exceeded the admitted MTP draft depth".into(),
+            ));
+        }
         let draft_tokens_proposed = output.draft_logits.len() as u32;
-        // Qwen3.8 has one native MTP layer. Greedy argmax equality against the
-        // target distribution is exact verification; the accepted token is
-        // the single returned token, not an additional context transition.
-        let accepted_draft_tokens = output
-            .draft_logits
-            .iter()
-            .filter_map(|logits| {
-                let draft = logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, left), (_, right)| left.total_cmp(right))?
-                    .0 as u32;
-                (draft == token_id).then_some(draft)
-            })
-            .collect::<Vec<_>>();
-        let added = 1_u64;
+        let (token_id, draft_tokens_verified, accepted_draft_tokens) = if mtp_enabled {
+            let mut accepted = Vec::new();
+            let mut verified = 0_u32;
+            let mut fallback = None;
+            for (draft_logits, target_logits) in output
+                .draft_logits
+                .iter()
+                .zip(&output.target_verification_logits)
+            {
+                let draft = greedy_token(draft_logits)?;
+                let target = greedy_token(target_logits)?;
+                verified += 1;
+                if draft != target {
+                    fallback = Some(target);
+                    break;
+                }
+                accepted.push(draft);
+            }
+            let token = match fallback {
+                Some(token) => token,
+                None => greedy_token(output.bonus_logits.as_ref().ok_or_else(|| {
+                    EngineError::InvalidArtifact("MTP block has no bonus logits".into())
+                })?)?,
+            };
+            if let Err(error) = self
+                .executor
+                .commit_speculative(accepted.len() as u32, cancellation)
+            {
+                self.invalidate_session()?;
+                return Err(error);
+            }
+            (token, verified, accepted)
+        } else {
+            let token = self
+                .sampler
+                .as_mut()
+                .ok_or_else(|| EngineError::InvalidState("active session has no sampler".into()))?
+                .sample(&output.target_logits)? as u32;
+            (token, 0, Vec::new())
+        };
+        let added = 1_u64
+            .checked_add(accepted_draft_tokens.len() as u64)
+            .ok_or_else(|| EngineError::MemoryBudget("decode token count overflows".into()))?;
         let new_context = session
             .context_tokens
             .checked_add(added)
@@ -476,7 +544,7 @@ impl<E: ModelExecutor> Engine<E> {
         Ok(GeneratedStep {
             token_id,
             draft_tokens_proposed,
-            draft_tokens_verified: draft_tokens_proposed,
+            draft_tokens_verified,
             accepted_draft_tokens,
         })
     }
@@ -610,6 +678,15 @@ fn cancelled(token: &CancellationToken) -> Result<()> {
     }
 }
 
+fn greedy_token(logits: &[f32]) -> Result<u32> {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(token, _)| token as u32)
+        .ok_or_else(|| EngineError::InvalidArtifact("greedy logits are empty".into()))
+}
+
 fn elapsed_micros(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u64::MAX as u128) as u64
 }
@@ -623,6 +700,8 @@ mod tests {
         leak_on_unload: bool,
         cancel_during_decode: bool,
         invalid_output: bool,
+        reject_draft: bool,
+        committed_drafts: Option<u32>,
     }
 
     impl MockExecutor {
@@ -631,15 +710,24 @@ mod tests {
                 return ExecutorStep {
                     target_logits: vec![0.0, f32::NAN, 2.0],
                     draft_logits: Vec::new(),
+                    target_verification_logits: Vec::new(),
+                    bonus_logits: None,
                 };
             }
+            let target_logits = vec![0.0, 1.0, 2.0];
             ExecutorStep {
-                target_logits: vec![0.0, 1.0, 2.0],
+                target_logits: target_logits.clone(),
                 draft_logits: if mtp {
-                    vec![vec![0.0, 1.0, 2.0]]
+                    vec![if self.reject_draft {
+                        vec![0.0, 2.0, 1.0]
+                    } else {
+                        vec![0.0, 1.0, 2.0]
+                    }]
                 } else {
                     Vec::new()
                 },
+                target_verification_logits: if mtp { vec![target_logits] } else { Vec::new() },
+                bonus_logits: mtp.then_some(vec![0.0, 2.0, 1.0]),
             }
         }
     }
@@ -698,6 +786,16 @@ mod tests {
                 cancellation.cancel();
             }
             Ok(self.output(mtp_enabled))
+        }
+
+        fn commit_speculative(
+            &mut self,
+            accepted_drafts: u32,
+            cancellation: &CancellationToken,
+        ) -> Result<()> {
+            cancelled(cancellation)?;
+            self.committed_drafts = Some(accepted_drafts);
+            Ok(())
         }
 
         fn reset_session(&mut self) -> Result<()> {
@@ -785,6 +883,8 @@ mod tests {
             leak_on_unload: false,
             cancel_during_decode: false,
             invalid_output: false,
+            reject_draft: false,
+            committed_drafts: None,
         });
         engine.warmup().unwrap();
         engine
@@ -802,14 +902,83 @@ mod tests {
             )
             .unwrap();
         let step = engine.decode(7, 2, &CancellationToken::default()).unwrap();
-        assert_eq!(step.token_id, 2);
+        assert_eq!(step.token_id, 1);
         assert_eq!(step.draft_tokens_proposed, step.draft_tokens_verified);
         assert_eq!(step.accepted_draft_tokens, vec![2]);
-        assert_eq!(engine.health().session.unwrap().context_tokens, 4);
+        assert_eq!(engine.health().session.unwrap().context_tokens, 5);
+        assert_eq!(engine.executor.committed_drafts, Some(1));
         engine.reset_session().unwrap();
         engine.unload().unwrap();
         assert_eq!(engine.health().lifecycle, EngineLifecycle::Unloaded);
         assert!(engine.health().allocations.is_zero());
+    }
+
+    #[test]
+    fn rejected_mtp_draft_commits_only_the_target_input() {
+        let mut engine = engine(MockExecutor {
+            allocations: AllocationSnapshot::default(),
+            leak_on_unload: false,
+            cancel_during_decode: false,
+            invalid_output: false,
+            reject_draft: true,
+            committed_drafts: None,
+        });
+        engine.warmup().unwrap();
+        engine
+            .prefill(
+                SessionOptions {
+                    id: 8,
+                    mtp_enabled: true,
+                    sampling: SamplerConfig {
+                        temperature: 0.0,
+                        ..SamplerConfig::default()
+                    },
+                },
+                &[1, 2, 3],
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        let step = engine.decode(8, 2, &CancellationToken::default()).unwrap();
+        assert_eq!(step.token_id, 2);
+        assert_eq!(step.draft_tokens_proposed, 1);
+        assert_eq!(step.draft_tokens_verified, 1);
+        assert!(step.accepted_draft_tokens.is_empty());
+        assert_eq!(engine.executor.committed_drafts, Some(0));
+        assert_eq!(engine.health().session.unwrap().context_tokens, 4);
+    }
+
+    #[test]
+    fn mtp_verification_reserves_the_complete_execution_span() {
+        let mut engine = engine(MockExecutor {
+            allocations: AllocationSnapshot::default(),
+            leak_on_unload: false,
+            cancel_during_decode: false,
+            invalid_output: false,
+            reject_draft: false,
+            committed_drafts: None,
+        });
+        engine.warmup().unwrap();
+        engine
+            .prefill(
+                SessionOptions {
+                    id: 9,
+                    mtp_enabled: true,
+                    sampling: SamplerConfig {
+                        temperature: 0.0,
+                        ..SamplerConfig::default()
+                    },
+                },
+                &[0; 15],
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.decode(9, 2, &CancellationToken::default()),
+            Err(EngineError::MemoryBudget(message))
+                if message.contains("verification block")
+        ));
+        assert_eq!(engine.health().session.unwrap().context_tokens, 15);
+        assert_eq!(engine.executor.committed_drafts, None);
     }
 
     #[test]
@@ -819,6 +988,8 @@ mod tests {
             leak_on_unload: false,
             cancel_during_decode: true,
             invalid_output: false,
+            reject_draft: false,
+            committed_drafts: None,
         });
         engine.warmup().unwrap();
         engine
@@ -847,6 +1018,8 @@ mod tests {
             leak_on_unload: false,
             cancel_during_decode: false,
             invalid_output: false,
+            reject_draft: false,
+            committed_drafts: None,
         });
         engine.warmup().unwrap();
         assert!(matches!(
@@ -874,6 +1047,8 @@ mod tests {
             leak_on_unload: true,
             cancel_during_decode: false,
             invalid_output: false,
+            reject_draft: false,
+            committed_drafts: None,
         });
         assert!(engine.unload().is_err());
         assert_eq!(engine.health().lifecycle, EngineLifecycle::UnloadFailed);
@@ -887,6 +1062,8 @@ mod tests {
             leak_on_unload: false,
             cancel_during_decode: false,
             invalid_output: false,
+            reject_draft: false,
+            committed_drafts: None,
         };
         validate_executor(
             BackendKind::Cuda,
@@ -913,6 +1090,8 @@ mod tests {
             leak_on_unload: false,
             cancel_during_decode: false,
             invalid_output: true,
+            reject_draft: false,
+            committed_drafts: None,
         });
         engine.warmup().unwrap();
         assert!(engine
@@ -939,6 +1118,8 @@ mod tests {
                 leak_on_unload: false,
                 cancel_during_decode: false,
                 invalid_output: false,
+                reject_draft: false,
+                committed_drafts: None,
             })
         };
         let mut left = make();
