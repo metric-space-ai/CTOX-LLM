@@ -44,7 +44,7 @@ valid prefix.
 
 - `xcrun -sdk macosx metal -c kernels/metal/q2q4_fused_matvec.metal -o target/fleet-metal.air` — compiles clean.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` — clean.
-- `cargo test` — 27 passed, 0 failed, including ABI constant checks against
+- `cargo test` on macOS — 28 passed, 0 failed, including ABI constant checks against
   `src/quant.rs`, invalid shape/buffer rejection, dispatch-name checks, and an
   in-test `xcrun metal` compile of the kernel source.
 

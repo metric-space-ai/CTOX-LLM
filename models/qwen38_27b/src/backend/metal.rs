@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_source_compiles_with_metal_frontend() {
+    fn kernel_source_declares_direct_msl_entry_points() {
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = crate_root.join(KERNEL_SOURCE_PATH);
         let text = std::fs::read_to_string(&source).expect("kernel source must be vendored");
@@ -469,7 +469,13 @@ mod tests {
             !text.contains("MPSGraph"),
             "no MPSGraph dependency permitted"
         );
+    }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kernel_source_compiles_with_metal_frontend() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = crate_root.join(KERNEL_SOURCE_PATH);
         let output = std::env::temp_dir().join(format!(
             "qwen38-metal-test-{}-{}.air",
             std::process::id(),

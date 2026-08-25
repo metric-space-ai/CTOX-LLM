@@ -24,6 +24,14 @@ class DatasetPipelineTests(unittest.TestCase):
         second = {"input": "2+2?", "output": "5"}
         self.assertNotEqual(canonical_text(first), canonical_text(second))
 
+    def test_german_rag_context_is_part_of_hashed_payload(self) -> None:
+        repo = "Beko2210/German-Instruct-Dataset"
+        row = {"input": "Fasse zusammen", "context": "Nur dieser Text", "output": "Kurzfassung"}
+        payload = recovery_payload(row, repo)
+        self.assertIn("Kontext:\nNur dieser Text", payload["messages"][0]["content"])
+        changed = dict(row, context="Ein anderer Text")
+        self.assertNotEqual(canonical_text(row, repo), canonical_text(changed, repo))
+
     def test_paired_sample_becomes_conversation(self) -> None:
         self.assertEqual(
             recovery_payload({"instruction": "hello", "response": "world"}),

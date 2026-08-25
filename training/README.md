@@ -32,6 +32,12 @@ Nemotron v2 is quarantined by default. Research may opt into the cohort, but a
 public checkpoint cannot claim release eligibility until a legal decision is
 recorded in the manifest.
 
+German calibration uses the pinned, CC-BY-4.0
+`Beko2210/German-Instruct-Dataset` source. Its optional RAG context is folded
+into the user turn before hashing, so context changes invalidate provenance in
+the same way as prompt or answer changes. Attribution remains required for any
+released derivative.
+
 Sample identities cover the complete recovery payload, including reference
 answers. Changing an answer therefore changes both the payload hash and sample
 identity; stale source coordinates cannot silently enter a teacher cache.

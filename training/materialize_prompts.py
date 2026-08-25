@@ -72,12 +72,12 @@ def materialize(groups: dict[SourceKey, dict[RecordKey, dict[str, Any]]], output
         dataset = load_dataset(repo, subset, split=split, revision=revision, streaming=True)
         for index, row in enumerate(dataset):
             source_id = source_id_for(row, index)
-            payload_sha = hashlib.sha256(canonical_text(row).encode("utf-8")).hexdigest()
+            payload_sha = hashlib.sha256(canonical_text(row, repo).encode("utf-8")).hexdigest()
             record = remaining.pop((source_id, payload_sha), None)
             if record is None:
                 continue
             materialized = dict(record)
-            materialized.update(recovery_payload(row))
+            materialized.update(recovery_payload(row, repo))
             output.write(json.dumps(materialized, ensure_ascii=False, sort_keys=True) + "\n")
             written += 1
             if not remaining:

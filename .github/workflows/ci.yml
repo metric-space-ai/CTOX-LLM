@@ -40,3 +40,5 @@ jobs:
       - run: python -m json.tool models/qwen38_27b/docs/BACKEND_STATUS.json >/dev/null
       - run: python -m json.tool models/qwen38_27b/docs/NATIVE_ARTIFACT_V1.json >/dev/null
       - run: python -m json.tool models/qwen38_27b/docs/RECOVERY_SMOKE_V1.json >/dev/null
+      - run: python -m json.tool models/qwen38_27b/docs/CALIBRATION_80_V1.json >/dev/null
+      - run: python -m json.tool models/qwen38_27b/docs/VISION_RESIDENCY_V1.json >/dev/null

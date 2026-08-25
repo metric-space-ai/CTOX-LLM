@@ -39,7 +39,14 @@ SOURCES = {
         "release_eligible": True,
         "quarantine_reason": None,
     },
+    "german-instruct": {
+        "repo": "Beko2210/German-Instruct-Dataset",
+        "release_eligible": True,
+        "quarantine_reason": None,
+    },
 }
+
+GERMAN_INSTRUCT_REPO = "Beko2210/German-Instruct-Dataset"
 
 CATEGORY_HINTS = {
     "code": "code",
@@ -70,7 +77,9 @@ class Record:
     quarantine_reason: str | None
 
 
-def recovery_payload(row: dict[str, Any]) -> dict[str, Any]:
+def recovery_payload(
+    row: dict[str, Any], source_repo: str | None = None
+) -> dict[str, Any]:
     """Return the complete payload consumed by recovery and teacher caching.
 
     Hashing only a prompt would leave a changed reference answer undetected.
@@ -95,6 +104,10 @@ def recovery_payload(row: dict[str, Any]) -> dict[str, Any]:
         ),
         None,
     )
+    if source_repo == GERMAN_INSTRUCT_REPO and prompt is not None:
+        context = row.get("context")
+        if context:
+            prompt = f"{prompt}\n\nKontext:\n{context}"
     if prompt is not None and answer is not None:
         return {
             "messages": [
@@ -114,8 +127,8 @@ def stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def canonical_text(row: dict[str, Any]) -> str:
-    return stable_json(recovery_payload(row))
+def canonical_text(row: dict[str, Any], source_repo: str | None = None) -> str:
+    return stable_json(recovery_payload(row, source_repo))
 
 
 def source_id_for(row: dict[str, Any], index: int) -> str:
@@ -124,8 +137,17 @@ def source_id_for(row: dict[str, Any], index: int) -> str:
 
 def category_for(subset: str, split: str, row: dict[str, Any]) -> str:
     explicit = str(row.get("category", "")).lower()
+    if explicit == "rag":
+        return "long_context"
+    if explicit in {"business", "german_pro", "bureaucracy", "hard_prompts", "safety"}:
+        return "chat"
     lowered = f"{subset} {split} {explicit}".lower()
     return next((category for hint, category in CATEGORY_HINTS.items() if hint in lowered), "chat")
+
+
+def nested_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = row.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
 
 
 def records(args: argparse.Namespace) -> Iterable[Record]:
@@ -143,13 +165,16 @@ def records(args: argparse.Namespace) -> Iterable[Record]:
     for subset in subsets:
         dataset = load_dataset(repo, subset, split=args.split, revision=revision, streaming=True)
         for index, row in enumerate(dataset):
-            text = canonical_text(row)
+            text = canonical_text(row, repo)
             prompt_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
             source_id = source_id_for(row, index)
             identity = "\0".join((repo, revision, subset, args.split, source_id, prompt_sha))
-            license_name = str(row.get("license", row.get("source_license", "dataset-card")))
+            metadata = nested_metadata(row)
+            license_name = str(
+                row.get("license", row.get("source_license", metadata.get("license", "dataset-card")))
+            )
             language = str(row.get("language", row.get("lang", "und")))
-            generator = row.get("generator") or row.get("model_name")
+            generator = row.get("generator") or row.get("model_name") or metadata.get("annotator")
             yield Record(
                 id=hashlib.sha256(identity.encode("utf-8")).hexdigest(),
                 source_repo=repo,
