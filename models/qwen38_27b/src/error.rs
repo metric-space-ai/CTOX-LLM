@@ -22,4 +22,8 @@ pub enum EngineError {
     MemoryBudget(String),
     #[error("invalid tensor shape: {0}")]
     Shape(String),
+    #[error("invalid engine state: {0}")]
+    InvalidState(String),
+    #[error("inference operation cancelled")]
+    Cancelled,
 }

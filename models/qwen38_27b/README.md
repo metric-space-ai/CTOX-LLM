@@ -105,3 +105,10 @@ in `src/release.rs` and documented in
 logical Q2/Q4+MTP identity across differently packed CUDA, Metal, CPU, and
 Snapdragon artifacts. No final release manifest can be sealed until recovery
 and held-out qualification freeze the actual logical checkpoint.
+
+The embeddable Rust lifecycle is implemented in `src/engine.rs` and documented
+in [`docs/ENGINE_ABI_V1.md`](docs/ENGINE_ABI_V1.md). It provides signed loading,
+warmup, single-session prefill/decode, MTP verification accounting,
+cancellation, reset, health/capabilities, metrics, and fail-closed zero-residue
+unload. The backend table remains unchanged: no complete decoder executor has
+yet passed the production promotion gates.

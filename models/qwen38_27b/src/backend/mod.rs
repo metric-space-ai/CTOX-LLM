@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::format::TensorDType;
 use crate::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Cpu,

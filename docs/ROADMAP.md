@@ -278,8 +278,11 @@ logical checkpoint and manifest contract are frozen.
 The `ctox.model-release.v2` Rust schema, signed integrity envelope, chunk and
 loader contract, backend logical-equivalence verifier, and checked memory-peak
 formulas are implemented. The actual release instance, tokenizer/template
-digests, measured platform profiles, and lifecycle ABI remain open until the
-final logical checkpoint and engine exist.
+digests and measured platform profiles remain open until the final logical
+checkpoint exists. The shared embeddable lifecycle ABI now covers signed load,
+warmup, incremental prefill/decode, cancellation, MTP accounting, reset,
+telemetry, and verified zero-residue unload; complete model executors and the
+thin IPC binding remain open.
 
 The immediate execution batch is:
 

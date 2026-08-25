@@ -7,6 +7,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::backend::BackendKind;
 use crate::config::{Qwen38Config, MODEL_ID};
 use crate::format::RecoveryMode;
 use crate::loader::ModelArtifact;
@@ -103,15 +104,6 @@ pub struct ReleasePackage {
     pub kind: PackageKind,
     pub default_download: bool,
     pub packs: Vec<BackendPack>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendKind {
-    Cpu,
-    Cuda,
-    Metal,
-    Snapdragon,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +321,18 @@ impl ReleaseManifest {
             .ok_or_else(|| {
                 EngineError::InvalidArtifact(format!(
                     "backend pack {pack_id} is not in release {}",
+                    self.release_id
+                ))
+            })
+    }
+
+    pub fn memory_profile(&self, profile_id: &str) -> Result<&MemoryProfile> {
+        self.memory_profiles
+            .iter()
+            .find(|profile| profile.profile_id == profile_id)
+            .ok_or_else(|| {
+                EngineError::InvalidArtifact(format!(
+                    "memory profile {profile_id} is not in release {}",
                     self.release_id
                 ))
             })
