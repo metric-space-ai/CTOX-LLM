@@ -3,17 +3,50 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Iterable
 from typing import Any
 
 
-def training_order(samples: int, epoch: int, seed: int) -> list[int]:
+def training_order(
+    samples: int,
+    epoch: int,
+    seed: int,
+    selected_indices: Iterable[int] | None = None,
+) -> list[int]:
     if samples <= 0 or epoch < 0:
         raise ValueError(
             "training order requires positive samples and a non-negative epoch"
         )
     order = list(range(samples))
     random.Random(f"ctox-recovery:{seed}:{epoch}").shuffle(order)
+    if selected_indices is not None:
+        selected = tuple(int(index) for index in selected_indices)
+        if len(selected) != len(set(selected)):
+            raise ValueError("selected recovery indices contain duplicates")
+        if not selected or any(index < 0 or index >= samples for index in selected):
+            raise ValueError("selected recovery index is empty or outside the cache")
+        selected_set = set(selected)
+        order = [index for index in order if index in selected_set]
     return order
+
+
+def resolve_sample_indices(
+    available_ids: Iterable[str],
+    requested_ids: Iterable[str] | None,
+) -> tuple[int, ...] | None:
+    if requested_ids is None:
+        return None
+    available = tuple(str(sample_id) for sample_id in available_ids)
+    requested = tuple(str(sample_id) for sample_id in requested_ids)
+    if len(available) != len(set(available)):
+        raise ValueError("teacher cache contains duplicate sample IDs")
+    if not requested or len(requested) != len(set(requested)):
+        raise ValueError("explicit recovery sample IDs are empty or duplicated")
+    positions = {sample_id: index for index, sample_id in enumerate(available)}
+    missing = sorted(set(requested) - set(positions))
+    if missing:
+        raise ValueError(f"explicit recovery sample IDs are absent: {missing}")
+    return tuple(positions[sample_id] for sample_id in sorted(requested))
 
 
 def recovery_training_status(

@@ -238,6 +238,13 @@ closed.
 The trainer reopens that set only with its expected manifest SHA-256, then
 reconstructs and compares the sample count, artifact bytes, content root, and
 every underlying batch-verification hash before the first optimization step.
+For bounded smoke tests and named ablations, repeatable `train_recovery.py
+--sample-id <verified-id>` restricts the deterministic epoch order to those
+exact cache identities. Every requested ID must exist in the admitted cache
+set, duplicates fail, and the sorted identity set is part of the immutable run
+contract. This cannot be combined with positional `--sample-limit`; release
+training continues to omit both selectors and therefore consumes the complete
+cache set.
 `ctox_artifact.py` provides the corresponding offline Python reader for the
 native Rust container. It validates the 64-byte header, version, endianness,
 manifest bounds, alignment, Q2/Q4 or mixed-row byte formulas, non-overlapping

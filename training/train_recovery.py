@@ -29,6 +29,7 @@ from end_to_end_recovery import (
 from recovery_training_state import (
     normalize_accumulated_gradients,
     recovery_training_status,
+    resolve_sample_indices,
     training_order,
 )
 from run_ledger import GpuRun, require_budget
@@ -113,6 +114,10 @@ def validate_arguments(args: argparse.Namespace) -> None:
         raise ValueError("--max-optimizer-steps must be positive")
     if args.sample_limit is not None and args.sample_limit <= 0:
         raise ValueError("--sample-limit must be positive")
+    if args.sample_ids and args.sample_limit is not None:
+        raise ValueError("--sample-id and --sample-limit cannot be combined")
+    if args.sample_ids and len(args.sample_ids) != len(set(args.sample_ids)):
+        raise ValueError("--sample-id values must be unique")
 
 
 def main() -> None:
@@ -139,6 +144,12 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-optimizer-steps", type=int)
     parser.add_argument("--sample-limit", type=int)
+    parser.add_argument(
+        "--sample-id",
+        dest="sample_ids",
+        action="append",
+        help="train only the exact verified cache identity; repeatable",
+    )
     parser.add_argument("--max-sequence-tokens", type=int, default=0)
     parser.add_argument("--oversize-policy", choices=("fail", "skip"), default="fail")
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -172,6 +183,10 @@ def main() -> None:
         )
         hidden_layers = [int(value) for value in cache.settings["hidden_layers"]]
         top_k = int(cache.settings["top_k"])
+        selected_indices = resolve_sample_indices(
+            (str(item["id"]) for item in cache.artifacts),
+            args.sample_ids,
+        )
         if not bool(cache.settings["mtp_targets"]):
             raise ValueError("end-to-end recovery requires verified MTP targets")
         artifact_sha256 = sha256_path(args.artifact)
@@ -219,6 +234,7 @@ def main() -> None:
                 "mtp_targets": True,
                 "epochs": args.epochs,
                 "sample_limit": args.sample_limit,
+                "sample_ids": sorted(args.sample_ids) if args.sample_ids else None,
                 "max_sequence_tokens": args.max_sequence_tokens,
                 "oversize_policy": args.oversize_policy,
                 "learning_rate": args.learning_rate,
@@ -312,7 +328,12 @@ def main() -> None:
                         bounded_stop = True
 
                 for epoch in range(cursor["epoch"], args.epochs):
-                    order = training_order(len(cache.artifacts), epoch, args.seed)
+                    order = training_order(
+                        len(cache.artifacts),
+                        epoch,
+                        args.seed,
+                        selected_indices,
+                    )
                     if args.sample_limit is not None:
                         order = order[: args.sample_limit]
                     position_start = (
@@ -400,7 +421,9 @@ def main() -> None:
             scale_root = scale_tensor_root(scale_tensors)
             status = recovery_training_status(
                 bounded_stop,
-                args.sample_limit,
+                args.sample_limit
+                if args.sample_limit is not None
+                else (len(selected_indices) if selected_indices is not None else None),
                 len(skipped),
             )
             report = {

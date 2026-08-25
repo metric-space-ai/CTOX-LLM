@@ -70,6 +70,7 @@ from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
 from recovery_training_state import (  # noqa: E402
     normalize_accumulated_gradients,
     recovery_training_status,
+    resolve_sample_indices,
     training_order,
 )
 
@@ -383,6 +384,18 @@ class DatasetPipelineTests(unittest.TestCase):
     def test_recovery_order_and_completion_status_fail_closed(self) -> None:
         self.assertEqual(training_order(9, 2, 38), training_order(9, 2, 38))
         self.assertNotEqual(training_order(9, 2, 38), training_order(9, 3, 38))
+        selected = resolve_sample_indices(
+            ["gamma", "alpha", "beta"],
+            ["beta", "alpha"],
+        )
+        self.assertEqual(selected, (1, 2))
+        restricted = training_order(3, 2, 38, selected)
+        self.assertEqual(set(restricted), {1, 2})
+        self.assertEqual(len(restricted), 2)
+        with self.assertRaisesRegex(ValueError, "absent"):
+            resolve_sample_indices(["alpha"], ["missing"])
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            training_order(3, 0, 38, [1, 1])
         self.assertEqual(
             recovery_training_status(False, None, 0),
             "complete",
