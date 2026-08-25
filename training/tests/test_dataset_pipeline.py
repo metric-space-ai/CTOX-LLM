@@ -61,7 +61,11 @@ try:  # Optional local training dependency; exercised in the pinned GPU venv.
 except ModuleNotFoundError:
     torch = None
 from pack_checkpoint import validate_recovery_source  # noqa: E402
-from packed_recovery_ops import packed_linear, packed_recovery_linear_class  # noqa: E402
+from packed_recovery_ops import (  # noqa: E402
+    packed_linear,
+    packed_recovery_embedding_class,
+    packed_recovery_linear_class,
+)
 from packed_recovery_model import PackedRecoveryRegistry  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
@@ -697,6 +701,20 @@ class DatasetPipelineTests(unittest.TestCase):
                     set(module.correction_tensors()),
                     {"weight.s_in", "weight.s_out"},
                 )
+                embedding_class = packed_recovery_embedding_class(torch)
+                embedding = embedding_class(
+                    artifact,
+                    "weight",
+                    torch.ones(64),
+                    torch.ones(2),
+                )
+                ids = torch.tensor([[1, 0, 1]])
+                embedded = embedding(ids)
+                expected_embedding = dense_weight.index_select(0, ids.reshape(-1)).reshape(1, 3, 64)
+                self.assertTrue(torch.allclose(embedded, expected_embedding))
+                embedded.sum().backward()
+                self.assertIsNotNone(embedding.log_s_in.grad)
+                self.assertIsNotNone(embedding.log_s_out.grad)
 
     def test_packed_recovery_registry_requires_and_loads_exact_scale_pairs(self) -> None:
         if torch is None:

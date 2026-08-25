@@ -7,6 +7,7 @@ from typing import Any
 
 _FUNCTIONS: dict[int, Any] = {}
 _MODULES: dict[int, Any] = {}
+_EMBEDDINGS: dict[int, Any] = {}
 
 
 def packed_linear_function(torch: Any) -> Any:
@@ -188,3 +189,81 @@ def packed_recovery_linear_class(torch: Any) -> Any:
 
     _MODULES[id(torch)] = PackedRecoveryLinear
     return PackedRecoveryLinear
+
+
+def packed_recovery_embedding_class(torch: Any) -> Any:
+    cached = _EMBEDDINGS.get(id(torch))
+    if cached is not None:
+        return cached
+
+    class PackedRecoveryEmbedding(torch.nn.Module):
+        def __init__(
+            self,
+            artifact: Any,
+            name: str,
+            initial_s_in: Any,
+            initial_s_out: Any,
+        ) -> None:
+            super().__init__()
+            rows, columns = map(int, artifact.tensors[name]["shape"])
+            if tuple(initial_s_in.shape) != (columns,) or tuple(initial_s_out.shape) != (rows,):
+                raise ValueError(f"packed embedding scale shape differs for {name}")
+            if (
+                not bool(torch.isfinite(initial_s_in).all())
+                or not bool(torch.isfinite(initial_s_out).all())
+                or bool((initial_s_in <= 0).any())
+                or bool((initial_s_out <= 0).any())
+            ):
+                raise ValueError(f"packed embedding scales are invalid for {name}")
+            self.artifact = artifact
+            self.name = name
+            self.rows = rows
+            self.columns = columns
+            self.log_s_in = torch.nn.Parameter(initial_s_in.float().log())
+            self.log_s_out = torch.nn.Parameter(initial_s_out.float().log())
+
+        def forward(self, input_ids: Any) -> Any:
+            if bool((input_ids < 0).any()) or bool((input_ids >= self.rows).any()):
+                raise ValueError(f"packed embedding token id is outside {self.name}")
+            flat = input_ids.reshape(-1).to(torch.long)
+            unique, inverse = torch.unique(flat, sorted=True, return_inverse=True)
+            decoded = torch.empty(
+                (unique.shape[0], self.columns),
+                device=input_ids.device,
+                dtype=self.log_s_in.dtype,
+            )
+            start_index = 0
+            while start_index < unique.shape[0]:
+                stop_index = start_index + 1
+                while (
+                    stop_index < unique.shape[0]
+                    and int(unique[stop_index]) == int(unique[stop_index - 1]) + 1
+                ):
+                    stop_index += 1
+                row_start = int(unique[start_index])
+                row_end = int(unique[stop_index - 1]) + 1
+                decoded[start_index:stop_index] = self.artifact.decode_matrix_rows(
+                    self.name,
+                    row_start,
+                    row_end,
+                    torch,
+                    str(input_ids.device),
+                ).to(decoded.dtype)
+                start_index = stop_index
+            selected = decoded.index_select(0, inverse).reshape(
+                *input_ids.shape, self.columns
+            )
+            input_scale = self.log_s_in.exp().to(selected.dtype)
+            output_scale = self.log_s_out.exp().index_select(0, flat).reshape(
+                *input_ids.shape, 1
+            ).to(selected.dtype)
+            return selected * input_scale * output_scale
+
+        def correction_tensors(self) -> dict[str, Any]:
+            return {
+                f"{self.name}.s_in": self.log_s_in.detach().exp().to(torch.float16).cpu(),
+                f"{self.name}.s_out": self.log_s_out.detach().exp().to(torch.float16).cpu(),
+            }
+
+    _EMBEDDINGS[id(torch)] = PackedRecoveryEmbedding
+    return PackedRecoveryEmbedding

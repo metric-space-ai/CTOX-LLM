@@ -175,6 +175,10 @@ names required by the native manifest.
 requires an exact FP16 scale pair with matching channel shapes, and constructs
 modules on demand. This prevents the trainer from optimizing a partial tensor
 set or silently initializing a missing correction to one.
+The packed embedding module decodes only unique token rows (coalescing adjacent
+IDs), then applies the same column and row corrections as the logical matrix.
+Gradients flow only into those corrections; the vocabulary matrix is never
+expanded or retained in BF16.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from packed_recovery_ops import packed_recovery_linear_class
+from packed_recovery_ops import (
+    packed_recovery_embedding_class,
+    packed_recovery_linear_class,
+)
 
 
 QUANT_DTYPES = frozenset({"q2_b64", "q4_b64", "mixed_q2_q4_b64"})
@@ -58,3 +61,11 @@ class PackedRecoveryRegistry:
             + int(self.artifact.tensors[f"{name}.s_out"]["shape"][0])
             for name in self.weight_names
         )
+
+    def make_embedding(self, name: str, device: str) -> Any:
+        if name not in self.weight_names:
+            raise ValueError(f"{name} is not a registered quantized CTOX weight")
+        s_in = self.artifact.decode_float_tensor(f"{name}.s_in", self.torch, device)
+        s_out = self.artifact.decode_float_tensor(f"{name}.s_out", self.torch, device)
+        module_class = packed_recovery_embedding_class(self.torch)
+        return module_class(self.artifact, name, s_in, s_out).to(device)
