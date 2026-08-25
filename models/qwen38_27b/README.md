@@ -108,7 +108,7 @@ and held-out qualification freeze the actual logical checkpoint.
 
 The embeddable Rust lifecycle is implemented in `src/engine.rs` and documented
 in [`docs/ENGINE_ABI_V1.md`](docs/ENGINE_ABI_V1.md). It provides signed loading,
-warmup, single-session prefill/decode, MTP verification accounting,
+warmup, single-session prefill/decode, engine-owned MTP verification,
 cancellation, reset, health/capabilities, metrics, and fail-closed zero-residue
 unload. The backend table remains unchanged: no complete decoder executor has
 yet passed the production promotion gates.
@@ -129,16 +129,21 @@ interleaved query/gate projection, head norms, partial RoPE, causal GQA, KV
 state, output gate, projection, and residual. Linear attention includes causal
 convolution, Q/K head repetition, beta/decay, recurrent state, gated RMSNorm,
 projection, and residual. The stateful layer iterator follows the frozen
-three-linear/one-full pattern for all configured layers. It remains a
-correctness executor: production paged-Q2/Q4 KV, fused token-mixer kernels,
-chunked prefill, MTP draft/verify, and optimized backend integration remain.
+three-linear/one-full pattern for all configured layers. The native MTP path
+normalizes the selected-token embedding and prior target final hidden, applies
+`mtp.fc`, its cached full-attention/MLP block, `mtp.norm`, and the shared LM
+head. It remains a correctness executor: production paged-Q2/Q4 KV, fused
+token-mixer kernels, chunked prefill, and optimized backend integration remain.
 
 `CpuCorrectnessExecutor` connects that target graph to the stable embeddable
 `ModelExecutor` lifecycle: shared-`Arc<Mmap>` load, warmup, sequential prefill,
 incremental decode, cancellation, reset, allocation reporting, and zero-residue
 unload are exercised together. Its promotion state is permanently `Verifier`,
-MTP is disabled, and production admission rejects it because attention and
-GatedDeltaNet still use scalar oracle composition.
+and production admission rejects it because attention, MTP attention, and
+GatedDeltaNet still use scalar oracle composition. Its MTP verifier is enabled
+only for greedy sampling: the executor returns unverified draft logits and the
+engine itself compares them with the target argmax, without double-counting
+the accepted token in context state.
 
 [`docs/MEMORY_PLAN_CORRECTION_V2.json`](docs/MEMORY_PLAN_CORRECTION_V2.json)
 records the 7.5-MiB causal-convolution state that the earlier calculated Fold

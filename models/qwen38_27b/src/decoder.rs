@@ -1,10 +1,10 @@
 //! Model-specific artifact graph composition.
 //!
 //! This module wires the frozen Qwen tensor names to backend operations. It is
-//! intentionally not a generic neural-network runtime. The first executable
-//! slice covers embedding, the exact residual MLP subgraph, final norm, and
-//! LM head. Token mixers are added separately and must pass the pinned Qwen
-//! oracle before a complete executor can be promoted.
+//! intentionally not a generic neural-network runtime. The mmap-backed
+//! correctness executor covers the complete target graph and native one-layer
+//! MTP graph. Production promotion still requires fused token-mixer kernels,
+//! full-artifact golden evidence, and same-device roofline measurements.
 
 use crate::backend::cpu::CpuBackend;
 use crate::backend::{Activation, Backend, BackendKind, ExecutionPolicy, PromotionState};
@@ -220,6 +220,56 @@ pub struct DecoderState {
     position: usize,
 }
 
+#[derive(Debug)]
+pub struct MtpState {
+    attention: FullAttentionState,
+    maximum_tokens: usize,
+    tokens: usize,
+}
+
+impl MtpState {
+    pub fn new(config: &Qwen38Config, maximum_tokens: usize) -> Result<Self> {
+        if config.mtp_num_hidden_layers != 1
+            || maximum_tokens < 2
+            || maximum_tokens > config.max_position_embeddings
+        {
+            return Err(EngineError::Shape(
+                "MTP state requires one layer and at least two admitted tokens".into(),
+            ));
+        }
+        Ok(Self {
+            attention: FullAttentionState::new(
+                config.num_key_value_heads,
+                config.head_dim,
+                maximum_tokens - 1,
+            )?,
+            maximum_tokens,
+            tokens: 0,
+        })
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        self.attention.allocated_bytes()
+    }
+
+    pub fn reset(&mut self) {
+        self.attention.reset();
+        self.tokens = 0;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetStep {
+    /// The target model's post-final-norm hidden state. This is precisely the
+    /// `last_hidden_state` consumed by Transformers' Qwen MTP layer.
+    pub final_hidden: Vec<f32>,
+    pub logits: Vec<f32>,
+}
+
 impl DecoderState {
     pub fn new(config: &Qwen38Config, maximum_tokens: usize) -> Result<Self> {
         if maximum_tokens == 0 || maximum_tokens > config.max_position_embeddings {
@@ -287,6 +337,8 @@ pub struct CpuCorrectnessExecutor {
     backend: CpuBackend,
     artifact: Option<ModelArtifact>,
     state: Option<DecoderState>,
+    mtp_state: Option<MtpState>,
+    last_final_hidden: Option<Vec<f32>>,
     admitted_context: usize,
     warmed: bool,
     allocations: AllocationSnapshot,
@@ -299,6 +351,8 @@ impl CpuCorrectnessExecutor {
             backend: CpuBackend::scalar_verifier(),
             artifact: None,
             state: None,
+            mtp_state: None,
+            last_final_hidden: None,
             admitted_context: 0,
             warmed: false,
             allocations: AllocationSnapshot::default(),
@@ -311,6 +365,8 @@ impl CpuCorrectnessExecutor {
             backend: CpuBackend::detect(ExecutionPolicy::Verifier)?,
             artifact: None,
             state: None,
+            mtp_state: None,
+            last_final_hidden: None,
             admitted_context: 0,
             warmed: false,
             allocations: AllocationSnapshot::default(),
@@ -323,6 +379,21 @@ impl CpuCorrectnessExecutor {
             .as_ref()
             .map(DecoderState::allocated_bytes)
             .unwrap_or(0)
+            .checked_add(
+                self.mtp_state
+                    .as_ref()
+                    .map(MtpState::allocated_bytes)
+                    .unwrap_or(0),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.last_final_hidden
+                        .as_ref()
+                        .map(|hidden| hidden.capacity() * std::mem::size_of::<f32>())
+                        .unwrap_or(0),
+                )
+            })
+            .ok_or_else(|| EngineError::MemoryBudget("CPU decoder state overflows".into()))?
             .try_into()
             .map_err(|_| EngineError::MemoryBudget("CPU decoder state exceeds u64".into()))?;
         Ok(())
@@ -412,6 +483,18 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
         state: &mut FullAttentionState,
         config: &Qwen38Config,
     ) -> Result<Vec<f32>> {
+        self.full_attention_residual_at(layer_prefix, hidden, position, position, state, config)
+    }
+
+    fn full_attention_residual_at(
+        &self,
+        layer_prefix: &str,
+        hidden: &[f32],
+        rope_position: usize,
+        cache_position: usize,
+        state: &mut FullAttentionState,
+        config: &Qwen38Config,
+    ) -> Result<Vec<f32>> {
         if hidden.len() != config.hidden_size
             || state.key_heads.len() != config.num_key_value_heads
             || state.head_dim != config.head_dim
@@ -479,10 +562,10 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
             config.num_key_value_heads,
             config.head_dim,
             config.rotary_dim,
-            position as u64,
+            rope_position as u64,
             config.rope_theta,
         )?;
-        state.append(position, &key, &value)?;
+        state.append(cache_position, &key, &value)?;
         let key = state.flattened_key();
         let value = state.flattened_value();
         let mut attention = grouped_query_attention(
@@ -494,7 +577,7 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
             1,
             state.tokens(),
             config.head_dim,
-            position,
+            cache_position,
         )?;
         sigmoid_gate(&mut attention, &gate)?;
         let projected = self.projection(&format!("{prefix}.o_proj.weight"), &attention)?;
@@ -640,19 +723,27 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
     }
 
     pub fn final_logits(&self, hidden: &[f32]) -> Result<Vec<f32>> {
-        let normalized = self.rms_norm("model.language_model.norm.weight", hidden)?;
-        self.projection("lm_head.weight", &normalized)
+        let normalized = self.final_hidden(hidden)?;
+        self.logits_from_final_hidden(&normalized)
+    }
+
+    pub fn final_hidden(&self, hidden: &[f32]) -> Result<Vec<f32>> {
+        self.rms_norm("model.language_model.norm.weight", hidden)
+    }
+
+    pub fn logits_from_final_hidden(&self, final_hidden: &[f32]) -> Result<Vec<f32>> {
+        self.projection("lm_head.weight", final_hidden)
     }
 
     /// Complete target-model decode for one input token. The method is a
     /// correctness composition over the frozen 64-layer topology; optimized
     /// executors batch/fuse these same transitions per backend.
-    pub fn decode_target_token(
+    pub fn decode_target_step(
         &self,
         token_id: u32,
         state: &mut DecoderState,
         config: &Qwen38Config,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<TargetStep> {
         if state.layers.len() != config.num_hidden_layers || state.position >= state.maximum_tokens
         {
             return Err(EngineError::Shape(
@@ -682,9 +773,69 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
             };
             hidden = self.decoder_mlp_residual(&prefix, &hidden)?;
         }
-        let logits = self.final_logits(&hidden)?;
+        let final_hidden = self.final_hidden(&hidden)?;
+        let logits = self.logits_from_final_hidden(&final_hidden)?;
         state.position += 1;
-        Ok(logits)
+        Ok(TargetStep {
+            final_hidden,
+            logits,
+        })
+    }
+
+    pub fn decode_target_token(
+        &self,
+        token_id: u32,
+        state: &mut DecoderState,
+        config: &Qwen38Config,
+    ) -> Result<Vec<f32>> {
+        Ok(self.decode_target_step(token_id, state, config)?.logits)
+    }
+
+    /// Execute the native Qwen3.8 one-layer MTP graph for base hidden state
+    /// `p` and the already target-selected token `p+1`. The result drafts
+    /// token `p+2`; acceptance is deliberately outside this method because a
+    /// target-model transition must verify every proposal.
+    pub fn mtp_draft(
+        &self,
+        next_token_id: u32,
+        previous_final_hidden: &[f32],
+        absolute_position: usize,
+        state: &mut MtpState,
+        config: &Qwen38Config,
+    ) -> Result<TargetStep> {
+        if previous_final_hidden.len() != config.hidden_size
+            || absolute_position != state.tokens + 1
+            || absolute_position >= state.maximum_tokens
+        {
+            return Err(EngineError::Shape(
+                "MTP hidden width or absolute position differs from its cache".into(),
+            ));
+        }
+        let embedding = self.embedding(next_token_id)?;
+        let embedding = self.rms_norm("mtp.pre_fc_norm_embedding.weight", &embedding)?;
+        let hidden = self.rms_norm("mtp.pre_fc_norm_hidden.weight", previous_final_hidden)?;
+        // Qwen3.8 leaves `mtp_hidden_states_first` unset. Transformers therefore
+        // uses [normalized embedding, normalized previous hidden] in this order.
+        let mut projection_input = Vec::with_capacity(config.hidden_size * 2);
+        projection_input.extend_from_slice(&embedding);
+        projection_input.extend_from_slice(&hidden);
+        let mut draft_hidden = self.projection("mtp.fc.weight", &projection_input)?;
+        draft_hidden = self.full_attention_residual_at(
+            "mtp.layers.0",
+            &draft_hidden,
+            absolute_position,
+            state.tokens,
+            &mut state.attention,
+            config,
+        )?;
+        draft_hidden = self.decoder_mlp_residual("mtp.layers.0", &draft_hidden)?;
+        let final_hidden = self.rms_norm("mtp.norm.weight", &draft_hidden)?;
+        let logits = self.logits_from_final_hidden(&final_hidden)?;
+        state.tokens += 1;
+        Ok(TargetStep {
+            final_hidden,
+            logits,
+        })
     }
 }
 
@@ -707,7 +858,8 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         ExecutorCapabilities {
             vocab_size: self.config.vocab_size,
             maximum_context_tokens: self.config.max_position_embeddings as u64,
-            mtp: false,
+            mtp: self.config.mtp_num_hidden_layers == 1,
+            maximum_draft_tokens: u32::from(self.config.mtp_num_hidden_layers == 1),
             cancellation: true,
             session_reset: true,
             no_hidden_fallbacks: false,
@@ -715,7 +867,11 @@ impl ModelExecutor for CpuCorrectnessExecutor {
     }
 
     fn load(&mut self, artifact: &ModelArtifact, profile: &MemoryProfile) -> Result<()> {
-        if self.artifact.is_some() || self.state.is_some() {
+        if self.artifact.is_some()
+            || self.state.is_some()
+            || self.mtp_state.is_some()
+            || self.last_final_hidden.is_some()
+        {
             return Err(EngineError::InvalidState(
                 "CPU correctness executor is already loaded".into(),
             ));
@@ -750,6 +906,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
     fn prefill(
         &mut self,
         tokens: &[u32],
+        mtp_enabled: bool,
         cancellation: &CancellationToken,
     ) -> Result<ExecutorStep> {
         if !self.warmed || tokens.is_empty() || tokens.len() > self.admitted_context {
@@ -758,24 +915,42 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             ));
         }
         self.state = Some(DecoderState::new(&self.config, self.admitted_context)?);
+        self.mtp_state = if mtp_enabled {
+            Some(MtpState::new(&self.config, self.admitted_context)?)
+        } else {
+            None
+        };
+        self.last_final_hidden = None;
         let artifact = self.artifact.as_ref().ok_or_else(|| {
             EngineError::InvalidState("CPU prefill has no loaded artifact".into())
         })?;
         let decoder = ArtifactDecoder::new(artifact, &self.backend, self.config.rms_norm_epsilon)?;
         let state = self.state.as_mut().expect("state created above");
         let mut target_logits = Vec::new();
-        for token in tokens {
+        for (position, token) in tokens.iter().enumerate() {
             if cancellation.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
-            target_logits = decoder.decode_target_token(*token, state, &self.config)?;
+            if mtp_enabled && position > 0 {
+                let previous = self.last_final_hidden.as_ref().ok_or_else(|| {
+                    EngineError::InvalidState("MTP prefill lost target final hidden state".into())
+                })?;
+                decoder.mtp_draft(
+                    *token,
+                    previous,
+                    position,
+                    self.mtp_state.as_mut().expect("MTP state created above"),
+                    &self.config,
+                )?;
+            }
+            let step = decoder.decode_target_step(*token, state, &self.config)?;
+            target_logits = step.logits;
+            self.last_final_hidden = Some(step.final_hidden);
         }
         self.update_session_allocation()?;
         Ok(ExecutorStep {
             target_logits,
-            draft_tokens_proposed: 0,
-            draft_tokens_verified: 0,
-            accepted_draft_tokens: Vec::new(),
+            draft_logits: Vec::new(),
         })
     }
 
@@ -785,12 +960,12 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         mtp_enabled: bool,
         cancellation: &CancellationToken,
     ) -> Result<ExecutorStep> {
-        if !self.warmed || mtp_enabled || cancellation.is_cancelled() {
+        if !self.warmed || cancellation.is_cancelled() {
             return if cancellation.is_cancelled() {
                 Err(EngineError::Cancelled)
             } else {
                 Err(EngineError::InvalidState(
-                    "CPU correctness decode is not warm or MTP was requested".into(),
+                    "CPU correctness decode is not warm".into(),
                 ))
             };
         }
@@ -802,24 +977,45 @@ impl ModelExecutor for CpuCorrectnessExecutor {
         let state = self.state.as_mut().ok_or_else(|| {
             EngineError::InvalidState("CPU decode requires a prefilled state".into())
         })?;
-        let target_logits = decoder.decode_target_token(token, state, &self.config)?;
+        let draft_logits = if mtp_enabled {
+            let previous = self.last_final_hidden.as_ref().ok_or_else(|| {
+                EngineError::InvalidState("MTP decode has no previous target hidden state".into())
+            })?;
+            let absolute_position = state.position();
+            let draft = decoder.mtp_draft(
+                token,
+                previous,
+                absolute_position,
+                self.mtp_state
+                    .as_mut()
+                    .ok_or_else(|| EngineError::InvalidState("MTP decode has no cache".into()))?,
+                &self.config,
+            )?;
+            vec![draft.logits]
+        } else {
+            Vec::new()
+        };
+        let target = decoder.decode_target_step(token, state, &self.config)?;
+        self.last_final_hidden = Some(target.final_hidden);
         self.update_session_allocation()?;
         Ok(ExecutorStep {
-            target_logits,
-            draft_tokens_proposed: 0,
-            draft_tokens_verified: 0,
-            accepted_draft_tokens: Vec::new(),
+            target_logits: target.logits,
+            draft_logits,
         })
     }
 
     fn reset_session(&mut self) -> Result<()> {
         self.state = None;
+        self.mtp_state = None;
+        self.last_final_hidden = None;
         self.allocations.session_bytes = 0;
         Ok(())
     }
 
     fn unload(&mut self) -> Result<()> {
         self.state = None;
+        self.mtp_state = None;
+        self.last_final_hidden = None;
         self.artifact = None;
         self.admitted_context = 0;
         self.warmed = false;
@@ -1000,10 +1196,56 @@ mod tests {
             hidden,
             1.0 / hidden as f32,
         ));
+        tensors.extend(recovered_matrix(
+            "mtp.fc.weight",
+            hidden,
+            hidden * 2,
+            1.0 / (hidden * 2) as f32,
+        ));
+        let mtp_layer = "mtp.layers.0";
+        for projection in ["gate_proj", "up_proj"] {
+            tensors.extend(recovered_matrix(
+                &format!("{mtp_layer}.mlp.{projection}.weight"),
+                intermediate,
+                hidden,
+                1.0 / hidden as f32,
+            ));
+        }
+        tensors.extend(recovered_matrix(
+            &format!("{mtp_layer}.mlp.down_proj.weight"),
+            hidden,
+            intermediate,
+            1.0 / intermediate as f32,
+        ));
+        tensors.extend(recovered_matrix(
+            &format!("{mtp_layer}.self_attn.q_proj.weight"),
+            query_width * 2,
+            hidden,
+            1.0 / hidden as f32,
+        ));
+        for projection in ["k_proj", "v_proj"] {
+            tensors.extend(recovered_matrix(
+                &format!("{mtp_layer}.self_attn.{projection}.weight"),
+                key_value_width,
+                hidden,
+                1.0 / hidden as f32,
+            ));
+        }
+        tensors.extend(recovered_matrix(
+            &format!("{mtp_layer}.self_attn.o_proj.weight"),
+            hidden,
+            query_width,
+            1.0 / query_width as f32,
+        ));
         for name in [
             format!("{layer}.input_layernorm.weight"),
             format!("{layer}.post_attention_layernorm.weight"),
+            format!("{mtp_layer}.input_layernorm.weight"),
+            format!("{mtp_layer}.post_attention_layernorm.weight"),
             "model.language_model.norm.weight".into(),
+            "mtp.norm.weight".into(),
+            "mtp.pre_fc_norm_embedding.weight".into(),
+            "mtp.pre_fc_norm_hidden.weight".into(),
         ] {
             tensors.push(PackedTensor {
                 name,
@@ -1015,6 +1257,8 @@ mod tests {
         for name in [
             format!("{layer}.self_attn.q_norm.weight"),
             format!("{layer}.self_attn.k_norm.weight"),
+            format!("{mtp_layer}.self_attn.q_norm.weight"),
+            format!("{mtp_layer}.self_attn.k_norm.weight"),
         ] {
             tensors.push(PackedTensor {
                 name,
@@ -1071,6 +1315,11 @@ mod tests {
 
         let linear_config = Qwen38Config {
             hidden_size: hidden,
+            num_attention_heads: query_heads,
+            num_key_value_heads: key_value_heads,
+            head_dim,
+            rotary_dim: 16,
+            rope_theta: 10_000.0,
             linear_num_key_heads: linear_key_heads,
             linear_num_value_heads: linear_value_heads,
             linear_key_head_dim: linear_key_dim,
@@ -1139,12 +1388,51 @@ mod tests {
             ..attention_config
         };
         let mut full_target_state = DecoderState::new(&full_decode_config, 2).unwrap();
-        let full_logits = decoder
-            .decode_target_token(0, &mut full_target_state, &full_decode_config)
+        let target_step = decoder
+            .decode_target_step(0, &mut full_target_state, &full_decode_config)
             .unwrap();
-        assert_eq!(full_logits.len(), 2);
-        assert!(full_logits.iter().all(|value| value.is_finite()));
+        assert_eq!(target_step.final_hidden.len(), hidden);
+        assert_eq!(target_step.logits.len(), 2);
+        assert!(target_step.logits.iter().all(|value| value.is_finite()));
         assert_eq!(full_target_state.position(), 1);
+
+        let mut mtp_state = MtpState::new(&full_decode_config, 2).unwrap();
+        let draft = decoder
+            .mtp_draft(
+                0,
+                &target_step.final_hidden,
+                1,
+                &mut mtp_state,
+                &full_decode_config,
+            )
+            .unwrap();
+        assert_eq!(draft.final_hidden.len(), hidden);
+        assert_eq!(draft.logits.len(), 2);
+        assert!(draft.logits.iter().all(|value| value.is_finite()));
+        assert_eq!(mtp_state.tokens(), 1);
+        assert!(decoder
+            .mtp_draft(
+                0,
+                &target_step.final_hidden,
+                2,
+                &mut mtp_state,
+                &full_decode_config,
+            )
+            .is_err());
+        mtp_state.reset();
+        assert_eq!(mtp_state.tokens(), 0);
+        assert_eq!(
+            decoder
+                .mtp_draft(
+                    0,
+                    &target_step.final_hidden,
+                    1,
+                    &mut mtp_state,
+                    &full_decode_config,
+                )
+                .unwrap(),
+            draft
+        );
 
         let profile = MemoryProfile {
             profile_id: "cpu-correctness-2".into(),
@@ -1171,17 +1459,24 @@ mod tests {
         executor.load(&artifact, &profile).unwrap();
         executor.warmup().unwrap();
         let cancellation = CancellationToken::default();
-        let prefill = executor.prefill(&[0], &cancellation).unwrap();
+        let prefill = executor.prefill(&[0], false, &cancellation).unwrap();
         assert_eq!(prefill.target_logits.len(), 2);
         assert!(executor.allocations().session_bytes > 0);
         let decode = executor.decode(0, false, &cancellation).unwrap();
         assert_eq!(decode.target_logits.len(), 2);
         executor.reset_session().unwrap();
         assert_eq!(executor.allocations().session_bytes, 0);
+        let mtp_prefill = executor.prefill(&[0], true, &cancellation).unwrap();
+        assert!(mtp_prefill.draft_logits.is_empty());
+        let mtp_decode = executor.decode(0, true, &cancellation).unwrap();
+        assert_eq!(mtp_decode.target_logits.len(), 2);
+        assert_eq!(mtp_decode.draft_logits.len(), 1);
+        assert_eq!(mtp_decode.draft_logits[0].len(), 2);
+        executor.reset_session().unwrap();
         let cancelled = CancellationToken::default();
         cancelled.cancel();
         assert!(matches!(
-            executor.prefill(&[0], &cancelled),
+            executor.prefill(&[0], false, &cancelled),
             Err(EngineError::Cancelled)
         ));
         executor.reset_session().unwrap();

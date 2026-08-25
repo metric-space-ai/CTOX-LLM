@@ -37,16 +37,21 @@ operations are:
 - `health`, `capabilities`, and timing metrics;
 - explicit `unload`.
 
-MTP output records proposed, target-verified, and accepted drafts separately.
-The engine rejects a step unless every proposed draft was verified, and it
-refuses any MTP output when the session disabled MTP. Context accounting
-includes accepted drafts.
+An executor returns target logits and, when enabled, unverified MTP draft
+logits. It cannot claim acceptance itself: sampling belongs to the engine.
+Qwen3.8 has one native MTP layer, so v1 admits at most one draft distribution
+per decode. The engine verifies its argmax against the target-selected token,
+then reports proposed, verified, and accepted counts. The accepted draft is
+the one returned token, not an additional context transition, and is never
+counted twice. MTP output is rejected when the session disabled MTP.
 
 Sampling is owned by this shared engine rather than by a particular embedding
 or wire server. `prefill` constructs one sampler from the explicit
 temperature, top-k, top-p, and seed values; every subsequent `decode` advances
 that same state. Native-library and IPC callers therefore use the same seeded
-random stream, while temperature zero remains an exact argmax path.
+random stream. The current MTP verifier is deliberately restricted to
+temperature zero, where target/draft argmax equality is exact. Non-greedy MTP
+fails closed until a probability-correct rejection sampler is implemented.
 
 An executor error, cancellation after partial execution, malformed logits, or
 an invalid MTP contract resets the entire session before another request is
@@ -59,9 +64,11 @@ allocations independently. `unload` succeeds only when every counter is zero;
 otherwise the engine enters `unload_failed` and exposes the residue through
 health. This is the contract required by model-TTL and process-TTL owners.
 
-The lifecycle implementation does not imply that a complete decoder executor
-exists. CPU, CUDA, Metal, and Snapdragon still need full graph implementations
-before any production load can pass their promotion gate.
+The CPU correctness executor now composes the complete target and native MTP
+graphs for sequential prefill/decode, including independent MTP KV state and
+target-final-hidden handoff. It remains a scalar verifier rather than a
+production executor. CUDA, Metal, CPU SIMD token mixers, and Snapdragon still
+need optimized full graph implementations before production admission.
 
 [`WIRE_PROTOCOL_V1.md`](WIRE_PROTOCOL_V1.md) maps this lifecycle onto versioned
 JSON Lines. It carries distinct request, operation, and session identities so
