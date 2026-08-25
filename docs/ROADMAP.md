@@ -33,6 +33,11 @@ the same BF16 teacher revision and provenance. The remaining 1,735 records are
 the next blocking artifact set; no smoke cache or failed/OOM directory counts
 toward that number.
 
+The exact missing cohort and its 16-batch execution plan are frozen in
+`models/qwen38_27b/docs/TEACHER_CACHE_FINAL_PLAN_V1.json`: 12,908,476 input
+tokens and 19,892,384,032 projected cache bytes (18.5263 GiB). The plan is
+disk-admitted on GPU3 and preserves the complete final domain/language mix.
+
 ## Frozen release invariants
 
 These constraints apply to every phase:

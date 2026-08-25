@@ -91,3 +91,10 @@ candidate is retained only as superseded evidence because its Nemotron-v1
 `chat` portion contained empty user turns. Five verified teacher batches cover
 593 final identities; the missing 1,735 BF16/MTP targets, end-to-end recovery,
 and held-out model-quality gates remain pending.
+
+The exact final-cache subtraction and disk-admitted execution plan are frozen
+in [`docs/TEACHER_CACHE_FINAL_PLAN_V1.json`](docs/TEACHER_CACHE_FINAL_PLAN_V1.json).
+Five verified batches contribute 593 unchanged final identities; the remaining
+1,735 samples require 16 token-aware batches and a projected 18.5263 GiB. The
+subtraction preserves the complete 36-domain/15-language corpus contract rather
+than selecting a coding-only or English-only cache subset.

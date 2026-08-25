@@ -1,0 +1,116 @@
+{
+  "format": "ctox.qwen38.teacher-cache-final-plan-evidence.v1",
+  "date": "2026-08-25",
+  "status": "final_missing_cohort_and_batch_plan_frozen",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "teacher_provenance_sha256": "d930966047fee2be4a3e1f70e55d0b507231bc5d9ead935bd166879d8bdc81d0",
+  "teacher_root_sha256": "c63bc259cd8d18b0a701983a226867927b4ec19b376a684b218c3fa572754524",
+  "final_train_cohort": {
+    "input": "release-recovery-train-2328-v7.jsonl",
+    "records": 2328,
+    "bytes": 48022202,
+    "sha256": "79d156969ae8846e8befd2406ae9837feb1c32cfc3e278338c3a533254471b4b"
+  },
+  "verified_reuse": {
+    "records": 593,
+    "verification_documents": 5,
+    "categories": {
+      "chat": 496,
+      "code": 56,
+      "long_context": 41
+    },
+    "verification_sha256": [
+      "3d72ab1bdf40b84ed98a374cd1511630494f96ae615d7478aebf15c83535f990",
+      "aca26409c4f4672158c1056fe9f9ec965765813e0a1cf7b93292c2c750e25c0e",
+      "a495f2d9d2fbc9ae981f0bcb6f3f8951cbb90c927430df9d991b834e1a339ddc",
+      "e3447e33f64129c346b77984929a0a34453965ed551280c1c189feb3930f182c",
+      "944c7ec69db086818e09a8d7aa19e8f8644776d5ec5f5914fc9aa6575fced464"
+    ]
+  },
+  "missing_selection": {
+    "input": "release-recovery-train-missing-teacher-1735-v1.jsonl",
+    "records": 1735,
+    "bytes": 44717904,
+    "sha256": "b1be12933a1eb49844ddd4e82c8bd8d98cf6b38bb298f9b82fda94243a9af420",
+    "selection_report": "release-recovery-train-missing-teacher-1735-v1.json",
+    "selection_report_bytes": 3407,
+    "selection_report_sha256": "d3577e762fc5ca3ea3ef7840fde091f699d8df212d6103144f0aa8cb89c81058",
+    "categories": {
+      "agentic": 381,
+      "chat": 370,
+      "code": 447,
+      "long_context": 14,
+      "math": 523
+    },
+    "language_strata": 14,
+    "sources": {
+      "Beko2210/German-Instruct-Dataset": 72,
+      "CohereLabs/aya_dataset": 74,
+      "HuggingFaceH4/ultrachat_200k": 232,
+      "metric-space-ai/CTOX-LLM": 7,
+      "nvidia/Nemotron-Agentic-v1": 125,
+      "nvidia/Nemotron-Post-Training-Dataset-v1": 1033,
+      "nvidia/Nemotron-SFT-Agentic-v2": 192
+    }
+  },
+  "teacher_settings": {
+    "target_mode": "assistant",
+    "top_k": 64,
+    "hidden_size": 5120,
+    "hidden_layers": [0, 15, 31, 47, 63],
+    "assistant_hidden_positions": 64,
+    "uniform_hidden_positions": 64,
+    "marker_window": 32,
+    "mtp_targets": true,
+    "conservative_file_overhead_bytes": 16384
+  },
+  "cache_plan": {
+    "path": "release-teacher-cache-train-missing-1735-v1.json",
+    "bytes": 741914,
+    "sha256": "252fafe6c57e2164206ec8f5124e0b78c446098bc6b510891e24489f0326c550",
+    "samples": 1735,
+    "sequence_tokens": 12908476,
+    "tensor_payload_bytes": 19863957792,
+    "projected_cache_bytes": 19892384032,
+    "projected_cache_gib": 18.526226311922073,
+    "sequence_tokens_p50": 3754,
+    "sequence_tokens_p95": 24584,
+    "sequence_tokens_max": 130930,
+    "file_bytes_max": 37698505
+  },
+  "batch_plan": {
+    "path": "release-teacher-cache-train-missing-batches-v1.json",
+    "bytes": 6437,
+    "sha256": "f8b6d2a0e17f58c27c068338bea7df23487816d430d91f616fed6096a6bd5b97",
+    "batches": 16,
+    "max_samples": 128,
+    "max_sequence_tokens": 1000000,
+    "max_projected_bytes": 2147483648,
+    "minimum_batch_samples": 63,
+    "maximum_batch_samples": 128,
+    "maximum_batch_sequence_tokens": 998697,
+    "maximum_batch_projected_bytes": 1754418012
+  },
+  "gpu3_admission": {
+    "free_bytes_before_execution": 95335161856,
+    "free_gib_before_execution": 88.78778839111328,
+    "free_after_projected_missing_cache_bytes": 75442777824,
+    "free_after_projected_missing_cache_gib": 70.2616730928421,
+    "disk_gate": "passed"
+  },
+  "general_purpose_coverage_contract": {
+    "evidence": "DOMAIN_COVERAGE_V2.json",
+    "semantic_domains": 36,
+    "semantic_families": 10,
+    "language_strata": 15,
+    "independent_train_and_evaluation_gates": true,
+    "translation_only_language_coverage_rejected": true,
+    "note": "Teacher-cache subtraction preserves the final corpus identities; it does not alter the domain or language selection."
+  },
+  "open_gates": [
+    "Execute and independently verify all 16 missing teacher-cache batches.",
+    "Assemble the five reused and 16 new verification documents into one exact 2,328-sample cache-set manifest.",
+    "Rehash every teacher artifact before the end-to-end recovery trainer admits the cache set."
+  ]
+}
