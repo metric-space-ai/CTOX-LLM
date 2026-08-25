@@ -171,6 +171,10 @@ parallel scale file after a checkpoint has been packed.
 parameters are logarithmic positive channel corrections. Packed weights and
 bias stay frozen, and export returns the exact `<weight>.s_in`/`.s_out` FP16
 names required by the native manifest.
+`PackedRecoveryRegistry` scans the native artifact for every quantized matrix,
+requires an exact FP16 scale pair with matching channel shapes, and constructs
+modules on demand. This prevents the trainer from optimizing a partial tensor
+set or silently initializing a missing correction to one.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized

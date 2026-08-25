@@ -62,6 +62,7 @@ except ModuleNotFoundError:
     torch = None
 from pack_checkpoint import validate_recovery_source  # noqa: E402
 from packed_recovery_ops import packed_linear, packed_recovery_linear_class  # noqa: E402
+from packed_recovery_model import PackedRecoveryRegistry  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
@@ -101,6 +102,18 @@ class DatasetPipelineTests(unittest.TestCase):
 
         def __call__(self, text, **_kwargs):
             return type("Encoded", (), {"input_ids": text.replace("\n", " \n ").split()})()
+
+    class FakePackedArtifact:
+        def __init__(self, torch_module):
+            self.torch = torch_module
+            self.tensors = {
+                "layer.weight": {"dtype": "q2_b64", "shape": [2, 64]},
+                "layer.weight.s_in": {"dtype": "f16", "shape": [64]},
+                "layer.weight.s_out": {"dtype": "f16", "shape": [2]},
+            }
+
+        def decode_float_tensor(self, name, _torch, device):
+            return self.torch.ones(tuple(self.tensors[name]["shape"]), device=device)
 
     def test_corpus_percentiles_are_deterministic(self) -> None:
         self.assertEqual(percentile([9, 1, 5, 3], 0.0), 1)
@@ -684,6 +697,17 @@ class DatasetPipelineTests(unittest.TestCase):
                     set(module.correction_tensors()),
                     {"weight.s_in", "weight.s_out"},
                 )
+
+    def test_packed_recovery_registry_requires_and_loads_exact_scale_pairs(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+        artifact = self.FakePackedArtifact(torch)
+        registry = PackedRecoveryRegistry(artifact, torch)
+        self.assertEqual(registry.weight_names, ["layer.weight"])
+        self.assertEqual(registry.scale_parameter_count(), 66)
+        artifact.tensors.pop("layer.weight.s_out")
+        with self.assertRaisesRegex(ValueError, "lacks"):
+            PackedRecoveryRegistry(artifact, torch)
 
     def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
