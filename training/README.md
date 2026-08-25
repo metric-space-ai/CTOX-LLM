@@ -59,3 +59,9 @@ source shards, slices matrices by rows, quantizes those chunks on one GPU,
 writes an aligned temporary data region, then creates the final manifest and
 checksummed `.ctoxq` artifact. It refuses to overwrite files and refuses plans
 above the Fold limit.
+
+Vision remains a separate phase-resident package. `build_vision_plan.py`
+zero-pads matrix columns to 64-value storage blocks so non-aligned vision MLPs
+can still use Q2/Q4 kernels. `plan_vision_residency.py` then selects whole
+text/MTP bundles to unmap before vision, and refuses a phase plan above the
+9.7-GiB operating target. Decoder workspaces are reused rather than duplicated.
