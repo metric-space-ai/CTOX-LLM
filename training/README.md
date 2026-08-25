@@ -59,6 +59,10 @@ count and elapsed time to `run-ledger.jsonl`.
 bytes, including alignment and recovery scales. It excludes vision, includes
 resident MTP, rejects a plan above 7.8 GiB, and emits the immutable assignment
 consumed by target packers.
+The resident tensor plan reserves 2 MiB below that package ceiling for the
+container manifest and release metadata. `pack_checkpoint.py` independently
+rejects a final file above the full 7.8-GiB package limit; fitting tensor bytes
+alone is not accepted as evidence.
 
 `pack_checkpoint.py` performs the direct BF16 conversion. It memory-maps all
 source shards, slices matrices by rows, quantizes those chunks on one GPU,

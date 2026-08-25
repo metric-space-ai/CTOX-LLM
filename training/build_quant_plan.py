@@ -15,7 +15,9 @@ BLOCK = 64
 Q2_BLOCK_BYTES = 18
 Q4_BLOCK_BYTES = 34
 ALIGNMENT = 256
-FOLD_LIMIT = 8_375_186_227
+FOLD_PACKAGE_LIMIT = 8_375_186_227
+CONTAINER_MANIFEST_RESERVE = 2 * 1024 * 1024
+FOLD_RESIDENT_LIMIT = FOLD_PACKAGE_LIMIT - CONTAINER_MANIFEST_RESERVE
 
 
 def align(value: int) -> int:
@@ -252,8 +254,10 @@ def main() -> None:
         "linear_out_q4_start": args.linear_out_q4_start,
         "total_bytes": total_bytes,
         "gib": total_bytes / 1024**3,
-        "fold_limit_bytes": FOLD_LIMIT,
-        "fits_fold_limit": total_bytes <= FOLD_LIMIT,
+        "fold_limit_bytes": FOLD_RESIDENT_LIMIT,
+        "fold_package_limit_bytes": FOLD_PACKAGE_LIMIT,
+        "container_manifest_reserve_bytes": CONTAINER_MANIFEST_RESERVE,
+        "fits_fold_limit": total_bytes <= FOLD_RESIDENT_LIMIT,
         "dtype_bytes": dict(dtype_bytes),
         "tensor_count": len(tensors),
         "tensors": tensors,
@@ -268,7 +272,7 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({key: plan[key] for key in ("total_bytes", "gib", "fits_fold_limit", "dtype_bytes")}, indent=2))
-    if total_bytes > FOLD_LIMIT:
+    if total_bytes > FOLD_RESIDENT_LIMIT:
         raise SystemExit(2)
 
 

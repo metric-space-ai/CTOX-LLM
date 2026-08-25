@@ -11,6 +11,11 @@ TRAINING = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TRAINING))
 
 from build_manifest import canonical_text, category_for, recovery_payload  # noqa: E402
+from build_quant_plan import (  # noqa: E402
+    CONTAINER_MANIFEST_RESERVE,
+    FOLD_PACKAGE_LIMIT,
+    FOLD_RESIDENT_LIMIT,
+)
 from collect_activation_stats import checkpoint_weight_name  # noqa: E402
 from materialize_prompts import load_manifests  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
@@ -197,6 +202,13 @@ class DatasetPipelineTests(unittest.TestCase):
                 {"embedding.weight": {1}},
             ),
             1792,
+        )
+
+    def test_fold_package_budget_reserves_manifest_bytes(self) -> None:
+        self.assertEqual(CONTAINER_MANIFEST_RESERVE, 2 * 1024 * 1024)
+        self.assertEqual(
+            FOLD_RESIDENT_LIMIT + CONTAINER_MANIFEST_RESERVE,
+            FOLD_PACKAGE_LIMIT,
         )
 
     def test_vendor_manifest_detects_digest_changes(self) -> None:

@@ -249,6 +249,11 @@ def main() -> None:
             data.truncate(plan["total_bytes"])
             data.flush()
         assemble_artifact(args.output, data_path, plan, tensor_hashes)
+    package_limit = plan.get("fold_package_limit_bytes")
+    if package_limit is not None and args.output.stat().st_size > package_limit:
+        raise RuntimeError(
+            f"artifact is {args.output.stat().st_size} bytes, package limit is {package_limit}"
+        )
     artifact_hash = hashlib.sha256()
     with args.output.open("rb") as artifact:
         for chunk in iter(lambda: artifact.read(16 * 1024 * 1024), b""):

@@ -35,7 +35,9 @@ These constraints apply to every phase:
   recovery corrections, tokenizer, chat template, special tokens, and MTP
   weights. Backend packs are deterministic physical reorderings only.
 - No backend-dependent requantization or silent CPU fallback is allowed.
-- Text plus resident MTP and recovery data must be no larger than 7.8 GiB.
+- The complete text+MTP package must be no larger than 7.8 GiB. Its resident
+  tensor plan reserves 2 MiB for the manifest and release metadata; fitting
+  tensor bytes while the final file exceeds the ceiling is a hard failure.
 - The Fold limit applies to the entire visible inference process, including
   code, Java/JNI, native heaps, graph state, workspaces, KV state, and
   accelerator allocations: 9.7 GiB operating target and 10 GiB hard refusal.
