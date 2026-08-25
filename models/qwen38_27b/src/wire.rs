@@ -8,6 +8,7 @@ use crate::engine::{
     AllocationSnapshot, EngineLifecycle, EngineMetrics, ExecutorCapabilities, LoadProgress,
     SessionStatus,
 };
+use crate::sampler::SamplerConfig;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -94,6 +95,17 @@ pub struct SamplingParameters {
     pub top_k: u32,
     pub top_p: f32,
     pub seed: u64,
+}
+
+impl From<SamplingParameters> for SamplerConfig {
+    fn from(value: SamplingParameters) -> Self {
+        Self {
+            temperature: value.temperature,
+            top_k: value.top_k as usize,
+            top_p: value.top_p,
+            seed: value.seed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,7 +248,12 @@ mod tests {
         let decoded: WireRequest = serde_json::from_slice(&encoded).unwrap();
         decoded.validate_version().unwrap();
         assert_eq!(decoded.request_id, 9);
-        assert!(matches!(decoded.request, Request::Prefill(_)));
+        let Request::Prefill(prefill) = decoded.request else {
+            panic!("expected prefill request");
+        };
+        let sampler = SamplerConfig::from(prefill.sampling);
+        assert_eq!(sampler.seed, 42);
+        assert_eq!(sampler.top_k, 1);
     }
 
     #[test]

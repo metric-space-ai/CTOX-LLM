@@ -42,6 +42,12 @@ The engine rejects a step unless every proposed draft was verified, and it
 refuses any MTP output when the session disabled MTP. Context accounting
 includes accepted drafts.
 
+Sampling is owned by this shared engine rather than by a particular embedding
+or wire server. `prefill` constructs one sampler from the explicit
+temperature, top-k, top-p, and seed values; every subsequent `decode` advances
+that same state. Native-library and IPC callers therefore use the same seeded
+random stream, while temperature zero remains an exact argmax path.
+
 An executor error, cancellation after partial execution, malformed logits, or
 an invalid MTP contract resets the entire session before another request is
 allowed. This avoids continuing from partially advanced recurrent or KV state.

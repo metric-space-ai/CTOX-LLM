@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{BackendKind, ExecutionPolicy, PromotionState};
 use crate::loader::{ChecksumPolicy, ModelArtifact};
 use crate::release::{MemoryProfile, ReleaseManifest};
+use crate::sampler::{Sampler, SamplerConfig};
 use crate::{EngineError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +66,14 @@ impl AllocationSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorStep {
     pub target_logits: Vec<f32>,
+    pub draft_tokens_proposed: u32,
+    pub draft_tokens_verified: u32,
+    pub accepted_draft_tokens: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedStep {
+    pub token_id: u32,
     pub draft_tokens_proposed: u32,
     pub draft_tokens_verified: u32,
     pub accepted_draft_tokens: Vec<u32>,
@@ -135,10 +144,11 @@ impl CancellationToken {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct SessionOptions {
     pub id: u64,
     pub mtp_enabled: bool,
+    pub sampling: SamplerConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +202,7 @@ pub struct Engine<E: ModelExecutor> {
     executor: E,
     lifecycle: EngineLifecycle,
     session: Option<SessionStatus>,
+    sampler: Option<Sampler>,
     metrics: EngineMetrics,
 }
 
@@ -273,6 +284,7 @@ impl<E: ModelExecutor> Engine<E> {
             executor,
             lifecycle: EngineLifecycle::Loaded,
             session: None,
+            sampler: None,
             metrics: EngineMetrics {
                 cold_load_micros: elapsed_micros(started),
                 ..EngineMetrics::default()
@@ -302,7 +314,7 @@ impl<E: ModelExecutor> Engine<E> {
         options: SessionOptions,
         tokens: &[u32],
         cancellation: &CancellationToken,
-    ) -> Result<ExecutorStep> {
+    ) -> Result<GeneratedStep> {
         if self.lifecycle != EngineLifecycle::Warm || self.session.is_some() {
             return Err(EngineError::InvalidState(
                 "prefill requires a warm engine without an active session".into(),
@@ -322,6 +334,7 @@ impl<E: ModelExecutor> Engine<E> {
                 reason: "executor does not advertise MTP".into(),
             });
         }
+        let mut sampler = Sampler::new(options.sampling)?;
         cancelled(cancellation)?;
         let started = Instant::now();
         let output = match self.executor.prefill(tokens, cancellation) {
@@ -339,15 +352,22 @@ impl<E: ModelExecutor> Engine<E> {
             self.invalidate_session()?;
             return Err(error);
         }
+        let token_id = sampler.sample(&output.target_logits)? as u32;
         self.session = Some(SessionStatus {
             id: options.id,
             context_tokens: tokens.len() as u64,
             mtp_enabled: options.mtp_enabled,
         });
+        self.sampler = Some(sampler);
         self.lifecycle = EngineLifecycle::Active;
         self.metrics.prefill_calls += 1;
         self.metrics.last_prefill_micros = elapsed_micros(started);
-        Ok(output)
+        Ok(GeneratedStep {
+            token_id,
+            draft_tokens_proposed: output.draft_tokens_proposed,
+            draft_tokens_verified: output.draft_tokens_verified,
+            accepted_draft_tokens: output.accepted_draft_tokens,
+        })
     }
 
     pub fn decode(
@@ -355,7 +375,7 @@ impl<E: ModelExecutor> Engine<E> {
         session_id: u64,
         token: u32,
         cancellation: &CancellationToken,
-    ) -> Result<ExecutorStep> {
+    ) -> Result<GeneratedStep> {
         let session = *self
             .session
             .as_ref()
@@ -388,6 +408,11 @@ impl<E: ModelExecutor> Engine<E> {
             self.invalidate_session()?;
             return Err(error);
         }
+        let token_id = self
+            .sampler
+            .as_mut()
+            .ok_or_else(|| EngineError::InvalidState("active session has no sampler".into()))?
+            .sample(&output.target_logits)? as u32;
         let added = 1_u64
             .checked_add(output.accepted_draft_tokens.len() as u64)
             .ok_or_else(|| EngineError::MemoryBudget("decode token count overflows".into()))?;
@@ -407,7 +432,12 @@ impl<E: ModelExecutor> Engine<E> {
             .context_tokens = new_context;
         self.metrics.decode_calls += 1;
         self.metrics.last_decode_micros = elapsed_micros(started);
-        Ok(output)
+        Ok(GeneratedStep {
+            token_id,
+            draft_tokens_proposed: output.draft_tokens_proposed,
+            draft_tokens_verified: output.draft_tokens_verified,
+            accepted_draft_tokens: output.accepted_draft_tokens,
+        })
     }
 
     pub fn reset_session(&mut self) -> Result<()> {
@@ -425,6 +455,7 @@ impl<E: ModelExecutor> Engine<E> {
     fn invalidate_session(&mut self) -> Result<()> {
         let result = self.executor.reset_session();
         self.session = None;
+        self.sampler = None;
         self.lifecycle = if result.is_ok() {
             EngineLifecycle::Warm
         } else {
@@ -443,6 +474,7 @@ impl<E: ModelExecutor> Engine<E> {
             None
         };
         self.session = None;
+        self.sampler = None;
         let unload_error = self.executor.unload().err();
         let allocations = self.executor.allocations();
         if let Some(error) = reset_error.or(unload_error) {
@@ -683,6 +715,7 @@ mod tests {
             executor,
             lifecycle: EngineLifecycle::Loaded,
             session: None,
+            sampler: None,
             metrics: EngineMetrics::default(),
         }
     }
@@ -704,12 +737,17 @@ mod tests {
                 SessionOptions {
                     id: 7,
                     mtp_enabled: true,
+                    sampling: SamplerConfig {
+                        temperature: 0.0,
+                        ..SamplerConfig::default()
+                    },
                 },
                 &[1, 2, 3],
                 &CancellationToken::default(),
             )
             .unwrap();
         let step = engine.decode(7, 2, &CancellationToken::default()).unwrap();
+        assert_eq!(step.token_id, 2);
         assert_eq!(step.draft_tokens_proposed, step.draft_tokens_verified);
         assert_eq!(engine.health().session.unwrap().context_tokens, 5);
         engine.reset_session().unwrap();
@@ -732,6 +770,7 @@ mod tests {
                 SessionOptions {
                     id: 1,
                     mtp_enabled: false,
+                    sampling: SamplerConfig::default(),
                 },
                 &[1],
                 &CancellationToken::default(),
@@ -798,6 +837,7 @@ mod tests {
                 SessionOptions {
                     id: 1,
                     mtp_enabled: false,
+                    sampling: SamplerConfig::default(),
                 },
                 &[1],
                 &CancellationToken::default(),
@@ -806,5 +846,47 @@ mod tests {
         assert!(engine.health().session.is_none());
         assert_eq!(engine.health().lifecycle, EngineLifecycle::Warm);
         assert_eq!(engine.health().allocations.session_bytes, 0);
+    }
+
+    #[test]
+    fn session_sampler_keeps_seeded_token_decisions_in_the_shared_engine() {
+        let make = || {
+            engine(MockExecutor {
+                allocations: AllocationSnapshot::default(),
+                leak_on_unload: false,
+                cancel_during_decode: false,
+                invalid_output: false,
+            })
+        };
+        let mut left = make();
+        let mut right = make();
+        left.warmup().unwrap();
+        right.warmup().unwrap();
+        let options = SessionOptions {
+            id: 4,
+            mtp_enabled: false,
+            sampling: SamplerConfig {
+                seed: 91,
+                ..SamplerConfig::default()
+            },
+        };
+        let left_first = left
+            .prefill(options, &[1], &CancellationToken::default())
+            .unwrap();
+        let right_first = right
+            .prefill(options, &[1], &CancellationToken::default())
+            .unwrap();
+        assert_eq!(left_first.token_id, right_first.token_id);
+        for input in [0, 1, 2, 1, 0] {
+            assert_eq!(
+                left.decode(4, input, &CancellationToken::default())
+                    .unwrap()
+                    .token_id,
+                right
+                    .decode(4, input, &CancellationToken::default())
+                    .unwrap()
+                    .token_id
+            );
+        }
     }
 }

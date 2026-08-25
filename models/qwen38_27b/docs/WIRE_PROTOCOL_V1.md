@@ -16,7 +16,9 @@ Version 1 declares these requests:
 
 Prefill fixes sampling parameters and seed for the session. Decode retains that
 state instead of accepting silent per-token sampling changes. MTP is selected
-per session. Request IDs correlate transport calls; operation IDs correlate
+per session. Sampling is executed by the shared Rust engine, not duplicated in
+the server, so embedded and IPC integrations advance identical seeded sampler
+state. Request IDs correlate transport calls; operation IDs correlate
 long-running load/generation streams; session IDs bind recurrent and KV state.
 
 One request may emit several response lines with the same request and operation
