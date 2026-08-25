@@ -15,6 +15,10 @@ Before assigning scarce Q4 capacity, `collect_activation_stats.py` hooks the
 real BF16 text graph and stores only per-channel input/output mean squares for
 quantized linear modules. These diagonal statistics support activation-weighted
 Q2/Q4 error scoring without retaining source prompts or token activations.
+Long calibration runs use `--start-sample`/`--max-samples` batches. Successful
+batches are immutable and `merge_activation_stats.py` combines their channel
+means using exact token counts, so a transient GPU failure never invalidates
+already completed work.
 `score_quant_sensitivity.py` then reuses the packer's canonical Q2/Q4 code
 construction and estimates each matrix's output error under a diagonal input
 covariance. Q4 optimization consumes the resulting measured quality gain per
