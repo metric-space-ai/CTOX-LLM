@@ -16,7 +16,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
-    candidates = json.loads(args.sensitivity.read_text(encoding="utf-8"))
+    sensitivity = json.loads(args.sensitivity.read_text(encoding="utf-8"))
+    candidates = sensitivity.get("candidates", sensitivity) if isinstance(sensitivity, dict) else sensitivity
     selected = []
     bytes_used = sum(item["q4_bytes"] if item.get("fixed_q4") else item["q2_bytes"] for item in candidates)
     optional = []

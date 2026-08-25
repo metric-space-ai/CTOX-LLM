@@ -20,6 +20,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import BinaryIO
 
+from quantization import quantize_components
 from run_ledger import GpuRun, require_budget
 
 
@@ -45,13 +46,8 @@ def quantize_blocks(values, dtype: str) -> bytes:
     import torch
 
     blocks = values.float().reshape(-1, 64)
-    scales = blocks.abs().amax(dim=1)
-    safe_scales = torch.where(scales == 0, torch.ones_like(scales), scales)
-    normalized = blocks / safe_scales[:, None]
+    scales, codes = quantize_components(torch, values, dtype)
     if dtype == "q2_b64":
-        boundaries = torch.tensor([-2.0 / 3.0, 0.0, 2.0 / 3.0], device=values.device)
-        codes = torch.bucketize(normalized, boundaries).to(torch.uint8)
-        codes = torch.where(scales[:, None] == 0, torch.zeros_like(codes), codes)
         grouped = codes.reshape(-1, 16, 4)
         packed = (
             grouped[:, :, 0]
@@ -63,8 +59,6 @@ def quantize_blocks(values, dtype: str) -> bytes:
         output[:, :2] = scales.to(torch.float16).contiguous().view(torch.uint8).reshape(-1, 2)
         output[:, 2:] = packed
     elif dtype == "q4_b64":
-        codes = ((normalized.clamp(-1.0, 1.0) * 7.5) + 7.5).round().to(torch.uint8)
-        codes = torch.where(scales[:, None] == 0, torch.zeros_like(codes), codes)
         grouped = codes.reshape(-1, 32, 2)
         packed = grouped[:, :, 0] | (grouped[:, :, 1] << 4)
         output = torch.empty((blocks.shape[0], Q4_BLOCK_BYTES), dtype=torch.uint8, device=values.device)
