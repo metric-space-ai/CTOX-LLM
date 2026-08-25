@@ -87,6 +87,9 @@
     "semantic_domain_families": 16,
     "train_domain_quota_gaps": 0,
     "evaluation_domain_quota_gaps": 0,
+    "train_primary_domain_quota_gaps": 2,
+    "evaluation_primary_domain_quota_gaps": 3,
+    "primary_domain_supplement_required": true,
     "train_evaluation_overlap": 0
   },
   "broad_teacher_smoke": {

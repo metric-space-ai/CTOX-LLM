@@ -91,6 +91,12 @@ release-size teacher cache begins.
 NLI classifier. Threshold labels are supplemented only by deterministic source
 facts (for example, an actual tool schema or the pinned code/math split). Its
 tags guide cohort selection and are never used as target labels during recovery.
+The domain gate has two independent views. Multi-label counts prove that a
+domain is present, while `minimum_primary_train`/`minimum_primary_evaluation`
+require enough records whose clearest semantic assignment is that domain.
+`audit_domain_tags.py` can apply a stricter policy to frozen classifier output
+without rerunning the revision-pinned NLI model. A multi-label pass never
+overrides a primary-domain gap.
 
 `plan_teacher_cache.py` tokenizes the complete frozen cohort with the same
 assistant, hidden-state, marker-window, and MTP position rules as the cache

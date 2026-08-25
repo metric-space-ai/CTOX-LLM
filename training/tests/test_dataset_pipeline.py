@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 TRAINING = Path(__file__).resolve().parents[1]
@@ -31,7 +32,7 @@ from cache_teacher import (  # noqa: E402
     position_sets,
     validate_local_model_provenance,
 )
-from classify_domains import classification_text, deterministic_labels  # noqa: E402
+from classify_domains import classification_text, deterministic_labels, quota_gaps  # noqa: E402
 from collect_activation_stats import (  # noqa: E402
     checkpoint_weight_name,
     prefill_ranges,
@@ -121,6 +122,23 @@ class DatasetPipelineTests(unittest.TestCase):
             },
         )
         self.assertIn("user: Debug this program", classification_text(record))
+
+    def test_domain_gate_requires_clear_primary_examples_not_only_multilabel_hits(self) -> None:
+        rubric = {
+            "policy": {"minimum_primary_train": 2},
+            "domains": {
+                "a": {"minimum_train": 2},
+                "b": {"minimum_train": 2},
+            },
+        }
+        gaps, primary_gaps = quota_gaps(
+            Counter({"a": 3, "b": 3}),
+            Counter({"a": 3, "b": 1}),
+            rubric,
+            "train",
+        )
+        self.assertEqual(gaps, {})
+        self.assertEqual(primary_gaps, {"b": {"observed": 1, "required": 2}})
 
     def test_hash_covers_reference_answer(self) -> None:
         first = {"input": "2+2?", "output": "4"}

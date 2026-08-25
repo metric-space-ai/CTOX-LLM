@@ -203,6 +203,27 @@ def write_json_atomic(path: Path, document: dict[str, Any]) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
+def quota_gaps(
+    counts: Counter[str],
+    primary_counts: Counter[str],
+    rubric: dict[str, Any],
+    partition: str,
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+    minimum_key = f"minimum_{partition}"
+    primary_minimum = int(rubric["policy"][f"minimum_primary_{partition}"])
+    multi_label = {
+        name: {"observed": counts[name], "required": int(domain[minimum_key])}
+        for name, domain in rubric["domains"].items()
+        if counts[name] < int(domain[minimum_key])
+    }
+    primary = {
+        name: {"observed": primary_counts[name], "required": primary_minimum}
+        for name in rubric["domains"]
+        if primary_counts[name] < primary_minimum
+    }
+    return multi_label, primary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
@@ -246,12 +267,9 @@ def main() -> None:
         output_sha256 = write_jsonl_atomic(args.output, tagged)
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    minimum_key = f"minimum_{args.partition}"
-    gaps = {
-        name: {"observed": counts[name], "required": domain[minimum_key]}
-        for name, domain in rubric["domains"].items()
-        if counts[name] < domain[minimum_key]
-    }
+    gaps, primary_gaps = quota_gaps(
+        counts, primary_counts, rubric, args.partition
+    )
     summary = {
         "format": "ctox.recovery-domain-audit.v1",
         "partition": args.partition,
@@ -266,6 +284,7 @@ def main() -> None:
         "primary_domain_counts": dict(sorted(primary_counts.items())),
         "below_threshold_fallback_records": fallback_count,
         "quota_gaps": gaps,
+        "primary_quota_gaps": primary_gaps,
         "output": str(args.output),
         "output_bytes": args.output.stat().st_size,
         "output_sha256": output_sha256,

@@ -1,7 +1,7 @@
 {
   "format": "ctox.qwen38.recovery-corpus-evidence.v3",
   "date": "2026-08-25",
-  "status": "materialized_domain_gate_passed",
+  "status": "materialized_multilabel_gate_passed_primary_supplement_required",
   "model": "Qwen/Qwen3.8-27B",
   "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
   "teacher_provenance": {
@@ -95,9 +95,9 @@
     }
   },
   "domain_gate": {
-    "status": "passed_no_quota_gaps",
+    "status": "multi_label_passed_primary_supplement_required",
     "rubric": "training/DOMAIN_RUBRIC.json",
-    "rubric_sha256": "bc30063c072c04ff5cbfc127bec6fcdeec84dbc00038a1ce92dd77d976708c6a",
+    "rubric_sha256": "ddb4165f903c850ce313e52a9e9ae86967ed54da2598c3f0a162c8649a0f2e28",
     "classifier": "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
     "classifier_revision": "8adb042d524ecd5c26d3e3ba0e3fbcf7e2d0864c",
     "classifier_license": "MIT",
@@ -112,7 +112,14 @@
       "maximum_domain_count": 1056,
       "minimum_primary_domain_count": 18,
       "maximum_primary_domain_count": 360,
-      "quota_gaps": 0
+      "quota_gaps": 0,
+      "primary_gate_artifact": "release-recovery-train-2072-primary-gate-v1.json",
+      "primary_gate_artifact_bytes": 1939,
+      "primary_gate_artifact_sha256": "566017c96f45c6c3bee8a75ce6d7aaa1761843f329b354bd74973e58d983a787",
+      "primary_quota_gaps": {
+        "safety_uncertainty": {"observed": 18, "required": 24},
+        "social_science_education": {"observed": 19, "required": 24}
+      }
     },
     "evaluation": {
       "tag_artifact": "release-recovery-evaluation-524-v2.jsonl",
@@ -124,7 +131,15 @@
       "maximum_domain_count": 264,
       "minimum_primary_domain_count": 1,
       "maximum_primary_domain_count": 81,
-      "quota_gaps": 0
+      "quota_gaps": 0,
+      "primary_gate_artifact": "release-recovery-evaluation-524-primary-gate-v1.json",
+      "primary_gate_artifact_bytes": 2017,
+      "primary_gate_artifact_sha256": "aa81a03c244fc58fdd08ebe6d5546bc867b13da40a476587bffdbc2af89c874f",
+      "primary_quota_gaps": {
+        "physical_sciences_environment": {"observed": 4, "required": 8},
+        "safety_uncertainty": {"observed": 1, "required": 8},
+        "social_science_education": {"observed": 4, "required": 8}
+      }
     },
     "interpretation": "multi-label selection audit only; tags are not recovery targets"
   },
@@ -164,6 +179,7 @@
     "total_gpu_hours": 5.230906743473477
   },
   "gates_still_open": [
+    "Add disjoint primary-domain supplements for safety, social science, and held-out physical science before final quality acceptance.",
     "Cache release-size BF16 top-64 logits, residual mass, selected hidden states, and MTP draft targets.",
     "Recompute full-corpus activation statistics and confirm or replace the provisional Q2/Q4 assignment.",
     "Run end-to-end KL, cross-entropy, hidden-state, activation, and MTP recovery.",
@@ -172,7 +188,7 @@
   "notes": [
     "The 384/96 Agentic release cohorts exclude 963 identities from all earlier Agentic materializations before ranking.",
     "Aya uses human-curated Apache-2.0 inputs/targets from twelve equal-weight language strata; inputs and targets are both part of the payload hash.",
-    "All 16 semantic domain families exceed their independent train and evaluation minima; low-confidence records retain a transparent best-label fallback flag.",
+    "All 16 semantic domain families exceed the multi-label minima, but the stricter primary-domain policy deliberately keeps safety, social science, and held-out physical science open for supplementation.",
     "A prior technical MTP smoke with an unverified typed revision was quarantined and is not release evidence."
   ]
 }

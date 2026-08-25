@@ -5,7 +5,9 @@
     "evaluation_must_be_disjoint": true,
     "labels_are_a_selection_gate_not_training_targets": true,
     "minimum_confidence": 0.7,
-    "unclassified_records_are_rejected": true
+    "unclassified_records_are_rejected": true,
+    "minimum_primary_train": 24,
+    "minimum_primary_evaluation": 8
   },
   "domains": {
     "agentic_tools_search": {
