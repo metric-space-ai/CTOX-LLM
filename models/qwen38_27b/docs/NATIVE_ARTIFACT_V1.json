@@ -1,0 +1,42 @@
+{
+  "format": "ctox.native-artifact-evidence.v1",
+  "status": "direct_quantization_baseline",
+  "recovery_scales": "identity_not_trained",
+  "model": "Qwen/Qwen3.8-27B",
+  "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "artifact": "Qwen3.8-27B-CTOX-Q2Q4-v1.ctoxq",
+  "artifact_bytes": 8342484480,
+  "artifact_gib": 7.7695441246,
+  "resident_weights_bytes": 8342086656,
+  "resident_weights_gib": 7.7691736221,
+  "sha256": "02d38cc877ad2ae8bea244bc11d4572ca0a8c84e757bdfbcb27ebbb9ed8c47f6",
+  "plan_sha256": "8c7e5556af5970d9d568086dc4ac6cc030669cd0278497f1e5f705d5d40a666e",
+  "tensors": {
+    "total": 1878,
+    "q2_b64": 445,
+    "q4_b64": 61,
+    "f16_including_recovery": 1276,
+    "f32": 96
+  },
+  "modules": {
+    "text_source_tensors": 851,
+    "mtp_source_tensors": 15,
+    "vision": "separate",
+    "mtp_packed_bytes": 145705984
+  },
+  "fold_128k_plan": {
+    "total_bytes": 10280903680,
+    "total_gib": 9.5748376846,
+    "target_gib": 9.7,
+    "hard_limit_gib": 10.0,
+    "verified": true
+  },
+  "verification": {
+    "all_tensor_sha256": "passed",
+    "rust_loader": "passed",
+    "gpu": "NVIDIA RTX A4500",
+    "packing_seconds": 78.769212,
+    "packing_gpu_hours": 0.0218803367,
+    "date": "2026-08-25"
+  }
+}

@@ -37,3 +37,4 @@ jobs:
       - run: python -m json.tool schemas/recovery-sample-v1.schema.json >/dev/null
       - run: python -m json.tool models/qwen38_27b/docs/BASELINE.json >/dev/null
       - run: python -m json.tool models/qwen38_27b/docs/BACKEND_STATUS.json >/dev/null
+      - run: python -m json.tool models/qwen38_27b/docs/NATIVE_ARTIFACT_V1.json >/dev/null

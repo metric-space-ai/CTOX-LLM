@@ -76,8 +76,9 @@ def canonical_text(row: dict[str, Any]) -> str:
     return json.dumps(row, ensure_ascii=False, sort_keys=True)
 
 
-def category_for(subset: str) -> str:
-    lowered = subset.lower()
+def category_for(subset: str, split: str, row: dict[str, Any]) -> str:
+    explicit = str(row.get("category", "")).lower()
+    lowered = f"{subset} {split} {explicit}".lower()
     return next((category for hint, category in CATEGORY_HINTS.items() if hint in lowered), "chat")
 
 
@@ -112,7 +113,7 @@ def records(args: argparse.Namespace) -> Iterable[Record]:
                 source_id=source_id,
                 license=license_name,
                 generator=str(generator) if generator else None,
-                category=category_for(subset),
+                category=category_for(subset, args.split, row),
                 language=language,
                 prompt_sha256=prompt_sha,
                 release_eligible=bool(source["release_eligible"]),
