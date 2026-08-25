@@ -143,6 +143,33 @@
     },
     "interpretation": "multi-label selection audit only; tags are not recovery targets"
   },
+  "primary_domain_supplement_candidates": {
+    "status": "materialized_disjoint_classification_pending",
+    "seed": "ctox-qwen38-primary-domain-supplement-v1",
+    "sources": [
+      "nvidia/Nemotron-Post-Training-Dataset-v1:Chat",
+      "nvidia/Nemotron-Post-Training-Dataset-v1:STEM"
+    ],
+    "excluded_existing_train_and_evaluation_ids": 2596,
+    "overlap_with_existing_cohorts": 0,
+    "train": {
+      "manifest": "primary-domain-candidates-train-1000-v1.jsonl",
+      "manifest_bytes": 560500,
+      "manifest_sha256": "1179ed380a4bbf8bcb25ba853df92f4679873f0f5093b8518e9f566f1bdafca4",
+      "materialized_bytes": 8845430,
+      "materialized_sha256": "3695e586478b80a354ef94a96e76f8e71397ce0aff372968d1d22cd989b8b33f",
+      "records": 1000
+    },
+    "evaluation": {
+      "manifest": "primary-domain-candidates-evaluation-500-v1.jsonl",
+      "manifest_bytes": 280250,
+      "manifest_sha256": "793fc4cd2b8d64abbbf7fb6dc0cf784b21c6c1f22103509669e0c6e245fd1815",
+      "materialized_bytes": 4618950,
+      "materialized_sha256": "5a0939364f0dd592c26413318473702bea33ee733e53285c9e17551c53a629c2",
+      "records": 500
+    },
+    "selection_gate": "classify and admit only samples needed to close the explicit primary-domain gaps"
+  },
   "mtp_teacher_smoke": {
     "status": "passed_with_verified_teacher_provenance",
     "artifact": "release-agentic-mtp-smoke-1-v2",
