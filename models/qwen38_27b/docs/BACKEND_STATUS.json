@@ -7,13 +7,13 @@
     },
     "cpu_avx2": {
       "state": "experimental",
-      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch"],
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch", "recovered_embedding_row"],
       "evidence": "../benchmarks/cpu/q2q4-packed-fused-matvec-20260825.json",
       "implementation_notes": "CPU_KERNEL_NOTES.md"
     },
     "cpu_neon": {
       "state": "experimental",
-      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch"],
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch", "recovered_embedding_row"],
       "evidence": "../benchmarks/cpu/q2q4-packed-fused-matvec-20260825.json",
       "implementation_notes": "CPU_KERNEL_NOTES.md"
     },

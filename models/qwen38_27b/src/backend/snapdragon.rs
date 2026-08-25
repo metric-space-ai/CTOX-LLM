@@ -1,4 +1,4 @@
-use crate::backend::{Backend, BackendKind, FusedMatVec, PromotionState};
+use crate::backend::{Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow};
 use crate::{EngineError, Result};
 
 /// Qualcomm contract. Proprietary QNN/Hexagon SDK objects are developer inputs
@@ -23,6 +23,14 @@ impl Backend for SnapdragonBackend {
             backend: "snapdragon",
             operation: "A8W2/A8W4 fused matvec",
             reason: "target SoC, QNN SDK, op package, and device verifier are not available".into(),
+        })
+    }
+
+    fn recovered_row(&self, _operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
+        Err(EngineError::UnsupportedOperation {
+            backend: "snapdragon",
+            operation: "Q2/Q4 recovered row gather",
+            reason: "QNN embedding gather op package and device verifier are not available".into(),
         })
     }
 }

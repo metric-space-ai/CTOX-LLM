@@ -114,9 +114,23 @@ pub struct FusedMatVec<'a> {
     pub activation: Activation,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveredRow<'a> {
+    pub dtype: TensorDType,
+    /// Exactly one packed matrix row, already resolved from a pure tensor or
+    /// the containing mixed Q2/Q4 row segment.
+    pub weights: &'a [u8],
+    pub columns: usize,
+    pub s_in: ScaleSlice<'a>,
+    /// One widened row scale. Only this scalar is touched for an embedding
+    /// lookup; the complete s_out tensor stays packed in the artifact.
+    pub s_out: f32,
+}
+
 pub trait Backend {
     fn kind(&self) -> BackendKind;
     fn promotion_state(&self) -> PromotionState;
     fn profile(&self) -> &'static str;
     fn fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<Vec<f32>>;
+    fn recovered_row(&self, operation: &RecoveredRow<'_>) -> Result<Vec<f32>>;
 }

@@ -1,4 +1,6 @@
-use crate::backend::{Backend, BackendKind, ExecutionPolicy, FusedMatVec, PromotionState};
+use crate::backend::{
+    Backend, BackendKind, ExecutionPolicy, FusedMatVec, PromotionState, RecoveredRow,
+};
 use crate::format::TensorDType;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q2_CODEBOOK, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
@@ -221,6 +223,66 @@ impl CpuBackend {
         }
         Ok(sum)
     }
+
+    fn decode_recovered_row(operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
+        if operation.columns == 0 || !operation.columns.is_multiple_of(BLOCK_LEN) {
+            return Err(EngineError::Shape(
+                "recovered row columns must be non-zero and divisible by 64".into(),
+            ));
+        }
+        if operation.s_in.len() != operation.columns || !operation.s_out.is_finite() {
+            return Err(EngineError::Shape(
+                "recovered row scale contract differs".into(),
+            ));
+        }
+        let block_bytes = match operation.dtype {
+            TensorDType::Q2B64 => Q2_BLOCK_BYTES,
+            TensorDType::Q4B64 => Q4_BLOCK_BYTES,
+            other => return Err(EngineError::UnsupportedDType(format!("{other:?}"))),
+        };
+        let expected = operation
+            .columns
+            .checked_div(BLOCK_LEN)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or_else(|| EngineError::Shape("recovered row size overflows usize".into()))?;
+        if operation.weights.len() != expected {
+            return Err(EngineError::Shape(format!(
+                "recovered row has {} packed bytes, expected {expected}",
+                operation.weights.len()
+            )));
+        }
+
+        let mut output = Vec::with_capacity(operation.columns);
+        for (block_index, block) in operation.weights.chunks_exact(block_bytes).enumerate() {
+            let scale = f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+            if !scale.is_finite() {
+                return Err(EngineError::InvalidArtifact(
+                    "recovered row block scale is non-finite".into(),
+                ));
+            }
+            for local_column in 0..BLOCK_LEN {
+                let normalized = match operation.dtype {
+                    TensorDType::Q2B64 => {
+                        let packed = block[2 + local_column / 4];
+                        Q2_CODEBOOK[((packed >> ((local_column % 4) * 2)) & 0x3) as usize]
+                    }
+                    TensorDType::Q4B64 => {
+                        let packed = block[2 + local_column / 2];
+                        let code = if local_column.is_multiple_of(2) {
+                            packed & 0x0f
+                        } else {
+                            packed >> 4
+                        };
+                        (f32::from(code) - 7.5) / 7.5
+                    }
+                    _ => unreachable!("dtype validated"),
+                };
+                let column = block_index * BLOCK_LEN + local_column;
+                output.push(scale * normalized * operation.s_in.value(column)? * operation.s_out);
+            }
+        }
+        Ok(output)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -352,6 +414,10 @@ impl Backend for CpuBackend {
             _ => unreachable!("dtype validated"),
         }
         Ok(output)
+    }
+
+    fn recovered_row(&self, operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
+        Self::decode_recovered_row(operation)
     }
 }
 

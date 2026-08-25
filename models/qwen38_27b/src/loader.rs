@@ -5,7 +5,7 @@ use std::path::Path;
 use memmap2::{Mmap, MmapOptions};
 use sha2::{Digest, Sha256};
 
-use crate::backend::{Activation, FusedMatVec, ScaleSlice};
+use crate::backend::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::{
     FileHeader, ModelManifest, QuantSegment, TensorDType, TensorEntry, HEADER_BYTES,
 };
@@ -39,6 +39,86 @@ pub struct QuantizedMatrixView<'a> {
     pub segments: &'a [QuantSegment],
     pub rows: usize,
     pub columns: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QuantizedRowView<'a> {
+    pub dtype: TensorDType,
+    pub weights: &'a [u8],
+    pub columns: usize,
+}
+
+impl<'a> QuantizedMatrixView<'a> {
+    pub fn row(self, row: usize) -> Result<QuantizedRowView<'a>> {
+        if row >= self.rows {
+            return Err(EngineError::Shape(format!(
+                "quantized row {row} exceeds {} rows",
+                self.rows
+            )));
+        }
+        let (dtype, payload, local_row) = match self.dtype {
+            TensorDType::Q2B64 | TensorDType::Q4B64 => (self.dtype, self.weights, row),
+            TensorDType::MixedQ2Q4B64 => {
+                let segment = self
+                    .segments
+                    .iter()
+                    .find(|segment| {
+                        usize::try_from(segment.row_start).is_ok_and(|start| row >= start)
+                            && usize::try_from(segment.row_end).is_ok_and(|end| row < end)
+                    })
+                    .ok_or_else(|| {
+                        EngineError::InvalidArtifact(format!(
+                            "mixed quantized row {row} has no segment"
+                        ))
+                    })?;
+                let start = usize::try_from(segment.row_start).map_err(|_| {
+                    EngineError::InvalidArtifact("mixed row start overflows usize".into())
+                })?;
+                let offset = usize::try_from(segment.offset).map_err(|_| {
+                    EngineError::InvalidArtifact("mixed row offset overflows usize".into())
+                })?;
+                let length = usize::try_from(segment.length).map_err(|_| {
+                    EngineError::InvalidArtifact("mixed row length overflows usize".into())
+                })?;
+                let end = offset.checked_add(length).ok_or_else(|| {
+                    EngineError::InvalidArtifact("mixed row payload range overflows".into())
+                })?;
+                if end > self.weights.len() {
+                    return Err(EngineError::InvalidArtifact(
+                        "mixed row segment exceeds matrix payload".into(),
+                    ));
+                }
+                (segment.dtype, &self.weights[offset..end], row - start)
+            }
+            other => return Err(EngineError::UnsupportedDType(format!("{other:?}"))),
+        };
+        let block_bytes = match dtype {
+            TensorDType::Q2B64 => crate::quant::Q2_BLOCK_BYTES,
+            TensorDType::Q4B64 => crate::quant::Q4_BLOCK_BYTES,
+            other => return Err(EngineError::UnsupportedDType(format!("{other:?}"))),
+        };
+        let row_bytes = self
+            .columns
+            .checked_div(crate::quant::BLOCK_LEN)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or_else(|| EngineError::Shape("quantized row byte size overflows".into()))?;
+        let start = local_row
+            .checked_mul(row_bytes)
+            .ok_or_else(|| EngineError::Shape("quantized row offset overflows".into()))?;
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or_else(|| EngineError::Shape("quantized row range overflows".into()))?;
+        if end > payload.len() {
+            return Err(EngineError::InvalidArtifact(
+                "quantized row exceeds its packed payload".into(),
+            ));
+        }
+        Ok(QuantizedRowView {
+            dtype,
+            weights: &payload[start..end],
+            columns: self.columns,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +211,17 @@ impl<'a> RecoveredMatrixView<'a> {
             s_out: Some(self.s_out.as_recovery_scales()?),
             bias: None,
             activation,
+        })
+    }
+
+    pub fn row_operation(self, row: usize) -> Result<RecoveredRow<'a>> {
+        let packed = self.matrix.row(row)?;
+        Ok(RecoveredRow {
+            dtype: packed.dtype,
+            weights: packed.weights,
+            columns: packed.columns,
+            s_in: self.s_in.as_recovery_scales()?,
+            s_out: self.s_out.value(row)?,
         })
     }
 }
@@ -395,6 +486,11 @@ mod tests {
             .fused_matvec(&operation)
             .unwrap();
         assert!((output[0] - 48.0).abs() < 1e-6);
+
+        let row = recovered.row_operation(0).unwrap();
+        let embedding = CpuBackend::scalar_verifier().recovered_row(&row).unwrap();
+        assert_eq!(embedding.len(), BLOCK_LEN);
+        assert!(embedding.iter().all(|value| (*value - 0.75).abs() < 1e-6));
     }
 
     #[test]
@@ -406,5 +502,52 @@ mod tests {
         assert!(view.as_recovery_scales().is_err());
         let nonfinite = f32::NAN.to_le_bytes();
         assert!(FloatTensorView::F32Le(&nonfinite).value(0).is_err());
+    }
+
+    #[test]
+    fn mixed_matrix_resolves_only_the_requested_row_group() {
+        let q2 = Q2Block64::quantize(&[0.25; BLOCK_LEN])
+            .unwrap()
+            .encode()
+            .to_vec();
+        let q4 = crate::quant::Q4Block64::quantize(&[-0.5; BLOCK_LEN])
+            .unwrap()
+            .encode()
+            .to_vec();
+        let mut weights = q2.clone();
+        weights.extend_from_slice(&q4);
+        let q2_length = u64::try_from(q2.len()).unwrap();
+        let segments = [
+            QuantSegment {
+                group_index: 0,
+                row_start: 0,
+                row_end: 1,
+                dtype: TensorDType::Q2B64,
+                offset: 0,
+                length: q2_length,
+            },
+            QuantSegment {
+                group_index: 1,
+                row_start: 1,
+                row_end: 2,
+                dtype: TensorDType::Q4B64,
+                offset: q2_length,
+                length: u64::try_from(q4.len()).unwrap(),
+            },
+        ];
+        let matrix = QuantizedMatrixView {
+            dtype: TensorDType::MixedQ2Q4B64,
+            weights: &weights,
+            segments: &segments,
+            rows: 2,
+            columns: BLOCK_LEN,
+        };
+        let first = matrix.row(0).unwrap();
+        let second = matrix.row(1).unwrap();
+        assert_eq!(first.dtype, TensorDType::Q2B64);
+        assert_eq!(first.weights, q2);
+        assert_eq!(second.dtype, TensorDType::Q4B64);
+        assert_eq!(second.weights, q4);
+        assert!(matrix.row(2).is_err());
     }
 }

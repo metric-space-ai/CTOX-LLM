@@ -30,6 +30,10 @@ for every block of every row. The current implementation:
    manifest row groups. Segment indices, row coverage, byte offsets, lengths,
    and Q2/Q4 dtypes are revalidated before execution. The path neither
    dequantizes nor repacks the complete tensor.
+5. Resolves embedding lookup to exactly one Q2 or Q4 packed row, including a
+   row inside a mixed tensor, and composes block scale, FP16 `s_in`, and the
+   single selected FP16 `s_out` value while producing the 5,120-element hidden
+   vector. It never materializes or scans the complete vocabulary matrix.
 
 ## Packed decode schemes
 
@@ -65,6 +69,8 @@ activations, plus arbitrary-code packed decode checks against
 `Q2Block64`/`Q4Block64` dequantization. Mixed-row tests compare one combined
 payload against independent pure-Q2 and pure-Q4 dispatches and prove malformed
 segment coverage fails closed.
+The mmap-to-kernel test also executes a recovered packed matrix and embedding
+row through the CPU backend and checks the composed numerical result.
 
 SIMD-vs-oracle differences come only from lane-wise reassociation and NEON
 FMA contraction (per-element products are bit-identical, see above). For

@@ -1,4 +1,4 @@
-use crate::backend::{Backend, BackendKind, FusedMatVec, PromotionState, ScaleSlice};
+use crate::backend::{Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
@@ -245,6 +245,16 @@ impl Backend for MetalBackend {
             backend: "metal",
             operation: "q2/q4 fused matvec",
             reason: "MSL candidate compiled but has not passed the same-device verifier and benchmark gates; dispatch is fail-closed".into(),
+        })
+    }
+
+    fn recovered_row(&self, _operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
+        Err(EngineError::UnsupportedOperation {
+            backend: "metal",
+            operation: "Q2/Q4 recovered row gather",
+            reason:
+                "embedding gather candidate has not passed same-device verifier and benchmark gates"
+                    .into(),
         })
     }
 }
