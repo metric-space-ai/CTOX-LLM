@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://metric-space.ai/ctox-llm/model-manifest-v1.schema.json",
+  "title": "CTOX-LLM model manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "model", "revision", "alignment", "tensors"],
+  "properties": {
+    "format": { "const": "ctox.q2q4.v1" },
+    "model": { "type": "string", "minLength": 1 },
+    "revision": { "type": "string", "minLength": 7 },
+    "alignment": { "type": "integer", "minimum": 64 },
+    "target": { "type": "string" },
+    "tensors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "dtype", "shape", "offset", "length", "sha256"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "dtype": { "enum": ["q2_b64", "q4_b64", "f16", "f32"] },
+          "shape": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+          "offset": { "type": "integer", "minimum": 0 },
+          "length": { "type": "integer", "minimum": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    }
+  }
+}

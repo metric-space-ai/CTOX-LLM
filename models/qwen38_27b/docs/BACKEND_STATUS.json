@@ -1,0 +1,31 @@
+{
+  "format": "ctox.backend-status.v1",
+  "backends": {
+    "cpu_scalar": {
+      "state": "verifier",
+      "production_allowed": false
+    },
+    "cpu_avx2": {
+      "state": "experimental",
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec"]
+    },
+    "cpu_neon": {
+      "state": "experimental",
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec"]
+    },
+    "cuda": {
+      "state": "contract",
+      "production_allowed": false,
+      "required_first_profile": "sm86"
+    },
+    "metal": {
+      "state": "contract",
+      "production_allowed": false
+    },
+    "snapdragon": {
+      "state": "contract",
+      "production_allowed": false,
+      "required_components": ["qnn_htp", "adreno_vulkan", "android_hardware_buffer"]
+    }
+  }
+}

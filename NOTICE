@@ -1,0 +1,17 @@
+CTOX-LLM
+Copyright 2026 Metric Space UG (haftungsbeschraenkt)
+
+The Apache-2.0 license in LICENSE applies only to original repository source.
+
+Model weights are not distributed in this source repository. Each published
+weight artifact must include a model card naming its base-model revision,
+license, quantization process, recovery datasets, and redistribution terms.
+
+Dataset records are not distributed in this source repository. Generated
+dataset manifests retain per-record source and license metadata.
+
+Qualcomm QNN and Hexagon SDK files are proprietary developer-supplied inputs
+and must not be copied into this repository or its release archives.
+
+The vendor directories intentionally contain no upstream sources until a
+specific kernel family is pinned and its license is recorded next to the pin.

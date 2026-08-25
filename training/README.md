@@ -1,0 +1,19 @@
+# Recovery training
+
+Training is offline tooling, not an inference-runtime dependency. The release
+pipeline has four immutable stages:
+
+1. `build_manifest.py` streams source datasets and emits provenance records.
+2. A separate materializer stores prompts referenced by those records in an
+   access-controlled cache; prompts are never committed.
+3. `cache_teacher.py` runs the pinned BF16 teacher and stores top-64 logits,
+   residual probability mass, and selected hidden states.
+4. `train_recovery.py` freezes Q2/Q4 codes and trains channel correction scales.
+
+Nemotron v2 is quarantined by default. Research may opt into the cohort, but a
+public checkpoint cannot claim release eligibility until a legal decision is
+recorded in the manifest.
+
+The 240 GPU-hour ceiling is cumulative across teacher generation, sensitivity
+runs, ablations, final recovery, and evaluation. Every command appends its GPU
+count and elapsed time to `run-ledger.jsonl`.

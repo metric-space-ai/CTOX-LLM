@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://metric-space.ai/ctox-llm/recovery-sample-v1.schema.json",
+  "title": "CTOX-LLM recovery sample v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id", "source_repo", "source_revision", "subset", "split",
+    "source_id", "license", "category", "language", "prompt_sha256",
+    "release_eligible"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "source_repo": { "type": "string" },
+    "source_revision": { "type": "string" },
+    "subset": { "type": "string" },
+    "split": { "type": "string" },
+    "source_id": { "type": "string" },
+    "license": { "type": "string" },
+    "generator": { "type": ["string", "null"] },
+    "category": {
+      "enum": ["code", "agentic", "math", "chat", "structured", "long_context"]
+    },
+    "language": { "type": "string" },
+    "prompt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "release_eligible": { "type": "boolean" },
+    "quarantine_reason": { "type": ["string", "null"] }
+  }
+}

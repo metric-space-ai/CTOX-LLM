@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+      - run: cargo fmt --manifest-path models/qwen38_27b/Cargo.toml --check
+      - run: cargo clippy --manifest-path models/qwen38_27b/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path models/qwen38_27b/Cargo.toml
+      - run: cargo run --quiet --manifest-path models/qwen38_27b/Cargo.toml --bin qwen38-memory-plan -- --context 131072
+
+  metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m compileall -q training
+      - run: python -m json.tool schemas/model-manifest-v1.schema.json >/dev/null
+      - run: python -m json.tool schemas/recovery-sample-v1.schema.json >/dev/null
+      - run: python -m json.tool models/qwen38_27b/docs/BASELINE.json >/dev/null
+      - run: python -m json.tool models/qwen38_27b/docs/BACKEND_STATUS.json >/dev/null

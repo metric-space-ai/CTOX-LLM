@@ -1,0 +1,42 @@
+{
+  "format": "ctox.baseline.v1",
+  "model": "Qwen/Qwen3.8-27B",
+  "source": {
+    "kind": "official-bf16-shards",
+    "shard_count": 18,
+    "shards_sha256_verified": true,
+    "revision": "must-be-frozen-before-release"
+  },
+  "direct_q2q4": {
+    "artifact": "Qwen3.8-27B-Q2Q4-android-direct.gguf",
+    "bytes": 9477560896,
+    "gib": 8.826666,
+    "sha256": "72ec3f74d4dcfdb41e691c4fbb98f714d360ac3712ecb7f9631f6661ab8de037",
+    "tensor_types": {
+      "f32": 353,
+      "q2_k": 344,
+      "q4_k": 154,
+      "q3": 0
+    },
+    "smoke_test": "passed_model_load_and_decode",
+    "benchmark": {
+      "date": "2026-08-25",
+      "llama_cpp_revision": "ef2d770117db45b05aa7ecd1b0acca36370c5470",
+      "gpu": "NVIDIA RTX A4500 20GB",
+      "prompt_tokens": 512,
+      "generated_tokens": 128,
+      "repetitions": 3,
+      "prompt_tokens_per_second": 709.273508,
+      "prompt_stddev": 4.441252,
+      "decode_tokens_per_second": 36.896507,
+      "decode_stddev": 0.171368
+    }
+  },
+  "requantized_reference": {
+    "artifact": "Qwen3.8-27B-Q2Q4-android-reference.gguf",
+    "gib": 8.826668,
+    "sha256": "524feb55a3cf7b53c421eb73d72caf8cfd56dbc0f2ffe4816225671989737aad",
+    "rtx_a4500_prompt_tokens_per_second": 710.7,
+    "rtx_a4500_decode_tokens_per_second": 37.0
+  }
+}

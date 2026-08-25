@@ -13,6 +13,21 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Model and training artifacts
+*.gguf
+*.safetensors
+*.ctoxq
+*.bin
+datasets/
+checkpoints/
+teacher-cache/
+run-ledger.jsonl
+
+# Proprietary accelerator SDKs
+qnn-sdk/
+hexagon-sdk/
+android-sdk/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

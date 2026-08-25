@@ -1,0 +1,48 @@
+[package]
+name = "ctox-qwen38-27b"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Self-contained Qwen3.8-27B Q2/Q4 inference engine for CTOX"
+
+[workspace]
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = []
+metal = []
+snapdragon = []
+android-jni = ["dep:jni"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+half = { version = "2", features = ["serde"] }
+jni = { version = "0.21", optional = true }
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[[bin]]
+name = "qwen38-memory-plan"
+path = "src/bin/memory_plan.rs"
+
+[[bin]]
+name = "qwen38-verify"
+path = "src/bin/verify.rs"
+
+[[bin]]
+name = "qwen38-server"
+path = "src/bin/server.rs"
