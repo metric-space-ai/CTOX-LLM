@@ -7,10 +7,13 @@
 //! full-artifact golden evidence, and same-device roofline measurements.
 
 use crate::backend::cpu::CpuBackend;
-use crate::backend::{Activation, Backend, BackendKind, ExecutionPolicy, PromotionState};
+use crate::backend::{
+    Activation, Backend, BackendKind, ExecutionPolicy, PromotionState, RecoveredRowMatVec,
+};
 use crate::config::LayerKind;
 use crate::engine::{
-    AllocationSnapshot, CancellationToken, ExecutorCapabilities, ExecutorStep, ModelExecutor,
+    AllocationSnapshot, CancellationToken, DraftDistribution, ExecutorCapabilities, ExecutorStep,
+    ModelExecutor,
 };
 use crate::loader::ModelArtifact;
 use crate::reference::{
@@ -471,6 +474,48 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
         }
         self.backend
             .fused_matvec(&matrix.operation(input, Activation::Identity)?)
+    }
+
+    /// Evaluate only release-bound LM-head rows for an MTP proposal. The
+    /// complete target LM head remains a separate mandatory operation.
+    pub fn restricted_logits_from_final_hidden(
+        &self,
+        final_hidden: &[f32],
+        token_ids: &[u32],
+    ) -> Result<DraftDistribution> {
+        let matrix = self.artifact.recovered_matrix("lm_head.weight")?;
+        if final_hidden.len() != matrix.matrix.columns
+            || token_ids.is_empty()
+            || token_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || token_ids
+                .iter()
+                .any(|token| *token as usize >= matrix.matrix.rows)
+        {
+            return Err(EngineError::Shape(
+                "restricted LM-head input or canonical token IDs differ".into(),
+            ));
+        }
+        let s_in = matrix.s_in.as_recovery_scales()?;
+        let corrected_input = final_hidden
+            .iter()
+            .enumerate()
+            .map(|(column, value)| Ok(value * s_in.value(column)?))
+            .collect::<Result<Vec<f32>>>()?;
+        let mut logits = Vec::with_capacity(token_ids.len());
+        for token in token_ids {
+            let row_index = *token as usize;
+            let row = matrix.matrix.row(row_index)?;
+            logits.push(self.backend.recovered_row_matvec(&RecoveredRowMatVec {
+                dtype: row.dtype,
+                weights: row.weights,
+                corrected_input: &corrected_input,
+                s_out: matrix.s_out.value(row_index)?,
+            })?);
+        }
+        Ok(DraftDistribution::Restricted {
+            token_ids: token_ids.to_vec(),
+            logits,
+        })
     }
 
     pub fn rms_norm(&self, name: &str, hidden: &[f32]) -> Result<Vec<f32>> {
@@ -1549,6 +1594,26 @@ mod tests {
         assert_eq!(logits.len(), 2);
         assert!(logits.iter().all(|value| value.is_finite()));
         assert!((logits[0] - logits[1]).abs() < 1e-6);
+        let final_hidden = decoder.final_hidden(&output).unwrap();
+        let restricted = decoder
+            .restricted_logits_from_final_hidden(&final_hidden, &[1])
+            .unwrap();
+        match restricted {
+            DraftDistribution::Restricted {
+                token_ids,
+                logits: scores,
+            } => {
+                assert_eq!(token_ids, vec![1]);
+                assert_eq!(scores, vec![logits[1]]);
+            }
+            DraftDistribution::Full(_) => panic!("restricted LM head returned full logits"),
+        }
+        assert!(decoder
+            .restricted_logits_from_final_hidden(&final_hidden, &[1, 1])
+            .is_err());
+        assert!(decoder
+            .restricted_logits_from_final_hidden(&final_hidden, &[2])
+            .is_err());
 
         let linear_decode_config = Qwen38Config {
             vocab_size: 2,

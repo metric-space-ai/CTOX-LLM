@@ -12,7 +12,9 @@
 //! scalar fallback exists, and execution is rejected until a same-device
 //! verifier run and benchmark evidence exist per `docs/PROMOTION_GATES.md`.
 
-use crate::backend::{Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow};
+use crate::backend::{
+    Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow, RecoveredRowMatVec,
+};
 use crate::format::TensorDType;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
@@ -299,6 +301,14 @@ impl Backend for CudaBackend {
             operation: "Q2/Q4 recovered row gather",
             reason: "embedding gather kernel has not passed the SM86 verifier and benchmark gates"
                 .into(),
+        })
+    }
+
+    fn recovered_row_matvec(&self, _operation: &RecoveredRowMatVec<'_>) -> Result<f32> {
+        Err(EngineError::UnsupportedOperation {
+            backend: "cuda",
+            operation: "recovered restricted LM-head row matvec",
+            reason: "the gathered Q2/Q4 SM86 proposal kernel is not promoted".into(),
         })
     }
 }

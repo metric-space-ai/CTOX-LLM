@@ -48,8 +48,8 @@ bonus distributions always remain full-vocabulary; consequently an omitted
 draft token causes rejection/fallback rather than changing target semantics.
 The signed release binds the exact ID file and multilingual/domain coverage.
 The executor retains the corresponding speculative state branch until the
-engine calls `commit_speculative(accepted_prefix_len)`. Rejection retains only the
-already processed input and discards the branch; acceptance commits exactly
+engine calls `commit_speculative(accepted_prefix_len)`. Rejection retains only
+the already processed input and discards the branch; acceptance commits exactly
 the accepted target prefix and advances the MTP cache through the same prefix.
 An error or cancellation invalidates the complete session rather than leaving
 an ambiguous partially committed state.
@@ -78,6 +78,13 @@ limit.
 An executor error, cancellation after partial execution, malformed logits, or
 an invalid MTP contract resets the entire session before another request is
 allowed. This avoids continuing from partially advanced recurrent or KV state.
+
+The model-local gathered-row contract applies packed `s_in` once to the MTP
+hidden vector, resolves each canonical token ID directly to its Q2/Q4 row, and
+applies that row's packed `s_out`. It neither expands the full matrix nor keeps
+a second restricted LM-head copy. CPU is the current correctness oracle;
+accelerator backends fail closed until a fused gathered-row kernel passes their
+own verifier and roofline gates.
 
 ## Unload guarantee
 

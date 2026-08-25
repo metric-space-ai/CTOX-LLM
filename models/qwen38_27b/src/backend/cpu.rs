@@ -1,5 +1,6 @@
 use crate::backend::{
     Backend, BackendKind, ExecutionPolicy, FusedMatVec, PromotionState, RecoveredRow,
+    RecoveredRowMatVec,
 };
 use crate::format::TensorDType;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q2_CODEBOOK, Q4_BLOCK_BYTES};
@@ -418,6 +419,27 @@ impl Backend for CpuBackend {
 
     fn recovered_row(&self, operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
         Self::decode_recovered_row(operation)
+    }
+
+    fn recovered_row_matvec(&self, operation: &RecoveredRowMatVec<'_>) -> Result<f32> {
+        if operation.corrected_input.is_empty()
+            || !operation.corrected_input.len().is_multiple_of(BLOCK_LEN)
+            || !operation.s_out.is_finite()
+            || operation
+                .corrected_input
+                .iter()
+                .any(|value| !value.is_finite())
+        {
+            return Err(EngineError::Shape(
+                "recovered row matvec input or output scale is invalid".into(),
+            ));
+        }
+        let sum = match operation.dtype {
+            TensorDType::Q2B64 => self.row_sum_q2(operation.weights, operation.corrected_input)?,
+            TensorDType::Q4B64 => self.row_sum_q4(operation.weights, operation.corrected_input)?,
+            other => return Err(EngineError::UnsupportedDType(format!("{other:?}"))),
+        };
+        Ok(sum * operation.s_out)
     }
 }
 

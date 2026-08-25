@@ -129,10 +129,21 @@ pub struct RecoveredRow<'a> {
     pub s_out: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveredRowMatVec<'a> {
+    pub dtype: TensorDType,
+    /// Exactly one packed row resolved from the canonical CTOXQ matrix.
+    pub weights: &'a [u8],
+    /// Input after applying the matrix-wide packed `s_in` exactly once.
+    pub corrected_input: &'a [f32],
+    pub s_out: f32,
+}
+
 pub trait Backend {
     fn kind(&self) -> BackendKind;
     fn promotion_state(&self) -> PromotionState;
     fn profile(&self) -> &'static str;
     fn fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<Vec<f32>>;
     fn recovered_row(&self, operation: &RecoveredRow<'_>) -> Result<Vec<f32>>;
+    fn recovered_row_matvec(&self, operation: &RecoveredRowMatVec<'_>) -> Result<f32>;
 }

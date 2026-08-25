@@ -1,4 +1,6 @@
-use crate::backend::{Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow, ScaleSlice};
+use crate::backend::{
+    Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow, RecoveredRowMatVec, ScaleSlice,
+};
 use crate::format::TensorDType;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
@@ -235,13 +237,14 @@ impl Backend for MetalBackend {
 
     fn fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<Vec<f32>> {
         // Validate eagerly so shape/buffer errors surface even while dispatch
-        // remains fail-closed, then refuse: the candidate has no verifier or
-        // benchmark evidence yet and there is no fallback path.
+        // remains fail-closed. The isolated candidate has verifier/benchmark
+        // evidence, but not the full-graph and ownership evidence required to
+        // expose this production Backend entry point.
         let (_layout, _params) = validate_operation(operation)?;
         Err(EngineError::UnsupportedOperation {
             backend: "metal",
             operation: "q2/q4 fused matvec",
-            reason: "MSL candidate compiled but has not passed the same-device verifier and benchmark gates; dispatch is fail-closed".into(),
+            reason: "MSL candidate passed isolated verification but lacks full-graph ownership, golden, and promotion evidence".into(),
         })
     }
 
@@ -252,6 +255,14 @@ impl Backend for MetalBackend {
             reason:
                 "embedding gather candidate has not passed same-device verifier and benchmark gates"
                     .into(),
+        })
+    }
+
+    fn recovered_row_matvec(&self, _operation: &RecoveredRowMatVec<'_>) -> Result<f32> {
+        Err(EngineError::UnsupportedOperation {
+            backend: "metal",
+            operation: "recovered restricted LM-head row matvec",
+            reason: "the gathered Q2/Q4 Metal proposal kernel is not promoted".into(),
         })
     }
 }

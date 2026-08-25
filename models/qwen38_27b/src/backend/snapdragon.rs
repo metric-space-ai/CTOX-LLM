@@ -1,4 +1,6 @@
-use crate::backend::{Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow};
+use crate::backend::{
+    Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow, RecoveredRowMatVec,
+};
 use crate::{EngineError, Result};
 
 /// Qualcomm contract. Proprietary QNN/Hexagon SDK objects are developer inputs
@@ -31,6 +33,14 @@ impl Backend for SnapdragonBackend {
             backend: "snapdragon",
             operation: "Q2/Q4 recovered row gather",
             reason: "QNN embedding gather op package and device verifier are not available".into(),
+        })
+    }
+
+    fn recovered_row_matvec(&self, _operation: &RecoveredRowMatVec<'_>) -> Result<f32> {
+        Err(EngineError::UnsupportedOperation {
+            backend: "snapdragon",
+            operation: "recovered restricted LM-head row matvec",
+            reason: "the gathered HTP proposal projection is not promoted".into(),
         })
     }
 }
