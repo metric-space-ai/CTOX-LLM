@@ -138,6 +138,23 @@ per-language diversity, and aggregate non-English-family cells, preferring
 broader coverage and then lower token cost. It fails with the unresolved cells
 when the candidate pool is insufficient and re-runs both complete gates over
 the combined cohort before writing release evidence.
+Semantic subject coverage is necessary but not sufficient for a general-purpose
+assistant. `SERVICE_MODE_RUBRIC.json` defines a second, orthogonal selection
+axis covering explanation, analysis, writing, extraction, planning, research,
+creative work, multi-turn dialogue, structured output, tool use, mathematics,
+coding, long-context retrieval, and safety/uncertainty. The same pinned
+multilingual NLI classifier is applied by `classify_service_modes.py`, while
+record facts such as real tool schemas, multi-turn messages, code/math splits,
+structured answers, and generated long-context records are preserved as
+deterministic labels. `audit_service_coverage.py` then fails closed on global
+mode quotas, mode diversity inside every one of the 36 primary domains and ten
+families, language-by-mode diversity, and explicit critical domain/mode pairs.
+These labels select and audit examples; they are never recovery targets. A
+service-mode failure is closed by `select_service_supplement.py` from a
+payload-disjoint candidate pool and requires new teacher targets, not a
+relabeling of cached samples. The selector greedily credits only currently
+open global, domain, family, language, and critical domain/mode cells, then
+re-runs the complete audit over the combined cohort before emitting evidence.
 Because independent NLI scores can produce unstable argmax choices between
 sibling domains, the selector may assign one candidate to a non-argmax primary
 only when that domain itself exceeds the rubric confidence and lies within the

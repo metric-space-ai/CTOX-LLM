@@ -1,0 +1,125 @@
+{
+  "format": "ctox.recovery-service-mode-rubric.v1",
+  "classification": "multi_label",
+  "policy": {
+    "minimum_confidence": 0.7,
+    "minimum_distinct_modes_per_domain_train": 2,
+    "minimum_distinct_modes_per_domain_evaluation": 2,
+    "minimum_distinct_modes_per_family_train": 8,
+    "minimum_distinct_modes_per_family_evaluation": 6,
+    "all_declared_domains_required": true,
+    "labels_are_selection_gates_not_training_targets": true
+  },
+  "modes": {
+    "explanation_question_answering": {
+      "description": "answering questions, explaining concepts, teaching, defining, and clarifying",
+      "minimum_train": 256,
+      "minimum_evaluation": 64
+    },
+    "analysis_comparison_synthesis": {
+      "description": "analyzing evidence, comparing alternatives, synthesizing information, and drawing reasoned conclusions",
+      "minimum_train": 160,
+      "minimum_evaluation": 40
+    },
+    "writing_editing_summarization": {
+      "description": "drafting, rewriting, editing, summarizing, changing tone, and producing professional communication",
+      "minimum_train": 96,
+      "minimum_evaluation": 24
+    },
+    "extraction_classification_transformation": {
+      "description": "extracting fields, classifying content, converting formats, and transforming supplied information",
+      "minimum_train": 80,
+      "minimum_evaluation": 20
+    },
+    "planning_decision_support": {
+      "description": "planning work, decomposing goals, making recommendations, weighing tradeoffs, and supporting decisions",
+      "minimum_train": 96,
+      "minimum_evaluation": 24
+    },
+    "research_evidence_factchecking": {
+      "description": "researching, retrieving sources, checking claims, citing evidence, and reconciling conflicting information",
+      "minimum_train": 48,
+      "minimum_evaluation": 12
+    },
+    "creative_generation": {
+      "description": "creative writing, ideation, storytelling, artistic concepts, and original content generation",
+      "minimum_train": 40,
+      "minimum_evaluation": 10
+    },
+    "multi_turn_dialogue": {
+      "description": "following conversational state, corrections, references, and constraints over multiple turns",
+      "minimum_train": 256,
+      "minimum_evaluation": 64
+    },
+    "structured_output_constraints": {
+      "description": "producing valid JSON, XML, tables, schemas, code blocks, or other constrained structured output",
+      "minimum_train": 192,
+      "minimum_evaluation": 48
+    },
+    "tool_calling_agentic": {
+      "description": "selecting tools, emitting function calls, interpreting tool results, and completing multi-step agent workflows",
+      "minimum_train": 192,
+      "minimum_evaluation": 48
+    },
+    "mathematical_reasoning": {
+      "description": "performing arithmetic, formal logic, proofs, quantitative reasoning, and mathematical problem solving",
+      "minimum_train": 128,
+      "minimum_evaluation": 32
+    },
+    "coding_debugging": {
+      "description": "writing, explaining, reviewing, testing, debugging, and refactoring software",
+      "minimum_train": 192,
+      "minimum_evaluation": 48
+    },
+    "long_context_retrieval": {
+      "description": "retrieving and integrating evidence from long supplied context without losing distant constraints",
+      "minimum_train": 48,
+      "minimum_evaluation": 16
+    },
+    "safety_uncertainty_calibration": {
+      "description": "handling unsafe or sensitive requests, expressing uncertainty, correcting false premises, and communicating risk",
+      "minimum_train": 48,
+      "minimum_evaluation": 12
+    }
+  },
+  "language_minimum_distinct_modes": {
+    "en": {"train": 12, "evaluation": 10},
+    "de": {"train": 8, "evaluation": 6},
+    "de-en-mixed": {"train": 6, "evaluation": 4},
+    "arb": {"train": 4, "evaluation": 3},
+    "fra": {"train": 4, "evaluation": 3},
+    "hin": {"train": 4, "evaluation": 3},
+    "ita": {"train": 4, "evaluation": 3},
+    "jpn": {"train": 4, "evaluation": 3},
+    "kor": {"train": 4, "evaluation": 3},
+    "nld": {"train": 4, "evaluation": 3},
+    "pol": {"train": 4, "evaluation": 3},
+    "por": {"train": 4, "evaluation": 3},
+    "rus": {"train": 4, "evaluation": 3},
+    "spa": {"train": 4, "evaluation": 3},
+    "zho": {"train": 4, "evaluation": 3}
+  },
+  "required_domain_mode_pairs": {
+    "agentic_tools_workflows": {
+      "tool_calling_agentic": {"train": 192, "evaluation": 48}
+    },
+    "research_search_factchecking": {
+      "research_evidence_factchecking": {"train": 24, "evaluation": 8}
+    },
+    "data_analysis_statistics_structured": {
+      "structured_output_constraints": {"train": 24, "evaluation": 8}
+    },
+    "mathematics_logic": {
+      "mathematical_reasoning": {"train": 48, "evaluation": 12}
+    },
+    "software_development": {
+      "coding_debugging": {"train": 64, "evaluation": 16}
+    },
+    "writing_editing_summarization": {
+      "writing_editing_summarization": {"train": 32, "evaluation": 8}
+    },
+    "safety_uncertainty": {
+      "safety_uncertainty_calibration": {"train": 24, "evaluation": 8}
+    }
+  }
+}

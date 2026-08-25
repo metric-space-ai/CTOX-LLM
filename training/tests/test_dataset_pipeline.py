@@ -22,6 +22,7 @@ from build_manifest import (  # noqa: E402
     source_uses_raw_jsonl,
 )
 from audit_corpus import percentile  # noqa: E402
+from audit_service_coverage import service_coverage_report  # noqa: E402
 from build_quant_plan import (  # noqa: E402
     CONTAINER_MANIFEST_RESERVE,
     FOLD_PACKAGE_LIMIT,
@@ -39,6 +40,10 @@ from classify_domains import (  # noqa: E402
     deterministic_primary_label,
     quota_gaps,
     validate_rubric,
+)
+from classify_service_modes import (  # noqa: E402
+    deterministic_modes,
+    validate_rubric as validate_service_rubric,
 )
 from apply_primary_overrides import apply_overrides  # noqa: E402
 from audit_selection_coverage import coverage_report, validate_language_rubric  # noqa: E402
@@ -89,6 +94,9 @@ from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
 from select_uncached_teacher_records import select_missing  # noqa: E402
 from select_primary_domain_supplement import select_supplement  # noqa: E402
+from select_service_supplement import (  # noqa: E402
+    select_supplement as select_service_supplement,
+)
 from select_coverage_supplement import (  # noqa: E402
     assigned_tag,
     candidate_coverage,
@@ -328,6 +336,196 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(
             {domain["family"] for domain in rubric["domains"].values()},
             set(rubric["policy"]["required_families"]),
+        )
+
+    def test_service_mode_rubric_is_joint_with_domains_and_languages(self) -> None:
+        domain_rubric = json.loads((TRAINING / "DOMAIN_RUBRIC.json").read_text())
+        language_rubric = json.loads((TRAINING / "LANGUAGE_RUBRIC.json").read_text())
+        service_rubric = json.loads(
+            (TRAINING / "SERVICE_MODE_RUBRIC.json").read_text()
+        )
+        validate_service_rubric(service_rubric, domain_rubric, language_rubric)
+        self.assertGreaterEqual(len(service_rubric["modes"]), 14)
+        self.assertEqual(
+            set(service_rubric["language_minimum_distinct_modes"]),
+            set(language_rubric["languages"]),
+        )
+
+    def test_deterministic_service_modes_preserve_hard_record_facts(self) -> None:
+        record = {
+            "category": "agentic",
+            "split": "code",
+            "tools": [{"type": "function"}],
+            "messages": [
+                {"role": "user", "content": "Calculate and call the tool"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"name": "calculate"}],
+                },
+                {"role": "tool", "content": "4"},
+                {"role": "assistant", "content": "{\"answer\": 4}"},
+            ],
+        }
+        self.assertEqual(
+            deterministic_modes(record),
+            {
+                "coding_debugging",
+                "multi_turn_dialogue",
+                "structured_output_constraints",
+                "tool_calling_agentic",
+            },
+        )
+
+    def test_service_matrix_fails_closed_on_domain_and_pair_gaps(self) -> None:
+        domain_rubric = {
+            "policy": {
+                "required_families": ["work"],
+                "minimum_confidence": 0.7,
+                "minimum_primary_train": 1,
+                "minimum_primary_evaluation": 1,
+            },
+            "domains": {
+                "software": {
+                    "family": "work",
+                    "description": "software",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                },
+                "writing": {
+                    "family": "work",
+                    "description": "writing",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                },
+            },
+        }
+        language_rubric = {"languages": {"en": {}}}
+        service_rubric = {
+            "format": "ctox.recovery-service-mode-rubric.v1",
+            "policy": {
+                "minimum_confidence": 0.7,
+                "minimum_distinct_modes_per_domain_train": 2,
+                "minimum_distinct_modes_per_domain_evaluation": 1,
+                "minimum_distinct_modes_per_family_train": 2,
+                "minimum_distinct_modes_per_family_evaluation": 1,
+                "all_declared_domains_required": True,
+            },
+            "modes": {
+                "code": {
+                    "description": "code",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                },
+                "explain": {
+                    "description": "explain",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                },
+            },
+            "language_minimum_distinct_modes": {
+                "en": {"train": 2, "evaluation": 1}
+            },
+            "required_domain_mode_pairs": {
+                "software": {"code": {"train": 1, "evaluation": 1}}
+            },
+        }
+        records = [{"id": "a", "language": "en"}]
+        report = service_coverage_report(
+            records,
+            {"a": {"primary_label": "software"}},
+            {"a": {"labels": ["explain"]}},
+            domain_rubric,
+            language_rubric,
+            service_rubric,
+            "train",
+        )
+        self.assertEqual(report["status"], "supplement_required")
+        self.assertIn("writing", report["domain_presence_gaps"])
+        self.assertIn("software", report["domain_mode_diversity_gaps"])
+        self.assertEqual(
+            report["required_domain_mode_pair_gaps"]["software"]["code"],
+            {"observed": 0, "required": 1},
+        )
+
+    def test_service_supplement_closes_only_real_matrix_gaps(self) -> None:
+        domain_rubric = {
+            "policy": {
+                "required_families": ["work"],
+                "minimum_confidence": 0.7,
+                "minimum_primary_train": 1,
+                "minimum_primary_evaluation": 1,
+            },
+            "domains": {
+                "software": {
+                    "family": "work",
+                    "description": "software",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                }
+            },
+        }
+        service_rubric = {
+            "format": "ctox.recovery-service-mode-rubric.v1",
+            "policy": {
+                "minimum_confidence": 0.7,
+                "minimum_distinct_modes_per_domain_train": 2,
+                "minimum_distinct_modes_per_domain_evaluation": 1,
+                "minimum_distinct_modes_per_family_train": 2,
+                "minimum_distinct_modes_per_family_evaluation": 1,
+                "all_declared_domains_required": True,
+            },
+            "modes": {
+                "code": {
+                    "description": "code",
+                    "minimum_train": 2,
+                    "minimum_evaluation": 1,
+                },
+                "explain": {
+                    "description": "explain",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                },
+            },
+            "language_minimum_distinct_modes": {
+                "en": {"train": 2, "evaluation": 1}
+            },
+            "required_domain_mode_pairs": {
+                "software": {"code": {"train": 2, "evaluation": 1}}
+            },
+        }
+        baseline = [{"id": "base", "language": "en"}]
+        language_rubric = {"languages": {"en": {}}}
+        baseline_domains = {"base": {"primary_label": "software"}}
+        baseline_services = {"base": {"labels": ["code"]}}
+        candidates = [
+            {"id": "expensive", "language": "en"},
+            {"id": "mixed", "language": "en"},
+        ]
+        candidate_domains = {
+            sample_id: {"primary_label": "software"}
+            for sample_id in ("expensive", "mixed")
+        }
+        candidate_services = {
+            "expensive": {"labels": ["explain"]},
+            "mixed": {"labels": ["code", "explain"]},
+        }
+        selected, evidence = select_service_supplement(
+            baseline,
+            baseline_domains,
+            baseline_services,
+            candidates,
+            candidate_domains,
+            candidate_services,
+            {"expensive": 1, "mixed": 20},
+            domain_rubric,
+            language_rubric,
+            service_rubric,
+            "train",
+        )
+        self.assertEqual([record["id"] for record in selected], ["mixed"])
+        self.assertTrue(
+            all(not values for values in evidence["remaining_requirements"].values())
         )
 
     def test_primary_quota_can_be_stricter_for_major_domains(self) -> None:
