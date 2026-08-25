@@ -35,7 +35,7 @@ impl CpuBackend {
         self.profile
     }
 
-    fn validate(operation: &FusedMatVec<'_>) -> Result<(usize, usize)> {
+    fn validate(operation: &FusedMatVec<'_>) -> Result<usize> {
         if operation.columns == 0
             || operation.rows == 0
             || !operation.columns.is_multiple_of(BLOCK_LEN)
@@ -67,26 +67,103 @@ impl CpuBackend {
                 }
             }
         }
+        let blocks_per_row = operation.columns / BLOCK_LEN;
         let block_bytes = match operation.dtype {
-            TensorDType::Q2B64 => Q2_BLOCK_BYTES,
-            TensorDType::Q4B64 => Q4_BLOCK_BYTES,
+            TensorDType::Q2B64 => Some(Q2_BLOCK_BYTES),
+            TensorDType::Q4B64 => Some(Q4_BLOCK_BYTES),
+            TensorDType::MixedQ2Q4B64 => None,
             other => {
                 return Err(EngineError::UnsupportedDType(format!("{other:?}")));
             }
         };
-        let blocks_per_row = operation.columns / BLOCK_LEN;
-        let expected = operation
-            .rows
-            .checked_mul(blocks_per_row)
-            .and_then(|blocks| blocks.checked_mul(block_bytes))
-            .ok_or_else(|| EngineError::Shape("weight buffer size overflows usize".into()))?;
-        if operation.weights.len() != expected {
+        if let Some(block_bytes) = block_bytes {
+            if !operation.segments.is_empty() {
+                return Err(EngineError::InvalidArtifact(
+                    "pure Q2/Q4 operation declares mixed row segments".into(),
+                ));
+            }
+            let expected = operation
+                .rows
+                .checked_mul(blocks_per_row)
+                .and_then(|blocks| blocks.checked_mul(block_bytes))
+                .ok_or_else(|| EngineError::Shape("weight buffer size overflows usize".into()))?;
+            if operation.weights.len() != expected {
+                return Err(EngineError::Shape(format!(
+                    "weight buffer has {} bytes, expected {expected}",
+                    operation.weights.len()
+                )));
+            }
+            return Ok(blocks_per_row);
+        }
+
+        if operation.segments.is_empty() {
+            return Err(EngineError::InvalidArtifact(
+                "mixed Q2/Q4 operation has no row segments".into(),
+            ));
+        }
+        let mut expected_row = 0_usize;
+        let mut expected_offset = 0_usize;
+        for (expected_group, segment) in operation.segments.iter().enumerate() {
+            let group_index = usize::try_from(segment.group_index).map_err(|_| {
+                EngineError::InvalidArtifact("mixed segment group index overflows usize".into())
+            })?;
+            let row_start = usize::try_from(segment.row_start).map_err(|_| {
+                EngineError::InvalidArtifact("mixed segment row start overflows usize".into())
+            })?;
+            let row_end = usize::try_from(segment.row_end).map_err(|_| {
+                EngineError::InvalidArtifact("mixed segment row end overflows usize".into())
+            })?;
+            let offset = usize::try_from(segment.offset).map_err(|_| {
+                EngineError::InvalidArtifact("mixed segment offset overflows usize".into())
+            })?;
+            let length = usize::try_from(segment.length).map_err(|_| {
+                EngineError::InvalidArtifact("mixed segment length overflows usize".into())
+            })?;
+            if group_index != expected_group
+                || row_start != expected_row
+                || row_end <= row_start
+                || row_end > operation.rows
+                || offset != expected_offset
+            {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "mixed Q2/Q4 operation has non-contiguous segment {}",
+                    segment.group_index
+                )));
+            }
+            let segment_block_bytes = match segment.dtype {
+                TensorDType::Q2B64 => Q2_BLOCK_BYTES,
+                TensorDType::Q4B64 => Q4_BLOCK_BYTES,
+                other => {
+                    return Err(EngineError::InvalidArtifact(format!(
+                        "mixed Q2/Q4 segment {} has invalid dtype {other:?}",
+                        segment.group_index
+                    )));
+                }
+            };
+            let expected_length = row_end
+                .checked_sub(row_start)
+                .and_then(|rows| rows.checked_mul(blocks_per_row))
+                .and_then(|blocks| blocks.checked_mul(segment_block_bytes))
+                .ok_or_else(|| EngineError::Shape("mixed segment size overflows usize".into()))?;
+            if length != expected_length {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "mixed Q2/Q4 segment {} has {length} bytes, expected {expected_length}",
+                    segment.group_index
+                )));
+            }
+            expected_row = row_end;
+            expected_offset = expected_offset.checked_add(length).ok_or_else(|| {
+                EngineError::Shape("mixed weight buffer size overflows usize".into())
+            })?;
+        }
+        if expected_row != operation.rows || expected_offset != operation.weights.len() {
             return Err(EngineError::Shape(format!(
-                "weight buffer has {} bytes, expected {expected}",
-                operation.weights.len()
+                "mixed segments cover {expected_row}/{} rows and {expected_offset}/{} bytes",
+                operation.rows,
+                operation.weights.len(),
             )));
         }
-        Ok((blocks_per_row, block_bytes))
+        Ok(blocks_per_row)
     }
 
     /// Dot product of one packed Q2 row against the corrected input.
@@ -194,7 +271,7 @@ impl Backend for CpuBackend {
     }
 
     fn fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<Vec<f32>> {
-        let (blocks_per_row, block_bytes) = Self::validate(operation)?;
+        let blocks_per_row = Self::validate(operation)?;
         // Apply s_in exactly once per operation. The previous implementation
         // rebuilt a scaled [f32; 64] input copy for every block of every row.
         let corrected;
@@ -210,18 +287,62 @@ impl Backend for CpuBackend {
             }
             None => operation.input,
         };
-        let row_bytes = blocks_per_row * block_bytes;
         let mut output = vec![0.0_f32; operation.rows];
-        for (row, output_value) in output.iter_mut().enumerate() {
-            let row_weights = &operation.weights[row * row_bytes..(row + 1) * row_bytes];
-            let mut sum = match operation.dtype {
-                TensorDType::Q2B64 => self.row_sum_q2(row_weights, input)?,
-                TensorDType::Q4B64 => self.row_sum_q4(row_weights, input)?,
-                _ => unreachable!("dtype validated"),
-            };
+        let finish_row = |row: usize, mut sum: f32| {
             sum += operation.bias.map(|bias| bias[row]).unwrap_or(0.0);
             sum *= operation.s_out.map(|scales| scales[row]).unwrap_or(1.0);
-            *output_value = operation.activation.apply(sum);
+            operation.activation.apply(sum)
+        };
+        match operation.dtype {
+            dtype @ (TensorDType::Q2B64 | TensorDType::Q4B64) => {
+                let block_bytes = match dtype {
+                    TensorDType::Q2B64 => Q2_BLOCK_BYTES,
+                    TensorDType::Q4B64 => Q4_BLOCK_BYTES,
+                    _ => unreachable!(),
+                };
+                let row_bytes = blocks_per_row * block_bytes;
+                for (row, output_value) in output.iter_mut().enumerate() {
+                    let row_weights = &operation.weights[row * row_bytes..(row + 1) * row_bytes];
+                    let sum = match dtype {
+                        TensorDType::Q2B64 => self.row_sum_q2(row_weights, input)?,
+                        TensorDType::Q4B64 => self.row_sum_q4(row_weights, input)?,
+                        _ => unreachable!(),
+                    };
+                    *output_value = finish_row(row, sum);
+                }
+            }
+            TensorDType::MixedQ2Q4B64 => {
+                for segment in operation.segments {
+                    let row_start = usize::try_from(segment.row_start)
+                        .expect("mixed segment row start validated");
+                    let row_end =
+                        usize::try_from(segment.row_end).expect("mixed segment row end validated");
+                    let offset =
+                        usize::try_from(segment.offset).expect("mixed segment offset validated");
+                    let length =
+                        usize::try_from(segment.length).expect("mixed segment length validated");
+                    let row_bytes = match segment.dtype {
+                        TensorDType::Q2B64 => blocks_per_row * Q2_BLOCK_BYTES,
+                        TensorDType::Q4B64 => blocks_per_row * Q4_BLOCK_BYTES,
+                        _ => unreachable!("mixed segment dtype validated"),
+                    };
+                    let payload = &operation.weights[offset..offset + length];
+                    for (local_row, output_value) in
+                        output[row_start..row_end].iter_mut().enumerate()
+                    {
+                        let row = row_start + local_row;
+                        let row_weights =
+                            &payload[local_row * row_bytes..(local_row + 1) * row_bytes];
+                        let sum = match segment.dtype {
+                            TensorDType::Q2B64 => self.row_sum_q2(row_weights, input)?,
+                            TensorDType::Q4B64 => self.row_sum_q4(row_weights, input)?,
+                            _ => unreachable!("mixed segment dtype validated"),
+                        };
+                        *output_value = finish_row(row, sum);
+                    }
+                }
+            }
+            _ => unreachable!("dtype validated"),
         }
         Ok(output)
     }
@@ -469,6 +590,7 @@ unsafe fn neon_packed_q4_dot(scale: f32, codes: &[u8; 32], input: &[f32; BLOCK_L
 mod tests {
     use super::*;
     use crate::backend::Activation;
+    use crate::format::QuantSegment;
     use crate::quant::{Q2Block64, Q4Block64};
 
     /// SIMD lanes accumulate in a different order than the sequential scalar
@@ -523,6 +645,7 @@ mod tests {
         let operation = FusedMatVec {
             dtype,
             weights: &weights,
+            segments: &[],
             rows,
             columns,
             input: &input,
@@ -563,6 +686,115 @@ mod tests {
     #[test]
     fn q4_single_block_identity_matches_scalar() {
         fused_case(TensorDType::Q4B64, 3, BLOCK_LEN, Activation::Identity);
+    }
+
+    #[test]
+    fn mixed_q2_q4_rows_match_their_pure_kernels() {
+        let columns = 2 * BLOCK_LEN;
+        let rows_per_segment = 2;
+        let q2 = encode_fixture(TensorDType::Q2B64, rows_per_segment, columns);
+        let q4 = encode_fixture(TensorDType::Q4B64, rows_per_segment, columns);
+        let q2_length = u64::try_from(q2.len()).unwrap();
+        let q4_length = u64::try_from(q4.len()).unwrap();
+        let mut weights = q2.clone();
+        weights.extend_from_slice(&q4);
+        let segments = [
+            QuantSegment {
+                group_index: 0,
+                row_start: 0,
+                row_end: 2,
+                dtype: TensorDType::Q2B64,
+                offset: 0,
+                length: q2_length,
+            },
+            QuantSegment {
+                group_index: 1,
+                row_start: 2,
+                row_end: 4,
+                dtype: TensorDType::Q4B64,
+                offset: q2_length,
+                length: q4_length,
+            },
+        ];
+        let input: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.023_437_5).cos())
+            .collect();
+        let mixed = FusedMatVec {
+            dtype: TensorDType::MixedQ2Q4B64,
+            weights: &weights,
+            segments: &segments,
+            rows: 4,
+            columns,
+            input: &input,
+            s_in: None,
+            s_out: None,
+            bias: None,
+            activation: Activation::Identity,
+        };
+        let q2_operation = FusedMatVec {
+            dtype: TensorDType::Q2B64,
+            weights: &q2,
+            segments: &[],
+            rows: rows_per_segment,
+            columns,
+            input: &input,
+            s_in: None,
+            s_out: None,
+            bias: None,
+            activation: Activation::Identity,
+        };
+        let q4_operation = FusedMatVec {
+            dtype: TensorDType::Q4B64,
+            weights: &q4,
+            segments: &[],
+            rows: rows_per_segment,
+            columns,
+            input: &input,
+            s_in: None,
+            s_out: None,
+            bias: None,
+            activation: Activation::Identity,
+        };
+
+        for backend in [CpuBackend::scalar_verifier(), detected()] {
+            let output = backend.fused_matvec(&mixed).unwrap();
+            let q2_output = backend.fused_matvec(&q2_operation).unwrap();
+            let q4_output = backend.fused_matvec(&q4_operation).unwrap();
+            assert_eq!(&output[..2], q2_output.as_slice());
+            assert_eq!(&output[2..], q4_output.as_slice());
+        }
+    }
+
+    #[test]
+    fn mixed_q2_q4_rejects_non_contiguous_manifest_segments() {
+        let columns = BLOCK_LEN;
+        let weights = encode_fixture(TensorDType::Q2B64, 2, columns);
+        let mut segments = [QuantSegment {
+            group_index: 0,
+            row_start: 0,
+            row_end: 2,
+            dtype: TensorDType::Q2B64,
+            offset: 0,
+            length: u64::try_from(weights.len()).unwrap(),
+        }];
+        segments[0].row_start = 1;
+        let input = [1.0_f32; BLOCK_LEN];
+        let operation = FusedMatVec {
+            dtype: TensorDType::MixedQ2Q4B64,
+            weights: &weights,
+            segments: &segments,
+            rows: 2,
+            columns,
+            input: &input,
+            s_in: None,
+            s_out: None,
+            bias: None,
+            activation: Activation::Identity,
+        };
+        assert!(matches!(
+            detected().fused_matvec(&operation),
+            Err(EngineError::InvalidArtifact(_))
+        ));
     }
 
     /// Exercise the packed decoders with arbitrary code bytes (not only the
@@ -622,6 +854,7 @@ mod tests {
         let operation = FusedMatVec {
             dtype,
             weights: &weights,
+            segments: &[],
             rows: 1,
             columns: BLOCK_LEN,
             input: &input,

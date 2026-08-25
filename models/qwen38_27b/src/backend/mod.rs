@@ -5,7 +5,7 @@ pub mod snapdragon;
 
 use serde::{Deserialize, Serialize};
 
-use crate::format::TensorDType;
+use crate::format::{QuantSegment, TensorDType};
 use crate::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -54,6 +54,9 @@ impl Activation {
 pub struct FusedMatVec<'a> {
     pub dtype: TensorDType,
     pub weights: &'a [u8],
+    /// Exact row-segment layout from the CTOXQ manifest for
+    /// `MixedQ2Q4B64`. Pure Q2/Q4 operations must leave this empty.
+    pub segments: &'a [QuantSegment],
     pub rows: usize,
     pub columns: usize,
     pub input: &'a [f32],

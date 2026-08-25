@@ -378,6 +378,7 @@ mod tests {
             let operation = FusedMatVec {
                 dtype,
                 weights: &weights,
+                segments: &[],
                 rows: 1,
                 columns: BLOCK_LEN,
                 input: &input,

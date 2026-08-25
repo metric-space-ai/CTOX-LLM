@@ -85,6 +85,7 @@ fn main() -> anyhow::Result<()> {
     let operation = FusedMatVec {
         dtype,
         weights: &weights,
+        segments: &[],
         rows: args.rows,
         columns: args.columns,
         input: &input,

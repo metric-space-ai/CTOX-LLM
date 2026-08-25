@@ -1,7 +1,8 @@
 # CPU packed Q2/Q4 kernel notes
 
-Scope: `src/backend/cpu.rs` fused matvec for `TensorDType::Q2B64` and
-`TensorDType::Q4B64`. Only these two dtypes exist; there is no Q3 path.
+Scope: `src/backend/cpu.rs` fused matvec for `TensorDType::Q2B64`,
+`TensorDType::Q4B64`, and manifest-defined `MixedQ2Q4B64` row groups. The
+mixed form dispatches only those same Q2 and Q4 kernels; there is no Q3 path.
 
 ## What changed
 
@@ -23,6 +24,10 @@ for every block of every row. The current implementation:
      arithmetic as the old oracle (`Q2Block64::dequantize` + `scalar_dot`).
    - `Avx2` (x86_64, runtime-detected) and `Neon` (aarch64): direct packed
      kernels.
+4. Executes mixed embedding/LM-head payloads directly by their contiguous
+   manifest row groups. Segment indices, row coverage, byte offsets, lengths,
+   and Q2/Q4 dtypes are revalidated before execution. The path neither
+   dequantizes nor repacks the complete tensor.
 
 ## Packed decode schemes
 
@@ -55,7 +60,9 @@ Tests in `src/backend/cpu.rs` compare the detected SIMD profile against the
 scalar oracle deterministically: Q2 and Q4, single- and multi-block rows,
 multiple rows, non-identity `s_in`/`s_out`, bias, Identity and SiLU
 activations, plus arbitrary-code packed decode checks against
-`Q2Block64`/`Q4Block64` dequantization.
+`Q2Block64`/`Q4Block64` dequantization. Mixed-row tests compare one combined
+payload against independent pure-Q2 and pure-Q4 dispatches and prove malformed
+segment coverage fails closed.
 
 SIMD-vs-oracle differences come only from lane-wise reassociation and NEON
 FMA contraction (per-element products are bit-identical, see above). For

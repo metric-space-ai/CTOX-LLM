@@ -269,6 +269,7 @@ mod tests {
         FusedMatVec {
             dtype,
             weights,
+            segments: &[],
             rows,
             columns,
             input,
