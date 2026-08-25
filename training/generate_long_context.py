@@ -294,14 +294,18 @@ def main() -> None:
     parser.add_argument("--targets", default=",".join(map(str, DEFAULT_TARGETS)))
     parser.add_argument("--languages", default="en,de")
     parser.add_argument("--samples-per-target", type=int, default=2)
+    parser.add_argument("--sample-index-start", type=int, default=0)
     parser.add_argument("--tolerance", type=int, default=256)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.manifest == args.output:
         raise SystemExit("--manifest and --output must be different files")
-    if args.samples_per_target <= 0 or args.tolerance <= 0:
-        raise SystemExit("--samples-per-target and --tolerance must be positive")
+    if args.samples_per_target <= 0 or args.sample_index_start < 0 or args.tolerance <= 0:
+        raise SystemExit(
+            "--samples-per-target and --tolerance must be positive; "
+            "--sample-index-start must be non-negative"
+        )
     targets = tuple(int(value) for value in args.targets.split(",") if value)
     languages = tuple(value for value in args.languages.split(",") if value)
     if not targets or not languages or any(language not in {"en", "de"} for language in languages):
@@ -317,7 +321,10 @@ def main() -> None:
     materialized = []
     for target in targets:
         for language in languages:
-            for sample_index in range(args.samples_per_target):
+            for sample_index in range(
+                args.sample_index_start,
+                args.sample_index_start + args.samples_per_target,
+            ):
                 manifest, sample = generated_record(
                     tokenizer,
                     args.seed,
