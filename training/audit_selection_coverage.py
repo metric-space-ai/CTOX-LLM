@@ -15,6 +15,39 @@ from typing import Any
 from classify_domains import validate_rubric
 
 
+def validate_language_rubric(
+    language_rubric: dict[str, Any], domain_rubric: dict[str, Any]
+) -> None:
+    languages = language_rubric["languages"]
+    if "en" not in languages or len(languages) < 2:
+        raise ValueError("language rubric must include English and multilingual coverage")
+    domains = domain_rubric["domains"]
+    if language_rubric["translation_domain"] not in domains:
+        raise ValueError("language rubric names an unknown translation domain")
+    required_families = set(domain_rubric["policy"]["required_families"])
+    family_minima = language_rubric["aggregate_non_english_family_minima"]
+    if set(family_minima) != required_families:
+        raise ValueError("non-English family minima differ from required semantic families")
+    for language, requirements in languages.items():
+        for partition in ("train", "evaluation"):
+            keys = (
+                f"minimum_{partition}",
+                f"minimum_primary_domains_{partition}",
+                f"minimum_non_translation_{partition}",
+            )
+            if any(int(requirements[key]) <= 0 for key in keys):
+                raise ValueError(f"language {language} has a non-positive {partition} quota")
+            if int(requirements[f"minimum_non_translation_{partition}"]) > int(
+                requirements[f"minimum_{partition}"]
+            ):
+                raise ValueError(
+                    f"language {language} requires more non-translation than total records"
+                )
+    for family, minima in family_minima.items():
+        if any(int(minima[partition]) <= 0 for partition in ("train", "evaluation")):
+            raise ValueError(f"semantic family {family} has a non-positive multilingual quota")
+
+
 def coverage_report(
     records: list[dict[str, Any]],
     tags: dict[str, dict[str, Any]],
@@ -23,6 +56,7 @@ def coverage_report(
     partition: str,
 ) -> dict[str, Any]:
     validate_rubric(domain_rubric)
+    validate_language_rubric(language_rubric, domain_rubric)
     record_ids = {str(record["id"]) for record in records}
     if len(record_ids) != len(records):
         raise ValueError("materialized selection contains duplicate ids")

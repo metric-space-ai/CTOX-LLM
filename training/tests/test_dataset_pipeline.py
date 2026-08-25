@@ -38,7 +38,7 @@ from classify_domains import (  # noqa: E402
     quota_gaps,
     validate_rubric,
 )
-from audit_selection_coverage import coverage_report  # noqa: E402
+from audit_selection_coverage import coverage_report, validate_language_rubric  # noqa: E402
 from collect_activation_stats import (  # noqa: E402
     checkpoint_weight_name,
     prefill_ranges,
@@ -157,7 +157,9 @@ class DatasetPipelineTests(unittest.TestCase):
 
     def test_release_domain_rubric_covers_every_required_family(self) -> None:
         rubric = json.loads((TRAINING / "DOMAIN_RUBRIC.json").read_text())
+        language_rubric = json.loads((TRAINING / "LANGUAGE_RUBRIC.json").read_text())
         validate_rubric(rubric)
+        validate_language_rubric(language_rubric, rubric)
         self.assertEqual(rubric["format"], "ctox.recovery-domain-rubric.v2")
         self.assertGreaterEqual(len(rubric["domains"]), 36)
         self.assertEqual(
@@ -215,18 +217,24 @@ class DatasetPipelineTests(unittest.TestCase):
             "languages": {
                 "en": {
                     "minimum_train": 1,
+                    "minimum_evaluation": 1,
                     "minimum_primary_domains_train": 1,
+                    "minimum_primary_domains_evaluation": 1,
                     "minimum_non_translation_train": 1,
+                    "minimum_non_translation_evaluation": 1,
                 },
                 "de": {
                     "minimum_train": 1,
+                    "minimum_evaluation": 1,
                     "minimum_primary_domains_train": 1,
+                    "minimum_primary_domains_evaluation": 1,
                     "minimum_non_translation_train": 1,
+                    "minimum_non_translation_evaluation": 1,
                 },
             },
             "aggregate_non_english_family_minima": {
-                "language": {"train": 1},
-                "software": {"train": 1},
+                "language": {"train": 1, "evaluation": 1},
+                "software": {"train": 1, "evaluation": 1},
             },
         }
         records = [{"id": "a", "language": "en"}, {"id": "b", "language": "de"}]
