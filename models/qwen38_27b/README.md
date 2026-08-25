@@ -127,9 +127,11 @@ The first mmap-backed executable graph slice now composes recovered embedding,
 Qwen RMSNorm, gate/up/SwiGLU/down with the residual connection, final norm, and
 the recovered LM head without copying or repacking model tensors. A pinned
 small-shape artifact test exercises the complete slice numerically. Full- and
-linear-attention token mixers, all 64-layer iteration, KV/state ownership, and
-MTP verification still have to be connected before this becomes an end-to-end
-decoder.
+attention now has a complete single-token correctness composition including
+the interleaved query/gate projection, head norms, partial RoPE, causal GQA,
+KV state, output gate, projection, and residual. Linear-attention composition,
+all 64-layer iteration, production paged-KV ownership, and MTP verification
+still have to be connected before this becomes an end-to-end decoder.
 
 [`docs/WIRE_PROTOCOL_V1.md`](docs/WIRE_PROTOCOL_V1.md) defines the matching
 versioned Unix-socket/named-pipe control and token-stream contract. The bring-up
