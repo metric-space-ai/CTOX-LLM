@@ -43,17 +43,20 @@ from merge_activation_stats import merged_metadata, source_runtime_profiles  # n
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
 from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_bytes  # noqa: E402
 from plan_teacher_cache import sample_tensor_bytes  # noqa: E402
+from plan_teacher_batches import batches as plan_teacher_batches  # noqa: E402
 from prompt_format import normalize_content, normalize_messages, normalize_tool_call  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
 from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
 from pack_checkpoint import validate_recovery_source  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
+from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
 from split_manifests import split  # noqa: E402
 from teacher_runtime import FLA_KERNEL_REVISION, weight_max_memory  # noqa: E402
 from verify_vendor_manifest import verify  # noqa: E402
 from verify_local_model import root_digest  # noqa: E402
 from verify_teacher_cache import expected_tensor_specs  # noqa: E402
+from run_teacher_batches import completed_batch_matches  # noqa: E402
 
 
 class DatasetPipelineTests(unittest.TestCase):
@@ -294,6 +297,69 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(specs["hidden_63"], ("BF16", [1, 10, 5120]))
         self.assertEqual(specs["mtp_hidden"], ("BF16", [1, 7, 5120]))
         self.assertEqual(specs["mtp_topk_indices"], ("I32", [1, 19, 64]))
+
+    def test_teacher_smoke_selects_every_domain_and_language_deterministically(self) -> None:
+        records = [
+            {"id": "a", "language": "de"},
+            {"id": "b", "language": "en"},
+            {"id": "c", "language": "ja"},
+        ]
+        tags = {
+            "a": {"primary_label": "everyday"},
+            "b": {"primary_label": "software"},
+            "c": {"primary_label": "software"},
+        }
+        plans = {
+            "a": {"sequence_tokens": 100, "projected_file_bytes": 200},
+            "b": {"sequence_tokens": 90, "projected_file_bytes": 180},
+            "c": {"sequence_tokens": 80, "projected_file_bytes": 160},
+        }
+        selected, domains, languages = select_teacher_smoke_ids(
+            records,
+            tags,
+            plans,
+            ["everyday", "software"],
+            ["de", "en", "ja"],
+            128,
+        )
+        self.assertEqual(selected, {"a", "b", "c"})
+        self.assertEqual(domains, {"everyday": "a", "software": "c"})
+        self.assertEqual(languages, {"de": "a", "en": "b", "ja": "c"})
+
+    def test_teacher_batches_are_contiguous_and_bound_all_resources(self) -> None:
+        samples = [
+            {
+                "id": str(index),
+                "source_line": index,
+                "sequence_tokens": tokens,
+                "projected_file_bytes": tokens * 10,
+            }
+            for index, tokens in enumerate([40, 50, 60, 30], 1)
+        ]
+        result = plan_teacher_batches(samples, 3, 100, 1000)
+        self.assertEqual([batch["start_sample"] for batch in result], [0, 2])
+        self.assertEqual([batch["samples"] for batch in result], [2, 2])
+        self.assertEqual([batch["sequence_tokens"] for batch in result], [90, 90])
+        self.assertEqual(sum(batch["projected_cache_bytes"] for batch in result), 1800)
+
+    def test_teacher_batch_runner_skips_only_matching_verified_work(self) -> None:
+        batch = {"start_sample": 128, "samples": 32}
+        run = {
+            "teacher_revision": "r",
+            "local_model_provenance_sha256": "p",
+            "start_sample": 128,
+            "selected_samples": 32,
+            "written_samples": 32,
+        }
+        verification = {
+            "status": "passed",
+            "teacher_revision": "r",
+            "teacher_provenance_sha256": "p",
+            "samples": 32,
+        }
+        self.assertTrue(completed_batch_matches(run, verification, batch, "r", "p"))
+        verification["samples"] = 31
+        self.assertFalse(completed_batch_matches(run, verification, batch, "r", "p"))
 
     def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

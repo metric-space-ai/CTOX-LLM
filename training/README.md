@@ -105,6 +105,19 @@ cache to its ordered source slice and teacher provenance, checks every tensor
 name, dtype, shape, MTP count, hidden layer, and payload hash, and emits a
 content-addressed artifact inventory. Recovery never consumes an unchecked
 directory merely because it contains safetensors files.
+`select_teacher_smoke.py` chooses the lowest-cost eligible records that cover
+every required primary semantic domain and every frozen language stratum. This
+gates the complete cache path on broad behavior rather than validating only an
+English coding or agentic example.
+`plan_teacher_batches.py` partitions the frozen source order into immutable
+batches bounded simultaneously by sample count, input tokens, and projected
+output bytes. Each batch uses `cache_teacher.py --start-sample/--max-samples`
+and passes the same verifier independently, so a late host or GPU failure does
+not invalidate earlier teacher work.
+`run_teacher_batches.py` executes that plan one batch at a time and immediately
+runs the content verifier. It skips existing work only when the completed run,
+source slice, teacher revision, provenance hash, and verification sample count
+all agree; partial directories stop the orchestrator for inspection.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized
