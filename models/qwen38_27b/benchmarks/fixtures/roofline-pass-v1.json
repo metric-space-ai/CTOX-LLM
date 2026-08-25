@@ -1,0 +1,16 @@
+{
+  "format": "ctox.qwen38.roofline-measurement.v1",
+  "hardware_profile": "synthetic-contract-fixture",
+  "phase": "decode",
+  "traffic_source": "exact_tensor_schedule",
+  "elapsed_seconds": 0.011764705882352941,
+  "accepted_tokens": 10,
+  "bytes_read": 900000000,
+  "bytes_written": 100000000,
+  "floating_point_operations": 100000000000.0,
+  "sustainable_bandwidth_bytes_per_second": 100000000000.0,
+  "sustainable_compute_flops_per_second": 100000000000000.0,
+  "dispatch_floor_seconds": 0.001,
+  "theoretical_bandwidth_bytes_per_second": 125000000000.0,
+  "theoretical_compute_flops_per_second": 125000000000000.0
+}

@@ -21,6 +21,13 @@ either prefill or decode throughput and must improve at least one by 10 percent.
 Peak-only results are insufficient for mobile: the Fold profile uses a
 30-minute warm run.
 
+Beating the pinned reference is necessary but no longer sufficient. Every
+production-reachable phase and shape sweep must pass `ROOFLINE_GATES.md`: at
+least 85 percent of the measured sustainable bandwidth/compute/dispatch
+roofline, complete traffic accounting, and no unexplained result above 105
+percent of the calculated ceiling. A backend remains `experimental` while a
+material roofline gap is unmeasured or unexplained.
+
 ## Model and Fold gates
 
 - weighted quality >= 95% of BF16;

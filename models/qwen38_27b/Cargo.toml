@@ -51,3 +51,7 @@ path = "src/bin/server.rs"
 [[bin]]
 name = "qwen38-kernel-bench"
 path = "src/bin/kernel_bench.rs"
+
+[[bin]]
+name = "qwen38-roofline-gate"
+path = "src/bin/roofline_gate.rs"

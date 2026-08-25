@@ -15,6 +15,7 @@ pub mod loader;
 pub mod memory;
 pub mod quant;
 pub mod release;
+pub mod roofline;
 pub mod sampler;
 pub mod server;
 pub mod wire;

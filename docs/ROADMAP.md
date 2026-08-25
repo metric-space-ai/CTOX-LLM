@@ -178,6 +178,9 @@ evidence is 593/2,328 complete.
    API. Do not introduce a general inference framework runtime.
 3. Tune an explicit SM86 profile for the RTX A4500 and record allocator,
    prefill, decode, cold-start, warm-start, and unload measurements.
+4. Measure sustainable memory bandwidth, typed tensor-core throughput, and
+   dispatch latency on the same device, then close every material gap reported
+   by `ROOFLINE_GATES.md` across the required shape/residue sweep.
 
 **Exit evidence**
 
@@ -185,6 +188,8 @@ evidence is 593/2,328 complete.
 - No fallback is observed in operation traces.
 - Prefill and decode do not regress versus the pinned reference, and at least
   one improves by 10% or more under identical conditions.
+- Every production-reachable CUDA phase reaches at least 85% of its measured
+  practical roofline; evidence above 105% is rejected as incomplete accounting.
 
 ## Phase 5: production CPU and Metal backends
 
@@ -205,6 +210,8 @@ evidence is 593/2,328 complete.
   same-hardware promotion gates as CUDA.
 - CUDA and Metal expose no backend-dependent model-quality delta beyond the
   documented floating-point accumulation tolerance.
+- CPU and Metal each carry their own sustainable ceiling measurements and pass
+  the full roofline shape/residue sweep rather than inheriting CUDA evidence.
 
 ## Phase 6: Snapdragon/Fold backend
 
