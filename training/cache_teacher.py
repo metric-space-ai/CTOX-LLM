@@ -50,40 +50,16 @@ def sparse_targets(torch: Any, model: Any, hidden: Any, top_k: int, chunk_size: 
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--revision", required=True)
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--ledger", type=Path, required=True)
-    parser.add_argument("--gpus", type=int, default=3)
-    parser.add_argument("--reserved-gpu-hours", type=float, required=True)
-    parser.add_argument("--top-k", type=int, default=64)
-    parser.add_argument("--max-length", type=int, default=8192)
-    parser.add_argument("--hidden-layers", default="0,15,31,47,63")
-    parser.add_argument("--logit-chunk", type=int, default=64)
-    args = parser.parse_args()
-    require_budget(args.ledger, args.reserved_gpu_hours)
+def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any, auto_tokenizer: Any) -> None:
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
     args.output.mkdir(parents=True)
-
-    try:
-        import torch
-        from safetensors.torch import save_file
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-    except ImportError as error:
-        raise SystemExit("install training/requirements.in before caching teacher targets") from error
-
     hidden_layers = [int(layer) for layer in args.hidden_layers.split(",") if layer]
-    if args.logit_chunk <= 0:
-        raise SystemExit("--logit-chunk must be positive")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
-    model = AutoModelForCausalLM.from_pretrained(
+    tokenizer = auto_tokenizer.from_pretrained(args.model, revision=args.revision)
+    model = auto_model.from_pretrained(
         args.model,
         revision=args.revision,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="balanced",
         low_cpu_mem_usage=True,
     ).eval()
@@ -93,15 +69,29 @@ def main() -> None:
     captured: dict[int, Any] = {}
     hooks = []
     for layer_index in hidden_layers:
+
         def capture(_module: Any, _inputs: Any, output: Any, index: int = layer_index) -> None:
             captured[index] = output[0] if isinstance(output, tuple) else output
 
         hooks.append(layers[layer_index].register_forward_hook(capture))
     resolved_revision = getattr(model.config, "_commit_hash", None) or args.revision
+    run_manifest = {
+        "schema_version": 1,
+        "teacher_model": args.model,
+        "teacher_revision": str(resolved_revision),
+        "architecture": type(model).__name__,
+        "dtype": "bfloat16",
+        "device_map": {name: str(device) for name, device in model.hf_device_map.items()},
+        "top_k": args.top_k,
+        "max_length": args.max_length,
+        "hidden_layers": hidden_layers,
+        "logit_chunk": args.logit_chunk,
+    }
+    (args.output / "run.json").write_text(
+        json.dumps(run_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     index_path = args.output / "index.jsonl"
-    with GpuRun(args.ledger, "teacher-cache", args.gpus, sys.argv), index_path.open(
-        "x", encoding="utf-8"
-    ) as index, args.input.open(encoding="utf-8") as source:
+    with index_path.open("x", encoding="utf-8") as index, args.input.open(encoding="utf-8") as source:
         for line_number, line in enumerate(source, 1):
             if not line.strip():
                 continue
@@ -167,6 +157,39 @@ def main() -> None:
             del output, tensors, top_indices, top_values, residual
     for hook in hooks:
         hook.remove()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--ledger", type=Path, required=True)
+    parser.add_argument("--gpus", type=int, default=3)
+    parser.add_argument("--reserved-gpu-hours", type=float, required=True)
+    parser.add_argument("--top-k", type=int, default=64)
+    parser.add_argument("--max-length", type=int, default=8192)
+    parser.add_argument("--hidden-layers", default="0,15,31,47,63")
+    parser.add_argument("--logit-chunk", type=int, default=64)
+    args = parser.parse_args()
+    require_budget(args.ledger, args.reserved_gpu_hours)
+    if args.top_k <= 0:
+        raise SystemExit("--top-k must be positive")
+    if args.max_length <= 0:
+        raise SystemExit("--max-length must be positive")
+    if args.logit_chunk <= 0:
+        raise SystemExit("--logit-chunk must be positive")
+
+    try:
+        import torch
+        from safetensors.torch import save_file
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as error:
+        raise SystemExit("install training/requirements.in before caching teacher targets") from error
+
+    with GpuRun(args.ledger, "teacher-cache", args.gpus, sys.argv):
+        cache(args, torch, save_file, AutoModelForCausalLM, AutoTokenizer)
 
 
 if __name__ == "__main__":
