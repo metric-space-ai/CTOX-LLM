@@ -159,6 +159,11 @@ Its row decoder reads only the requested Q2/Q4 or mixed-row slice, reconstructs
 the native FP16 block scale and bit ordering exactly, and leaves the canonical
 packed codes immutable. This bounded decoder is the correctness path for the
 future autograd/fused-kernel recovery adapter, not a second quantizer.
+`packed_recovery_ops.py` supplies the first bounded autograd primitive. Its
+forward decodes only an output-row chunk at a time; backward re-decodes those
+same immutable codes and analytically accumulates gradients for input,
+`s_in`, `s_out`, and bias. It therefore does not retain a dequantized BF16
+matrix between passes, and its gradients are tested against the dense oracle.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized

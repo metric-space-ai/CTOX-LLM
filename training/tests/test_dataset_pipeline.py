@@ -61,6 +61,7 @@ try:  # Optional local training dependency; exercised in the pinned GPU venv.
 except ModuleNotFoundError:
     torch = None
 from pack_checkpoint import validate_recovery_source  # noqa: E402
+from packed_recovery_ops import packed_linear  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
@@ -603,6 +604,65 @@ class DatasetPipelineTests(unittest.TestCase):
                 self.assertEqual(tuple(values.shape), (1, 64))
                 expected = torch.tensor([-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0])
                 self.assertTrue(torch.allclose(values[0, :4], expected))
+
+    def test_packed_linear_recomputes_codes_and_matches_dense_gradients(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "linear.ctoxq"
+            packed_code = bytes([0 | (1 << 2) | (2 << 4) | (3 << 6)])
+            scale_bytes = torch.tensor([1.0], dtype=torch.float16).view(torch.uint8).numpy().tobytes()
+            payload = scale_bytes + packed_code * 16
+            payload += scale_bytes + packed_code * 16
+            manifest = {
+                "format": "ctox.q2q4.v1",
+                "model": "test",
+                "revision": "revision",
+                "alignment": 64,
+                "target": "canonical-b64",
+                "tensors": [
+                    {
+                        "name": "weight",
+                        "dtype": "q2_b64",
+                        "shape": [2, 64],
+                        "offset": 0,
+                        "length": 36,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                ],
+            }
+            manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
+            data_offset = (HEADER.size + len(manifest_bytes) + 63) & ~63
+            path.write_bytes(
+                HEADER.pack(MAGIC, 1, ENDIAN_MARKER, len(manifest_bytes), data_offset, 1, 64)
+                + manifest_bytes
+                + b"\0" * (data_offset - HEADER.size - len(manifest_bytes))
+                + payload
+            )
+            with CtoxArtifact(path, verify_tensors=True) as artifact:
+                dense_weight = artifact.decode_matrix_rows("weight", 0, 2, torch, "cpu")
+                inputs = torch.randn(2, 3, 64, requires_grad=True)
+                s_in = torch.full((64,), 1.1, requires_grad=True)
+                s_out = torch.tensor([0.9, 1.2], requires_grad=True)
+                bias = torch.tensor([0.1, -0.2], requires_grad=True)
+                output = packed_linear(
+                    torch, artifact, "weight", inputs, s_in, s_out, bias, rows_per_chunk=1
+                )
+                output.square().sum().backward()
+                packed_grads = [value.grad.clone() for value in (inputs, s_in, s_out, bias)]
+
+                dense_inputs = inputs.detach().clone().requires_grad_()
+                dense_s_in = s_in.detach().clone().requires_grad_()
+                dense_s_out = s_out.detach().clone().requires_grad_()
+                dense_bias = bias.detach().clone().requires_grad_()
+                dense_output = torch.nn.functional.linear(
+                    dense_inputs * dense_s_in, dense_weight, dense_bias
+                ) * dense_s_out
+                dense_output.square().sum().backward()
+                for packed_grad, value in zip(
+                    packed_grads, (dense_inputs, dense_s_in, dense_s_out, dense_bias)
+                ):
+                    self.assertTrue(torch.allclose(packed_grad, value.grad, atol=1e-5, rtol=1e-5))
 
     def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
