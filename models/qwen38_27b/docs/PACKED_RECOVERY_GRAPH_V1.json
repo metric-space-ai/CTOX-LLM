@@ -1,0 +1,47 @@
+{
+  "format": "ctox.qwen38.packed-recovery-graph-evidence.v1",
+  "date": "2026-08-25",
+  "status": "base_graph_installed_no_end_to_end_forward_yet",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "native_artifact": {
+    "name": "multilingual-agentic-longcontext-167-all506-scale-fit-v1.ctoxq",
+    "bytes": 8373658112,
+    "sha256": "653b074ad3396c09772a3410fdc754e2e96dedfbfe363de935e84def75e1b69e",
+    "format": "ctox.q2q4.v2",
+    "tensors": 1878,
+    "quantized_weight_matrices": 506,
+    "logical_codes_mutated": false
+  },
+  "registry": {
+    "complete_scale_pairs": 506,
+    "scale_values": 7926272,
+    "scale_parameter_bytes_fp32": 31705088,
+    "lm_head_scale_values": 253440,
+    "lm_head_bias": false
+  },
+  "base_graph": {
+    "installed_packed_weights": 498,
+    "excluded_resident_mtp_weights": 8,
+    "loaded_frozen_float_parameters": 353,
+    "trainable_scale_values": 7802368,
+    "all_parameter_bytes_excluding_mmap_codes": 36509696,
+    "remaining_meta_parameters": 0,
+    "device_for_installation_smoke": "cpu",
+    "compute_dtype": "bfloat16"
+  },
+  "verified_components": [
+    "native header, endianness, alignment, range, dtype and checksum contracts",
+    "canonical Q2 and Q4 row decoding including mixed-row tensors",
+    "bounded packed-linear forward and analytic backward against dense gradients",
+    "bounded unique-row embedding with scale gradients",
+    "exact checkpoint-to-Transformers runtime-name mapping",
+    "complete meta-parameter replacement for the base text graph"
+  ],
+  "open_gates": [
+    "Install and execute the separate resident MTP graph from the same artifact.",
+    "Run a packed base-graph forward on cached teacher input and compare selected hidden states and logits.",
+    "Connect the six-family end-to-end recovery objective and optimizer.",
+    "Replace the Python correctness operator with verified fused CUDA kernels before performance acceptance."
+  ]
+}

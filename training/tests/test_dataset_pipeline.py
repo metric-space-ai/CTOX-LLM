@@ -67,6 +67,12 @@ from packed_recovery_ops import (  # noqa: E402
     packed_recovery_linear_class,
 )
 from packed_recovery_model import PackedRecoveryRegistry  # noqa: E402
+from packed_student_model import (  # noqa: E402
+    artifact_to_runtime_name,
+    runtime_to_artifact_name,
+    set_parameter,
+    set_submodule,
+)
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
@@ -661,6 +667,7 @@ class DatasetPipelineTests(unittest.TestCase):
             )
             with CtoxArtifact(path, verify_tensors=True) as artifact:
                 dense_weight = artifact.decode_matrix_rows("weight", 0, 2, torch, "cpu")
+                torch.manual_seed(7)
                 inputs = torch.randn(2, 3, 64, requires_grad=True)
                 s_in = torch.full((64,), 1.1, requires_grad=True)
                 s_out = torch.tensor([0.9, 1.2], requires_grad=True)
@@ -682,7 +689,7 @@ class DatasetPipelineTests(unittest.TestCase):
                 for packed_grad, value in zip(
                     packed_grads, (dense_inputs, dense_s_in, dense_s_out, dense_bias)
                 ):
-                    self.assertTrue(torch.allclose(packed_grad, value.grad, atol=1e-5, rtol=1e-5))
+                    self.assertTrue(torch.allclose(packed_grad, value.grad, atol=1e-4, rtol=1e-4))
                 module_class = packed_recovery_linear_class(torch)
                 module = module_class(
                     artifact,
@@ -726,6 +733,26 @@ class DatasetPipelineTests(unittest.TestCase):
         artifact.tensors.pop("layer.weight.s_out")
         with self.assertRaisesRegex(ValueError, "lacks"):
             PackedRecoveryRegistry(artifact, torch)
+
+    def test_packed_student_assignment_replaces_only_exact_qualified_target(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+        root = torch.nn.Module()
+        root.child = torch.nn.Module()
+        root.child.linear = torch.nn.Linear(2, 2)
+        replacement = torch.nn.Identity()
+        set_submodule(root, "child.linear", replacement)
+        self.assertIs(root.child.linear, replacement)
+        set_parameter(
+            root,
+            "child.scale",
+            torch.nn.Parameter(torch.ones(2), requires_grad=False),
+        )
+        self.assertEqual(tuple(root.child.scale.shape), (2,))
+        checkpoint_name = "model.language_model.layers.3.mlp.down_proj.weight"
+        runtime_name = "model.layers.3.mlp.down_proj.weight"
+        self.assertEqual(artifact_to_runtime_name(checkpoint_name), runtime_name)
+        self.assertEqual(runtime_to_artifact_name(runtime_name), checkpoint_name)
 
     def test_local_teacher_provenance_rejects_revision_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

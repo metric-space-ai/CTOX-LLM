@@ -62,10 +62,12 @@ class PackedRecoveryRegistry:
             for name in self.weight_names
         )
 
-    def make_embedding(self, name: str, device: str) -> Any:
+    def make_embedding(self, name: str, device: str, compute_dtype: Any | None = None) -> Any:
         if name not in self.weight_names:
             raise ValueError(f"{name} is not a registered quantized CTOX weight")
         s_in = self.artifact.decode_float_tensor(f"{name}.s_in", self.torch, device)
         s_out = self.artifact.decode_float_tensor(f"{name}.s_out", self.torch, device)
         module_class = packed_recovery_embedding_class(self.torch)
-        return module_class(self.artifact, name, s_in, s_out).to(device)
+        return module_class(
+            self.artifact, name, s_in, s_out, compute_dtype=compute_dtype
+        ).to(device)

@@ -179,6 +179,11 @@ The packed embedding module decodes only unique token rows (coalescing adjacent
 IDs), then applies the same column and row corrections as the logical matrix.
 Gradients flow only into those corrections; the vocabulary matrix is never
 expanded or retained in BF16.
+`packed_student_model.py` replaces the meta-initialized Qwen embedding and
+linear modules with those packed operators, loads every remaining frozen
+FP16/FP32 norm and recurrent parameter from the same container, excludes MTP
+for its separate graph, and fails if any meta parameter or unmatched module
+remains. Only logarithmic recovery scales retain gradients.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized

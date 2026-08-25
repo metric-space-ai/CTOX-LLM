@@ -203,6 +203,7 @@ def packed_recovery_embedding_class(torch: Any) -> Any:
             name: str,
             initial_s_in: Any,
             initial_s_out: Any,
+            compute_dtype: Any | None = None,
         ) -> None:
             super().__init__()
             rows, columns = map(int, artifact.tensors[name]["shape"])
@@ -219,6 +220,7 @@ def packed_recovery_embedding_class(torch: Any) -> Any:
             self.name = name
             self.rows = rows
             self.columns = columns
+            self.compute_dtype = compute_dtype or initial_s_in.dtype
             self.log_s_in = torch.nn.Parameter(initial_s_in.float().log())
             self.log_s_out = torch.nn.Parameter(initial_s_out.float().log())
 
@@ -230,7 +232,7 @@ def packed_recovery_embedding_class(torch: Any) -> Any:
             decoded = torch.empty(
                 (unique.shape[0], self.columns),
                 device=input_ids.device,
-                dtype=self.log_s_in.dtype,
+                dtype=self.compute_dtype,
             )
             start_index = 0
             while start_index < unique.shape[0]:
