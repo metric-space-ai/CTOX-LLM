@@ -24,10 +24,16 @@ paths needed to build them.
 | Runtime | Checksummed v1/v2 container, corrected memory planner, graph ownership plan, stable lifecycle/wire contracts, target+MTP correctness composition, fail-closed greedy MTP verification, and bring-up server that deliberately returns `engine_not_ready` | Production `ModelExecutor`, tokenizer/template binding, probability-correct non-greedy MTP, optimized streaming prefill/decode, and full-artifact unload evidence |
 
 The corrected 9.5822-GiB baseline and 9.6110-GiB initializer 128K figures are
-verified calculations, not measured RSS/PSS/VRAM peaks. The correction adds
+verified no-MTP calculations, not measured RSS/PSS/VRAM peaks. The v2 correction adds
 the previously omitted 7.5-MiB causal-convolution state to the 144-MiB
 GatedDeltaNet recurrent state and is recorded in
-`models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V2.json`. Likewise, the planned
+`models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V2.json`. Active MTP additionally
+requires a 72.1875-MiB independent KV cache and speculative target-state
+storage. The admitted calculated MTP4 profile uses FP16 recurrent state plus
+one replay checkpoint and totals 9.6815 GiB for the initializer, leaving only
+18.95 MiB to the 9.7-GiB target; aligned MTP4 state pages do not fit. This v3
+correction is recorded in
+`models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V3.json`. Likewise, the planned
 9.6976-GiB vision phase is not yet Android device evidence.
 
 The five verified release teacher-cache batches currently cover 593 of the
@@ -155,7 +161,9 @@ evidence is 593/2,328 complete.
    deterministic seeds, and token streaming.
 2. Execute the complete 64-layer hybrid graph: embeddings, full attention,
    GatedDeltaNet/linear attention, FFN, normalization, RoPE, residual paths,
-   LM head, and MTP draft/target verification.
+   LM head, and chained MTP draft/block-target verification. The current
+   one-draft path remains the oracle; production MTP4 must replay the accepted
+   prefix from one FP16 target-state checkpoint on the Fold profile.
 3. Implement paged Q2 KV with Q4 sink/recent pages, exact linear-attention
    state, bounded prefill/decode arenas, cancellation, and one active session.
 4. Make the scalar path the test oracle only. Production policy fails closed

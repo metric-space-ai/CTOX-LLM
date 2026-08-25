@@ -1,0 +1,60 @@
+{
+  "format": "ctox.qwen38.memory-plan-correction.v3",
+  "date": "2026-08-25",
+  "status": "authoritative_calculated_speculative_memory_correction",
+  "reason": "MTP execution requires an independent full-attention KV cache, and multi-token target verification requires either a replay checkpoint or one aligned recurrent-state page per speculative position.",
+  "context_tokens": 131072,
+  "mtp_kv": {
+    "layers": 1,
+    "raw_q2_bytes": 67108864,
+    "scale_bytes": 8388608,
+    "q4_recent_and_sink_delta_bytes": 196608,
+    "total_bytes": 75694080,
+    "total_mib": 72.1875
+  },
+  "linear_state_profiles": {
+    "f32_base_bytes": 158859264,
+    "f32_base_mib": 151.5,
+    "f16_base_bytes": 79429632,
+    "f16_base_mib": 75.75,
+    "mtp4_f16_replay_extra_bytes": 79429632,
+    "mtp4_f16_aligned_extra_bytes": 317718528,
+    "mtp4_f32_replay_extra_bytes": 158859264
+  },
+  "fold_128k": {
+    "direct_baseline_no_mtp_f32_bytes": 10288768000,
+    "direct_baseline_mtp4_f16_replay_bytes": 10364462080,
+    "expanded_initializer_no_mtp_f32_bytes": 10319733760,
+    "expanded_initializer_mtp4_f16_replay_bytes": 10395427840,
+    "expanded_initializer_mtp4_f16_replay_gib": 9.6814966202,
+    "expanded_initializer_mtp4_f16_replay_headroom_to_9_7_gib_bytes": 19867853,
+    "expanded_initializer_mtp4_f16_replay_headroom_mib": 18.9474611282,
+    "expanded_initializer_mtp4_f16_aligned_bytes": 10633716736,
+    "expanded_initializer_mtp4_f16_aligned_gib": 9.9034204483,
+    "expanded_initializer_mtp4_f32_replay_bytes": 10554287104,
+    "expanded_initializer_mtp4_f32_replay_gib": 9.8294458389,
+    "operating_target_bytes": 10415295693,
+    "hard_limit_bytes": 10737418240
+  },
+  "decision": {
+    "admitted": "mtp4_f16_replay_on_reject",
+    "rejected_above_operating_target": [
+      "mtp4_f16_aligned_pages",
+      "mtp4_f32_replay_on_reject"
+    ],
+    "required_device_evidence": "FP16 recurrent-state quality and numerical stability must pass the BF16/FP32 golden suite before this calculated profile can become a release profile."
+  },
+  "verification": {
+    "authoritative_implementation": "src/memory.rs",
+    "command": "qwen38-memory-plan --context 131072 --linear-state f16 --mtp-draft-tokens 4 --speculative-state replay-on-reject --json"
+  },
+  "supersedes": [
+    "Any claim that the v2 9.6110-GiB initializer total already included an active MTP KV cache or speculative target-state storage"
+  ],
+  "does_not_change": [
+    "The v2 no-MTP calculated totals",
+    "Artifact bytes or SHA-256 digests",
+    "Logical Q2/Q4 assignments",
+    "Recovery-scale bytes"
+  ]
+}

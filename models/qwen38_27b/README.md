@@ -76,8 +76,10 @@ The expanded initializer in
 823,996 observed tokens. All 506 matrices, including embedding, LM head, and
 resident MTP, are activation weighted. The resulting 127-Q4/377-Q2/two-mixed
 assignment and trained channel-scale initializer produce a fully checksummed
-8,373,658,112-byte CTOXQ artifact and a corrected calculated 9.6110-GiB 128K whole-process
-plan. It is still not the release checkpoint: end-to-end KL, cross-entropy,
+8,373,658,112-byte CTOXQ artifact. Its no-MTP FP32-state 128K plan is 9.6110
+GiB; the corrected active-MTP4 FP16 replay plan is 9.6815 GiB. These remain
+calculated profiles rather than device measurements. It is still not the
+release checkpoint: end-to-end KL, cross-entropy,
 hidden-state, and MTP distillation plus held-out quality gates remain pending.
 
 The final quality-filtered corpus evidence in
@@ -147,8 +149,13 @@ the accepted token in context state.
 
 [`docs/MEMORY_PLAN_CORRECTION_V2.json`](docs/MEMORY_PLAN_CORRECTION_V2.json)
 records the 7.5-MiB causal-convolution state that the earlier calculated Fold
-figures omitted. The corrected initializer plan remains admitted below 9.7
-GiB; historical artifact hashes and byte counts are unchanged.
+figures omitted. The subsequent active-MTP correction in
+[`docs/MEMORY_PLAN_CORRECTION_V3.json`](docs/MEMORY_PLAN_CORRECTION_V3.json)
+adds the independent 72.1875-MiB MTP KV cache and speculative target-state
+strategy. Only FP16 state plus replay-on-reject keeps MTP4 below 9.7 GiB, with
+about 18.95 MiB calculated headroom; this profile still requires numerical and
+Android PSS/accelerator-memory evidence. Historical artifact hashes and byte
+counts are unchanged.
 
 [`docs/WIRE_PROTOCOL_V1.md`](docs/WIRE_PROTOCOL_V1.md) defines the matching
 versioned Unix-socket/named-pipe control and token-stream contract. The bring-up

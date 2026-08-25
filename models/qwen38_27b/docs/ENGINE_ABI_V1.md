@@ -39,8 +39,8 @@ operations are:
 
 An executor returns target logits and, when enabled, unverified MTP draft
 logits. It cannot claim acceptance itself: sampling belongs to the engine.
-Qwen3.8 has one native MTP layer, so v1 admits at most one draft distribution
-per decode. The engine verifies its argmax against the target-selected token,
+The current v1 correctness executor unrolls at most one draft distribution per
+decode. The engine verifies its argmax against the target-selected token,
 then reports proposed, verified, and accepted counts. The accepted draft is
 the one returned token, not an additional context transition, and is never
 counted twice. MTP output is rejected when the session disabled MTP.
@@ -52,6 +52,9 @@ that same state. Native-library and IPC callers therefore use the same seeded
 random stream. The current MTP verifier is deliberately restricted to
 temperature zero, where target/draft argmax equality is exact. Non-greedy MTP
 fails closed until a probability-correct rejection sampler is implemented.
+Production MTP will chain the native module for several drafts and verify the
+whole candidate block with rollback/replay state semantics; the one-layer
+checkpoint does not impose a one-token scheduler limit.
 
 An executor error, cancellation after partial execution, malformed logits, or
 an invalid MTP contract resets the entire session before another request is

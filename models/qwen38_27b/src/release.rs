@@ -11,6 +11,7 @@ use crate::backend::BackendKind;
 use crate::config::{Qwen38Config, MODEL_ID};
 use crate::format::RecoveryMode;
 use crate::loader::ModelArtifact;
+use crate::memory::{LinearStateDType, SpeculativeStateStrategy};
 use crate::{EngineError, Result};
 
 pub const RELEASE_FORMAT: &str = "ctox.model-release.v2";
@@ -149,8 +150,13 @@ pub struct MemoryProfile {
     pub resident_model_bytes: u64,
     pub persistent_backend_graph_bytes: u64,
     pub persistent_runtime_bytes: u64,
+    pub linear_state_dtype: LinearStateDType,
     pub linear_state_bytes_per_session: u64,
+    pub mtp_draft_tokens: u32,
+    pub speculative_state_strategy: SpeculativeStateStrategy,
+    pub speculative_linear_state_bytes_per_session: u64,
     pub kv: KvMemoryFormula,
+    pub mtp_kv: KvMemoryFormula,
     pub prefill_scratch_peak_bytes: u64,
     pub decode_scratch_peak_bytes: u64,
     pub loader_transient_peak_bytes: u64,
@@ -262,6 +268,8 @@ impl MemoryProfile {
     pub fn steady_bytes(&self) -> Result<u64> {
         let session_state = self
             .linear_state_bytes_per_session
+            .checked_add(self.speculative_linear_state_bytes_per_session)
+            .ok_or_else(|| EngineError::MemoryBudget("combined linear state overflows".into()))?
             .checked_mul(self.sessions as u64)
             .ok_or_else(|| EngineError::MemoryBudget("linear state overflows".into()))?;
         Self::checked_sum(
@@ -271,6 +279,7 @@ impl MemoryProfile {
                 self.persistent_runtime_bytes,
                 session_state,
                 self.kv.bytes(self.context_tokens, self.sessions)?,
+                self.mtp_kv.bytes(self.context_tokens, self.sessions)?,
                 self.accelerator_unattributed_reserve_bytes,
             ],
             "steady memory",
@@ -553,6 +562,24 @@ impl ReleaseManifest {
             {
                 return invalid("memory profile identity or dimensions are invalid");
             }
+            let expected_speculative_state = match profile.speculative_state_strategy {
+                SpeculativeStateStrategy::Disabled => 0,
+                SpeculativeStateStrategy::ReplayOnReject => profile.linear_state_bytes_per_session,
+                SpeculativeStateStrategy::AlignedPages => profile
+                    .linear_state_bytes_per_session
+                    .checked_mul(profile.mtp_draft_tokens as u64)
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget("profile speculative state overflows".into())
+                    })?,
+            };
+            let mtp_kv_bytes = profile.mtp_kv.bytes(profile.context_tokens, 1)?;
+            if (profile.mtp_draft_tokens == 0)
+                != (profile.speculative_state_strategy == SpeculativeStateStrategy::Disabled)
+                || profile.speculative_linear_state_bytes_per_session != expected_speculative_state
+                || (profile.mtp_draft_tokens == 0) != (mtp_kv_bytes == 0)
+            {
+                return invalid("memory profile MTP/state strategy is inconsistent");
+            }
             if profile.maximum_peak_bytes()? > profile.hard_limit_bytes {
                 return Err(EngineError::MemoryBudget(format!(
                     "memory profile {} exceeds its hard limit",
@@ -715,12 +742,22 @@ mod tests {
                 resident_model_bytes: 8_000_000_000,
                 persistent_backend_graph_bytes: 64 << 20,
                 persistent_runtime_bytes: 64 << 20,
+                linear_state_dtype: LinearStateDType::F32,
                 linear_state_bytes_per_session: 303 << 19,
+                mtp_draft_tokens: 0,
+                speculative_state_strategy: SpeculativeStateStrategy::Disabled,
+                speculative_linear_state_bytes_per_session: 0,
                 kv: KvMemoryFormula {
                     fixed_bytes_per_session: 0,
                     bytes_per_token_per_session: 9_216,
                     retained_q4_tokens_per_session: 384,
                     q4_delta_bytes_per_token: 8_192,
+                },
+                mtp_kv: KvMemoryFormula {
+                    fixed_bytes_per_session: 0,
+                    bytes_per_token_per_session: 0,
+                    retained_q4_tokens_per_session: 0,
+                    q4_delta_bytes_per_token: 0,
                 },
                 prefill_scratch_peak_bytes: 128 << 20,
                 decode_scratch_peak_bytes: 32 << 20,
@@ -845,6 +882,22 @@ mod tests {
         context_overflow.memory_profiles[0].context_tokens = 262_145;
         context_overflow.seal_unsigned().unwrap();
         assert!(context_overflow.validate().is_err());
+
+        let mut hidden_mtp_memory = manifest();
+        hidden_mtp_memory.memory_profiles[0].mtp_draft_tokens = 4;
+        hidden_mtp_memory.seal_unsigned().unwrap();
+        assert!(hidden_mtp_memory.validate().is_err());
+
+        let mut wrong_replay_bytes = manifest();
+        wrong_replay_bytes.memory_profiles[0].mtp_draft_tokens = 4;
+        wrong_replay_bytes.memory_profiles[0].speculative_state_strategy =
+            SpeculativeStateStrategy::ReplayOnReject;
+        wrong_replay_bytes.memory_profiles[0]
+            .mtp_kv
+            .fixed_bytes_per_session = 1;
+        wrong_replay_bytes.memory_profiles[0].speculative_linear_state_bytes_per_session = 1;
+        wrong_replay_bytes.seal_unsigned().unwrap();
+        assert!(wrong_replay_bytes.validate().is_err());
     }
 
     #[test]

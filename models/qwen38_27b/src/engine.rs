@@ -343,6 +343,13 @@ impl<E: ModelExecutor> Engine<E> {
                 reason: "executor does not advertise MTP".into(),
             });
         }
+        if options.mtp_enabled && self.memory_profile.mtp_draft_tokens == 0 {
+            return Err(EngineError::UnsupportedOperation {
+                backend: "model_executor",
+                operation: "mtp",
+                reason: "the admitted memory profile reserves no MTP runtime state".into(),
+            });
+        }
         if options.mtp_enabled && options.sampling.temperature != 0.0 {
             return Err(EngineError::UnsupportedOperation {
                 backend: "model_executor",
@@ -572,6 +579,7 @@ fn validate_executor<E: ModelExecutor>(
         || capabilities.maximum_context_tokens < memory_profile.context_tokens
         || capabilities.vocab_size == 0
         || capabilities.mtp != (capabilities.maximum_draft_tokens > 0)
+        || capabilities.maximum_draft_tokens < memory_profile.mtp_draft_tokens
     {
         return Err(EngineError::UnsupportedOperation {
             backend: "model_executor",
@@ -723,10 +731,20 @@ mod tests {
             resident_model_bytes: 10,
             persistent_backend_graph_bytes: 0,
             persistent_runtime_bytes: 0,
+            linear_state_dtype: crate::memory::LinearStateDType::F32,
             linear_state_bytes_per_session: 0,
+            mtp_draft_tokens: 1,
+            speculative_state_strategy: crate::memory::SpeculativeStateStrategy::ReplayOnReject,
+            speculative_linear_state_bytes_per_session: 0,
             kv: crate::release::KvMemoryFormula {
                 fixed_bytes_per_session: 0,
                 bytes_per_token_per_session: 1,
+                retained_q4_tokens_per_session: 0,
+                q4_delta_bytes_per_token: 0,
+            },
+            mtp_kv: crate::release::KvMemoryFormula {
+                fixed_bytes_per_session: 1,
+                bytes_per_token_per_session: 0,
                 retained_q4_tokens_per_session: 0,
                 q4_delta_bytes_per_token: 0,
             },

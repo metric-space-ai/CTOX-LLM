@@ -4,6 +4,12 @@ Status: **Contract**. No production CUDA kernel is authored in this change and
 no benchmark numbers are claimed. This note records the vendored baseline, the
 ABI the future kernel must satisfy, and the evidence required to promote.
 
+The serving evidence and non-transferable benchmark distinctions from the
+user-supplied RTX 3090 project are pinned separately in
+[`RTX3090_UPSTREAM_NOTES.md`](RTX3090_UPSTREAM_NOTES.md). In particular, its
+chained MTP, split-KV verify attention, FP16 recurrent state, and hybrid prefix
+cache inform CTOX candidates but do not promote a CTOX kernel.
+
 ## Vendored baseline
 
 Pinned llama.cpp revision `ef2d770117db45b05aa7ecd1b0acca36370c5470` (MIT,

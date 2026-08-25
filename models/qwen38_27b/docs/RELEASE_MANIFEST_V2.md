@@ -43,8 +43,11 @@ Each profile exposes exact components, not only artifact size:
 
 - resident model and MTP bytes;
 - persistent backend graph and runtime bytes;
-- linear-attention state per session;
-- KV fixed bytes, bytes per token, and Q4 sink/recent delta;
+- signed FP16/FP32 linear-attention state dtype and base bytes per session;
+- MTP draft depth plus `disabled`, `replay_on_reject`, or `aligned_pages`
+  target-state strategy and its additional bytes per session;
+- separate target and MTP KV fixed bytes, bytes per token, and Q4 sink/recent
+  deltas—the MTP cache may not be hidden inside an unattributed reserve;
 - prefill/decode scratch peaks;
 - loader transient peak and unattributed accelerator reserve.
 

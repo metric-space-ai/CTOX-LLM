@@ -876,6 +876,16 @@ impl ModelExecutor for CpuCorrectnessExecutor {
                 "CPU correctness executor is already loaded".into(),
             ));
         }
+        if profile.linear_state_dtype != crate::memory::LinearStateDType::F32
+            || profile.mtp_draft_tokens > 1
+        {
+            return Err(EngineError::UnsupportedOperation {
+                backend: "cpu",
+                operation: "correctness executor memory profile",
+                reason: "the scalar oracle owns FP32 state and at most one unrolled MTP draft"
+                    .into(),
+            });
+        }
         let admitted_context = usize::try_from(profile.context_tokens)
             .map_err(|_| EngineError::MemoryBudget("CPU context capacity exceeds usize".into()))?;
         if admitted_context == 0 || admitted_context > self.config.max_position_embeddings {
@@ -1442,8 +1452,18 @@ mod tests {
             resident_model_bytes: artifact.file_bytes(),
             persistent_backend_graph_bytes: 0,
             persistent_runtime_bytes: 0,
+            linear_state_dtype: crate::memory::LinearStateDType::F32,
             linear_state_bytes_per_session: 9_216,
+            mtp_draft_tokens: 0,
+            speculative_state_strategy: crate::memory::SpeculativeStateStrategy::Disabled,
+            speculative_linear_state_bytes_per_session: 0,
             kv: KvMemoryFormula {
+                fixed_bytes_per_session: 0,
+                bytes_per_token_per_session: 0,
+                retained_q4_tokens_per_session: 0,
+                q4_delta_bytes_per_token: 0,
+            },
+            mtp_kv: KvMemoryFormula {
                 fixed_bytes_per_session: 0,
                 bytes_per_token_per_session: 0,
                 retained_q4_tokens_per_session: 0,

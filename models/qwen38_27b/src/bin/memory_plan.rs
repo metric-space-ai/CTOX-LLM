@@ -1,6 +1,40 @@
-use clap::Parser;
-use ctox_qwen38_27b::memory::{FoldMemoryPlan, FOLD_WEIGHT_LIMIT_BYTES};
+use clap::{Parser, ValueEnum};
+use ctox_qwen38_27b::memory::{
+    FoldMemoryPlan, LinearStateDType, SpeculativeStateStrategy, FOLD_WEIGHT_LIMIT_BYTES,
+};
 use ctox_qwen38_27b::Qwen38Config;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LinearStateArg {
+    F16,
+    F32,
+}
+
+impl From<LinearStateArg> for LinearStateDType {
+    fn from(value: LinearStateArg) -> Self {
+        match value {
+            LinearStateArg::F16 => Self::F16,
+            LinearStateArg::F32 => Self::F32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SpeculativeStateArg {
+    Disabled,
+    ReplayOnReject,
+    AlignedPages,
+}
+
+impl From<SpeculativeStateArg> for SpeculativeStateStrategy {
+    fn from(value: SpeculativeStateArg) -> Self {
+        match value {
+            SpeculativeStateArg::Disabled => Self::Disabled,
+            SpeculativeStateArg::ReplayOnReject => Self::ReplayOnReject,
+            SpeculativeStateArg::AlignedPages => Self::AlignedPages,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(about = "Calculate and verify the Qwen3.8 Fold memory plan")]
@@ -9,14 +43,26 @@ struct Args {
     context: u64,
     #[arg(long, default_value_t = FOLD_WEIGHT_LIMIT_BYTES)]
     weights_bytes: u64,
+    #[arg(long, value_enum, default_value_t = LinearStateArg::F32)]
+    linear_state: LinearStateArg,
+    #[arg(long, default_value_t = 0)]
+    mtp_draft_tokens: u32,
+    #[arg(long, value_enum, default_value_t = SpeculativeStateArg::Disabled)]
+    speculative_state: SpeculativeStateArg,
     #[arg(long)]
     json: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let plan =
-        FoldMemoryPlan::for_context(&Qwen38Config::default(), args.context, args.weights_bytes)?;
+    let plan = FoldMemoryPlan::for_execution(
+        &Qwen38Config::default(),
+        args.context,
+        args.weights_bytes,
+        args.linear_state.into(),
+        args.mtp_draft_tokens,
+        args.speculative_state.into(),
+    )?;
     plan.verify()?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -35,10 +81,20 @@ fn main() -> anyhow::Result<()> {
             FoldMemoryPlan::gib(plan.kv_q4_recent_and_sink_bytes)
         );
         println!(
+            "MTP KV:         {:.3} GiB",
+            FoldMemoryPlan::gib(plan.mtp_kv_bytes)
+        );
+        println!(
             "linear state:   {:.3} GiB (recurrent {:.3} + conv {:.3})",
             FoldMemoryPlan::gib(plan.linear_state_bytes),
             FoldMemoryPlan::gib(plan.linear_recurrent_state_bytes),
             FoldMemoryPlan::gib(plan.linear_convolution_state_bytes)
+        );
+        println!(
+            "spec state:     {:.3} GiB ({:?}, {} drafts)",
+            FoldMemoryPlan::gib(plan.speculative_extra_linear_state_bytes),
+            plan.speculative_state_strategy,
+            plan.speculative_draft_tokens
         );
         println!(
             "runtime:        {:.3} GiB",
