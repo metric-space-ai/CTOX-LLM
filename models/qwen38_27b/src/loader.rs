@@ -17,6 +17,7 @@ pub struct ModelArtifact {
     mmap: Mmap,
     header: FileHeader,
     manifest: ModelManifest,
+    manifest_sha256: String,
 }
 
 impl ModelArtifact {
@@ -41,7 +42,9 @@ impl ModelArtifact {
                 "tensor data overlaps manifest".into(),
             ));
         }
-        let manifest: ModelManifest = serde_json::from_slice(&mmap[manifest_start..manifest_end])?;
+        let manifest_bytes = &mmap[manifest_start..manifest_end];
+        let manifest_sha256 = format!("{:x}", Sha256::digest(manifest_bytes));
+        let manifest: ModelManifest = serde_json::from_slice(manifest_bytes)?;
         let expected_format = format!("ctox.q2q4.v{}", header.version);
         if manifest.format != expected_format {
             return Err(EngineError::InvalidArtifact(format!(
@@ -67,6 +70,7 @@ impl ModelArtifact {
             mmap,
             header,
             manifest,
+            manifest_sha256,
         };
         if checksum_policy == ChecksumPolicy::AllTensors {
             artifact.verify_checksums()?;
@@ -76,6 +80,14 @@ impl ModelArtifact {
 
     pub fn manifest(&self) -> &ModelManifest {
         &self.manifest
+    }
+
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
+    pub fn file_bytes(&self) -> u64 {
+        self.mmap.len() as u64
     }
 
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {

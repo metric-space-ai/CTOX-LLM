@@ -623,5 +623,7 @@ mod tests {
         .unwrap();
         let artifact = ModelArtifact::open(path, ChecksumPolicy::AllTensors).unwrap();
         assert_eq!(artifact.manifest().tensors.len(), 1);
+        assert_eq!(artifact.manifest_sha256().len(), 64);
+        assert!(artifact.file_bytes() > HEADER_BYTES as u64);
     }
 }

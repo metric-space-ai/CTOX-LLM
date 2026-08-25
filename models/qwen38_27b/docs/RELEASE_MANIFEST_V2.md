@@ -32,6 +32,10 @@ must call `verify_signature` with a trusted public key selected outside the
 downloaded manifest; an embedded public key from the same download would not
 establish trust. Any changed tokenizer, template, model identity, package,
 chunk, loader policy, or memory number invalidates the digest and signature.
+After installation, `admit_artifact` also compares the opened CTOXQ file size,
+the SHA-256 of its original embedded manifest bytes, model/revision, physical
+target, trained-recovery digest, and fixed-qcode marker with the signed pack.
+Signing one manifest therefore cannot authorize a different local pack.
 
 ## Memory interpretation
 

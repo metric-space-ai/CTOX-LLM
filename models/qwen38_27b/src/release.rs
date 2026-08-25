@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::{Qwen38Config, MODEL_ID};
+use crate::format::RecoveryMode;
+use crate::loader::ModelArtifact;
 use crate::{EngineError, Result};
 
 pub const RELEASE_FORMAT: &str = "ctox.model-release.v2";
@@ -118,6 +120,7 @@ pub struct BackendPack {
     pub backend: BackendKind,
     pub hardware_profile: String,
     pub artifact: ReleaseFile,
+    pub artifact_target: String,
     pub artifact_manifest_sha256: String,
     pub logical_checkpoint_sha256: String,
     pub logical_tensor_root_sha256: String,
@@ -318,6 +321,19 @@ impl MemoryProfile {
 }
 
 impl ReleaseManifest {
+    pub fn backend_pack(&self, pack_id: &str) -> Result<&BackendPack> {
+        self.packages
+            .iter()
+            .flat_map(|package| &package.packs)
+            .find(|pack| pack.pack_id == pack_id)
+            .ok_or_else(|| {
+                EngineError::InvalidArtifact(format!(
+                    "backend pack {pack_id} is not in release {}",
+                    self.release_id
+                ))
+            })
+    }
+
     fn unsigned_bytes(&self) -> Result<Vec<u8>> {
         Ok(serde_json::to_vec(&UnsignedManifest {
             format: &self.format,
@@ -360,24 +376,36 @@ impl ReleaseManifest {
 
     pub fn verify_backend_pack_equivalence(&self, first: &str, second: &str) -> Result<()> {
         self.validate()?;
-        let find = |pack_id: &str| {
-            self.packages
-                .iter()
-                .flat_map(|package| &package.packs)
-                .find(|pack| pack.pack_id == pack_id)
-                .ok_or_else(|| {
-                    EngineError::InvalidArtifact(format!(
-                        "backend pack {pack_id} is not in release {}",
-                        self.release_id
-                    ))
-                })
-        };
-        let first = find(first)?;
-        let second = find(second)?;
+        let first = self.backend_pack(first)?;
+        let second = self.backend_pack(second)?;
         if first.logical_checkpoint_sha256 != second.logical_checkpoint_sha256
             || first.logical_tensor_root_sha256 != second.logical_tensor_root_sha256
         {
             return invalid("backend packs do not represent the same logical checkpoint");
+        }
+        Ok(())
+    }
+
+    pub fn admit_artifact(&self, pack_id: &str, artifact: &ModelArtifact) -> Result<()> {
+        self.validate()?;
+        let pack = self.backend_pack(pack_id)?;
+        let manifest = artifact.manifest();
+        if artifact.file_bytes() != pack.artifact.bytes
+            || artifact.manifest_sha256() != pack.artifact_manifest_sha256
+            || manifest.model != self.model.model_id
+            || manifest.revision != self.model.bf16_revision
+            || manifest.target != pack.artifact_target
+        {
+            return invalid("loaded artifact does not match its signed backend-pack identity");
+        }
+        let recovery = manifest.recovery.as_ref().ok_or_else(|| {
+            EngineError::InvalidArtifact("release artifact has no recovery provenance".into())
+        })?;
+        if recovery.mode != RecoveryMode::Trained
+            || recovery.artifact_sha256.as_deref() != Some(&self.model.recovery_sha256)
+            || !recovery.fixed_logical_qcodes
+        {
+            return invalid("release artifact recovery does not match canonical model identity");
         }
         Ok(())
     }
@@ -465,6 +493,7 @@ impl ReleaseManifest {
                 pack.artifact.validate()?;
                 if pack.pack_id.is_empty()
                     || pack.hardware_profile.is_empty()
+                    || pack.artifact_target.is_empty()
                     || !pack_ids.insert(&pack.pack_id)
                     || !pack_keys.insert((package.kind, pack.backend, &pack.hardware_profile))
                     || !file_paths.insert(&pack.artifact.relative_path)
@@ -579,9 +608,17 @@ fn invalid<T>(message: impl Into<String>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::*;
+    use crate::format::{
+        align_up, FileHeader, ModelManifest, RecoveryProvenance, TensorDType, TensorEntry,
+        DEFAULT_ALIGNMENT, HEADER_BYTES,
+    };
+    use crate::loader::ChecksumPolicy;
+    use crate::quant::{Q2Block64, BLOCK_LEN};
 
     fn digest(character: char) -> String {
         std::iter::repeat_n(character, 64).collect()
@@ -607,6 +644,7 @@ mod tests {
             backend: BackendKind::Cuda,
             hardware_profile: "sm86".into(),
             artifact: file("packs/text-cuda-sm86.ctoxq", 8_000_000_000, 'a'),
+            artifact_target: "cuda-sm86".into(),
             artifact_manifest_sha256: digest('b'),
             logical_checkpoint_sha256: digest('c'),
             logical_tensor_root_sha256: digest('d'),
@@ -693,6 +731,74 @@ mod tests {
         };
         manifest.seal_unsigned().unwrap();
         manifest
+    }
+
+    fn write_admitted_artifact(
+        release: &mut ReleaseManifest,
+    ) -> (tempfile::TempDir, ModelArtifact) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("text-cuda-sm86.ctoxq");
+        let payload = Q2Block64::quantize(&[0.25; BLOCK_LEN])
+            .unwrap()
+            .encode()
+            .to_vec();
+        let manifest = ModelManifest {
+            format: "ctox.q2q4.v1".into(),
+            model: MODEL_ID.into(),
+            revision: release.model.bf16_revision.clone(),
+            alignment: DEFAULT_ALIGNMENT,
+            target: "cuda-sm86".into(),
+            recovery: Some(RecoveryProvenance {
+                mode: RecoveryMode::Trained,
+                format: "ctox.recovery.channel-scales.v2".into(),
+                plan_sha256: digest('a'),
+                fixed_logical_qcodes: true,
+                artifact_sha256: Some(release.model.recovery_sha256.clone()),
+                activation_stats_sha256: Some(digest('b')),
+                report_sha256: Some(digest('c')),
+            }),
+            tensors: vec![TensorEntry {
+                name: "model.embed_tokens.weight".into(),
+                dtype: TensorDType::Q2B64,
+                shape: vec![1, BLOCK_LEN as u64],
+                offset: 0,
+                length: payload.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&payload)),
+                segments: Vec::new(),
+            }],
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let data_offset = align_up(
+            (HEADER_BYTES + manifest_bytes.len()) as u64,
+            DEFAULT_ALIGNMENT as u64,
+        )
+        .unwrap();
+        let header = FileHeader {
+            version: 1,
+            manifest_len: manifest_bytes.len() as u64,
+            data_offset,
+            tensor_count: 1,
+            alignment: DEFAULT_ALIGNMENT,
+        };
+        let mut file = Vec::from(header.encode());
+        file.extend_from_slice(&manifest_bytes);
+        file.resize(data_offset as usize, 0);
+        file.extend_from_slice(&payload);
+        fs::write(&path, &file).unwrap();
+
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors).unwrap();
+        let pack = &mut release.packages[0].packs[0];
+        pack.artifact.bytes = file.len() as u64;
+        pack.artifact.sha256 = format!("{:x}", Sha256::digest(&file));
+        pack.artifact.chunks = vec![FileChunk {
+            index: 0,
+            offset: 0,
+            length: file.len() as u64,
+            sha256: pack.artifact.sha256.clone(),
+        }];
+        pack.artifact_manifest_sha256 = artifact.manifest_sha256().into();
+        release.seal_unsigned().unwrap();
+        (directory, artifact)
     }
 
     #[test]
@@ -785,5 +891,16 @@ mod tests {
         assert!(manifest
             .verify_backend_pack_equivalence("text-cuda-sm86", "text-metal-apple9")
             .is_err());
+    }
+
+    #[test]
+    fn signed_pack_identity_admits_only_the_bound_ctoxq_manifest() {
+        let mut release = manifest();
+        let (_directory, artifact) = write_admitted_artifact(&mut release);
+        release.admit_artifact("text-cuda-sm86", &artifact).unwrap();
+
+        release.packages[0].packs[0].artifact_manifest_sha256 = digest('9');
+        release.seal_unsigned().unwrap();
+        assert!(release.admit_artifact("text-cuda-sm86", &artifact).is_err());
     }
 }
