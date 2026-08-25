@@ -19,12 +19,11 @@
 // fp16 representation and are widened only in registers. Scales are optional;
 // absent pointers imply 1.0 for s_in/s_out and 0.0 for bias.
 //
-// Dispatch organization: one threadgroup per output row. Threads in the group
-// cover the 64-value blocks of the row cooperatively; each thread fully
-// accumulates its assigned blocks with float4/ushort4 vectorized loads, then a
-// simdgroup reduction followed by a threadgroup reduction produces the row
-// sum. Rows and columns are bounds-checked, and trailing partial blocks are
-// handled element-wise.
+// Dispatch organization: every 32-wide simdgroup produces four output rows.
+// Each lane owns two values of every 64-value block, loads input/s_in once,
+// and reuses those values across the four rows. This follows the multi-row
+// matvec organization used by upstream ggml Metal while preserving
+// CTOX's distinct Q2_B64/Q4_B64 codes and fused recovery semantics.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -65,77 +64,81 @@ inline float q2_normalized(uint code) {
                       :  1.0f;
 }
 
-template <uint BLOCK_BYTES, bool IS_Q2>
-inline float fused_row_dot(device const uchar* weights,
-                           device const float* input,
-                           device const half* s_in,
-                           constant FusedMatVecParams& params,
-                           uint row,
-                           uint lane,
-                           uint lanes_per_group) {
-    constexpr uint CODE_BYTES = BLOCK_BYTES - 2;
-    float partial = 0.0f;
-    device const uchar* row_base = weights + ulong(row) * params.blocks_per_row * BLOCK_BYTES;
-    for (uint block = lane; block < params.blocks_per_row; block += lanes_per_group) {
-        uint column_start = block * Q2Q4_BLOCK_LEN;
-        // Bounds-check columns: trailing partial blocks contribute only the
-        // valid prefix; columns beyond `columns` contribute zero.
-        uint valid = min(uint(Q2Q4_BLOCK_LEN), params.columns - column_start);
-        device const uchar* block_base = row_base + ulong(block) * BLOCK_BYTES;
-        float scale = read_scale(block_base);
-        device const uchar* codes = block_base + 2;
-        float block_sum = 0.0f;
-        for (uint byte_index = 0; byte_index < CODE_BYTES; ++byte_index) {
-            uint packed = uint(codes[byte_index]);
-            constexpr uint VALUES_PER_BYTE = IS_Q2 ? 4 : 2;
-            for (uint packed_lane = 0; packed_lane < VALUES_PER_BYTE; ++packed_lane) {
-                uint value_index = byte_index * VALUES_PER_BYTE + packed_lane;
-                if (value_index >= valid) {
-                    continue;
-                }
-                uint bits_per_value = IS_Q2 ? 2u : 4u;
-                uint mask = IS_Q2 ? 0x3u : 0xfu;
-                uint code = (packed >> (packed_lane * bits_per_value)) & mask;
-                float normalized = IS_Q2 ? q2_normalized(code)
-                                         : ((float(code) - 7.5f) / 7.5f);
-                uint column = column_start + value_index;
-                float gate = params.has_s_in != 0u ? float(s_in[column]) : 1.0f;
-                block_sum = fma(scale * normalized, input[column] * gate, block_sum);
-            }
+constant uint ROWS_PER_SIMDGROUP = 4;
+
+inline void finish_rows(thread float* partial,
+                        device const half* s_out,
+                        device const float* bias,
+                        device float* output,
+                        constant FusedMatVecParams& params,
+                        uint first_row,
+                        uint simd_lane) {
+    for (uint row_offset = 0; row_offset < ROWS_PER_SIMDGROUP; ++row_offset) {
+        uint row = first_row + row_offset;
+        if (row >= params.rows) {
+            continue;
         }
-        partial += block_sum;
+        float total = simd_sum(partial[row_offset]);
+        if (simd_lane == 0u) {
+            total += params.has_bias != 0u ? bias[row] : 0.0f;
+            total *= params.has_s_out != 0u ? float(s_out[row]) : 1.0f;
+            output[row] = apply_activation(total, params.activation);
+        }
     }
-    // Simdgroup reduction, then threadgroup reduction across simdgroups is
-    // handled by the caller via a shared scratch buffer.
-    return partial;
 }
 
-inline void reduce_and_store(threadgroup float* scratch,
-                             float partial,
-                             uint row,
-                             uint lane,
-                             uint simd_lane,
-                             uint simd_group,
-                             uint lanes_per_group,
-                             constant FusedMatVecParams& params,
-                             device const half* s_out,
-                             device const float* bias,
-                             device float* output) {
-    float simd_total = simd_sum(partial);
-    if (simd_lane == 0u) {
-        scratch[simd_group] = simd_total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0u) {
-        uint group_count = (lanes_per_group + 31u) / 32u;
-        float total = 0.0f;
-        for (uint g = 0; g < group_count; ++g) {
-            total += scratch[g];
+template <uint BLOCK_BYTES, bool IS_Q2>
+inline void fused_rows(device const uchar* weights,
+                       device const float* input,
+                       device const half* s_in,
+                       device const half* s_out,
+                       device const float* bias,
+                       device float* output,
+                       constant FusedMatVecParams& params,
+                       uint first_row,
+                       uint simd_lane) {
+    float partial[ROWS_PER_SIMDGROUP] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint block = 0; block < params.blocks_per_row; ++block) {
+        uint column_start = block * Q2Q4_BLOCK_LEN;
+        uint value0 = simd_lane;
+        uint value1 = simd_lane + 32u;
+        uint column0 = column_start + value0;
+        uint column1 = column_start + value1;
+        float x0 = input[column0];
+        float x1 = input[column1];
+        if (params.has_s_in != 0u) {
+            x0 *= float(s_in[column0]);
+            x1 *= float(s_in[column1]);
         }
-        total += params.has_bias != 0u ? bias[row] : 0.0f;
-        total *= params.has_s_out != 0u ? float(s_out[row]) : 1.0f;
-        output[row] = apply_activation(total, params.activation);
+        for (uint row_offset = 0; row_offset < ROWS_PER_SIMDGROUP; ++row_offset) {
+            uint row = first_row + row_offset;
+            if (row >= params.rows) {
+                continue;
+            }
+            device const uchar* block_base = weights
+                + ulong(row) * params.blocks_per_row * BLOCK_BYTES
+                + ulong(block) * BLOCK_BYTES;
+            float scale = read_scale(block_base);
+            device const uchar* codes = block_base + 2;
+            if (IS_Q2) {
+                uint packed0 = uint(codes[value0 / 4u]);
+                uint packed1 = uint(codes[value1 / 4u]);
+                uint code0 = (packed0 >> ((value0 % 4u) * 2u)) & 0x3u;
+                uint code1 = (packed1 >> ((value1 % 4u) * 2u)) & 0x3u;
+                partial[row_offset] += scale
+                    * (q2_normalized(code0) * x0 + q2_normalized(code1) * x1);
+            } else {
+                uint packed0 = uint(codes[value0 / 2u]);
+                uint packed1 = uint(codes[value1 / 2u]);
+                uint code0 = (packed0 >> ((value0 % 2u) * 4u)) & 0xfu;
+                uint code1 = (packed1 >> ((value1 % 2u) * 4u)) & 0xfu;
+                float normalized0 = (float(code0) - 7.5f) * (1.0f / 7.5f);
+                float normalized1 = (float(code1) - 7.5f) * (1.0f / 7.5f);
+                partial[row_offset] += scale * (normalized0 * x0 + normalized1 * x1);
+            }
+        }
     }
+    finish_rows(partial, s_out, bias, output, params, first_row, simd_lane);
 }
 
 // Q2_B64 fused matvec candidate entry point.
@@ -147,20 +150,17 @@ kernel void q2_b64_fused_matvec(
     device const float* bias [[buffer(4)]],
     device float* output [[buffer(5)]],
     constant FusedMatVecParams& params [[buffer(6)]],
-    threadgroup float* scratch [[threadgroup(0)]],
     uint group_id [[threadgroup_position_in_grid]],
-    uint lane [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
     uint lanes_per_group [[threads_per_threadgroup]]) {
-    // Bounds-check rows: excess threadgroups exit without touching memory.
-    if (group_id >= params.rows) {
+    uint simd_groups = (lanes_per_group + 31u) / 32u;
+    uint first_row = (group_id * simd_groups + simd_group) * ROWS_PER_SIMDGROUP;
+    if (first_row >= params.rows) {
         return;
     }
-    float partial = fused_row_dot<Q2_BLOCK_BYTES, true>(
-        weights, input, s_in, params, group_id, lane, lanes_per_group);
-    reduce_and_store(scratch, partial, group_id, lane, simd_lane, simd_group,
-                     lanes_per_group, params, s_out, bias, output);
+    fused_rows<Q2_BLOCK_BYTES, true>(weights, input, s_in, s_out, bias,
+                                     output, params, first_row, simd_lane);
 }
 
 // Q4_B64 fused matvec candidate entry point.
@@ -172,18 +172,15 @@ kernel void q4_b64_fused_matvec(
     device const float* bias [[buffer(4)]],
     device float* output [[buffer(5)]],
     constant FusedMatVecParams& params [[buffer(6)]],
-    threadgroup float* scratch [[threadgroup(0)]],
     uint group_id [[threadgroup_position_in_grid]],
-    uint lane [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
     uint lanes_per_group [[threads_per_threadgroup]]) {
-    // Bounds-check rows: excess threadgroups exit without touching memory.
-    if (group_id >= params.rows) {
+    uint simd_groups = (lanes_per_group + 31u) / 32u;
+    uint first_row = (group_id * simd_groups + simd_group) * ROWS_PER_SIMDGROUP;
+    if (first_row >= params.rows) {
         return;
     }
-    float partial = fused_row_dot<Q4_BLOCK_BYTES, false>(
-        weights, input, s_in, params, group_id, lane, lanes_per_group);
-    reduce_and_store(scratch, partial, group_id, lane, simd_lane, simd_group,
-                     lanes_per_group, params, s_out, bias, output);
+    fused_rows<Q4_BLOCK_BYTES, false>(weights, input, s_in, s_out, bias,
+                                      output, params, first_row, simd_lane);
 }

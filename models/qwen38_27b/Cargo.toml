@@ -58,3 +58,8 @@ path = "src/bin/kernel_bench.rs"
 [[bin]]
 name = "qwen38-roofline-gate"
 path = "src/bin/roofline_gate.rs"
+
+[[bin]]
+name = "qwen38-metal-bench"
+path = "src/bin/metal_bench.rs"
+required-features = ["metal"]

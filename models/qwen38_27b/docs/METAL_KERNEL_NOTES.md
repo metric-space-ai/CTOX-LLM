@@ -30,7 +30,8 @@ exist in this format.
   (`half`), 4 bias (`float`), 5 output (`float`), 6 params
   (`FusedMatVecParams`, eight LE u32 words, 32 bytes: rows, columns,
   blocks_per_row, has_s_in, has_s_out, has_bias, activation, reserved).
-- threadgroup(0): 8 f32 scratch slots for the cross-simdgroup reduction.
+- No threadgroup scratch allocation: every output row is reduced wholly inside
+  one simdgroup.
 - Fused semantics identical to the CPU oracle:
   `y[r] = act(s_out[r] * (sum_c w[r,c] * x[c] * s_in[c] + bias[r]))`,
   activation 0 = identity, 1 = SiLU (`x / (1 + exp(-x))`).
@@ -40,12 +41,18 @@ exist in this format.
 
 ## Organization
 
-One threadgroup per output row (grid = rows); threads stride over the row's
-64-value blocks and decode directly into the dot product without a per-thread
-dequantization array. Per-thread partials are reduced with `simd_sum` plus a
-threadgroup scratch pass; lane 0 applies bias/s_out/activation. Rows and
-columns are bounds-checked; trailing partial blocks contribute only their
-valid prefix.
+The current candidate assigns four output rows to each 32-wide simdgroup. A
+lane processes two positions from every 64-value block and reuses its corrected
+input values across the four rows. Each row ends in an independent `simd_sum`;
+lane zero applies bias, `s_out`, and activation. The host can sweep one, two,
+four, or eight simdgroups per threadgroup and will eventually pin the winner
+per hardware profile and matrix shape.
+
+`PreparedMetalMatVec` allocates immutable weights, packed recovery scales,
+bias, parameters, input, and output once. Repeated dispatches reuse those
+buffers, and `write_input` changes only the decode activation vector. This
+proves resident per-operation ownership but is not yet the final zero-copy
+CTOXQ import or full-graph arena.
 
 ## Validation evidence (this worktree, Apple M5)
 
@@ -57,6 +64,12 @@ valid prefix.
   dispatches Q2 and Q4 on the 10-core Apple M5 GPU. Eleven 192-column rows use
   non-identity packed-FP16 `s_in`/`s_out`, bias, and SiLU, and pass the scalar
   CPU oracle tolerance for every output row.
+- `prepared_projection_reuses_resident_buffers_and_updates_only_input` proves
+  that a second dispatch changes output after updating only the existing input
+  buffer and rejects a mismatched input shape.
+- `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
+  those resident buffers, reports the exact requested buffer bytes, and keeps
+  its output marked `verifier_only_not_promotion_evidence`.
 - The complete suite also covers ABI constants against `src/quant.rs`, invalid
   shape/buffer rejection, dispatch-name checks, and an in-test `xcrun metal`
   compilation of the source.
@@ -70,7 +83,14 @@ dequantization array before this source was accepted.
 - The verifier currently creates shared staging buffers for an isolated
   operation. It is not evidence for resident model tensors or the required
   no-duplicate loader ownership contract.
-- No sustained device-resident benchmark or roofline evidence exists yet.
+- Exploratory 5120x5120 measurements exposed a large unresolved kernel gap.
+  The best observed intervals reached roughly 5.81 GB/s for Q2 and 11.08 GB/s
+  for Q4, while the earlier CTOX M5 hardware probe measured approximately
+  60.6 GB/s sustained read bandwidth at a large working set. These small-matrix
+  figures are not directly comparable roofline evidence, vary under desktop
+  load, and deliberately fail promotion rather than being presented as wins.
+- No controlled size/residue/thermal sweep or hardware-counter roofline
+  evidence exists yet.
 - No full embedding, attention, GatedDeltaNet, MTP, sampling, or model-graph
   Metal execution exists yet.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;

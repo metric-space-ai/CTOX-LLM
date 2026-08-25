@@ -9,31 +9,98 @@ use std::mem::size_of_val;
 use std::slice;
 
 use metal_driver::{
-    CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
+    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
     MTLResourceOptions, MTLSize,
 };
 
 use super::metal::{
-    validate_operation, MetalBufferAbi, Q2_KERNEL_NAME, Q4_KERNEL_NAME, REDUCTION_SCRATCH_FLOATS,
+    validate_operation, MetalBufferAbi, MAX_SIMDGROUPS_PER_THREADGROUP, Q2_KERNEL_NAME,
+    Q4_KERNEL_NAME,
 };
 use super::{FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
 use crate::{EngineError, Result};
 
 const KERNEL_SOURCE: &str = include_str!("../../kernels/metal/q2q4_fused_matvec.metal");
-const MAX_THREADS_PER_GROUP: usize = REDUCTION_SCRATCH_FLOATS * 32;
+const MAX_THREADS_PER_GROUP: usize = MAX_SIMDGROUPS_PER_THREADGROUP * 32;
+const DEFAULT_SIMDGROUPS: usize = 2;
+const ROWS_PER_SIMDGROUP: usize = 4;
 
 /// An explicitly verifier-only Metal runtime owning compiled MSL pipelines.
 ///
 /// Creating this object compiles the in-crate source through the native Metal
-/// driver. Dispatches allocate shared buffers for the small verifier inputs;
-/// production graph residency and zero-copy weight ownership are separate
-/// promotion requirements and are not claimed by this type.
+/// driver. Callers may prepare and retain shared Metal buffers across
+/// dispatches; zero-copy artifact import and full-graph ownership remain
+/// separate promotion requirements and are not claimed by this type.
 pub struct MetalCandidateRuntime {
     device: Device,
     queue: CommandQueue,
     q2_pipeline: ComputePipelineState,
     q4_pipeline: ComputePipelineState,
+}
+
+/// Device buffers for one prepared projection. Weight and recovery buffers
+/// are immutable and stay resident across dispatches; only the small input
+/// buffer needs updating between decode tokens.
+pub struct PreparedMetalMatVec {
+    dtype: TensorDType,
+    rows: usize,
+    columns: usize,
+    thread_width: usize,
+    weights_buffer: Buffer,
+    input_buffer: Buffer,
+    s_in_buffer: Buffer,
+    s_out_buffer: Buffer,
+    bias_buffer: Buffer,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    resident_bytes: usize,
+}
+
+impl PreparedMetalMatVec {
+    pub fn dtype(&self) -> TensorDType {
+        self.dtype
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// Exact requested Metal buffer bytes owned by this prepared operation.
+    /// Allocator page rounding is intentionally not inferred here and must be
+    /// measured separately for full-process residency evidence.
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    /// Replaces the decode input without reallocating weights, corrections,
+    /// output, or parameter buffers.
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        if input.len() != self.columns {
+            return Err(EngineError::Shape(format!(
+                "Metal prepared input has {} values, expected {}",
+                input.len(),
+                self.columns
+            )));
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidArtifact(
+                "Metal prepared input contains a non-finite value".into(),
+            ));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                self.input_buffer.contents().cast::<f32>(),
+                input.len(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl MetalCandidateRuntime {
@@ -88,13 +155,31 @@ impl MetalCandidateRuntime {
     /// Executes the candidate kernel with its exact CTOXQ FP16 recovery-scale
     /// ABI. There is no CPU or alternate-kernel fallback.
     pub fn dispatch_fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<Vec<f32>> {
+        let prepared = self.prepare_fused_matvec(operation)?;
+        self.dispatch_prepared(&prepared)
+    }
+
+    /// Copies one operation into reusable shared Metal buffers. This is the
+    /// verifier precursor to the final mmap/no-copy graph loader: repeated
+    /// dispatches no longer duplicate immutable tensor data.
+    pub fn prepare_fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<PreparedMetalMatVec> {
+        self.prepare_fused_matvec_with_simdgroups(operation, DEFAULT_SIMDGROUPS)
+    }
+
+    /// Autotuning entry point. Release profiles pin the winning simdgroup
+    /// count per operation shape instead of relying on a global default.
+    pub fn prepare_fused_matvec_with_simdgroups(
+        &self,
+        operation: &FusedMatVec<'_>,
+        simdgroups: usize,
+    ) -> Result<PreparedMetalMatVec> {
         let (layout, params) = validate_operation(operation)?;
         let pipeline = match layout.dtype {
             TensorDType::Q2B64 => &self.q2_pipeline,
             TensorDType::Q4B64 => &self.q4_pipeline,
             _ => unreachable!("Metal validation accepts only Q2/Q4"),
         };
-        let thread_width = dispatch_width(pipeline)?;
+        let thread_width = dispatch_width(pipeline, simdgroups)?;
         let dummy_half = [0_u8; 2];
         let dummy_float = [0.0_f32];
         let s_in = fp16_bytes_or_dummy(operation.s_in, &dummy_half);
@@ -116,29 +201,84 @@ impl MetalCandidateRuntime {
             .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
         let params_buffer = buffer_with_data(&self.device, &params);
 
+        let resident_bytes = operation
+            .weights
+            .len()
+            .checked_add(size_of_val(operation.input))
+            .and_then(|total| total.checked_add(s_in.len()))
+            .and_then(|total| total.checked_add(s_out.len()))
+            .and_then(|total| total.checked_add(size_of_val(bias)))
+            .and_then(|total| total.checked_add(output_bytes))
+            .and_then(|total| total.checked_add(params.len()))
+            .ok_or_else(|| EngineError::Shape("Metal resident byte count overflows".into()))?;
+        Ok(PreparedMetalMatVec {
+            dtype: layout.dtype,
+            rows: operation.rows,
+            columns: operation.columns,
+            thread_width,
+            weights_buffer,
+            input_buffer,
+            s_in_buffer,
+            s_out_buffer,
+            bias_buffer,
+            output_buffer,
+            params_buffer,
+            resident_bytes,
+        })
+    }
+
+    /// Dispatches an already resident projection. Command encoding and
+    /// completion remain synchronous so verifier and benchmark callers obtain
+    /// an unambiguous interval and completed output.
+    pub fn dispatch_prepared(&self, prepared: &PreparedMetalMatVec) -> Result<Vec<f32>> {
+        let pipeline = match prepared.dtype {
+            TensorDType::Q2B64 => &self.q2_pipeline,
+            TensorDType::Q4B64 => &self.q4_pipeline,
+            _ => unreachable!("prepared Metal operation is Q2/Q4"),
+        };
+
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-q2q4-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(MetalBufferAbi::WEIGHTS as u64, Some(&weights_buffer), 0);
-        encoder.set_buffer(MetalBufferAbi::INPUT as u64, Some(&input_buffer), 0);
-        encoder.set_buffer(MetalBufferAbi::S_IN as u64, Some(&s_in_buffer), 0);
-        encoder.set_buffer(MetalBufferAbi::S_OUT as u64, Some(&s_out_buffer), 0);
-        encoder.set_buffer(MetalBufferAbi::BIAS as u64, Some(&bias_buffer), 0);
-        encoder.set_buffer(MetalBufferAbi::OUTPUT as u64, Some(&output_buffer), 0);
-        encoder.set_buffer(MetalBufferAbi::PARAMS as u64, Some(&params_buffer), 0);
-        encoder.set_threadgroup_memory_length(
-            MetalBufferAbi::REDUCTION_SCRATCH as u64,
-            (REDUCTION_SCRATCH_FLOATS * std::mem::size_of::<f32>()) as u64,
+        encoder.set_buffer(
+            MetalBufferAbi::WEIGHTS as u64,
+            Some(&prepared.weights_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::INPUT as u64,
+            Some(&prepared.input_buffer),
+            0,
+        );
+        encoder.set_buffer(MetalBufferAbi::S_IN as u64, Some(&prepared.s_in_buffer), 0);
+        encoder.set_buffer(
+            MetalBufferAbi::S_OUT as u64,
+            Some(&prepared.s_out_buffer),
+            0,
+        );
+        encoder.set_buffer(MetalBufferAbi::BIAS as u64, Some(&prepared.bias_buffer), 0);
+        encoder.set_buffer(
+            MetalBufferAbi::OUTPUT as u64,
+            Some(&prepared.output_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
         );
         encoder.dispatch_thread_groups(
             MTLSize {
-                width: operation.rows as u64,
+                width: prepared
+                    .rows
+                    .div_ceil((prepared.thread_width / 32) * ROWS_PER_SIMDGROUP)
+                    as u64,
                 height: 1,
                 depth: 1,
             },
             MTLSize {
-                width: thread_width as u64,
+                width: prepared.thread_width as u64,
                 height: 1,
                 depth: 1,
             },
@@ -156,7 +296,11 @@ impl MetalCandidateRuntime {
         // StorageModeShared makes the completed result coherently visible to
         // the CPU on Apple Silicon. Copy before the Metal buffer is dropped.
         let output = unsafe {
-            slice::from_raw_parts(output_buffer.contents().cast::<f32>(), operation.rows).to_vec()
+            slice::from_raw_parts(
+                prepared.output_buffer.contents().cast::<f32>(),
+                prepared.rows,
+            )
+            .to_vec()
         };
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
@@ -167,7 +311,7 @@ impl MetalCandidateRuntime {
     }
 }
 
-fn dispatch_width(pipeline: &ComputePipelineState) -> Result<usize> {
+fn dispatch_width(pipeline: &ComputePipelineState, simdgroups: usize) -> Result<usize> {
     let execution_width = pipeline.thread_execution_width() as usize;
     let maximum = pipeline.max_total_threads_per_threadgroup() as usize;
     if execution_width == 0 || maximum < execution_width {
@@ -175,11 +319,22 @@ fn dispatch_width(pipeline: &ComputePipelineState) -> Result<usize> {
             "Metal pipeline reports an invalid execution width".into(),
         ));
     }
-    let capped = maximum.min(MAX_THREADS_PER_GROUP);
-    let width = capped / execution_width * execution_width;
-    if width == 0 || width.div_ceil(32) > REDUCTION_SCRATCH_FLOATS {
+    if !matches!(simdgroups, 1 | 2 | 4 | 8) {
+        return Err(EngineError::Shape(format!(
+            "Metal simdgroup count must be one of 1,2,4,8, got {simdgroups}"
+        )));
+    }
+    let width = execution_width
+        .checked_mul(simdgroups)
+        .ok_or_else(|| EngineError::Shape("Metal thread width overflows".into()))?;
+    if width > maximum || width > MAX_THREADS_PER_GROUP {
+        return Err(EngineError::InvalidState(format!(
+            "Metal pipeline cannot dispatch {simdgroups} simdgroups"
+        )));
+    }
+    if width == 0 || width.div_ceil(32) > MAX_SIMDGROUPS_PER_THREADGROUP {
         return Err(EngineError::InvalidState(
-            "Metal pipeline cannot satisfy the reduction scratch ABI".into(),
+            "Metal pipeline exceeds the supported simdgroup count".into(),
         ));
     }
     Ok(width)
@@ -277,17 +432,78 @@ mod tests {
                 activation: Activation::Silu,
             };
             let expected = cpu.fused_matvec(&operation).expect("scalar oracle");
-            let actual = runtime
-                .dispatch_fused_matvec(&operation)
-                .expect("Metal candidate dispatch");
-            for (row, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
-                let absolute = (expected - actual).abs();
-                let tolerance = 2.0e-4_f32.max(expected.abs() * 3.0e-5);
-                assert!(
-                    absolute <= tolerance,
-                    "{dtype:?} row {row}: expected {expected}, got {actual}, absolute error {absolute}, tolerance {tolerance}"
-                );
+            for simdgroups in [1, 2, 4, 8] {
+                let prepared = runtime
+                    .prepare_fused_matvec_with_simdgroups(&operation, simdgroups)
+                    .expect("prepare Metal geometry");
+                let actual = runtime
+                    .dispatch_prepared(&prepared)
+                    .expect("Metal candidate dispatch");
+                for (row, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+                    let absolute = (expected - actual).abs();
+                    let tolerance = 2.0e-4_f32.max(expected.abs() * 3.0e-5);
+                    assert!(
+                        absolute <= tolerance,
+                        "{dtype:?} simdgroups {simdgroups} row {row}: expected {expected}, got {actual}, absolute error {absolute}, tolerance {tolerance}"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn prepared_projection_reuses_resident_buffers_and_updates_only_input() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let rows = 3;
+        let columns = BLOCK_LEN;
+        let weights = packed_weights(TensorDType::Q4B64, rows, columns);
+        let input: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.05).sin())
+            .collect();
+        let operation = FusedMatVec {
+            dtype: TensorDType::Q4B64,
+            weights: &weights,
+            segments: &[],
+            rows,
+            columns,
+            input: &input,
+            s_in: None,
+            s_out: None,
+            bias: None,
+            activation: Activation::Identity,
+        };
+        let prepared = runtime
+            .prepare_fused_matvec(&operation)
+            .expect("prepare resident projection");
+        assert!(runtime
+            .prepare_fused_matvec_with_simdgroups(&operation, 3)
+            .is_err());
+        assert_eq!(prepared.dtype(), TensorDType::Q4B64);
+        assert_eq!(prepared.rows(), rows);
+        assert_eq!(prepared.columns(), columns);
+        assert_eq!(
+            prepared.resident_bytes(),
+            weights.len()
+                + size_of_val(input.as_slice())
+                + 2
+                + 2
+                + size_of_val(&[0.0_f32])
+                + rows * std::mem::size_of::<f32>()
+                + 32
+        );
+        let first = runtime
+            .dispatch_prepared(&prepared)
+            .expect("first resident dispatch");
+        assert!(first.iter().any(|value| value.abs() > 1.0e-4));
+
+        let zero_input = vec![0.0; columns];
+        prepared
+            .write_input(&zero_input)
+            .expect("update resident input");
+        let second = runtime
+            .dispatch_prepared(&prepared)
+            .expect("second resident dispatch");
+        assert!(second.iter().all(|value| value.abs() <= f32::EPSILON));
+        assert!(prepared.write_input(&[0.0; 3]).is_err());
     }
 }

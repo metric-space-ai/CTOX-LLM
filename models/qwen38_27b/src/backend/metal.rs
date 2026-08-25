@@ -30,9 +30,8 @@ pub const Q4_CODE_BYTES: usize = 32;
 /// Values encoded by the Q2 two-bit codes, in code order.
 pub const Q2_CODEBOOK: [f32; 4] = [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0];
 
-/// Number of f32 scratch slots per threadgroup for the two-stage
-/// simdgroup -> threadgroup reduction (one slot per 32-wide simdgroup).
-pub const REDUCTION_SCRATCH_FLOATS: usize = 8;
+/// Largest candidate threadgroup profile: eight 32-wide simdgroups.
+pub const MAX_SIMDGROUPS_PER_THREADGROUP: usize = 8;
 
 /// Metal buffer bindings shared by both candidate kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +45,6 @@ impl MetalBufferAbi {
     pub const BIAS: u32 = 4;
     pub const OUTPUT: u32 = 5;
     pub const PARAMS: u32 = 6;
-    /// threadgroup(0) scratch used by the cross-simdgroup reduction.
-    pub const REDUCTION_SCRATCH: u32 = 0;
 }
 
 /// Activation codes consumed by `apply_activation` in the MSL source.
@@ -325,7 +322,7 @@ mod tests {
         assert_eq!(Q4_CODE_BYTES * 2, BLOCK_LEN);
         assert_eq!(Q2_CODEBOOK, crate::quant::Q2_CODEBOOK);
         assert_eq!(MetalFusedMatVecParams::BYTE_LEN, 32);
-        assert_eq!(REDUCTION_SCRATCH_FLOATS * 32, 256);
+        assert_eq!(MAX_SIMDGROUPS_PER_THREADGROUP * 32, 256);
     }
 
     #[test]
