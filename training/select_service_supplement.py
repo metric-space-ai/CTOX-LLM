@@ -309,6 +309,8 @@ def main() -> None:
     parser.add_argument("--service-rubric", type=Path, required=True)
     parser.add_argument("--partition", choices=("train", "evaluation"), required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output-domain-tags", type=Path, required=True)
+    parser.add_argument("--output-service-tags", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
     try:
@@ -341,6 +343,14 @@ def main() -> None:
         )
         selected_sha256 = write_jsonl_atomic(args.output, selected)
         selected_ids = {str(record["id"]) for record in selected}
+        selected_domain_tags_sha256 = write_jsonl_atomic(
+            args.output_domain_tags,
+            [candidate_domain_tags[str(record["id"])] for record in selected],
+        )
+        selected_service_tags_sha256 = write_jsonl_atomic(
+            args.output_service_tags,
+            [candidate_service_tags[str(record["id"])] for record in selected],
+        )
         combined = baseline + selected
         combined_domain_tags = dict(baseline_domain_tags)
         combined_domain_tags.update(
@@ -371,6 +381,8 @@ def main() -> None:
                 "selected_records": len(selected),
                 "selected_tokens": sum(token_costs[str(record["id"])] for record in selected),
                 "selected_sha256": selected_sha256,
+                "selected_domain_tags_sha256": selected_domain_tags_sha256,
+                "selected_service_tags_sha256": selected_service_tags_sha256,
                 **evidence,
                 "final_report": final_report,
             },
