@@ -112,3 +112,8 @@ warmup, single-session prefill/decode, MTP verification accounting,
 cancellation, reset, health/capabilities, metrics, and fail-closed zero-residue
 unload. The backend table remains unchanged: no complete decoder executor has
 yet passed the production promotion gates.
+
+[`docs/WIRE_PROTOCOL_V1.md`](docs/WIRE_PROTOCOL_V1.md) defines the matching
+versioned Unix-socket/named-pipe control and token-stream contract. The bring-up
+server negotiates and reports health but remains fail-closed with
+`engine_not_ready` for inference until a complete executor is installed.

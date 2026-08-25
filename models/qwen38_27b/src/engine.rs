@@ -171,7 +171,8 @@ pub struct EngineHealth {
     pub allocations: AllocationSnapshot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LoadProgress {
     SignatureVerified,
     ArtifactOpened,

@@ -282,7 +282,10 @@ digests and measured platform profiles remain open until the final logical
 checkpoint exists. The shared embeddable lifecycle ABI now covers signed load,
 warmup, incremental prefill/decode, cancellation, MTP accounting, reset,
 telemetry, and verified zero-residue unload; complete model executors and the
-thin IPC binding remain open.
+thin IPC executor binding remain open. The versioned JSON-lines request,
+operation, session, progress, token-stream, cancellation, reset, and unload
+wire contract is implemented, and the bring-up server rejects inference until
+it can own a promoted executor.
 
 The immediate execution batch is:
 

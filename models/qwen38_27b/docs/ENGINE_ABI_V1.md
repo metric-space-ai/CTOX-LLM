@@ -56,3 +56,7 @@ health. This is the contract required by model-TTL and process-TTL owners.
 The lifecycle implementation does not imply that a complete decoder executor
 exists. CPU, CUDA, Metal, and Snapdragon still need full graph implementations
 before any production load can pass their promotion gate.
+
+[`WIRE_PROTOCOL_V1.md`](WIRE_PROTOCOL_V1.md) maps this lifecycle onto versioned
+JSON Lines. It carries distinct request, operation, and session identities so
+streaming and cancellation do not collapse into an ambiguous single RPC.
