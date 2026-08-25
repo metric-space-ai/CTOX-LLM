@@ -1,4 +1,4 @@
-use crate::backend::{Backend, BackendKind, FusedMatVec, PromotionState};
+use crate::backend::{Backend, BackendKind, FusedMatVec, PromotionState, ScaleSlice};
 use crate::format::TensorDType;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
@@ -173,20 +173,36 @@ pub fn validate_operation(
         )));
     }
     if let Some(scales) = operation.s_in {
+        if !matches!(scales, ScaleSlice::F16Le(_)) {
+            return Err(EngineError::UnsupportedDType(
+                "Metal recovery scales must remain packed FP16".into(),
+            ));
+        }
         if scales.len() != operation.columns {
             return Err(EngineError::Shape(
                 "s_in length differs from columns".into(),
             ));
         }
     }
-    for (label, values) in [("s_out", operation.s_out), ("bias", operation.bias)] {
-        if let Some(values) = values {
-            if values.len() != operation.rows {
-                return Err(EngineError::Shape(format!(
-                    "{label} length differs from rows"
-                )));
-            }
-        }
+    if operation
+        .s_out
+        .is_some_and(|values| values.len() != operation.rows)
+    {
+        return Err(EngineError::Shape("s_out length differs from rows".into()));
+    }
+    if operation
+        .s_out
+        .is_some_and(|values| !matches!(values, ScaleSlice::F16Le(_)))
+    {
+        return Err(EngineError::UnsupportedDType(
+            "Metal recovery scales must remain packed FP16".into(),
+        ));
+    }
+    if operation
+        .bias
+        .is_some_and(|values| values.len() != operation.rows)
+    {
+        return Err(EngineError::Shape("bias length differs from rows".into()));
     }
     let rows = u32::try_from(operation.rows)
         .map_err(|_| EngineError::Shape("rows exceed u32 dispatch limit".into()))?;
@@ -238,6 +254,7 @@ mod tests {
     use super::*;
     use crate::backend::{Activation, ExecutionPolicy};
     use crate::quant::{Q2Block64, Q4Block64};
+    use half::f16;
 
     fn encode_weights(dtype: TensorDType, rows: usize, columns: usize) -> Vec<u8> {
         let blocks = rows * (columns / BLOCK_LEN);
@@ -278,6 +295,13 @@ mod tests {
             bias: None,
             activation: Activation::Identity,
         }
+    }
+
+    fn f16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
     }
 
     #[test]
@@ -347,12 +371,12 @@ mod tests {
     fn params_encode_matches_msl_struct() {
         let weights = encode_weights(TensorDType::Q4B64, 3, 128);
         let input = [1.0_f32; 128];
-        let s_in = [1.0_f32; 128];
-        let s_out = [1.0_f32; 3];
+        let s_in = f16_bytes(&[1.0_f32; 128]);
+        let s_out = f16_bytes(&[1.0_f32; 3]);
         let bias = [0.5_f32; 3];
         let mut operation = valid_operation(TensorDType::Q4B64, &weights, &input, 3, 128);
-        operation.s_in = Some(&s_in);
-        operation.s_out = Some(&s_out);
+        operation.s_in = Some(ScaleSlice::F16Le(&s_in));
+        operation.s_out = Some(ScaleSlice::F16Le(&s_out));
         operation.bias = Some(&bias);
         operation.activation = Activation::Silu;
         let (layout, params) = validate_operation(&operation).unwrap();
@@ -401,18 +425,18 @@ mod tests {
             Err(EngineError::Shape(_))
         ));
 
-        let s_in = [1.0_f32; 64];
+        let s_in = f16_bytes(&[1.0_f32; 64]);
         operation = valid_operation(TensorDType::Q2B64, &weights, &input, rows, columns);
-        operation.s_in = Some(&s_in);
+        operation.s_in = Some(ScaleSlice::F16Le(&s_in));
         assert!(matches!(
             validate_operation(&operation),
             Err(EngineError::Shape(_))
         ));
 
-        let s_out = [1.0_f32; 3];
+        let s_out = f16_bytes(&[1.0_f32; 3]);
         let bias = [0.0_f32; 1];
         operation.s_in = None;
-        operation.s_out = Some(&s_out);
+        operation.s_out = Some(ScaleSlice::F16Le(&s_out));
         assert!(matches!(
             validate_operation(&operation),
             Err(EngineError::Shape(_))
@@ -422,6 +446,14 @@ mod tests {
         assert!(matches!(
             validate_operation(&operation),
             Err(EngineError::Shape(_))
+        ));
+
+        let expanded_scales = [1.0_f32; 128];
+        operation = valid_operation(TensorDType::Q2B64, &weights, &input, rows, columns);
+        operation.s_in = Some(ScaleSlice::F32(&expanded_scales));
+        assert!(matches!(
+            validate_operation(&operation),
+            Err(EngineError::UnsupportedDType(_))
         ));
     }
 

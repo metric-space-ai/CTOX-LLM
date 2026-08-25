@@ -15,8 +15,9 @@
 //
 // Fused semantics (matching the CPU oracle in src/backend/cpu.rs):
 //   y[row] = act(s_out[row] * (sum_c w[row, c] * x[c] * s_in[c] + bias[row]))
-// with act in {identity, SiLU}. Scales are optional; absent pointers imply 1.0
-// for s_in/s_out and 0.0 for bias.
+// with act in {identity, SiLU}. Recovery scales stay in their packed CTOXQ
+// fp16 representation and are widened only in registers. Scales are optional;
+// absent pointers imply 1.0 for s_in/s_out and 0.0 for bias.
 //
 // Dispatch organization: one threadgroup per output row. Threads in the group
 // cover the 64-value blocks of the row cooperatively; each thread fully
@@ -67,7 +68,7 @@ inline float q2_normalized(uint code) {
 template <uint BLOCK_BYTES, bool IS_Q2>
 inline float fused_row_dot(device const uchar* weights,
                            device const float* input,
-                           device const float* s_in,
+                           device const half* s_in,
                            constant FusedMatVecParams& params,
                            uint row,
                            uint lane,
@@ -98,7 +99,7 @@ inline float fused_row_dot(device const uchar* weights,
                 float normalized = IS_Q2 ? q2_normalized(code)
                                          : ((float(code) - 7.5f) / 7.5f);
                 uint column = column_start + value_index;
-                float gate = params.has_s_in != 0u ? s_in[column] : 1.0f;
+                float gate = params.has_s_in != 0u ? float(s_in[column]) : 1.0f;
                 block_sum = fma(scale * normalized, input[column] * gate, block_sum);
             }
         }
@@ -117,7 +118,7 @@ inline void reduce_and_store(threadgroup float* scratch,
                              uint simd_group,
                              uint lanes_per_group,
                              constant FusedMatVecParams& params,
-                             device const float* s_out,
+                             device const half* s_out,
                              device const float* bias,
                              device float* output) {
     float simd_total = simd_sum(partial);
@@ -132,7 +133,7 @@ inline void reduce_and_store(threadgroup float* scratch,
             total += scratch[g];
         }
         total += params.has_bias != 0u ? bias[row] : 0.0f;
-        total *= params.has_s_out != 0u ? s_out[row] : 1.0f;
+        total *= params.has_s_out != 0u ? float(s_out[row]) : 1.0f;
         output[row] = apply_activation(total, params.activation);
     }
 }
@@ -141,8 +142,8 @@ inline void reduce_and_store(threadgroup float* scratch,
 kernel void q2_b64_fused_matvec(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
-    device const float* s_in [[buffer(2)]],
-    device const float* s_out [[buffer(3)]],
+    device const half* s_in [[buffer(2)]],
+    device const half* s_out [[buffer(3)]],
     device const float* bias [[buffer(4)]],
     device float* output [[buffer(5)]],
     constant FusedMatVecParams& params [[buffer(6)]],
@@ -166,8 +167,8 @@ kernel void q2_b64_fused_matvec(
 kernel void q4_b64_fused_matvec(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
-    device const float* s_in [[buffer(2)]],
-    device const float* s_out [[buffer(3)]],
+    device const half* s_in [[buffer(2)]],
+    device const half* s_out [[buffer(3)]],
     device const float* bias [[buffer(4)]],
     device float* output [[buffer(5)]],
     constant FusedMatVecParams& params [[buffer(6)]],

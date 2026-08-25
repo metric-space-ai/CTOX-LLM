@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use ctox_qwen38_27b::backend::cpu::CpuBackend;
-use ctox_qwen38_27b::backend::{Activation, Backend, ExecutionPolicy, FusedMatVec};
+use ctox_qwen38_27b::backend::{Activation, Backend, ExecutionPolicy, FusedMatVec, ScaleSlice};
 use ctox_qwen38_27b::format::TensorDType;
 use ctox_qwen38_27b::quant::{Q2Block64, Q4Block64, BLOCK_LEN};
 use serde::Serialize;
@@ -89,8 +89,8 @@ fn main() -> anyhow::Result<()> {
         rows: args.rows,
         columns: args.columns,
         input: &input,
-        s_in: Some(&s_in),
-        s_out: Some(&s_out),
+        s_in: Some(ScaleSlice::F32(&s_in)),
+        s_out: Some(ScaleSlice::F32(&s_out)),
         bias: Some(&bias),
         activation: Activation::Silu,
     };

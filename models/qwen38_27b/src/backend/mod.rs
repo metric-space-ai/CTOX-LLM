@@ -6,7 +6,9 @@ pub mod snapdragon;
 use serde::{Deserialize, Serialize};
 
 use crate::format::{QuantSegment, TensorDType};
+use crate::EngineError;
 use crate::Result;
+use half::f16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +53,52 @@ impl Activation {
     }
 }
 
+/// Recovery scales can be supplied either by tests/host code as native f32 or
+/// directly from the little-endian FP16 CTOXQ payload. Production loaders use
+/// the latter so no full scale tensor is expanded or duplicated before a
+/// fused kernel launch.
+#[derive(Debug, Clone, Copy)]
+pub enum ScaleSlice<'a> {
+    F32(&'a [f32]),
+    F16Le(&'a [u8]),
+}
+
+impl ScaleSlice<'_> {
+    pub fn len(self) -> usize {
+        match self {
+            Self::F32(values) => values.len(),
+            Self::F16Le(bytes) => bytes.len() / 2,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn value(self, index: usize) -> Result<f32> {
+        if index >= self.len() {
+            return Err(EngineError::Shape(format!(
+                "recovery scale index {index} exceeds {} values",
+                self.len()
+            )));
+        }
+        let value = match self {
+            Self::F32(values) => values[index],
+            Self::F16Le(bytes) => {
+                let offset = index * 2;
+                f16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32()
+            }
+        };
+        if !value.is_finite() {
+            return Err(EngineError::InvalidArtifact(format!(
+                "recovery scale {index} is non-finite"
+            )));
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct FusedMatVec<'a> {
     pub dtype: TensorDType,
     pub weights: &'a [u8],
@@ -60,8 +108,8 @@ pub struct FusedMatVec<'a> {
     pub rows: usize,
     pub columns: usize,
     pub input: &'a [f32],
-    pub s_in: Option<&'a [f32]>,
-    pub s_out: Option<&'a [f32]>,
+    pub s_in: Option<ScaleSlice<'a>>,
+    pub s_out: Option<ScaleSlice<'a>>,
     pub bias: Option<&'a [f32]>,
     pub activation: Activation,
 }

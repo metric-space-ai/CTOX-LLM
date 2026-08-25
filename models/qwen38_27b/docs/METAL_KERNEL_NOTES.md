@@ -23,13 +23,17 @@ exist in this format.
 
 ## ABI
 
-- Buffers: 0 weights, 1 input, 2 s_in, 3 s_out, 4 bias, 5 output, 6 params
+- Buffers: 0 weights (`uchar`), 1 input (`float`), 2 s_in (`half`), 3 s_out
+  (`half`), 4 bias (`float`), 5 output (`float`), 6 params
   (`FusedMatVecParams`, eight LE u32 words, 32 bytes: rows, columns,
   blocks_per_row, has_s_in, has_s_out, has_bias, activation, reserved).
 - threadgroup(0): 8 f32 scratch slots for the cross-simdgroup reduction.
 - Fused semantics identical to the CPU oracle:
   `y[r] = act(s_out[r] * (sum_c w[r,c] * x[c] * s_in[c] + bias[r]))`,
   activation 0 = identity, 1 = SiLU (`x / (1 + exp(-x))`).
+- `s_in` and `s_out` stay byte-identical to the FP16 CTOXQ recovery tensors;
+  kernels widen individual values in registers. No startup expansion to f32
+  or duplicate scale allocation is permitted.
 
 ## Organization
 
@@ -44,7 +48,7 @@ valid prefix.
 
 - `xcrun -sdk macosx metal -c kernels/metal/q2q4_fused_matvec.metal -o target/fleet-metal.air` — compiles clean.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` — clean.
-- `cargo test` on macOS — 28 passed, 0 failed, including ABI constant checks against
+- `cargo test` on macOS — complete crate suite passes, including ABI constant checks against
   `src/quant.rs`, invalid shape/buffer rejection, dispatch-name checks, and an
   in-test `xcrun metal` compile of the kernel source.
 

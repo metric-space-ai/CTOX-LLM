@@ -46,6 +46,9 @@ pub struct KernelParam {
 ///
 /// The kernel must fuse input scale (`s_in`), output scale (`s_out`), bias,
 /// and the activation in one launch; there is no unfused production path.
+/// Both recovery-scale pointers address the original packed FP16 CTOXQ data;
+/// a conforming module widens values in registers and must not require an f32
+/// scale expansion at load time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaKernelAbi {
     /// Exact `CUfunction` symbol the cubin/fatbin module must export.

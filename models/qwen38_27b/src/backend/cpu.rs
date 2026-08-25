@@ -58,14 +58,17 @@ impl CpuBackend {
                 ));
             }
         }
-        for (label, values) in [("s_out", operation.s_out), ("bias", operation.bias)] {
-            if let Some(values) = values {
-                if values.len() != operation.rows {
-                    return Err(EngineError::Shape(format!(
-                        "{label} length differs from rows"
-                    )));
-                }
-            }
+        if operation
+            .s_out
+            .is_some_and(|values| values.len() != operation.rows)
+        {
+            return Err(EngineError::Shape("s_out length differs from rows".into()));
+        }
+        if operation
+            .bias
+            .is_some_and(|values| values.len() != operation.rows)
+        {
+            return Err(EngineError::Shape("bias length differs from rows".into()));
         }
         let blocks_per_row = operation.columns / BLOCK_LEN;
         let block_bytes = match operation.dtype {
@@ -280,18 +283,22 @@ impl Backend for CpuBackend {
                 corrected = operation
                     .input
                     .iter()
-                    .zip(scales)
-                    .map(|(value, scale)| value * scale)
-                    .collect::<Vec<f32>>();
+                    .enumerate()
+                    .map(|(index, value)| Ok(value * scales.value(index)?))
+                    .collect::<Result<Vec<f32>>>()?;
                 &corrected
             }
             None => operation.input,
         };
         let mut output = vec![0.0_f32; operation.rows];
-        let finish_row = |row: usize, mut sum: f32| {
+        let finish_row = |row: usize, mut sum: f32| -> Result<f32> {
             sum += operation.bias.map(|bias| bias[row]).unwrap_or(0.0);
-            sum *= operation.s_out.map(|scales| scales[row]).unwrap_or(1.0);
-            operation.activation.apply(sum)
+            sum *= operation
+                .s_out
+                .map(|scales| scales.value(row))
+                .transpose()?
+                .unwrap_or(1.0);
+            Ok(operation.activation.apply(sum))
         };
         match operation.dtype {
             dtype @ (TensorDType::Q2B64 | TensorDType::Q4B64) => {
@@ -308,7 +315,7 @@ impl Backend for CpuBackend {
                         TensorDType::Q4B64 => self.row_sum_q4(row_weights, input)?,
                         _ => unreachable!(),
                     };
-                    *output_value = finish_row(row, sum);
+                    *output_value = finish_row(row, sum)?;
                 }
             }
             TensorDType::MixedQ2Q4B64 => {
@@ -338,7 +345,7 @@ impl Backend for CpuBackend {
                             TensorDType::Q4B64 => self.row_sum_q4(row_weights, input)?,
                             _ => unreachable!("mixed segment dtype validated"),
                         };
-                        *output_value = finish_row(row, sum);
+                        *output_value = finish_row(row, sum)?;
                     }
                 }
             }
@@ -589,7 +596,7 @@ unsafe fn neon_packed_q4_dot(scale: f32, codes: &[u8; 32], input: &[f32; BLOCK_L
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Activation;
+    use crate::backend::{Activation, ScaleSlice};
     use crate::format::QuantSegment;
     use crate::quant::{Q2Block64, Q4Block64};
 
@@ -649,8 +656,8 @@ mod tests {
             rows,
             columns,
             input: &input,
-            s_in: Some(&s_in),
-            s_out: Some(&s_out),
+            s_in: Some(ScaleSlice::F32(&s_in)),
+            s_out: Some(ScaleSlice::F32(&s_out)),
             bias: Some(&bias),
             activation,
         };
@@ -686,6 +693,49 @@ mod tests {
     #[test]
     fn q4_single_block_identity_matches_scalar() {
         fused_case(TensorDType::Q4B64, 3, BLOCK_LEN, Activation::Identity);
+    }
+
+    #[test]
+    fn packed_f16_recovery_scales_match_host_f32_scales() {
+        let weights = encode_fixture(TensorDType::Q2B64, 2, BLOCK_LEN);
+        let input: Vec<f32> = (0..BLOCK_LEN)
+            .map(|index| (index as f32 * 0.0625).sin())
+            .collect();
+        let s_in: Vec<f32> = (0..BLOCK_LEN)
+            .map(|index| f16::from_f32(0.75 + (index % 9) as f32 * 0.03125).to_f32())
+            .collect();
+        let s_out = [f16::from_f32(1.25).to_f32(), f16::from_f32(0.875).to_f32()];
+        let s_in_f16: Vec<u8> = s_in
+            .iter()
+            .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes())
+            .collect();
+        let s_out_f16: Vec<u8> = s_out
+            .iter()
+            .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes())
+            .collect();
+        let f32_operation = FusedMatVec {
+            dtype: TensorDType::Q2B64,
+            weights: &weights,
+            segments: &[],
+            rows: 2,
+            columns: BLOCK_LEN,
+            input: &input,
+            s_in: Some(ScaleSlice::F32(&s_in)),
+            s_out: Some(ScaleSlice::F32(&s_out)),
+            bias: None,
+            activation: Activation::Identity,
+        };
+        let f16_operation = FusedMatVec {
+            s_in: Some(ScaleSlice::F16Le(&s_in_f16)),
+            s_out: Some(ScaleSlice::F16Le(&s_out_f16)),
+            ..f32_operation
+        };
+        for backend in [CpuBackend::scalar_verifier(), detected()] {
+            assert_eq!(
+                backend.fused_matvec(&f16_operation).unwrap(),
+                backend.fused_matvec(&f32_operation).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -859,7 +909,7 @@ mod tests {
             columns: BLOCK_LEN,
             input: &input,
             s_in: None,
-            s_out: Some(&[2.0]),
+            s_out: Some(ScaleSlice::F32(&[2.0])),
             bias: Some(&[1.0]),
             activation: Activation::Identity,
         };

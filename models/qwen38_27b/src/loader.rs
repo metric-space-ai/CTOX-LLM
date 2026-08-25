@@ -5,6 +5,7 @@ use std::path::Path;
 use memmap2::{Mmap, MmapOptions};
 use sha2::{Digest, Sha256};
 
+use crate::backend::ScaleSlice;
 use crate::format::{
     FileHeader, ModelManifest, QuantSegment, TensorDType, TensorEntry, HEADER_BYTES,
 };
@@ -46,7 +47,7 @@ pub enum FloatTensorView<'a> {
     F32Le(&'a [u8]),
 }
 
-impl FloatTensorView<'_> {
+impl<'a> FloatTensorView<'a> {
     pub fn len(self) -> usize {
         match self {
             Self::F16Le(bytes) => bytes.len() / 2,
@@ -89,6 +90,18 @@ impl FloatTensorView<'_> {
 
     pub fn to_f32_vec(self) -> Result<Vec<f32>> {
         (0..self.len()).map(|index| self.value(index)).collect()
+    }
+
+    /// Borrow recovery scales in the exact on-disk FP16 representation used
+    /// by fused CPU/Metal/CUDA kernels. F32 tensors are deliberately rejected:
+    /// converting them would not be a zero-copy recovery-scale binding.
+    pub fn as_recovery_scales(self) -> Result<ScaleSlice<'a>> {
+        match self {
+            Self::F16Le(bytes) => Ok(ScaleSlice::F16Le(bytes)),
+            Self::F32Le(_) => Err(EngineError::UnsupportedDType(
+                "recovery scales must be packed FP16".into(),
+            )),
+        }
     }
 }
 
@@ -335,6 +348,10 @@ mod tests {
         assert_eq!(recovered.s_in.len(), BLOCK_LEN);
         assert_eq!(recovered.s_in.value(BLOCK_LEN - 1).unwrap(), 1.0);
         assert_eq!(recovered.s_out.value(0).unwrap(), 1.5);
+        assert!(matches!(
+            recovered.s_in.as_recovery_scales().unwrap(),
+            ScaleSlice::F16Le(_)
+        ));
         assert_eq!(
             artifact
                 .float_tensor("A_log")
@@ -354,6 +371,7 @@ mod tests {
         let view = FloatTensorView::F32Le(&finite);
         assert_eq!(view.value(0).unwrap(), 1.0);
         assert!(view.value(1).is_err());
+        assert!(view.as_recovery_scales().is_err());
         let nonfinite = f32::NAN.to_le_bytes();
         assert!(FloatTensorView::F32Le(&nonfinite).value(0).is_err());
     }

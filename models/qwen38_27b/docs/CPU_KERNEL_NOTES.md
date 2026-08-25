@@ -13,7 +13,9 @@ for every block of every row. The current implementation:
 1. Applies `s_in` exactly once per operation, producing the corrected input
    `x[i] = input[i] * s_in[i]` (a single `Vec<f32>` per call, borrowed
    directly when `s_in` is absent). Per-element products are identical to the
-   old code, so the scalar oracle is numerically unchanged.
+   old code, so the scalar oracle is numerically unchanged. Production scales
+   are read directly from their little-endian FP16 mmap payload and widened
+   per value; no persistent f32 scale copy is created.
 2. Reads block scales and code bytes straight from the packed weight slice
    and decodes them in SIMD registers. No heap allocation and no
    dequantization temporary exists inside the block loop.
