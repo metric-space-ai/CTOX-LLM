@@ -21,26 +21,52 @@ from typing import Any, Iterable
 SOURCES = {
     "nemotron-v1": {
         "repo": "nvidia/Nemotron-Post-Training-Dataset-v1",
+        "reviewed_revision": "74e23eb6f830fef4a9e96a92f6f6262214cbb9a8",
+        "default_splits": ("chat", "code", "math", "stem", "tool_calling"),
+        "default_language": "en",
+        "allowed_licenses": ("cc-by-4.0",),
         "release_eligible": True,
         "quarantine_reason": None,
     },
     "nemotron-v2": {
         "repo": "nvidia/Nemotron-Post-Training-Dataset-v2",
+        "reviewed_revision": "5c89e01dd720ae0f4058445ed49c5fb68a03c76e",
+        "default_splits": (
+            "chat",
+            "code",
+            "math",
+            "stem",
+            "multilingual_de",
+        ),
+        "default_language": "und",
+        "allowed_licenses": ("cc-by-4.0",),
         "release_eligible": False,
-        "quarantine_reason": "gated generated-data terms require release review",
+        "quarantine_reason": "gated access and derivative-use review are not yet documented",
     },
     "nemotron-agentic-v1": {
         "repo": "nvidia/Nemotron-Agentic-v1",
+        "reviewed_revision": "650d590978ca35c8f1ecea2faf136e5fac421b62",
+        "default_splits": ("interactive_agent", "tool_calling"),
+        "default_language": "en",
+        "allowed_licenses": ("cc-by-4.0",),
         "release_eligible": True,
         "quarantine_reason": None,
     },
     "nemotron-sft-agentic-v2": {
         "repo": "nvidia/Nemotron-SFT-Agentic-v2",
+        "reviewed_revision": "7c804833427f633ccd53b582dbf02525fd680f78",
+        "default_splits": ("interactive_agent", "search", "tool_calling"),
+        "default_language": "en",
+        "allowed_licenses": ("apache-2.0", "cc-by-4.0", "mit"),
         "release_eligible": True,
         "quarantine_reason": None,
     },
     "german-instruct": {
         "repo": "Beko2210/German-Instruct-Dataset",
+        "reviewed_revision": "4456bdf1b82f906a70fb9e5431530d2e9d1c565b",
+        "default_splits": ("train",),
+        "default_language": "de",
+        "allowed_licenses": ("cc-by-4.0",),
         "release_eligible": True,
         "quarantine_reason": None,
     },
@@ -57,6 +83,7 @@ CATEGORY_HINTS = {
     "stem": "math",
     "structured": "structured",
     "long": "long_context",
+    "search": "agentic",
 }
 
 
@@ -69,6 +96,7 @@ class Record:
     split: str
     source_id: str
     license: str
+    dataset_card_licenses: list[str]
     generator: str | None
     category: str
     language: str
@@ -90,7 +118,11 @@ def recovery_payload(
     for key in ("messages", "conversation", "conversations"):
         value = row.get(key)
         if isinstance(value, list) and value:
-            return {"messages": value}
+            payload = {"messages": value}
+            tools = row.get("tools")
+            if isinstance(tools, list) and tools:
+                payload["tools"] = tools
+            return payload
 
     prompt = next(
         (row[key] for key in ("prompt", "input", "question", "instruction") if row.get(key)),
@@ -132,7 +164,15 @@ def canonical_text(row: dict[str, Any], source_repo: str | None = None) -> str:
 
 
 def source_id_for(row: dict[str, Any], index: int) -> str:
-    return str(row.get("id", row.get("uuid", index)))
+    for candidate in (row.get("id"), row.get("uuid")):
+        if candidate is not None and str(candidate):
+            return str(candidate)
+    metadata = nested_metadata(row)
+    for key in ("uuid", "id", "alt_id"):
+        candidate = metadata.get(key)
+        if candidate is not None and str(candidate):
+            return str(candidate)
+    return str(index)
 
 
 def category_for(subset: str, split: str, row: dict[str, Any]) -> str:
@@ -149,59 +189,145 @@ def category_for(subset: str, split: str, row: dict[str, Any]) -> str:
 
 def nested_metadata(row: dict[str, Any]) -> dict[str, Any]:
     metadata = row.get("metadata")
-    return metadata if isinstance(metadata, dict) else {}
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str):
+        try:
+            decoded = json.loads(metadata)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def license_ids(value: Any) -> list[str]:
+    """Normalize dataset-card and per-record license identifiers.
+
+    Empty placeholders deliberately do not become licenses; callers must fall
+    back to the pinned dataset card or fail closed.
+    """
+
+    values = value if isinstance(value, list) else [value]
+    normalized = []
+    aliases = {
+        "cc by 4.0": "cc-by-4.0",
+        "cc-by-4": "cc-by-4.0",
+        "apache 2.0": "apache-2.0",
+        "apache-2": "apache-2.0",
+    }
+    for item in values:
+        if item is None:
+            continue
+        license_id = str(item).strip().lower()
+        if license_id in {"", "dataset-card", "unknown", "none", "n/a"}:
+            continue
+        license_id = aliases.get(license_id, license_id)
+        if license_id not in normalized:
+            normalized.append(license_id)
+    return sorted(normalized)
+
+
+def card_license_ids(info: Any) -> list[str]:
+    card = getattr(info, "card_data", None)
+    if card is None:
+        return []
+    if isinstance(card, dict):
+        return license_ids(card.get("license"))
+    return license_ids(getattr(card, "license", None))
 
 
 def records(args: argparse.Namespace) -> Iterable[Record]:
     try:
-        from datasets import get_dataset_config_names, load_dataset
+        from datasets import get_dataset_config_names, get_dataset_split_names, load_dataset
         from huggingface_hub import HfApi
     except ImportError as error:
         raise SystemExit("install training/requirements.in before building a manifest") from error
 
     source = SOURCES[args.source]
     repo = source["repo"]
-    revision = HfApi().dataset_info(repo, revision=args.revision).sha
+    requested_revision = args.revision or source["reviewed_revision"]
+    info = HfApi().dataset_info(repo, revision=requested_revision)
+    revision = info.sha
+    dataset_card_licenses = card_license_ids(info)
+    allowed_licenses = set(source["allowed_licenses"])
+    if not dataset_card_licenses:
+        raise RuntimeError(f"{repo}@{revision} has no machine-readable dataset-card license")
+    unexpected_card_licenses = set(dataset_card_licenses) - allowed_licenses
+    if unexpected_card_licenses and source["release_eligible"]:
+        raise RuntimeError(
+            f"{repo}@{revision} contains unreviewed dataset-card licenses: "
+            + ", ".join(sorted(unexpected_card_licenses))
+        )
     subsets = [args.subset] if args.subset else get_dataset_config_names(repo, revision=revision)
+    requested_splits = tuple(args.split or source["default_splits"])
     emitted = 0
     for subset in subsets:
-        dataset = load_dataset(repo, subset, split=args.split, revision=revision, streaming=True)
-        for index, row in enumerate(dataset):
-            text = canonical_text(row, repo)
-            prompt_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            source_id = source_id_for(row, index)
-            identity = "\0".join((repo, revision, subset, args.split, source_id, prompt_sha))
-            metadata = nested_metadata(row)
-            license_name = str(
-                row.get("license", row.get("source_license", metadata.get("license", "dataset-card")))
+        available_splits = set(get_dataset_split_names(repo, subset, revision=revision))
+        unavailable = set(requested_splits) - available_splits
+        if unavailable:
+            raise RuntimeError(
+                f"{repo}/{subset}@{revision} has no splits: {', '.join(sorted(unavailable))}; "
+                f"available: {', '.join(sorted(available_splits))}"
             )
-            language = str(row.get("language", row.get("lang", "und")))
-            generator = row.get("generator") or row.get("model_name") or metadata.get("annotator")
-            yield Record(
-                id=hashlib.sha256(identity.encode("utf-8")).hexdigest(),
-                source_repo=repo,
-                source_revision=revision,
-                subset=subset,
-                split=args.split,
-                source_id=source_id,
-                license=license_name,
-                generator=str(generator) if generator else None,
-                category=category_for(subset, args.split, row),
-                language=language,
-                prompt_sha256=prompt_sha,
-                release_eligible=bool(source["release_eligible"]),
-                quarantine_reason=source["quarantine_reason"],
-            )
-            emitted += 1
-            if args.limit and emitted >= args.limit:
-                return
+        for split in requested_splits:
+            dataset = load_dataset(repo, subset, split=split, revision=revision, streaming=True)
+            for index, row in enumerate(dataset):
+                text = canonical_text(row, repo)
+                prompt_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                source_id = source_id_for(row, index)
+                identity = "\0".join((repo, revision, subset, split, source_id, prompt_sha))
+                metadata = nested_metadata(row)
+                record_licenses = license_ids(
+                    row.get("license", row.get("source_license", metadata.get("license")))
+                )
+                effective_licenses = record_licenses or dataset_card_licenses
+                unexpected_licenses = set(effective_licenses) - allowed_licenses
+                release_eligible = bool(source["release_eligible"] and not unexpected_licenses)
+                quarantine_reason = source["quarantine_reason"]
+                if unexpected_licenses:
+                    quarantine_reason = (
+                        "record contains unreviewed licenses: "
+                        + ", ".join(sorted(unexpected_licenses))
+                    )
+                language = str(
+                    row.get("language", row.get("lang", source["default_language"]))
+                )
+                generator = (
+                    row.get("generator")
+                    or row.get("model_name")
+                    or row.get("model")
+                    or metadata.get("annotator")
+                )
+                yield Record(
+                    id=hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                    source_repo=repo,
+                    source_revision=revision,
+                    subset=subset,
+                    split=split,
+                    source_id=source_id,
+                    license=",".join(effective_licenses),
+                    dataset_card_licenses=dataset_card_licenses,
+                    generator=str(generator) if generator else None,
+                    category=category_for(subset, split, row),
+                    language=language,
+                    prompt_sha256=prompt_sha,
+                    release_eligible=release_eligible,
+                    quarantine_reason=quarantine_reason,
+                )
+                emitted += 1
+                if args.limit and emitted >= args.limit:
+                    return
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=sorted(SOURCES), required=True)
     parser.add_argument("--subset")
-    parser.add_argument("--split", default="train")
+    parser.add_argument(
+        "--split",
+        action="append",
+        help="source split to include; repeat for multiple splits (defaults are source-specific)",
+    )
     parser.add_argument("--revision")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--output", type=Path, required=True)

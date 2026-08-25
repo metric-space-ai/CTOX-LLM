@@ -45,6 +45,20 @@ identity; stale source coordinates cannot silently enter a teacher cache.
 manifest, preventing source order from biasing smoke tests and calibration
 cohorts.
 
+Agentic manifests pin source-specific splits and reviewed upstream revisions.
+Their complete tool schemas are part of both the payload hash and materialized
+teacher input; changing a function name or JSON schema therefore invalidates
+the sample identity. Dataset-card and per-record licenses are recorded
+separately and unreviewed license identifiers fail closed.
+
+`generate_long_context.py` builds Apache-2.0 procedural retrieval dossiers at
+32K, 64K, and 128K. Every context consists of distinct structured records, and
+the answer requires following a link between two records inserted at recorded
+token offsets. It does not repeat or pad a short prompt. Calibration and
+evaluation invocations must use different seeds and splits. NVIDIA's
+`ChatQA2-Long-SFT-data` is useful external evidence that 131K training examples
+exist, but its non-commercial terms exclude it from the public CTOX checkpoint.
+
 Teacher caching renders a normalized copy of source messages. OpenAI-shaped
 tool calls are converted to Qwen's flat chat-template form without changing the
 hashed source payload. Only requested transformer layers are captured, and the

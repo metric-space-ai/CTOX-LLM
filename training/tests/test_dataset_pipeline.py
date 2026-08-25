@@ -10,7 +10,14 @@ from pathlib import Path
 TRAINING = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TRAINING))
 
-from build_manifest import canonical_text, category_for, recovery_payload  # noqa: E402
+from build_manifest import (  # noqa: E402
+    SOURCES,
+    canonical_text,
+    category_for,
+    license_ids,
+    recovery_payload,
+    source_id_for,
+)
 from build_quant_plan import (  # noqa: E402
     CONTAINER_MANIFEST_RESERVE,
     FOLD_PACKAGE_LIMIT,
@@ -21,16 +28,85 @@ from materialize_prompts import load_manifests  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
 from optimize_q4_budget import layout_bytes, mixed_tensor_bytes  # noqa: E402
 from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
+from generate_long_context import generated_record  # noqa: E402
 from score_quant_sensitivity import row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from verify_vendor_manifest import verify  # noqa: E402
 
 
 class DatasetPipelineTests(unittest.TestCase):
+    class WordTokenizer:
+        def apply_chat_template(self, messages, **_kwargs):
+            return "\n".join(f"{message['role']}: {message['content']}" for message in messages)
+
+        def __call__(self, text, **_kwargs):
+            return type("Encoded", (), {"input_ids": text.replace("\n", " \n ").split()})()
+
     def test_hash_covers_reference_answer(self) -> None:
         first = {"input": "2+2?", "output": "4"}
         second = {"input": "2+2?", "output": "5"}
         self.assertNotEqual(canonical_text(first), canonical_text(second))
+
+    def test_hash_covers_tool_schema(self) -> None:
+        first = {
+            "messages": [{"role": "user", "content": "Check Berlin"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        }
+        second = json.loads(json.dumps(first))
+        second["tools"][0]["function"]["name"] = "forecast"
+        self.assertNotEqual(canonical_text(first), canonical_text(second))
+        self.assertEqual(recovery_payload(first)["tools"], first["tools"])
+
+    def test_agentic_source_defaults_are_pinned(self) -> None:
+        source = SOURCES["nemotron-sft-agentic-v2"]
+        self.assertEqual(len(source["reviewed_revision"]), 40)
+        self.assertEqual(
+            source["default_splits"],
+            ("interactive_agent", "search", "tool_calling"),
+        )
+        self.assertIn("cc-by-4.0", source["allowed_licenses"])
+
+    def test_nested_metadata_supplies_stable_source_id(self) -> None:
+        row = {"metadata": {"uuid": "stable-row-id"}}
+        self.assertEqual(source_id_for(row, 17), "stable-row-id")
+        encoded = {"metadata": json.dumps({"uuid": "encoded-row-id"})}
+        self.assertEqual(source_id_for(encoded, 17), "encoded-row-id")
+
+    def test_license_ids_normalize_and_drop_placeholders(self) -> None:
+        self.assertEqual(
+            license_ids(["CC BY 4.0", "apache-2.0", "dataset-card", "CC BY 4.0"]),
+            ["apache-2.0", "cc-by-4.0"],
+        )
+
+    def test_long_context_generator_is_sized_and_requires_two_retrieval_positions(self) -> None:
+        manifest, materialized = generated_record(
+            self.WordTokenizer(),
+            seed="calibration-v1",
+            target_tokens=4096,
+            language="de",
+            sample_index=1,
+            tolerance=128,
+            source_revision="a" * 40,
+            split="calibration",
+        )
+        self.assertGreaterEqual(manifest["rendered_tokens"], 4096 - 128)
+        self.assertLessEqual(manifest["rendered_tokens"], 4096)
+        self.assertEqual(manifest["release_eligible"], True)
+        positions = manifest["marker_normalized_positions"]
+        self.assertEqual(len(positions), 2)
+        self.assertGreater(abs(positions[0] - positions[1]), 0.25)
+        self.assertEqual(
+            hashlib.sha256(canonical_text(materialized).encode()).hexdigest(),
+            manifest["prompt_sha256"],
+        )
 
     def test_german_rag_context_is_part_of_hashed_payload(self) -> None:
         repo = "Beko2210/German-Instruct-Dataset"
