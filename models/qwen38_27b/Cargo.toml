@@ -46,3 +46,7 @@ path = "src/bin/verify.rs"
 [[bin]]
 name = "qwen38-server"
 path = "src/bin/server.rs"
+
+[[bin]]
+name = "qwen38-kernel-bench"
+path = "src/bin/kernel_bench.rs"

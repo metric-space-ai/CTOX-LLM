@@ -9,9 +9,11 @@ pub mod config;
 pub mod error;
 pub mod format;
 pub mod graph;
+pub mod kv_cache;
 pub mod loader;
 pub mod memory;
 pub mod quant;
+pub mod sampler;
 pub mod server;
 pub mod wire;
 
