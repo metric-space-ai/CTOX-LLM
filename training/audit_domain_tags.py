@@ -9,7 +9,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from classify_domains import quota_gaps
+from classify_domains import quota_gaps, validate_rubric
 
 
 def main() -> None:
@@ -24,6 +24,7 @@ def main() -> None:
     try:
         rubric_bytes = args.rubric.read_bytes()
         rubric = json.loads(rubric_bytes)
+        validate_rubric(rubric)
         counts: Counter[str] = Counter()
         primary_counts: Counter[str] = Counter()
         fallback = 0

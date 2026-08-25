@@ -1,94 +1,302 @@
 {
-  "format": "ctox.recovery-domain-rubric.v1",
+  "format": "ctox.recovery-domain-rubric.v2",
   "classification": "multi_label",
   "policy": {
     "evaluation_must_be_disjoint": true,
     "labels_are_a_selection_gate_not_training_targets": true,
     "minimum_confidence": 0.7,
     "unclassified_records_are_rejected": true,
-    "minimum_primary_train": 24,
-    "minimum_primary_evaluation": 8
+    "minimum_primary_train": 16,
+    "minimum_primary_evaluation": 4,
+    "required_families": [
+      "agentic_information",
+      "business_law_public",
+      "daily_life",
+      "engineering_design",
+      "language_communication",
+      "life_health",
+      "quantitative_natural_sciences",
+      "safety",
+      "society_humanities",
+      "software_data"
+    ]
   },
   "domains": {
-    "agentic_tools_search": {
-      "description": "planning, function calls, tool results, search and multi-step execution",
-      "minimum_evaluation": 64,
-      "minimum_train": 256
+    "agentic_tools_workflows": {
+      "family": "agentic_information",
+      "description": "planning, function calls, tool schemas, tool results, search and multi-step agent execution",
+      "minimum_train": 192,
+      "minimum_evaluation": 48,
+      "minimum_primary_train": 64,
+      "minimum_primary_evaluation": 16
     },
-    "arts_culture_creative": {
-      "description": "literature, arts, media, culture and creative composition",
+    "research_search_factchecking": {
+      "family": "agentic_information",
+      "description": "research, information retrieval, source comparison, evidence synthesis and fact checking",
+      "minimum_train": 48,
       "minimum_evaluation": 12,
-      "minimum_train": 48
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
     },
-    "business_economics_finance": {
-      "description": "business operations, accounting, economics and personal or corporate finance",
+    "business_operations_management": {
+      "family": "business_law_public",
+      "description": "business operations, strategy, management, marketing, sales, procurement and entrepreneurship",
+      "minimum_train": 48,
       "minimum_evaluation": 12,
-      "minimum_train": 48
+      "minimum_primary_train": 32,
+      "minimum_primary_evaluation": 8
     },
-    "data_structured_outputs": {
-      "description": "data analysis, extraction, classification, tables, JSON, XML and constrained formats",
-      "minimum_evaluation": 24,
-      "minimum_train": 96
+    "economics_accounting_finance": {
+      "family": "business_law_public",
+      "description": "economics, accounting, taxation, personal finance, banking, investment and corporate finance",
+      "minimum_train": 48,
+      "minimum_evaluation": 12,
+      "minimum_primary_train": 32,
+      "minimum_primary_evaluation": 8
+    },
+    "law_regulation_administration": {
+      "family": "business_law_public",
+      "description": "law, contracts, regulation, compliance, government services and public administration",
+      "minimum_train": 48,
+      "minimum_evaluation": 12,
+      "minimum_primary_train": 32,
+      "minimum_primary_evaluation": 8
     },
     "everyday_practical": {
-      "description": "ordinary assistance, home, food, travel and personal organization",
-      "minimum_evaluation": 12,
-      "minimum_train": 48
+      "family": "daily_life",
+      "description": "ordinary assistance, personal organization, purchasing, scheduling and practical problem solving",
+      "minimum_train": 64,
+      "minimum_evaluation": 16,
+      "minimum_primary_train": 48,
+      "minimum_primary_evaluation": 12
     },
-    "hardware_engineering": {
-      "description": "electronics, hardware, manufacturing and engineering practice",
+    "food_home_travel_lifestyle": {
+      "family": "daily_life",
+      "description": "cooking, nutrition, household tasks, consumer travel, hospitality and lifestyle planning",
+      "minimum_train": 48,
       "minimum_evaluation": 12,
-      "minimum_train": 48
+      "minimum_primary_train": 32,
+      "minimum_primary_evaluation": 8
     },
-    "history_geography_politics": {
-      "description": "history, geography, civics, institutions and political systems",
-      "minimum_evaluation": 12,
-      "minimum_train": 48
+    "sports_fitness_recreation": {
+      "family": "daily_life",
+      "description": "sports, exercise, fitness, games, hobbies and outdoor recreation",
+      "minimum_train": 24,
+      "minimum_evaluation": 8
     },
-    "law_government_administration": {
-      "description": "law, regulation, government services and public administration",
-      "minimum_evaluation": 12,
-      "minimum_train": 48
+    "media_journalism_entertainment": {
+      "family": "daily_life",
+      "description": "news writing, journalism, film, television, music, games and entertainment media",
+      "minimum_train": 24,
+      "minimum_evaluation": 8
     },
-    "life_sciences_medicine": {
-      "description": "biology, health and medicine with uncertainty-aware general assistance",
+    "electrical_hardware_engineering": {
+      "family": "engineering_design",
+      "description": "electronics, electrical engineering, computer hardware, embedded systems and chip design",
+      "minimum_train": 40,
+      "minimum_evaluation": 10,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "mechanical_civil_manufacturing": {
+      "family": "engineering_design",
+      "description": "mechanical and civil engineering, construction, manufacturing, materials processing and maintenance",
+      "minimum_train": 32,
+      "minimum_evaluation": 8,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "design_architecture": {
+      "family": "engineering_design",
+      "description": "product design, industrial design, architecture, visual design and human factors",
+      "minimum_train": 24,
+      "minimum_evaluation": 8
+    },
+    "transport_logistics": {
+      "family": "engineering_design",
+      "description": "transportation systems, vehicles, aviation, shipping, supply chains and logistics",
+      "minimum_train": 24,
+      "minimum_evaluation": 8
+    },
+    "general_knowledge_explanation": {
+      "family": "language_communication",
+      "description": "general knowledge, definitions, conceptual explanation, comparison and question answering",
+      "minimum_train": 128,
+      "minimum_evaluation": 32,
+      "minimum_primary_train": 64,
+      "minimum_primary_evaluation": 16
+    },
+    "writing_editing_summarization": {
+      "family": "language_communication",
+      "description": "writing, rewriting, editing, summarization, reports and professional communication",
+      "minimum_train": 96,
+      "minimum_evaluation": 24,
+      "minimum_primary_train": 48,
+      "minimum_primary_evaluation": 12
+    },
+    "translation_localization_linguistics": {
+      "family": "language_communication",
+      "description": "translation, localization, grammar, terminology, language learning and linguistics",
+      "minimum_train": 48,
       "minimum_evaluation": 12,
-      "minimum_train": 48
+      "minimum_primary_train": 32,
+      "minimum_primary_evaluation": 8
+    },
+    "interpersonal_communication": {
+      "family": "language_communication",
+      "description": "emails, meetings, negotiation, conflict resolution, social communication and tone adaptation",
+      "minimum_train": 40,
+      "minimum_evaluation": 10,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "creative_arts_literature": {
+      "family": "language_communication",
+      "description": "creative writing, literature, visual arts, music, cultural interpretation and composition",
+      "minimum_train": 40,
+      "minimum_evaluation": 10,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "biology_biotechnology": {
+      "family": "life_health",
+      "description": "biology, ecology, genetics, microbiology, neuroscience and biotechnology",
+      "minimum_train": 40,
+      "minimum_evaluation": 10,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "medicine_health": {
+      "family": "life_health",
+      "description": "medicine, public health, symptoms, clinical concepts and uncertainty-aware health assistance",
+      "minimum_train": 48,
+      "minimum_evaluation": 12,
+      "minimum_primary_train": 32,
+      "minimum_primary_evaluation": 8
+    },
+    "agriculture_food_systems": {
+      "family": "life_health",
+      "description": "agriculture, horticulture, forestry, animal husbandry and food production systems",
+      "minimum_train": 24,
+      "minimum_evaluation": 8
     },
     "mathematics_logic": {
-      "description": "arithmetic, algebra, geometry, probability and formal reasoning",
-      "minimum_evaluation": 32,
-      "minimum_train": 128
+      "family": "quantitative_natural_sciences",
+      "description": "arithmetic, algebra, geometry, calculus, probability, discrete mathematics and formal logic",
+      "minimum_train": 96,
+      "minimum_evaluation": 24,
+      "minimum_primary_train": 48,
+      "minimum_primary_evaluation": 12
     },
-    "physical_sciences_environment": {
-      "description": "physics, chemistry, earth science, climate and environment",
-      "minimum_evaluation": 12,
-      "minimum_train": 48
+    "physics_astronomy": {
+      "family": "quantitative_natural_sciences",
+      "description": "physics, applied physics, astronomy, cosmology and measurement",
+      "minimum_train": 40,
+      "minimum_evaluation": 10,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "chemistry_materials": {
+      "family": "quantitative_natural_sciences",
+      "description": "chemistry, chemical engineering, materials science and laboratory analysis",
+      "minimum_train": 40,
+      "minimum_evaluation": 10,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "earth_climate_environment": {
+      "family": "quantitative_natural_sciences",
+      "description": "earth science, geology, weather, climate, energy and environmental science",
+      "minimum_train": 40,
+      "minimum_evaluation": 10,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
     },
     "safety_uncertainty": {
-      "description": "refusal, uncertainty calibration and safe handling of sensitive requests",
+      "family": "safety",
+      "description": "refusal, harm prevention, uncertainty calibration, risk communication and sensitive requests",
+      "minimum_train": 48,
       "minimum_evaluation": 12,
-      "minimum_train": 48
+      "minimum_primary_train": 32,
+      "minimum_primary_evaluation": 8
     },
-    "social_science_education": {
-      "description": "education, psychology, sociology and learning support",
+    "history_archaeology": {
+      "family": "society_humanities",
+      "description": "history, historiography, archaeology, historical sources and chronology",
+      "minimum_train": 32,
+      "minimum_evaluation": 8,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "geography_geopolitics": {
+      "family": "society_humanities",
+      "description": "human and physical geography, regions, geopolitics and international relations",
+      "minimum_train": 32,
+      "minimum_evaluation": 8,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "politics_civics_institutions": {
+      "family": "society_humanities",
+      "description": "political systems, civics, elections, public institutions and democratic processes",
+      "minimum_train": 32,
+      "minimum_evaluation": 8,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "education_learning": {
+      "family": "society_humanities",
+      "description": "teaching, tutoring, curriculum, pedagogy, assessment and learning support",
+      "minimum_train": 40,
+      "minimum_evaluation": 10,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "psychology_sociology": {
+      "family": "society_humanities",
+      "description": "psychology, sociology, anthropology, organizations and human behavior",
+      "minimum_train": 32,
+      "minimum_evaluation": 8,
+      "minimum_primary_train": 24,
+      "minimum_primary_evaluation": 8
+    },
+    "philosophy_ethics_religion": {
+      "family": "society_humanities",
+      "description": "philosophy, ethics, critical reasoning, religion and comparative belief systems",
+      "minimum_train": 24,
+      "minimum_evaluation": 8
+    },
+    "software_development": {
+      "family": "software_data",
+      "description": "software development, algorithms, programming, debugging, testing and code review",
+      "minimum_train": 192,
+      "minimum_evaluation": 48,
+      "minimum_primary_train": 64,
+      "minimum_primary_evaluation": 16
+    },
+    "systems_cloud_databases": {
+      "family": "software_data",
+      "description": "operating systems, networking, distributed systems, cloud infrastructure and databases",
+      "minimum_train": 48,
       "minimum_evaluation": 12,
-      "minimum_train": 48
+      "minimum_primary_train": 32,
+      "minimum_primary_evaluation": 8
     },
-    "software_cybersecurity": {
-      "description": "coding, debugging, review, testing, systems, databases and defensive security",
-      "minimum_evaluation": 64,
-      "minimum_train": 256
-    },
-    "translation_languages": {
-      "description": "translation, localization, grammar and cross-lingual communication",
+    "cybersecurity_privacy": {
+      "family": "software_data",
+      "description": "defensive cybersecurity, secure development, privacy, identity and incident response",
+      "minimum_train": 48,
       "minimum_evaluation": 12,
-      "minimum_train": 48
+      "minimum_primary_train": 32,
+      "minimum_primary_evaluation": 8
     },
-    "writing_communication": {
-      "description": "explanation, summarization, rewriting and professional communication",
-      "minimum_evaluation": 12,
-      "minimum_train": 48
+    "data_analysis_statistics_structured": {
+      "family": "software_data",
+      "description": "data analysis, statistics, extraction, classification, tables, JSON, XML and constrained output",
+      "minimum_train": 96,
+      "minimum_evaluation": 24,
+      "minimum_primary_train": 48,
+      "minimum_primary_evaluation": 12
     }
   }
 }

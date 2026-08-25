@@ -1,0 +1,33 @@
+{
+  "format": "ctox.recovery-language-rubric.v1",
+  "translation_domain": "translation_localization_linguistics",
+  "languages": {
+    "en": {"minimum_train": 1400, "minimum_evaluation": 350, "minimum_primary_domains_train": 24, "minimum_primary_domains_evaluation": 18, "minimum_non_translation_train": 1200, "minimum_non_translation_evaluation": 300},
+    "de": {"minimum_train": 128, "minimum_evaluation": 32, "minimum_primary_domains_train": 8, "minimum_primary_domains_evaluation": 6, "minimum_non_translation_train": 96, "minimum_non_translation_evaluation": 24},
+    "de-en-mixed": {"minimum_train": 64, "minimum_evaluation": 16, "minimum_primary_domains_train": 6, "minimum_primary_domains_evaluation": 4, "minimum_non_translation_train": 48, "minimum_non_translation_evaluation": 12},
+    "arb": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "fra": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "hin": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "ita": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "jpn": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "kor": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "nld": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "pol": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "por": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "rus": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "spa": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6},
+    "zho": {"minimum_train": 32, "minimum_evaluation": 8, "minimum_primary_domains_train": 4, "minimum_primary_domains_evaluation": 3, "minimum_non_translation_train": 24, "minimum_non_translation_evaluation": 6}
+  },
+  "aggregate_non_english_family_minima": {
+    "agentic_information": {"train": 12, "evaluation": 3},
+    "business_law_public": {"train": 12, "evaluation": 3},
+    "daily_life": {"train": 12, "evaluation": 3},
+    "engineering_design": {"train": 8, "evaluation": 2},
+    "language_communication": {"train": 24, "evaluation": 6},
+    "life_health": {"train": 8, "evaluation": 2},
+    "quantitative_natural_sciences": {"train": 12, "evaluation": 3},
+    "safety": {"train": 4, "evaluation": 1},
+    "society_humanities": {"train": 12, "evaluation": 3},
+    "software_data": {"train": 24, "evaluation": 6}
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "format": "ctox.qwen38.domain-coverage-policy.v2",
+  "date": "2026-08-25",
+  "status": "policy_committed_reclassification_and_supplement_selection_pending",
+  "scope": "Qwen3.8-27B Q2/Q4 recovery selection and held-out quality evaluation",
+  "policy": {
+    "semantic_domains": 36,
+    "required_semantic_families": 10,
+    "language_strata": 15,
+    "joint_language_domain_gate": true,
+    "translation_only_language_coverage_rejected": true,
+    "domain_labels_are_training_targets": false,
+    "existing_teacher_cache_samples_remain_content_valid": true,
+    "new_supplements_are_disjoint_additive_batches": true
+  },
+  "inputs": {
+    "domain_rubric": "training/DOMAIN_RUBRIC.json",
+    "language_rubric": "training/LANGUAGE_RUBRIC.json",
+    "classifier": "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+    "classifier_revision": "8adb042d524ecd5c26d3e3ba0e3fbcf7e2d0864c"
+  },
+  "invalidated_as_final_release_evidence": [
+    "release-recovery-train-2072-v2.jsonl domain tags",
+    "release-recovery-evaluation-524-v2.jsonl domain tags",
+    "16-domain primary-gate summaries"
+  ],
+  "still_valid": [
+    "frozen train and held-out sample identities and payload hashes",
+    "completed BF16 teacher-cache artifacts for unchanged sample identities",
+    "zero train/evaluation overlap evidence",
+    "source revision and license provenance"
+  ],
+  "release_gate": "Reclassify both frozen cohorts and disjoint candidate pools under v2, select only high-confidence gap-closing additions, pass joint language/domain coverage, then cache additions separately."
+}

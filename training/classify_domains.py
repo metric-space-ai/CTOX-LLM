@@ -40,16 +40,48 @@ def deterministic_labels(record: dict[str, Any], final_answer: str) -> set[str]:
     labels: set[str] = set()
     category = record.get("category")
     if category == "agentic" or record.get("tools"):
-        labels.add("agentic_tools_search")
+        labels.add("agentic_tools_workflows")
     if category == "code":
-        labels.add("software_cybersecurity")
+        labels.add("software_development")
     if category == "math":
         labels.add("mathematics_logic")
     if category == "long_context":
-        labels.add("data_structured_outputs")
+        labels.add("data_analysis_statistics_structured")
     if final_answer.lstrip().startswith(("{", "[", "<", "```")):
-        labels.add("data_structured_outputs")
+        labels.add("data_analysis_statistics_structured")
     return labels
+
+
+def validate_rubric(rubric: dict[str, Any]) -> None:
+    policy = rubric["policy"]
+    domains = rubric["domains"]
+    required_families = set(policy["required_families"])
+    if not domains:
+        raise ValueError("domain rubric is empty")
+    observed_families = set()
+    for name, domain in domains.items():
+        family = domain.get("family")
+        if family not in required_families:
+            raise ValueError(f"domain {name} has unknown family {family!r}")
+        observed_families.add(family)
+        if not str(domain.get("description", "")).strip():
+            raise ValueError(f"domain {name} has no classifier description")
+        for partition in ("train", "evaluation"):
+            minimum = int(domain[f"minimum_{partition}"])
+            primary = int(
+                domain.get(
+                    f"minimum_primary_{partition}",
+                    policy[f"minimum_primary_{partition}"],
+                )
+            )
+            if minimum <= 0 or primary <= 0:
+                raise ValueError(f"domain {name} has a non-positive {partition} quota")
+    missing = required_families - observed_families
+    if missing:
+        raise ValueError(f"domain rubric omits required families: {sorted(missing)}")
+    confidence = float(policy["minimum_confidence"])
+    if not 0.0 < confidence <= 1.0:
+        raise ValueError("minimum_confidence must be in (0, 1]")
 
 
 def read_records(path: Path) -> list[dict[str, Any]]:
@@ -210,16 +242,29 @@ def quota_gaps(
     partition: str,
 ) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
     minimum_key = f"minimum_{partition}"
-    primary_minimum = int(rubric["policy"][f"minimum_primary_{partition}"])
     multi_label = {
         name: {"observed": counts[name], "required": int(domain[minimum_key])}
         for name, domain in rubric["domains"].items()
         if counts[name] < int(domain[minimum_key])
     }
     primary = {
-        name: {"observed": primary_counts[name], "required": primary_minimum}
-        for name in rubric["domains"]
-        if primary_counts[name] < primary_minimum
+        name: {
+            "observed": primary_counts[name],
+            "required": int(
+                domain.get(
+                    f"minimum_primary_{partition}",
+                    rubric["policy"][f"minimum_primary_{partition}"],
+                )
+            ),
+        }
+        for name, domain in rubric["domains"].items()
+        if primary_counts[name]
+        < int(
+            domain.get(
+                f"minimum_primary_{partition}",
+                rubric["policy"][f"minimum_primary_{partition}"],
+            )
+        )
     }
     return multi_label, primary
 
@@ -242,6 +287,7 @@ def main() -> None:
         raise SystemExit(f"refusing to overwrite {args.summary}")
     rubric = json.loads(args.rubric.read_text(encoding="utf-8"))
     try:
+        validate_rubric(rubric)
         import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
     except ImportError as error:

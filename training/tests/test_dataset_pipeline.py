@@ -32,7 +32,13 @@ from cache_teacher import (  # noqa: E402
     position_sets,
     validate_local_model_provenance,
 )
-from classify_domains import classification_text, deterministic_labels, quota_gaps  # noqa: E402
+from classify_domains import (  # noqa: E402
+    classification_text,
+    deterministic_labels,
+    quota_gaps,
+    validate_rubric,
+)
+from audit_selection_coverage import coverage_report  # noqa: E402
 from collect_activation_stats import (  # noqa: E402
     checkpoint_weight_name,
     prefill_ranges,
@@ -142,12 +148,101 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(
             deterministic_labels(record, record["messages"][-1]["content"]),
             {
-                "agentic_tools_search",
-                "data_structured_outputs",
-                "software_cybersecurity",
+                "agentic_tools_workflows",
+                "data_analysis_statistics_structured",
+                "software_development",
             },
         )
         self.assertIn("user: Debug this program", classification_text(record))
+
+    def test_release_domain_rubric_covers_every_required_family(self) -> None:
+        rubric = json.loads((TRAINING / "DOMAIN_RUBRIC.json").read_text())
+        validate_rubric(rubric)
+        self.assertEqual(rubric["format"], "ctox.recovery-domain-rubric.v2")
+        self.assertGreaterEqual(len(rubric["domains"]), 36)
+        self.assertEqual(
+            {domain["family"] for domain in rubric["domains"].values()},
+            set(rubric["policy"]["required_families"]),
+        )
+
+    def test_primary_quota_can_be_stricter_for_major_domains(self) -> None:
+        rubric = {
+            "policy": {
+                "minimum_primary_train": 1,
+            },
+            "domains": {
+                "general": {
+                    "minimum_train": 1,
+                    "minimum_primary_train": 3,
+                },
+                "niche": {"minimum_train": 1},
+            },
+        }
+        gaps, primary_gaps = quota_gaps(
+            Counter({"general": 5, "niche": 5}),
+            Counter({"general": 2, "niche": 1}),
+            rubric,
+            "train",
+        )
+        self.assertEqual(gaps, {})
+        self.assertEqual(primary_gaps, {"general": {"observed": 2, "required": 3}})
+
+    def test_joint_language_gate_rejects_translation_only_coverage(self) -> None:
+        domain_rubric = {
+            "policy": {
+                "required_families": ["language", "software"],
+                "minimum_confidence": 0.7,
+                "minimum_primary_train": 1,
+                "minimum_primary_evaluation": 1,
+            },
+            "domains": {
+                "translation": {
+                    "family": "language",
+                    "description": "translation",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                },
+                "code": {
+                    "family": "software",
+                    "description": "software",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                },
+            },
+        }
+        language_rubric = {
+            "translation_domain": "translation",
+            "languages": {
+                "en": {
+                    "minimum_train": 1,
+                    "minimum_primary_domains_train": 1,
+                    "minimum_non_translation_train": 1,
+                },
+                "de": {
+                    "minimum_train": 1,
+                    "minimum_primary_domains_train": 1,
+                    "minimum_non_translation_train": 1,
+                },
+            },
+            "aggregate_non_english_family_minima": {
+                "language": {"train": 1},
+                "software": {"train": 1},
+            },
+        }
+        records = [{"id": "a", "language": "en"}, {"id": "b", "language": "de"}]
+        tags = {
+            "a": {"primary_label": "code"},
+            "b": {"primary_label": "translation"},
+        }
+        report = coverage_report(
+            records, tags, domain_rubric, language_rubric, "train"
+        )
+        self.assertEqual(report["status"], "supplement_required")
+        self.assertEqual(report["non_translation_gaps"]["de"]["observed"], 0)
+        self.assertEqual(
+            report["aggregate_non_english_family_gaps"]["software"]["observed"],
+            0,
+        )
 
     def test_domain_gate_requires_clear_primary_examples_not_only_multilabel_hits(self) -> None:
         rubric = {

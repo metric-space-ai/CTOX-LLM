@@ -83,10 +83,14 @@ the exact total before materialization.
 `audit_corpus.py` re-verifies every materialized payload hash and reports exact
 language, capability, source, prompt-length, assistant-target, multi-turn,
 structured-output, and tool-schema distributions before GPU work is admitted.
-`DOMAIN_RUBRIC.json` is the subsequent semantic gate: its 16 multi-label domain
-families have independent train/evaluation minima. Source split names are not
-accepted as domain evidence; underfilled labels must be replenished before the
-release-size teacher cache begins.
+`DOMAIN_RUBRIC.json` is the subsequent semantic gate. Version 2 expands the
+coarse 16-label pilot into 36 independently gated service domains grouped into
+ten required families. It separates, for example, medicine from biology,
+physics from chemistry, software development from systems and cybersecurity,
+and finance from business operations and law. Major general, coding, agentic,
+writing, mathematics, and structured-data domains have higher primary quotas;
+the long tail still requires unambiguous train and held-out examples. Source
+split names are not accepted as domain evidence.
 `classify_domains.py` applies that rubric with a revision-pinned multilingual
 NLI classifier. Threshold labels are supplemented only by deterministic source
 facts (for example, an actual tool schema or the pinned code/math split). Its
@@ -102,6 +106,13 @@ disjoint candidate pool. It requires the target to be the candidate's primary
 label above a configurable confidence floor, adds a safety margin, and ranks
 confidence before token cost; broad low-confidence multi-label matches cannot
 enter merely to satisfy a quota.
+`LANGUAGE_RUBRIC.json` independently fixes English, German, mixed German-English,
+and twelve additional language minima. `audit_selection_coverage.py` joins the
+frozen semantic tags back to the exact materialized records and rejects a mix
+when a language contains only translation tasks, too few distinct primary
+domains, or when the combined non-English cohort omits any required semantic
+family. Language count alone is therefore not accepted as multilingual
+coverage.
 
 `plan_teacher_cache.py` tokenizes the complete frozen cohort with the same
 assistant, hidden-state, marker-window, and MTP position rules as the cache

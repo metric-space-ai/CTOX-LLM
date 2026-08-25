@@ -29,8 +29,9 @@ avoids defining multilingual as only French and Spanish translation.
 
 ## Application-domain coverage
 
-The general, German, and multilingual strata are tagged and audited against the
-following domain matrix before teacher caching:
+The general, German, and multilingual strata are tagged and audited against a
+36-domain matrix before a release candidate is admitted. The compact list below
+is a readable summary; `DOMAIN_RUBRIC.json` contains the binding quotas:
 
 - everyday assistance, communication, rewriting, summarization, and education;
 - software, data, cybersecurity, hardware, and engineering;
@@ -47,6 +48,19 @@ counts from source metadata plus the frozen multi-label classifier contract in
 misses its minimum is replenished from its source pool before training. Medical,
 legal, and financial records preserve general assistance and uncertainty
 behavior; they are not treated as a substitute for expert-reviewed knowledge.
+
+The semantic gate is hierarchical: every one of ten families must be present,
+and every one of its 36 leaf domains must independently meet both a multi-label
+minimum and a clear-primary minimum. This prevents broad labels such as STEM,
+business, or humanities from hiding a missing field. Coding, agentic work, and
+mathematics retain higher quotas without being allowed to displace ordinary
+language, professional, scientific, societal, creative, and daily-life tasks.
+
+Multilingual admission is joint rather than a raw language count. Each of the
+15 declared language strata must contain several distinct primary domains and
+enough non-translation tasks. Across all non-English records, every semantic
+family—including software/data, safety, science, business/law, and daily life—
+must have primary examples in both recovery and held-out evaluation.
 
 ## Length and output-shape gates
 
