@@ -174,6 +174,12 @@ batches bounded simultaneously by sample count, input tokens, and projected
 output bytes. Each batch uses `cache_teacher.py --start-sample/--max-samples`
 and passes the same verifier independently, so a late host or GPU failure does
 not invalidate earlier teacher work.
+`select_uncached_teacher_records.py` subtracts only passed, revision- and
+provenance-matched teacher verifications from a final materialized cohort. It
+requires identical hidden-layer, hidden-size, top-k, and MTP settings and
+rejects any cached identity outside the final cohort. This permits verified
+batches from a superseded cohort ordering to be reused by exact payload
+identity without treating failed or smoke directories as evidence.
 `run_teacher_batches.py` executes that plan one batch at a time and immediately
 runs the content verifier. It skips existing work only when the completed run,
 source slice, teacher revision, provenance hash, and verification sample count
@@ -200,10 +206,12 @@ collapse multilingual/domain selection into a target label.
 only passed verification documents with one teacher revision and provenance,
 rejects duplicate sample identities and unsafe paths, and rechecks each
 artifact's exact byte length and SHA-256 when that sample is opened.
-After the final batch, `build_teacher_cache_set.py` resolves the batch plan to
-the exact ordered verification documents, rehashes every artifact by default,
-and emits the single content-addressed cache-set manifest accepted by the
-end-to-end trainer. Missing batches or a different sample count fail closed.
+After the final batch, `build_teacher_cache_set.py` resolves either one batch
+plan or an explicit list of verification documents, rehashes every artifact by
+default, and emits the single content-addressed cache-set manifest accepted by
+the end-to-end trainer. With `--expected-input`, its cached identity union must
+equal the final cohort exactly. Missing, extra, or settings-incompatible
+batches fail closed.
 The trainer reopens that set only with its expected manifest SHA-256, then
 reconstructs and compares the sample count, artifact bytes, content root, and
 every underlying batch-verification hash before the first optimization step.

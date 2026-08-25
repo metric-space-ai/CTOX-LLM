@@ -80,14 +80,14 @@ assignment and trained channel-scale initializer produce a fully checksummed
 plan. It is still not the release checkpoint: end-to-end KL, cross-entropy,
 hidden-state, and MTP distillation plus held-out quality gates remain pending.
 
-The release-size corpus candidate in
-[`docs/RECOVERY_CORPUS_V3.json`](docs/RECOVERY_CORPUS_V3.json) materializes
-2,072 recovery-training and 524 held-out samples with zero identity overlap.
-It balances ordinary chat, coding, mathematics/STEM, Agentic/tool use, German,
-twelve equal-weight additional languages, and genuine 32K/64K/128K retrieval.
-Every payload hash and all 2,596 final Assistant targets pass the tokenizer
-audit. The BF16 teacher is now byte-verified against the pinned Hub commit and
-the provenance-bound MTP target smoke passes. A revision-pinned multilingual
-NLI audit also places every sample against the frozen 16-family domain rubric;
-all independent train/evaluation minima pass. The release-size teacher cache
-and end-to-end recovery remain pending.
+The final quality-filtered corpus evidence in
+[`docs/RECOVERY_CORPUS_V4.json`](docs/RECOVERY_CORPUS_V4.json) freezes 2,328
+recovery-training and 642 held-out samples with zero identity and complete
+payload overlap. It balances ordinary chat, coding, mathematics/STEM,
+Agentic/tool use, German, twelve additional language strata, and genuine
+32K/64K/128K retrieval. All 36 service domains, ten domain families, and 15
+language strata pass independent train/evaluation gates. The earlier v3
+candidate is retained only as superseded evidence because its Nemotron-v1
+`chat` portion contained empty user turns. Five verified teacher batches cover
+593 final identities; the missing 1,735 BF16/MTP targets, end-to-end recovery,
+and held-out model-quality gates remain pending.

@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+CACHE_SETTING_KEYS = ("hidden_layers", "hidden_size", "top_k", "mtp_targets")
+
+
 def sha256_bytes(encoded: bytes) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
@@ -23,6 +26,7 @@ class VerifiedTeacherCache:
         self.teacher_provenance_sha256 = teacher_provenance_sha256
         self.batches: list[dict[str, Any]] = []
         self.artifacts: list[dict[str, Any]] = []
+        self.settings: dict[str, Any] | None = None
         seen_ids = set()
         for verification_path in verification_paths:
             encoded = verification_path.read_bytes()
@@ -35,6 +39,13 @@ class VerifiedTeacherCache:
                 raise ValueError(f"teacher revision differs in {verification_path}")
             if document.get("teacher_provenance_sha256") != teacher_provenance_sha256:
                 raise ValueError(f"teacher provenance differs in {verification_path}")
+            settings = {key: document.get(key) for key in CACHE_SETTING_KEYS}
+            if any(value is None for value in settings.values()):
+                raise ValueError(f"teacher cache settings are incomplete in {verification_path}")
+            if self.settings is None:
+                self.settings = settings
+            elif settings != self.settings:
+                raise ValueError(f"teacher cache settings differ in {verification_path}")
             cache = Path(document["cache"])
             local_artifacts = document.get("artifacts", [])
             if len(local_artifacts) != int(document.get("samples", -1)):
@@ -72,6 +83,8 @@ class VerifiedTeacherCache:
                 )
         if not self.artifacts:
             raise ValueError("verified teacher cache is empty")
+        if self.settings is None:
+            raise ValueError("verified teacher cache has no settings contract")
 
     @classmethod
     def from_manifest(
@@ -92,7 +105,7 @@ class VerifiedTeacherCache:
             str(document["teacher_provenance_sha256"]),
         )
         rebuilt = result.manifest()
-        for key in ("samples", "artifact_bytes", "artifact_root_sha256"):
+        for key in ("samples", "artifact_bytes", "artifact_root_sha256", "settings"):
             if rebuilt[key] != document.get(key):
                 raise ValueError(f"teacher cache-set {key} differs from verified batches")
         recorded_batches = document["batches"]
@@ -122,6 +135,7 @@ class VerifiedTeacherCache:
             "format": "ctox.teacher-cache-set.v1",
             "teacher_revision": self.teacher_revision,
             "teacher_provenance_sha256": self.teacher_provenance_sha256,
+            "settings": self.settings,
             "batches": self.batches,
             "samples": len(self.artifacts),
             "artifact_bytes": sum(artifact["bytes"] for artifact in self.artifacts),

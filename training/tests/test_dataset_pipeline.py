@@ -87,6 +87,7 @@ from packed_student_model import (  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
+from select_uncached_teacher_records import select_missing  # noqa: E402
 from select_primary_domain_supplement import select_supplement  # noqa: E402
 from select_coverage_supplement import (  # noqa: E402
     assigned_tag,
@@ -896,6 +897,10 @@ class DatasetPipelineTests(unittest.TestCase):
                         "status": "passed",
                         "teacher_revision": "r",
                         "teacher_provenance_sha256": "p",
+                        "hidden_layers": [0, 15, 31, 47, 63],
+                        "hidden_size": 5120,
+                        "top_k": 64,
+                        "mtp_targets": True,
                         "cache": str(cache),
                         "samples": 1,
                         "artifact_bytes": 5,
@@ -914,11 +919,29 @@ class DatasetPipelineTests(unittest.TestCase):
             manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
             loaded = VerifiedTeacherCache.from_manifest(manifest_path, manifest_sha256)
             self.assertEqual(loaded.manifest()["artifact_root_sha256"], manifest["artifact_root_sha256"])
+            mismatched = root / "mismatched.json"
+            mismatched_document = json.loads(verification.read_text())
+            mismatched_document["top_k"] = 32
+            mismatched.write_text(json.dumps(mismatched_document), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "settings differ"):
+                VerifiedTeacherCache([verification, mismatched], "r", "p")
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 VerifiedTeacherCache([verification, verification], "r", "p")
             artifact.write_bytes(b"other")
             with self.assertRaisesRegex(ValueError, "content"):
                 dataset.verified_artifact_path(0)
+
+    def test_uncached_teacher_selection_is_exact_and_rejects_extras(self) -> None:
+        records = [
+            {"id": "a", "category": "chat"},
+            {"id": "b", "category": "code"},
+            {"id": "c", "category": "math"},
+        ]
+        reused, missing = select_missing(records, {"a", "c"})
+        self.assertEqual([record["id"] for record in reused], ["a", "c"])
+        self.assertEqual([record["id"] for record in missing], ["b"])
+        with self.assertRaisesRegex(ValueError, "outside final cohort"):
+            select_missing(records, {"z"})
 
     def test_python_ctox_reader_matches_native_header_and_tensor_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

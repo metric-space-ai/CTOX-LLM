@@ -13,19 +13,25 @@ paths needed to build them.
 
 | Area | Current evidence | Missing before release |
 |---|---|---|
-| BF16 origin | `Qwen/Qwen3.8-27B` revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | Frozen tokenizer, template, special-token, and model-file digests in one release manifest |
+| BF16 origin | `Qwen/Qwen3.8-27B` revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`; 23 files/55,575,959,504 bytes verified under root SHA-256 `c63bc259cd8d18b0a701983a226867927b4ec19b376a684b218c3fa572754524` | Bind tokenizer, template, special-token, model-file, logical-checkpoint, and backend-pack digests in the final release manifest |
 | Native baseline | 8,342,484,480-byte CTOXQ file; 8,342,086,656 resident bytes; text plus MTP; SHA-256 `02d38cc877ad2ae8bea244bc11d4572ca0a8c84e757bdfbcb27ebbb9ed8c47f6` | Recovery scales are identity values; this is not the quality checkpoint |
 | Expanded initializer | 167 unique samples/823,996 observed tokens; all 506 matrices covered; 127 Q4, 377 Q2, and two mixed matrices; 8,373,052,416 resident bytes; fully checksummed 8,373,658,112-byte CTOXQ pack | Release-size agentic and teacher cohorts, end-to-end KL/CE/hidden/MTP recovery, held-out evaluation, and final logical digest |
-| Recovery data | 2,072 training and 524 held-out materialized samples; 15 language labels; ordinary chat, code, math/STEM, Agentic/tools, structured output, German, and genuine 32K/64K/128K; zero split/prior-calibration overlap; all payloads and Assistant targets verified; all 16 semantic domain minima pass | Cache release-size sparse BF16/MTP teacher targets and run release-quality evaluation |
+| Recovery data | Final quality-filtered 2,328 training and 642 held-out samples; 36 service domains in ten families; 15 language strata; 503 code, 381 agentic, 523 math, 866 ordinary-chat, and 55 long-context training records; zero ID and complete-payload overlap | Cache the 1,735 training identities not yet covered by the five verified release batches, assemble one 2,328-sample teacher cache set, then run final sensitivity/recovery/evaluation |
 | CPU | Scalar oracle plus experimental packed AVX2/NEON Q2/Q4 matvec | Complete graph operations, ISA profiles, end-to-end correctness, and production benchmark |
 | CUDA | Pinned upstream reference sources and SM86 ABI contract | CTOX Q2_B64/Q4_B64 kernels, graph execution, verifier, and GPU3 benchmark |
 | Metal | Compilable Q2/Q4 MSL candidate | Runtime dispatch, same-device numerical evidence, full graph, and benchmark |
 | Snapdragon | QNN/Vulkan/AHardwareBuffer contract | Exact Fold SoC support, compiled HTP/Vulkan graph, shared-memory proof, and device measurements |
-| Runtime | Loader, memory planner, wire types, and bring-up server | Stable `Engine` ABI, tokenizer, full decoder, MTP verification, streaming, cancellation, session reset, and complete unload |
+| Runtime | Checksummed v1/v2 container, memory planner, graph ownership plan, wire types, experimental fused CPU matvec, and bring-up server that deliberately returns `engine_not_ready` | Stable `Engine` ABI, tokenizer, executable full decoder, MTP verification, streaming, cancellation, session reset, and complete unload |
 
 The reported 9.5748-GiB baseline and 9.6037-GiB initializer 128K figures are
 verified calculations, not measured RSS/PSS/VRAM peaks. Likewise, the planned
 9.6976-GiB vision phase is not yet Android device evidence.
+
+The five verified release teacher-cache batches currently cover 593 of the
+2,328 final training identities. Their reusable identities are content-bound to
+the same BF16 teacher revision and provenance. The remaining 1,735 records are
+the next blocking artifact set; no smoke cache or failed/OOM directory counts
+toward that number.
 
 ## Frozen release invariants
 
@@ -71,28 +77,37 @@ These constraints apply to every phase:
 - A backend-pack verifier proves equal logical tensor digests.
 - ABI lifecycle tests include cancelled loads and repeated load/unload cycles.
 
-## Phase 1: finish the recovery corpus and teacher evidence
+## Phase 1: freeze the recovery corpus and finish teacher evidence
+
+**Status:** corpus selection and held-out disjointness are complete; teacher
+evidence is 593/2,328 complete.
 
 **Work**
 
-1. Run activation collection for the pinned German cohort and merge it with the
-   existing Nemotron statistics by exact observed token counts.
-2. Add release-eligible agentic/tool-use, structured-output, bilingual code,
-   mathematics, and genuine long-context/RAG samples. Record repository,
-   immutable revision, license, record hash, language, domain, and length.
-3. Build 32K, 64K, and 128K calibration/evaluation examples that exercise
-   retrieval positions rather than merely padding short prompts.
-4. Capture BF16 top-64 logits, residual mass, selected hidden states, and the
-   activation statistics required by the recovery losses. Cover embedding,
-   LM head, and every resident MTP matrix explicitly.
-5. Keep Nemotron v2 quarantined until its public derivative-use decision is
+1. Preserve the final 2,328/642 materialized identities and provenance-only
+   manifests recorded by `RECOVERY_CORPUS_V4.json`; do not reuse the superseded
+   2,072/524 cohort as release evidence.
+2. Compute the exact final-minus-verified set from passed batch-verification
+   manifests. Reject smoke, failed, duplicate, wrong-revision, or
+   wrong-provenance cache entries.
+3. Plan and execute the missing 1,735 records in token-aware immutable batches.
+   Long-context batches use the already measured safe memory profiles and exact
+   prefix-resume semantics.
+4. Capture BF16 top-64 logits, residual mass, selected hidden states, and MTP
+   targets under the same settings as the existing verified batches.
+5. Assemble all passed batches into one content-addressed 2,328-sample cache-set
+   manifest and rehash every artifact before recovery admission.
+6. Keep Nemotron v2 quarantined until its public derivative-use decision is
    documented. Track all GPU work in the 240-GPU-hour ledger.
 
 **Exit evidence**
 
 - Immutable provenance and cohort manifests with no unresolved release-license
-  finding.
-- Reproducible teacher-cache hashes and coverage report for every planned loss.
+  finding; 36/36 domains and 15/15 language strata pass in both partitions.
+- Exactly 2,328 unique, verified teacher artifacts under one teacher revision,
+  provenance digest, loss-position contract, and cache-set root hash.
+- Reproducible teacher-cache hashes and coverage report for every planned loss;
+  missing, duplicate, and extra cache identities are all hard failures.
 - Separate calibration, recovery-training, and held-out evaluation splits.
 
 ## Phase 2: train and freeze the final Q2/Q4 checkpoint
@@ -249,7 +264,7 @@ These constraints apply to every phase:
 
 The critical path is:
 
-`complete corpus -> final sensitivity -> recovery training -> final logical checkpoint -> complete Rust graph -> CUDA reference backend -> Metal/CPU -> Snapdragon device backend -> integrations -> release`
+`complete final teacher cache -> final activation/sensitivity -> recovery training -> held-out quality loop -> final logical checkpoint -> complete Rust graph -> CUDA reference backend -> Metal/CPU -> Snapdragon device backend -> integrations -> release`
 
 Contract work in Phase 0 may proceed alongside the data pipeline, but neither
 backend tuning nor Greppy integration may invent a model identity before the
@@ -257,13 +272,18 @@ logical checkpoint and manifest contract are frozen.
 
 The immediate execution batch is:
 
-1. expand the release-eligible Agentic, tool-calling, bilingual-code, and
-   mathematics cohorts and freeze disjoint train/evaluation splits;
-2. cache sparse BF16 top-64 logits and selected hidden targets for that cohort,
-   including explicit resident-MTP targets;
-3. replace the layer-only recovery placeholder with a complete fixed-qcode
-   student graph consuming KL, cross-entropy, hidden, activation, and MTP loss;
-4. run bounded recovery ablations from the verified 167-sample initializer;
-5. evaluate held-out quality before freezing the final logical checkpoint;
-6. complete the v2 release manifest and embeddable `Engine` lifecycle while GPU
-   recovery runs proceed.
+1. emit an exact final-minus-verified 1,735-record cohort and a report binding
+   the final corpus hash to the five reused verification hashes;
+2. produce its exact teacher-cache size and token-aware batch plan, then run and
+   verify each missing BF16/MTP batch;
+3. assemble and rehash the full 2,328-record teacher cache set;
+4. recompute all-506-matrix activation statistics and the Q2/Q4 assignment on
+   the final cohort under the 7.8-GiB package ceiling;
+5. replace `train_recovery.py`'s layer-only utility with a complete packed
+   fixed-qcode student trainer consuming KL, CE, hidden, activation, and MTP
+   losses, while retaining the bounded layer utility as an initializer tool;
+6. run held-out quality/long-context/MTP ablations until the release gates pass,
+   then freeze the logical checkpoint and release manifest;
+7. in parallel where it does not consume the recovery GPU, complete the
+   embeddable Rust `Engine` lifecycle and scalar full-graph oracle. Accelerator
+   tuning begins only after logical checkpoint identity is frozen.
