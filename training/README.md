@@ -129,6 +129,10 @@ MTP draft target.
 only passed verification documents with one teacher revision and provenance,
 rejects duplicate sample identities and unsafe paths, and rechecks each
 artifact's exact byte length and SHA-256 when that sample is opened.
+After the final batch, `build_teacher_cache_set.py` resolves the batch plan to
+the exact ordered verification documents, rehashes every artifact by default,
+and emits the single content-addressed cache-set manifest accepted by the
+end-to-end trainer. Missing batches or a different sample count fail closed.
 
 Agentic manifests pin source-specific splits and reviewed upstream revisions.
 Their complete tool schemas are part of both the payload hash and materialized
