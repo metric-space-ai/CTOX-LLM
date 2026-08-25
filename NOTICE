@@ -15,3 +15,13 @@ and must not be copied into this repository or its release archives.
 
 The vendor directories intentionally contain no upstream sources until a
 specific kernel family is pinned and its license is recorded next to the pin.
+
+Vendored third-party source:
+
+- models/qwen38_27b/vendor/cuda/ contains MIT-licensed CUDA MMQ/dequant
+  reference files from llama.cpp (https://github.com/ggml-org/llama.cpp),
+  pinned to revision ef2d770117db45b05aa7ecd1b0acca36370c5470,
+  Copyright (c) 2023-2026 The ggml authors. The MIT license text and
+  per-file digests are recorded next to the pin in
+  models/qwen38_27b/vendor/cuda/LICENSE and
+  models/qwen38_27b/vendor/cuda/UPSTREAM.json.

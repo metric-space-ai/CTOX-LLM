@@ -1,0 +1,91 @@
+{
+  "upstream": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "revision": "ef2d770117db45b05aa7ecd1b0acca36370c5470",
+    "license": "MIT",
+    "license_file": "LICENSE",
+    "fetched": "2026-08-25",
+    "archive": "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/ef2d770117db45b05aa7ecd1b0acca36370c5470"
+  },
+  "scope": "Minimum MIT-licensed upstream CUDA MMQ/dequant reference set relevant to 2-bit and 4-bit operations for the SM86 Q2_B64/Q4_B64 correctness baseline. Files are byte-identical to the pinned revision; verify with the SHA-256 values below before trusting any anchor.",
+  "files": [
+    {
+      "path": "ggml/src/ggml-common.h",
+      "upstream_path": "ggml/src/ggml-common.h",
+      "sha256": "578a0cffc8284387191aceb7128cc39d92a3b3edc199fe0b79ed8627fefcc633",
+      "lines": 1901,
+      "purpose": "Ground-truth upstream packed block layouts (block_q2_K lines 288-299, block_q4_K lines 317-328, QK_K super-block constants lines 87-151) that the MMQ tile loaders consume. Vendored because mmq.cuh dereferences these structs."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/dequantize.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/dequantize.cuh",
+      "sha256": "d9f0c9bc245f6f0ff9bd117a81b4ba6542df4aadfd421e69d19877c1c7d471aa",
+      "lines": 99,
+      "purpose": "Device dequantization patterns: half-scale fetch plus nibble/bit extraction (dequantize_q4_0 lines 25-38). Reference for the Q2_B64/Q4_B64 dequant stage of the fused matvec."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/vecdotq.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/vecdotq.cuh",
+      "sha256": "69ee2488c89da7e6d31a91d2f33f3312d7c66dbcb60b4c42f154bdf775c4436a",
+      "lines": 1317,
+      "purpose": "dp4a-based quantized dot products: integer unpack helpers (get_int_b1/b2/b4 lines 7-32) and vec_dot_q4_0_q8_1_impl (lines 115-137) plus Q2_K/Q4_K impls used by the MMQ dp4a fallback. Reference for the 2-bit/4-bit integer accumulation stage."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/mma.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/mma.cuh",
+      "sha256": "c7e0f3332da182e203b4b953f9fa8535ffca3767d2b7d4d7dbf7ce486262d1af",
+      "lines": 1456,
+      "purpose": "mma.sync and ldmatrix wrappers gated on Ampere (lines 923-1022, 1162-1224). Required include of mmq.cuh; ground truth for the SM86 mma tile path."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/mmq.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/mmq.cuh",
+      "sha256": "6d153a9d6f293a4ff5f11e7886a48bf765b21d74075d73b2097a2b2a9149de6f",
+      "lines": 4176,
+      "purpose": "MMQ shared-memory tile layouts and kernels: dp4a tile sizes for Q2_K/Q4_K (lines 186-229), load_tiles_q2_K (lines 1628-1685), load_tiles_q4_K (line 2093), mul_mat_q kernel entry (line 3542) and launch logic (lines 3955-4090). Reference for tile sizing and launch geometry of the future fused kernels."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/mmq.cu",
+      "upstream_path": "ggml/src/ggml-cuda/mmq.cu",
+      "sha256": "550b1f1baf1db0e349b0974754e4810bfb90fc9e7c97873622daf06f02e8a63c",
+      "lines": 379,
+      "purpose": "Host-side MMQ dispatch: stream-k selection for Volta+ (lines 121-122, 252-260) and per-architecture MMQ eligibility in ggml_cuda_should_use_mmq (lines 267-378). Reference for SM86 profile gating in the Rust ABI descriptor."
+    }
+  ],
+  "required_includes_not_vendored": [
+    {
+      "path": "ggml/src/ggml-cuda/common.cuh",
+      "reason": "Framework glue (device props, stream helpers, ggml_cuda_dp4a at line 694). Pulls in the full ggml API headers; outside the minimum kernel-reference set. Must be re-added before any real compilation of the vendored files."
+    },
+    {
+      "path": "ggml/include/ggml.h",
+      "reason": "ggml core public API; framework scope, not a 2-bit/4-bit kernel reference."
+    },
+    {
+      "path": "ggml/src/ggml-impl.h",
+      "reason": "ggml internal helpers required by common.cuh; framework scope."
+    },
+    {
+      "path": "ggml/include/ggml-cuda.h",
+      "reason": "ggml CUDA backend public header required by common.cuh; framework scope."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/vendors/cuda.h",
+      "reason": "CUDA toolkit include shim selected by common.cuh on NVIDIA builds; toolchain scope."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/quantize.cuh",
+      "reason": "Required by mmq.cu host dispatch for activation quantization; not part of the 2-bit/4-bit weight-path reference."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/mmid.cuh",
+      "reason": "Required by mmq.cu for MoE expert routing; out of scope for the dense fused matvec baseline."
+    }
+  ],
+  "notes": [
+    "The vendored files are reference material for the correctness baseline only. They are not compiled into the crate and no production CUDA kernel is derived from them yet.",
+    "Upstream layouts (Q2_K/Q4_K super-blocks) differ from the crate Q2_B64/Q4_B64 layouts (64-value blocks, f16 scale, no zero-point); the vendored files pin the dp4a/mma techniques and launch geometry, not the block format.",
+    "Q3 formats exist upstream but are deliberately out of scope; this crate supports only Q2_B64 and Q4_B64.",
+    "Promotion to Verifier requires the same-device evidence described in docs/CUDA_KERNEL_NOTES.md and docs/PROMOTION_GATES.md."
+  ]
+}

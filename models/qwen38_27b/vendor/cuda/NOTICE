@@ -1,0 +1,21 @@
+CUDA kernel reference material vendored from llama.cpp
+=======================================================
+
+Source:     https://github.com/ggml-org/llama.cpp
+Revision:   ef2d770117db45b05aa7ecd1b0acca36370c5470 (pinned, immutable)
+License:    MIT License, Copyright (c) 2023-2026 The ggml authors
+            (full text in LICENSE alongside this notice)
+
+Vendored files (unmodified, byte-identical to the pinned revision):
+
+  ggml/src/ggml-common.h            - upstream packed block layouts
+  ggml/src/ggml-cuda/dequantize.cuh - device dequantization patterns
+  ggml/src/ggml-cuda/vecdotq.cuh    - dp4a quantized dot products
+  ggml/src/ggml-cuda/mma.cuh        - Ampere mma.sync / ldmatrix wrappers
+  ggml/src/ggml-cuda/mmq.cuh        - MMQ tile layouts and kernels
+  ggml/src/ggml-cuda/mmq.cu         - MMQ host dispatch and arch gating
+
+Per-file SHA-256 digests, purposes, and the list of required upstream
+includes deliberately NOT vendored (with reasons) are recorded in
+UPSTREAM.json. These files are correctness-baseline reference material;
+they are not compiled into the crate. See docs/CUDA_KERNEL_NOTES.md.
