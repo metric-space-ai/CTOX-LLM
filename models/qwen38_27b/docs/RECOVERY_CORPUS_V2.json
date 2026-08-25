@@ -1,7 +1,7 @@
 {
   "format": "ctox.recovery-corpus-evidence.v2",
   "date": "2026-08-25",
-  "status": "corpus_generated_sparse_teacher_long_context_smoke_passed",
+  "status": "corpus_generated_sparse_teacher_and_activation_bands_passed",
   "model": "Qwen/Qwen3.8-27B",
   "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
   "source_policy": "training/SOURCE_POLICY.md",
@@ -133,7 +133,7 @@
   "pending": [
     "build the release-size agentic/tool-calling cohort across all reviewed splits",
     "cache the release-size sparse BF16 teacher cohort",
-    "collect and merge the full 32K/64K/128K activation-statistics cohort",
+    "collect and merge the release-size multilingual activation-statistics cohort",
     "train recovery corrections",
     "evaluate the recovered checkpoint on held-out long-context samples"
   ]

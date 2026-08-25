@@ -10,8 +10,49 @@ from pathlib import Path
 from typing import Any
 
 
+SEMANTIC_METADATA_FIELDS = (
+    "model",
+    "revision",
+    "observed_modules",
+    "target_tensors",
+    "unobserved_tensors",
+    "input_only_tensors",
+    "row_frequency_tensors",
+    "fla_kernel",
+)
+RUNTIME_METADATA_FIELDS = (
+    "gpu_weight_memory_gib",
+    "cpu_offload_memory_gib",
+    "mtp_device",
+    "prefill_chunk_tokens",
+    "torch_version",
+    "torch_cuda_version",
+    "pytorch_cuda_alloc_conf",
+    "cuda_memory",
+)
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def merged_metadata(
+    reference: dict[str, str],
+    sample_ids: list[str],
+    total_tokens: int,
+    input_hashes: list[str],
+    runtime_profiles: list[dict[str, str | None]],
+) -> dict[str, str]:
+    return {
+        "format": "ctox.activation-diagonal.v1",
+        **{field: reference[field] for field in SEMANTIC_METADATA_FIELDS},
+        "sample_ids": json.dumps(sample_ids, separators=(",", ":")),
+        "samples": str(len(sample_ids)),
+        "tokens": str(total_tokens),
+        "merged_batches": str(len(input_hashes)),
+        "input_sha256": json.dumps(input_hashes, separators=(",", ":")),
+        "source_runtime_profiles": json.dumps(runtime_profiles, separators=(",", ":")),
+    }
 
 
 def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file: Any) -> None:
@@ -25,6 +66,7 @@ def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file
     reference_metadata: dict[str, str] | None = None
     total_tokens = 0
     input_hashes = []
+    runtime_profiles = []
     for path in paths:
         with safe_open(path, framework="pt", device="cpu") as source:
             metadata = source.metadata()
@@ -34,14 +76,7 @@ def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file
             if reference_keys is not None and keys != reference_keys:
                 raise ValueError(f"{path} has a different tensor set")
             if reference_metadata is not None:
-                for field in (
-                    "model",
-                    "revision",
-                    "target_tensors",
-                    "unobserved_tensors",
-                    "input_only_tensors",
-                    "row_frequency_tensors",
-                ):
+                for field in SEMANTIC_METADATA_FIELDS:
                     if metadata.get(field) != reference_metadata.get(field):
                         raise ValueError(f"{path} metadata field {field} differs")
             reference_keys = keys
@@ -54,6 +89,9 @@ def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file
             sample_ids.extend(batch_ids)
             total_tokens += int(metadata["tokens"])
             input_hashes.append(sha256(path))
+            runtime_profiles.append(
+                {field: metadata.get(field) for field in RUNTIME_METADATA_FIELDS}
+            )
             bases = [key.removesuffix(".token_count") for key in keys if key.endswith(".token_count")]
             for base in bases:
                 count = int(source.get_tensor(f"{base}.token_count")[0])
@@ -97,15 +135,13 @@ def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file
     save_file(
         tensors,
         output,
-        metadata={
-            **reference_metadata,
-            "format": "ctox.activation-diagonal.v1",
-            "sample_ids": json.dumps(sample_ids, separators=(",", ":")),
-            "samples": str(len(sample_ids)),
-            "tokens": str(total_tokens),
-            "merged_batches": str(len(paths)),
-            "input_sha256": json.dumps(input_hashes, separators=(",", ":")),
-        },
+        metadata=merged_metadata(
+            reference_metadata,
+            sample_ids,
+            total_tokens,
+            input_hashes,
+            runtime_profiles,
+        ),
     )
 
 

@@ -56,5 +56,8 @@ tool-schema-complete NVIDIA Agentic samples plus disjoint bilingual 32K, 64K,
 and 128K calibration/evaluation cohorts. These samples are generated and hash
 verified. [`docs/TEACHER_CACHE_SMOKE_V1.json`](docs/TEACHER_CACHE_SMOKE_V1.json)
 adds real stateful BF16 teacher passes at 32K, 64K, and 128K and complete 32K
-activation coverage for all 506 quantized matrices. Release-size teacher and
+activation coverage for all 506 quantized matrices. The same evidence now
+includes count-weighted 32K/64K/128K activation bands, a 506-matrix
+sensitivity pass, and an exact 7.797994-GiB budget candidate. Those are
+single-sample-per-band smoke results; release-size multilingual teacher and
 activation cohorts plus recovery training are still pending.

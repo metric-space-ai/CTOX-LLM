@@ -19,6 +19,10 @@ Long calibration runs use `--start-sample`/`--max-samples` batches. Successful
 batches are immutable and `merge_activation_stats.py` combines their channel
 means using exact token counts, so a transient GPU failure never invalidates
 already completed work.
+Merged artifacts retain only semantic model/statistics metadata at top level.
+Weight placement, allocator configuration, Torch/CUDA versions, and measured
+CUDA peaks remain an ordered `source_runtime_profiles` list, so batches made
+with different safe offload profiles cannot be mislabeled as one runtime.
 `score_quant_sensitivity.py` then reuses the packer's canonical Q2/Q4 code
 construction and estimates each matrix's output error under a diagonal input
 covariance. Q4 optimization consumes the resulting measured quality gain per

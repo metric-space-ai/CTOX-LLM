@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,12 @@ from mtp_teacher import (
 )
 from prompt_format import render_record
 from run_ledger import GpuRun, require_budget
-from teacher_runtime import install_pinned_fla_kernel, weight_max_memory
+from teacher_runtime import (
+    cuda_memory_evidence,
+    install_pinned_fla_kernel,
+    reset_cuda_memory_peaks,
+    weight_max_memory,
+)
 
 
 QUANTIZED_DTYPES = frozenset({"q2_b64", "q4_b64", "mixed_q2_q4_b64"})
@@ -104,6 +110,7 @@ def collect(
         raise RuntimeError("teacher model does not expose its base model")
     mtp_device = resolve_mtp_device(args, torch, base_model)
     mtp_model = load_mtp_teacher(model, Path(args.model), mtp_device, safe_open)
+    reset_cuda_memory_peaks(torch, args.gpus)
 
     accumulators: dict[str, dict[str, Any]] = {}
     hooks = []
@@ -351,6 +358,7 @@ def collect(
     observed_names.update(input_only_tensors)
     observed_names.update(row_frequency_tensors)
     unobserved = sorted(targets - observed_names)
+    cuda_memory = cuda_memory_evidence(torch, args.gpus)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     save_file(
         tensors,
@@ -372,6 +380,11 @@ def collect(
             "cpu_offload_memory_gib": str(args.cpu_offload_memory_gib),
             "mtp_device": str(mtp_device),
             "prefill_chunk_tokens": str(args.prefill_chunk_tokens),
+            "device_map": json.dumps(model.hf_device_map, sort_keys=True, separators=(",", ":")),
+            "torch_version": str(torch.__version__),
+            "torch_cuda_version": str(torch.version.cuda),
+            "pytorch_cuda_alloc_conf": str(os.environ.get("PYTORCH_CUDA_ALLOC_CONF")),
+            "cuda_memory": json.dumps(cuda_memory, separators=(",", ":")),
         },
     )
     print(

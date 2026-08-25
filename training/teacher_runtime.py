@@ -52,3 +52,30 @@ def weight_max_memory(
     }
     result["cpu"] = f"{cpu_offload_memory_gib}GiB"
     return result
+
+
+def reset_cuda_memory_peaks(torch: Any, gpu_count: int) -> None:
+    if not torch.cuda.is_available():
+        return
+    for device_index in range(min(gpu_count, torch.cuda.device_count())):
+        torch.cuda.reset_peak_memory_stats(device_index)
+
+
+def cuda_memory_evidence(torch: Any, gpu_count: int) -> list[dict[str, Any]]:
+    if not torch.cuda.is_available():
+        return []
+    devices = []
+    for device_index in range(min(gpu_count, torch.cuda.device_count())):
+        torch.cuda.synchronize(device_index)
+        devices.append(
+            {
+                "index": device_index,
+                "name": torch.cuda.get_device_name(device_index),
+                "allocated_bytes": int(torch.cuda.memory_allocated(device_index)),
+                "peak_allocated_bytes": int(
+                    torch.cuda.max_memory_allocated(device_index)
+                ),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device_index)),
+            }
+        )
+    return devices

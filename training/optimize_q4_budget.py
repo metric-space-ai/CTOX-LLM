@@ -10,6 +10,9 @@ import math
 from pathlib import Path
 
 
+QUANTIZED_DTYPES = frozenset({"q2_b64", "q4_b64", "mixed_q2_q4_b64"})
+
+
 def align(value: int, alignment: int) -> int:
     return (value + alignment - 1) & ~(alignment - 1)
 
@@ -40,7 +43,7 @@ def layout_bytes(
     position = 0
     for entry in plan["tensors"]:
         position = align(position, plan["alignment"])
-        if entry["source_shard"] is not None and entry["dtype"] in {"q2_b64", "q4_b64"}:
+        if entry["source_shard"] is not None and entry["dtype"] in QUANTIZED_DTYPES:
             if entry["name"] in mixed_groups:
                 position += mixed_tensor_bytes(
                     mixed_groups[entry["name"]],
@@ -57,6 +60,31 @@ def layout_bytes(
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def initial_selections(
+    candidates: list[dict],
+    mixed_groups: dict[str, list[dict]],
+) -> tuple[set[str], dict[str, set[int]]]:
+    selected = {
+        item["name"]
+        for item in candidates
+        if item.get("fixed_q4") and item["name"] not in mixed_groups
+    }
+    selected_row_groups: dict[str, set[int]] = {}
+    for item in candidates:
+        if item["name"] not in mixed_groups:
+            continue
+        groups = mixed_groups[item["name"]]
+        if item.get("fixed_q4"):
+            selected_row_groups[item["name"]] = {
+                group["group_index"] for group in groups
+            }
+        else:
+            selected_row_groups[item["name"]] = {
+                group["group_index"] for group in groups if group.get("fixed_q4")
+            }
+    return selected, selected_row_groups
 
 
 def main() -> None:
@@ -76,15 +104,7 @@ def main() -> None:
         for item in candidates
         if item.get("row_groups")
     }
-    selected = {
-        item["name"]
-        for item in candidates
-        if item.get("fixed_q4") and item["name"] not in mixed_groups
-    }
-    selected_row_groups = {
-        name: {group["group_index"] for group in groups if group.get("fixed_q4")}
-        for name, groups in mixed_groups.items()
-    }
+    selected, selected_row_groups = initial_selections(candidates, mixed_groups)
     base_bytes = layout_bytes(plan, selected, mixed_groups, selected_row_groups)
     if base_bytes > args.budget_bytes:
         raise SystemExit(f"fixed Q4 policy requires {base_bytes} bytes, above budget")

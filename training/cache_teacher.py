@@ -19,7 +19,12 @@ from typing import Any
 
 from prompt_format import normalize_messages, render_record
 from run_ledger import GpuRun, require_budget
-from teacher_runtime import install_pinned_fla_kernel, weight_max_memory
+from teacher_runtime import (
+    cuda_memory_evidence,
+    install_pinned_fla_kernel,
+    reset_cuda_memory_peaks,
+    weight_max_memory,
+)
 
 
 def write_json_atomic(path: Path, document: dict[str, Any]) -> None:
@@ -190,9 +195,7 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
         "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
     }
     write_json_atomic(args.output / "run.json", run_manifest)
-    if torch.cuda.is_available():
-        for device_index in range(min(args.gpus, torch.cuda.device_count())):
-            torch.cuda.reset_peak_memory_stats(device_index)
+    reset_cuda_memory_peaks(torch, args.gpus)
     index_path = args.output / "index.jsonl"
     seen_samples = 0
     written_samples = 0
@@ -354,22 +357,9 @@ def cache(args: argparse.Namespace, torch: Any, save_file: Any, auto_model: Any,
             written_samples += 1
     for hook in hooks:
         hook.remove()
-    if torch.cuda.is_available():
-        devices = []
-        for device_index in range(min(args.gpus, torch.cuda.device_count())):
-            torch.cuda.synchronize(device_index)
-            devices.append(
-                {
-                    "index": device_index,
-                    "name": torch.cuda.get_device_name(device_index),
-                    "allocated_bytes": int(torch.cuda.memory_allocated(device_index)),
-                    "peak_allocated_bytes": int(
-                        torch.cuda.max_memory_allocated(device_index)
-                    ),
-                    "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device_index)),
-                }
-            )
-        run_manifest["cuda_memory"] = devices
+    cuda_memory = cuda_memory_evidence(torch, args.gpus)
+    if cuda_memory:
+        run_manifest["cuda_memory"] = cuda_memory
     run_manifest["written_samples"] = written_samples
     write_json_atomic(args.output / "run.json", run_manifest)
 

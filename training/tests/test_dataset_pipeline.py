@@ -30,8 +30,9 @@ from collect_activation_stats import (  # noqa: E402
     quantized_source_names,
 )
 from materialize_prompts import load_manifests  # noqa: E402
+from merge_activation_stats import merged_metadata  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
-from optimize_q4_budget import layout_bytes, mixed_tensor_bytes  # noqa: E402
+from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_bytes  # noqa: E402
 from prompt_format import normalize_messages, normalize_tool_call  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
@@ -259,6 +260,35 @@ class DatasetPipelineTests(unittest.TestCase):
             ["lm_head.weight", "matrix.weight"],
         )
 
+    def test_merged_activation_metadata_does_not_claim_one_runtime_profile(self) -> None:
+        reference = {
+            "model": "model",
+            "revision": "revision",
+            "observed_modules": "2",
+            "target_tensors": "2",
+            "unobserved_tensors": "[]",
+            "input_only_tensors": "[]",
+            "row_frequency_tensors": "[]",
+            "fla_kernel": "{}",
+            "gpu_weight_memory_gib": "16",
+        }
+        metadata = merged_metadata(
+            reference,
+            ["a", "b"],
+            12,
+            ["1" * 64, "2" * 64],
+            [
+                {"gpu_weight_memory_gib": "16"},
+                {"gpu_weight_memory_gib": "9"},
+            ],
+        )
+        self.assertNotIn("gpu_weight_memory_gib", metadata)
+        self.assertEqual(metadata["merged_batches"], "2")
+        self.assertEqual(
+            [profile["gpu_weight_memory_gib"] for profile in json.loads(metadata["source_runtime_profiles"])],
+            ["16", "9"],
+        )
+
     def test_mtp_names_map_to_frozen_checkpoint(self) -> None:
         self.assertEqual(
             mtp_checkpoint_weight_name("layers.0.eh_proj"),
@@ -351,6 +381,32 @@ class DatasetPipelineTests(unittest.TestCase):
             ),
             1792,
         )
+        plan["tensors"][0]["dtype"] = "mixed_q2_q4_b64"
+        self.assertEqual(
+            layout_bytes(
+                plan,
+                set(),
+                {"embedding.weight": groups},
+                {"embedding.weight": {1}},
+            ),
+            1792,
+        )
+
+    def test_fixed_mixed_tensor_selects_every_row_group(self) -> None:
+        groups = [{"group_index": 0}, {"group_index": 1}]
+        candidates = [
+            {
+                "name": "lm_head.weight",
+                "fixed_q4": True,
+                "row_groups": groups,
+            }
+        ]
+        selected, selected_groups = initial_selections(
+            candidates,
+            {"lm_head.weight": groups},
+        )
+        self.assertEqual(selected, set())
+        self.assertEqual(selected_groups, {"lm_head.weight": {0, 1}})
 
     def test_fold_package_budget_reserves_manifest_bytes(self) -> None:
         self.assertEqual(CONTAINER_MANIFEST_RESERVE, 2 * 1024 * 1024)

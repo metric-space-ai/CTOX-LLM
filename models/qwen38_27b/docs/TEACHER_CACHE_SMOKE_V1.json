@@ -109,6 +109,97 @@
     "elapsed_seconds": 92.3914361000061,
     "gpu_hours": 0.07699286341667175
   },
+  "long_context_activation_bands": [
+    {
+      "band": "32K",
+      "sequence_tokens": 32584,
+      "mtp_token_pairs": 32583,
+      "observed_quantized_matrices": 506,
+      "artifact_bytes": 31894304,
+      "artifact_sha256": "c00a81eb559cf28c8b45f9f014d2bd042ffa31b0bb5642d1264fa415449c5197",
+      "elapsed_seconds": 92.3914361000061,
+      "gpu_hours": 0.07699286341667175
+    },
+    {
+      "band": "64K",
+      "sequence_tokens": 65350,
+      "mtp_token_pairs": 65349,
+      "observed_quantized_matrices": 506,
+      "artifact_bytes": 31896560,
+      "artifact_sha256": "4b15b69021f69526f01f323b493dfd05a2e5400cf06c6bfe5919102cb61770a6",
+      "elapsed_seconds": 469.34866547584534,
+      "gpu_hours": 0.3911238878965378,
+      "cuda_peak_allocated_bytes": [
+        12142051328,
+        13496026112,
+        14392186368
+      ],
+      "cuda_peak_reserved_bytes": [
+        12603883520,
+        14264827904,
+        15294529536
+      ]
+    },
+    {
+      "band": "128K",
+      "sequence_tokens": 130925,
+      "mtp_token_pairs": 130924,
+      "observed_quantized_matrices": 506,
+      "artifact_bytes": 31896592,
+      "artifact_sha256": "10bd31cbd67c01c80e4a9cd02612c033fc7cd0f3a7b969a5f779476cbb92c7c3",
+      "elapsed_seconds": 1201.535037279129,
+      "gpu_hours": 1.0012791977326074,
+      "cuda_peak_allocated_bytes": [
+        16085310976,
+        14257407488,
+        15657749504
+      ],
+      "cuda_peak_reserved_bytes": [
+        16657678336,
+        16108224512,
+        17702060032
+      ]
+    }
+  ],
+  "merged_long_context_activation": {
+    "samples": 3,
+    "text_tokens": 228859,
+    "mtp_token_pairs": 228856,
+    "tensor_fields": 1515,
+    "artifact_bytes": 31896424,
+    "artifact_sha256": "ad6d15c29044965d244d08a8a911dc1547c62fb51b618722a5bbf308bc8944c9",
+    "exact_count_weighting": "passed",
+    "runtime_profiles_separate": true
+  },
+  "long_context_sensitivity_smoke": {
+    "candidates": 506,
+    "observed": 506,
+    "fixed_q4_candidates": 37,
+    "artifact_bytes": 1115331,
+    "artifact_sha256": "f57dea19db6377dba9f6f33cc55696ba2c404f357ec39b6b58bef0ca1942fe47",
+    "elapsed_seconds": 37.04409646987915,
+    "gpu_hours": 0.010290026797188653,
+    "embedding_q2_relative_error": 2.83106922454873,
+    "embedding_q4_relative_error": 0.08305821163923405,
+    "lm_head_q2_relative_error": 0.11908766987328,
+    "lm_head_q4_relative_error": 0.004574723219133969
+  },
+  "long_context_budget_candidate": {
+    "status": "smoke_only_not_release_assignment",
+    "assignment_sha256": "5e33281a08490e13e54430300b5b4eade5e2ce9abb6cdc00ac8281ce52f58083",
+    "plan_sha256": "5957c07ed90c8e70bd353e897b17315efe0a9e77e6d3a27032e2e04d9ff83272",
+    "base_bytes": 8090428416,
+    "resident_bytes": 8373031936,
+    "resident_gib": 7.7979936599731445,
+    "resident_limit_bytes": 8373089075,
+    "resident_headroom_bytes": 57139,
+    "container_manifest_reserve_bytes": 2097152,
+    "full_q4_matrices": 148,
+    "lm_head_q4_row_groups": 970,
+    "lm_head_row_groups": 970,
+    "embedding_q4_row_groups": 49,
+    "embedding_row_groups": 970
+  },
   "known_failed_attempts": [
     {
       "stage": "generic_transformers_kernel_switch",
@@ -126,7 +217,7 @@
   "limitations": [
     "These are one-sample smoke artifacts per context band, not the release-size teacher cache.",
     "Only decoder layer 0 hidden targets are cached in this memory-validation pass.",
-    "The 64K and 128K activation-statistics cohorts are not yet materialized.",
+    "Only one English activation-statistics sample per 32K/64K/128K band is materialized; this is not the release-size multilingual cohort.",
     "No recovery corrections have been trained from these targets yet."
   ]
 }
