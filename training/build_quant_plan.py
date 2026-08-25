@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from collections import Counter
@@ -93,6 +94,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--assignment", type=Path)
     parser.add_argument("--q-proj-q4-start", type=int, default=35)
     parser.add_argument("--linear-out-q4-start", type=int, default=64)
     parser.add_argument("--late-ffn-q4-start", type=int, default=64)
@@ -105,6 +107,12 @@ def main() -> None:
         from safetensors import safe_open
     except ImportError as error:
         raise SystemExit("install training/requirements.in before planning quantization") from error
+    assigned_q4: set[str] | None = None
+    if args.assignment:
+        assignment = json.loads(args.assignment.read_text(encoding="utf-8"))
+        if assignment.get("format") != "ctox.q2q4.assignment.v1":
+            raise SystemExit("unsupported Q2/Q4 assignment")
+        assigned_q4 = set(assignment["q4_tensors"])
 
     # Metadata lookup is shard-batched and never materializes tensor values.
     shard_tensors: dict[str, list[str]] = {}
@@ -131,6 +139,8 @@ def main() -> None:
             args.linear_out_q4_start,
             args.late_ffn_q4_start,
         )
+        if assigned_q4 is not None and dtype in {"q2_b64", "q4_b64"}:
+            dtype = "q4_b64" if name in assigned_q4 else "q2_b64"
         elements = math.prod(shape)
         size = packed_bytes(dtype, elements)
         logical_bytes = align(logical_bytes)
@@ -172,6 +182,13 @@ def main() -> None:
                 dtype_bytes["recovery_f16"] += correction_size
 
     total_bytes = align(logical_bytes)
+    quantized_names = {
+        entry["name"] for entry in tensors if entry["dtype"] in {"q2_b64", "q4_b64"}
+    }
+    if assigned_q4 is not None:
+        unknown = assigned_q4 - quantized_names
+        if unknown:
+            raise SystemExit(f"assignment contains {len(unknown)} non-quantizable tensors")
     plan = {
         "format": "ctox.q2q4.quant-plan.v1",
         "model": "Qwen/Qwen3.8-27B",
@@ -190,6 +207,12 @@ def main() -> None:
         "tensor_count": len(tensors),
         "tensors": tensors,
     }
+    if args.assignment:
+        plan["assignment"] = {
+            "path": str(args.assignment),
+            "sha256": hashlib.sha256(args.assignment.read_bytes()).hexdigest(),
+            "q4_tensor_count": len(assigned_q4 or ()),
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({key: plan[key] for key in ("total_bytes", "gib", "fits_fold_limit", "dtype_bytes")}, indent=2))

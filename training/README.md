@@ -19,6 +19,10 @@ Q2/Q4 error scoring without retaining source prompts or token activations.
 construction and estimates each matrix's output error under a diagonal input
 covariance. Q4 optimization consumes the resulting measured quality gain per
 additional byte.
+The optimizer recomputes the complete aligned native layout for every accepted
+Q4 candidate, including non-quantized tensors and recovery scales. Its immutable
+assignment can be passed back to `build_quant_plan.py --assignment`; a raw sum
+of weight bytes is never accepted as the Fold memory gate.
 
 Nemotron v2 is quarantined by default. Research may opt into the cohort, but a
 public checkpoint cannot claim release eligibility until a legal decision is
