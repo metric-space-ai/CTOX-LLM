@@ -83,6 +83,7 @@ from score_quant_sensitivity import quantized_entries, row_group_document  # noq
 from select_manifest import select  # noqa: E402
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
 from select_primary_domain_supplement import select_supplement  # noqa: E402
+from select_coverage_supplement import select_joint_supplement  # noqa: E402
 from split_manifests import split  # noqa: E402
 from teacher_runtime import FLA_KERNEL_REVISION, weight_max_memory  # noqa: E402
 from teacher_cache_dataset import VerifiedTeacherCache  # noqa: E402
@@ -251,6 +252,86 @@ class DatasetPipelineTests(unittest.TestCase):
             report["aggregate_non_english_family_gaps"]["software"]["observed"],
             0,
         )
+
+    def test_joint_supplement_closes_domain_and_multilingual_gaps(self) -> None:
+        domain_rubric = {
+            "policy": {
+                "required_families": ["language", "software"],
+                "minimum_confidence": 0.7,
+                "minimum_primary_train": 1,
+                "minimum_primary_evaluation": 1,
+            },
+            "domains": {
+                "translation": {
+                    "family": "language",
+                    "description": "translation",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                },
+                "code": {
+                    "family": "software",
+                    "description": "software",
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                },
+            },
+        }
+        language_rubric = {
+            "translation_domain": "translation",
+            "languages": {
+                language: {
+                    "minimum_train": 1,
+                    "minimum_evaluation": 1,
+                    "minimum_primary_domains_train": 1,
+                    "minimum_primary_domains_evaluation": 1,
+                    "minimum_non_translation_train": 1,
+                    "minimum_non_translation_evaluation": 1,
+                }
+                for language in ("en", "de")
+            },
+            "aggregate_non_english_family_minima": {
+                "language": {"train": 1, "evaluation": 1},
+                "software": {"train": 1, "evaluation": 1},
+            },
+        }
+        baseline = [
+            {"id": "base-en", "language": "en"},
+            {"id": "base-de", "language": "de"},
+        ]
+        baseline_tags = {
+            sample_id: {
+                "primary_label": "translation",
+                "labels": ["translation"],
+                "scores": {"translation": 0.95},
+            }
+            for sample_id in ("base-en", "base-de")
+        }
+        candidates = [
+            {"id": "code-en", "language": "en"},
+            {"id": "code-de", "language": "de"},
+        ]
+        candidate_tags = {
+            sample_id: {
+                "primary_label": "code",
+                "labels": ["code"],
+                "scores": {"code": 0.9},
+            }
+            for sample_id in ("code-en", "code-de")
+        }
+        selected, evidence = select_joint_supplement(
+            baseline,
+            baseline_tags,
+            candidates,
+            candidate_tags,
+            {"code-en": 10, "code-de": 12},
+            domain_rubric,
+            language_rubric,
+            "train",
+            domain_margin=0,
+            minimum_confidence=0.8,
+        )
+        self.assertEqual({record["id"] for record in selected}, {"code-en", "code-de"})
+        self.assertTrue(all(not values for values in evidence["remaining_requirements"].values()))
 
     def test_domain_gate_requires_clear_primary_examples_not_only_multilabel_hits(self) -> None:
         rubric = {

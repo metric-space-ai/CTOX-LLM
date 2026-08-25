@@ -113,6 +113,13 @@ when a language contains only translation tasks, too few distinct primary
 domains, or when the combined non-English cohort omits any required semantic
 family. Language count alone is therefore not accepted as multilingual
 coverage.
+`select_coverage_supplement.py` performs the corresponding deterministic
+gap-closing selection. It greedily credits only high-confidence candidates for
+the exact still-open multi-label, primary-domain, language, non-translation,
+per-language diversity, and aggregate non-English-family cells, preferring
+broader coverage and then lower token cost. It fails with the unresolved cells
+when the candidate pool is insufficient and re-runs both complete gates over
+the combined cohort before writing release evidence.
 
 `plan_teacher_cache.py` tokenizes the complete frozen cohort with the same
 assistant, hidden-state, marker-window, and MTP position rules as the cache
