@@ -8,6 +8,7 @@ pub mod cuda_graph;
 pub mod cuda_runtime;
 pub mod cuda_schedule;
 pub mod metal;
+pub mod metal_graph;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod metal_runtime;
 pub mod metal_schedule;

@@ -198,7 +198,12 @@ frozen 645-step decode schedule covering all 64 layers, target LM head, native
 MTP transition, and exactly one final command-buffer wait. The contract proves
 16 paged-attention and 48 linear-attention layers, both residual norms per
 layer, and every KV/convolution/recurrent state mutation before runtime binding
-is admitted.
+is admitted. The matching artifact-resource plan now binds every schedule step
+to the exact backend-neutral ownership set: all 505 non-embedding projections,
+262 recovery activation groups, 48 linear mixers, 17 full-attention owners,
+four regular norms, and 130 residual norms. This closes the logical binding
+contract; it does not yet provide the complete Metal executor or hardware
+promotion evidence.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

@@ -13,6 +13,7 @@ usage, no scalar fallback.
 - Kernel source: `kernels/metal/q2q4_fused_matvec.metal`
 - Rust ABI/dispatch contract: `src/backend/metal.rs`
 - Frozen complete-decode schedule: `src/backend/metal_schedule.rs`
+- Complete artifact-resource binding: `src/backend/metal_graph.rs`
 - Direct verifier runtime: `src/backend/metal_runtime.rs`
 
 The model-specific schedule contains exactly 645 ordered steps: embedding and
@@ -21,6 +22,14 @@ native MTP verification, and one command-buffer commit/wait. Validation rejects
 an altered topology, an unavailable producer slot, a missing causal state
 mutation, or any intermediate host wait. This is an assembly contract, not yet
 a complete Metal executor or promotion result.
+
+`MetalDecodeBindingPlan` resolves those 645 steps against all 505
+non-embedding projections, 262 recovery activation groups, 48 linear mixers,
+16 target plus one MTP full-attention state, four regular norms, 130 residual
+norms, and the final token barrier. The names and activation-group policy are
+derived from the same tensor contract and fan-out policy as CUDA; Metal may
+change physical layout but may not requantize or alter logical Q2/Q4 codes.
+This remains a binding plan rather than executable graph state.
 
 ## Entry points
 
