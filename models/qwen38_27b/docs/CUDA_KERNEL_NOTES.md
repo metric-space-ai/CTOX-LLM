@@ -117,7 +117,7 @@ one thread owns one value column. Decay and update stores round immediately to
 FP16, matching the Rust and Metal oracle. CUDA 12.6 compiled the candidate for
 SM86 with 24 registers, 40 bytes shared memory, and zero stack/spill bytes
 (current unified cubin SHA-256
-`1ecb57894af1e019d3dc6d4767f651b28c565758bf94a917578c92530a608b12`).
+`f963daa12772ed2b64ef25da79f6145851a0de368f5cec198b386763b147baf2`).
 The numerical verifier is built for a later physical-GPU-2 run after the
 teacher/evaluation/activation pipeline releases GPU 1+2; GPU 0 remains
 reserved for Greppy. No numerical or performance promotion is claimed yet.
@@ -151,7 +151,8 @@ views, computes `SiLU(gate) * up`, applies the down-projection's packed FP16
 `s_in`, and emits A8 codes/scales in one launch. This avoids materializing and
 rereading a 69,632-byte f32 SwiGLU tensor for every token and layer. Its
 verifier compares every A8 code and block scale with the Rust oracle before
-the candidate may feed the existing Q2/Q4 dp4a down projection.
+the candidate may feed the existing Q2/Q4 dp4a down projection. CUDA 12.6
+reports 18 registers, 12 bytes shared memory, and no stack or spill traffic.
 
 The general Qwen `(1 + weight)` RMSNorm candidate uses one 256-thread block
 per row and an eight-warp reduction, so hidden width 5,120 does not serialize
@@ -189,7 +190,7 @@ output scans. CUDA 12.6 reports 15 registers/76 bytes shared memory for Q4
 packing, 16 registers/no shared memory for demotion, and 128 registers/no
 shared memory for GQA; all three have zero stack/spill bytes. GQA's
 16-warps-per-SM launch bound is explicit. The current unified cubin SHA-256 is
-`1ecb57894af1e019d3dc6d4767f651b28c565758bf94a917578c92530a608b12`.
+`f963daa12772ed2b64ef25da79f6145851a0de368f5cec198b386763b147baf2`.
 Its numerical/demotion/reset/unload verifier is queued on physical GPU 2 after
 the teacher, evaluation, activation and earlier verifier chain; GPU 0 is never
 eligible. The CPU `PagedKvCache` exists only in the separate verifier as an
