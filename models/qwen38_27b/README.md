@@ -277,7 +277,7 @@ verification, a sendable adapter
 owns this deliberately thread-affine CUDA executor on one dedicated worker;
 the socket threads exchange typed commands and never move driver objects.
 
-Chunked CUDA prefill now also has a layer-major 613-step schedule contract and
+Chunked CUDA prefill now also has a layer-major 645-step schedule contract and
 single-copy graph workspace primitives. The schedule batches every large
 Q2/Q4 projection, retains causal device scans for paged GQA, convolution,
 GatedDelta recurrence, and MTP state, computes the target LM head only for the
@@ -295,7 +295,9 @@ A/B in one launch while sharing the immutable A_log/dt_bias allocation. The
 direct causal paged-GQA prefill scan is also exact against sequential all-Q4
 decode and stays within `5.97e-8` of the mixed Q2/Q4 scalar oracle. A batched
 KV page packer and executor replacement of the current sequential loop remain
-open.
+open. The schedule now names batched key RoPE and persistent KV append
+explicitly before every causal GQA scan; these state mutations can no longer
+be hidden by a nominal attention step.
 
 An isolated mixed-Q2/Q4 split-KV attention candidate now covers the five
 causal tail queries used by MTP4 verification. Sixteen KV segments expose

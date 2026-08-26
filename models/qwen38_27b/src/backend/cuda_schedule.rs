@@ -93,6 +93,8 @@ pub enum CudaPrefillOperation {
     RmsNormBatch,
     FullAttentionFanoutBatch,
     QueryGateNormRopeBatch,
+    KeyRopeBatch,
+    PagedKvAppendBatch,
     PagedGqaCausalScan,
     AttentionGateOutputProjectionBatch,
     LinearFanoutBatch,
@@ -163,7 +165,7 @@ impl CudaPrefillSchedule {
                 "CUDA prefill chunk capacity must be in 1..=65535".into(),
             ));
         }
-        let mut steps = Vec::with_capacity(613);
+        let mut steps = Vec::with_capacity(645);
         prefill_push(
             &mut steps,
             None,
@@ -189,6 +191,18 @@ impl CudaPrefillSchedule {
                         &mut steps,
                         Some(layer),
                         CudaPrefillOperation::QueryGateNormRopeBatch,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::KeyRopeBatch,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::PagedKvAppendBatch,
                         false,
                     );
                     prefill_push(
@@ -339,6 +353,25 @@ impl CudaPrefillSchedule {
                 return Err(EngineError::InvalidState(format!(
                     "CUDA prefill layer {layer} has {causal_scans} causal scans, expected {expected}"
                 )));
+            }
+            if layer_steps
+                .iter()
+                .any(|step| step.operation == CudaPrefillOperation::FullAttentionFanoutBatch)
+            {
+                let operations: Vec<_> = layer_steps.iter().map(|step| step.operation).collect();
+                let required = [
+                    CudaPrefillOperation::FullAttentionFanoutBatch,
+                    CudaPrefillOperation::QueryGateNormRopeBatch,
+                    CudaPrefillOperation::KeyRopeBatch,
+                    CudaPrefillOperation::PagedKvAppendBatch,
+                    CudaPrefillOperation::PagedGqaCausalScan,
+                    CudaPrefillOperation::AttentionGateOutputProjectionBatch,
+                ];
+                if !operations.starts_with(&required) {
+                    return Err(EngineError::InvalidState(format!(
+                        "CUDA prefill full-attention layer {layer} omits or reorders RoPE/KV/causal attention"
+                    )));
+                }
             }
         }
         Ok(())
@@ -786,7 +819,7 @@ mod tests {
     #[test]
     fn prefill_schedule_is_layer_major_and_has_no_host_token_loop() {
         let schedule = CudaPrefillSchedule::qwen38(&Qwen38Config::default(), 512).unwrap();
-        assert_eq!(schedule.steps.len(), 613);
+        assert_eq!(schedule.steps.len(), 645);
         assert_eq!(schedule.full_attention_layers, 16);
         assert_eq!(schedule.linear_attention_layers, 48);
         assert_eq!(
@@ -817,6 +850,14 @@ mod tests {
             step.operation == CudaPrefillOperation::FullAttentionFanoutBatch
                 && step.operation.is_batched_projection()
         }));
+        assert_eq!(
+            schedule
+                .steps
+                .iter()
+                .filter(|step| step.operation == CudaPrefillOperation::PagedKvAppendBatch)
+                .count(),
+            16
+        );
     }
 
     #[test]
