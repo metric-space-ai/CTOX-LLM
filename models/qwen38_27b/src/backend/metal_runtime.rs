@@ -20,10 +20,11 @@ use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row,
     MetalArgMaxFinalBufferAbi, MetalArgMaxParams, MetalArgMaxPartialBufferAbi, MetalBufferAbi,
     MetalCausalConvBufferAbi, MetalCausalConvParams, MetalFusedMatVecParams,
-    MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedRmsNormBufferAbi,
-    MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
-    MetalRmsNormBufferAbi, MetalRmsNormParams, ARGMAX_F32_FINAL_KERNEL_NAME,
-    ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME,
+    MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi,
+    MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalPagedGqaBufferAbi,
+    MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams, MetalRmsNormBufferAbi,
+    MetalRmsNormParams, ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME,
+    CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME,
     MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
     Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
     Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
@@ -67,6 +68,7 @@ pub struct MetalCandidateRuntime {
     partial_rope_pipeline: ComputePipelineState,
     paged_gqa_decode_pipeline: ComputePipelineState,
     gated_delta_f16_pipeline: ComputePipelineState,
+    gated_delta_prepare_f32_pipeline: ComputePipelineState,
     causal_conv_f16_pipeline: ComputePipelineState,
     argmax_f32_partial_pipeline: ComputePipelineState,
     argmax_f32_final_pipeline: ComputePipelineState,
@@ -378,6 +380,20 @@ pub struct PreparedMetalGatedDelta {
     transient_bytes: usize,
     checkpoint_valid: bool,
     poisoned: bool,
+}
+
+/// Immutable mmap-backed A_log/dt_bias resources for the exact Qwen
+/// GatedDelta preparation step. All five dynamic outputs live in the shared
+/// decode arena and no operation-local activation buffer is retained.
+pub struct PreparedMappedMetalGatedDeltaPrepare {
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    mapping: MappedMetalArtifact,
+    a_log_offset: u64,
+    dt_bias_offset: u64,
+    params_buffer: Buffer,
+    transient_bytes: usize,
 }
 
 /// Mmap-backed FP16 convolution weight and persistent FP16 history for one
@@ -1399,6 +1415,16 @@ impl PreparedMetalGatedDelta {
     }
 }
 
+impl PreparedMappedMetalGatedDeltaPrepare {
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.mapping.copied_model_bytes()
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+}
+
 impl PreparedMappedMetalCausalConv {
     pub fn channels(&self) -> usize {
         self.channels
@@ -1612,6 +1638,13 @@ impl MetalCandidateRuntime {
                     "Metal gated-delta function lookup failed: {message}"
                 ))
             })?;
+        let gated_delta_prepare_f32_function = library
+            .get_function(GATED_DELTA_PREP_F32_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal gated-delta preparation function lookup failed: {message}"
+                ))
+            })?;
         let causal_conv_f16_function = library
             .get_function(CAUSAL_CONV_F16_KERNEL_NAME, None)
             .map_err(|message| {
@@ -1724,6 +1757,13 @@ impl MetalCandidateRuntime {
                     "Metal gated-delta pipeline creation failed: {message}"
                 ))
             })?;
+        let gated_delta_prepare_f32_pipeline = device
+            .new_compute_pipeline_state_with_function(&gated_delta_prepare_f32_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal gated-delta preparation pipeline creation failed: {message}"
+                ))
+            })?;
         let causal_conv_f16_pipeline = device
             .new_compute_pipeline_state_with_function(&causal_conv_f16_function)
             .map_err(|message| {
@@ -1769,6 +1809,7 @@ impl MetalCandidateRuntime {
             partial_rope_pipeline,
             paged_gqa_decode_pipeline,
             gated_delta_f16_pipeline,
+            gated_delta_prepare_f32_pipeline,
             causal_conv_f16_pipeline,
             argmax_f32_partial_pipeline,
             argmax_f32_final_pipeline,
@@ -3144,6 +3185,79 @@ impl MetalCandidateRuntime {
             output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
             params_buffer: buffer_with_data(&self.device, &params.encode()),
             transient_bytes,
+        })
+    }
+
+    /// Prepare the immutable parameters for the exact Qwen GatedDelta input
+    /// transformation. Dynamic inputs and all five outputs are graph-owned
+    /// shared-arena views; only the 16-byte geometry block is allocated.
+    pub fn prepare_mapped_gated_delta_prepare_graph_io(
+        &self,
+        mapping: &MappedMetalArtifact,
+        a_log: FloatTensorView<'_>,
+        dt_bias: FloatTensorView<'_>,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+    ) -> Result<PreparedMappedMetalGatedDeltaPrepare> {
+        if (key_heads, value_heads, key_dim) != (16, 48, 128) {
+            return Err(EngineError::Shape(format!(
+                "Metal GatedDelta preparation requires exact Qwen geometry 16/48/128, got {key_heads}/{value_heads}/{key_dim}"
+            )));
+        }
+        let expected_values = value_heads;
+        let expected_bytes = expected_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal GatedDelta parameters overflow".into())
+            })?;
+        let a_log_bytes = match a_log {
+            FloatTensorView::F32Le(bytes) if bytes.len() == expected_bytes => bytes,
+            FloatTensorView::F32Le(bytes) => {
+                return Err(EngineError::Shape(format!(
+                    "Metal A_log has {} bytes, expected {expected_bytes}",
+                    bytes.len()
+                )))
+            }
+            FloatTensorView::F16Le(_) => {
+                return Err(EngineError::UnsupportedDType(
+                    "Metal A_log must remain packed FP32".into(),
+                ))
+            }
+        };
+        let dt_bias_bytes = match dt_bias {
+            FloatTensorView::F32Le(bytes) if bytes.len() == expected_bytes => bytes,
+            FloatTensorView::F32Le(bytes) => {
+                return Err(EngineError::Shape(format!(
+                    "Metal dt_bias has {} bytes, expected {expected_bytes}",
+                    bytes.len()
+                )))
+            }
+            FloatTensorView::F16Le(_) => {
+                return Err(EngineError::UnsupportedDType(
+                    "Metal dt_bias must remain packed FP32".into(),
+                ))
+            }
+        };
+        for index in 0..expected_values {
+            a_log.value(index)?;
+            dt_bias.value(index)?;
+        }
+        let params = MetalGatedDeltaPrepareParams {
+            key_heads: usize_to_u32(key_heads, "Metal GatedDelta key heads")?,
+            value_heads: usize_to_u32(value_heads, "Metal GatedDelta value heads")?,
+            key_dim: usize_to_u32(key_dim, "Metal GatedDelta key dimension")?,
+            reserved0: 0,
+        };
+        Ok(PreparedMappedMetalGatedDeltaPrepare {
+            key_heads,
+            value_heads,
+            key_dim,
+            mapping: mapping.clone(),
+            a_log_offset: mapping.byte_offset(a_log_bytes, "GatedDelta A_log")?,
+            dt_bias_offset: mapping.byte_offset(dt_bias_bytes, "GatedDelta dt_bias")?,
+            params_buffer: buffer_with_data(&self.device, &params.encode()),
+            transient_bytes: MetalGatedDeltaPrepareParams::BYTE_LEN,
         })
     }
 
@@ -4797,6 +4911,80 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_gated_delta_prepare_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalGatedDeltaPrepare,
+        arena: &Buffer,
+        convolved_qkv_offset: u64,
+        raw_a_offset: u64,
+        raw_b_offset: u64,
+        query_offset: u64,
+        key_offset: u64,
+        value_offset: u64,
+        log_decay_offset: u64,
+        beta_offset: u64,
+    ) -> Result<()> {
+        let thread_width =
+            dispatch_width(&self.gated_delta_prepare_f32_pipeline, DEFAULT_SIMDGROUPS)?;
+        let output_values = prepared
+            .value_heads
+            .checked_mul(prepared.key_dim)
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal GatedDelta output shape overflows".into())
+            })?;
+        encoder.set_compute_pipeline_state(&self.gated_delta_prepare_f32_pipeline);
+        for (binding, buffer, offset) in [
+            (
+                MetalGatedDeltaPrepareBufferAbi::CONVOLVED_QKV,
+                arena,
+                convolved_qkv_offset,
+            ),
+            (MetalGatedDeltaPrepareBufferAbi::RAW_A, arena, raw_a_offset),
+            (MetalGatedDeltaPrepareBufferAbi::RAW_B, arena, raw_b_offset),
+            (
+                MetalGatedDeltaPrepareBufferAbi::A_LOG,
+                &prepared.mapping.inner.buffer,
+                prepared.a_log_offset,
+            ),
+            (
+                MetalGatedDeltaPrepareBufferAbi::DT_BIAS,
+                &prepared.mapping.inner.buffer,
+                prepared.dt_bias_offset,
+            ),
+            (MetalGatedDeltaPrepareBufferAbi::QUERY, arena, query_offset),
+            (MetalGatedDeltaPrepareBufferAbi::KEY, arena, key_offset),
+            (MetalGatedDeltaPrepareBufferAbi::VALUE, arena, value_offset),
+            (
+                MetalGatedDeltaPrepareBufferAbi::LOG_DECAY,
+                arena,
+                log_decay_offset,
+            ),
+            (MetalGatedDeltaPrepareBufferAbi::BETA, arena, beta_offset),
+        ] {
+            encoder.set_buffer(binding as u64, Some(buffer), offset);
+        }
+        encoder.set_buffer(
+            MetalGatedDeltaPrepareBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: output_values.div_ceil(thread_width) as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: thread_width as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
     fn validate_mapped_norm_projection(
         &self,
         norm: &PreparedMappedMetalRmsNorm,
@@ -5124,10 +5312,9 @@ impl MetalCandidateRuntime {
             .collect()
     }
 
-    /// Dispatch the exact first three operations of the frozen decode graph:
-    /// embedding, layer-0 RMSNorm, and the four-way linear-attention fan-out.
-    /// When supplied, the layer-0 convolution is encoded as step four and
-    /// consumes/overwrites the exact `LinearQkv` view in place.
+    /// Dispatch up to the exact first five operations of the frozen decode graph:
+    /// embedding, layer-0 RMSNorm, four-way linear-attention fan-out, in-place
+    /// convolution, and the five-output GatedDelta preparation.
     /// All activations are typed views into one schedule-derived arena. The
     /// prepared graph resources own only immutable parameters and tiny command
     /// metadata; no operation-local input or output activation is allocated.
@@ -5139,6 +5326,10 @@ impl MetalCandidateRuntime {
         norm: &PreparedMappedMetalRmsNorm,
         projections: [&PreparedMappedMetalMatVec; 4],
         mut convolution: Option<&mut PreparedMappedMetalCausalConv>,
+        gated_delta_prepare: Option<(
+            &PreparedMappedMetalGatedDeltaPrepare,
+            [&PreparedMetalDecodeBufferView<'_>; 5],
+        )>,
         embedding_output: &PreparedMetalDecodeBufferView<'_>,
         normalized_output: &PreparedMetalDecodeBufferView<'_>,
         projection_outputs: [&PreparedMetalDecodeBufferView<'_>; 4],
@@ -5148,6 +5339,13 @@ impl MetalCandidateRuntime {
             MetalBufferSlot::LinearZ,
             MetalBufferSlot::LinearA,
             MetalBufferSlot::LinearB,
+        ];
+        const DELTA_OUTPUT_SLOTS: [MetalBufferSlot; 5] = [
+            MetalBufferSlot::Query,
+            MetalBufferSlot::Key,
+            MetalBufferSlot::Value,
+            MetalBufferSlot::LogDecay,
+            MetalBufferSlot::Beta,
         ];
         if token >= embedding.rows
             || embedding.columns != norm.columns
@@ -5267,6 +5465,46 @@ impl MetalCandidateRuntime {
                 ));
             }
         }
+        if let Some((prepared, outputs)) = gated_delta_prepare.as_ref() {
+            if convolution.is_none()
+                || prepared.key_heads != 16
+                || prepared.value_heads != 48
+                || prepared.key_dim != 128
+                || !Rc::ptr_eq(&prepared.mapping.inner, &embedding.mapping.inner)
+                || projections[0].rows != 10_240
+                || projections[2].rows != prepared.value_heads
+                || projections[3].rows != prepared.value_heads
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal GatedDelta preparation does not match the exact layer-0 fan-out".into(),
+                ));
+            }
+            let qk_values = prepared
+                .value_heads
+                .checked_mul(prepared.key_dim)
+                .ok_or_else(|| {
+                    EngineError::MemoryBudget("Metal GatedDelta view shape overflows".into())
+                })?;
+            let expected_values = [
+                qk_values,
+                qk_values,
+                qk_values,
+                prepared.value_heads,
+                prepared.value_heads,
+            ];
+            for ((output, slot), values) in
+                outputs.iter().zip(DELTA_OUTPUT_SLOTS).zip(expected_values)
+            {
+                if output.slot() != slot
+                    || output.values() != values
+                    || !std::ptr::eq(arena, output.buffer())
+                {
+                    return Err(EngineError::InvalidArtifact(format!(
+                        "Metal GatedDelta preparation does not match arena slot {slot:?}"
+                    )));
+                }
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-embedding-norm-linear-fanout");
@@ -5307,6 +5545,21 @@ impl MetalCandidateRuntime {
             )?;
             convolution.poisoned = true;
         }
+        if let Some((prepared, outputs)) = gated_delta_prepare.as_ref() {
+            self.encode_mapped_gated_delta_prepare_between(
+                encoder,
+                prepared,
+                arena,
+                projection_outputs[0].offset(),
+                projection_outputs[2].offset(),
+                projection_outputs[3].offset(),
+                outputs[0].offset(),
+                outputs[1].offset(),
+                outputs[2].offset(),
+                outputs[3].offset(),
+                outputs[4].offset(),
+            )?;
+        }
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -5338,6 +5591,24 @@ impl MetalCandidateRuntime {
                 Ok(values)
             })
             .collect::<Result<Vec<_>>>()?;
+        if let Some((_, delta_outputs)) = gated_delta_prepare {
+            for output in delta_outputs {
+                let offset = usize::try_from(output.offset()).map_err(|_| {
+                    EngineError::MemoryBudget("Metal GatedDelta output offset exceeds usize".into())
+                })?;
+                let values = unsafe {
+                    slice::from_raw_parts(
+                        arena.contents().cast::<u8>().add(offset).cast::<f32>(),
+                        output.values(),
+                    )
+                };
+                if values.iter().any(|value| !value.is_finite()) {
+                    return Err(EngineError::InvalidState(
+                        "Metal GatedDelta preparation produced non-finite output".into(),
+                    ));
+                }
+            }
+        }
         if let Some(convolution) = convolution {
             convolution.poisoned = false;
         }
@@ -5867,6 +6138,13 @@ mod tests {
         values
             .iter()
             .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
             .collect()
     }
 
@@ -7400,6 +7678,12 @@ mod tests {
         let convolution_weight_values: Vec<f32> = (0..convolution_channels * convolution_kernel)
             .map(|index| 0.08 + 0.01 * (index % convolution_kernel) as f32)
             .collect();
+        let a_log_values: Vec<f32> = (0..config.linear_num_value_heads)
+            .map(|index| -0.4 + index as f32 * 0.003)
+            .collect();
+        let dt_bias_values: Vec<f32> = (0..config.linear_num_value_heads)
+            .map(|index| -0.2 + index as f32 * 0.002)
+            .collect();
         for (name, dtype, rows) in projection_specs {
             tensors.extend(repeated_recovered_tensors(
                 name, dtype, rows, columns, &s_in, 1.0625,
@@ -7410,6 +7694,18 @@ mod tests {
             dtype: TensorDType::F16,
             shape: vec![convolution_channels as u64, convolution_kernel as u64],
             bytes: f16_bytes(&convolution_weight_values),
+        });
+        tensors.push(PackedTensor {
+            name: "layer0.linear.A_log".into(),
+            dtype: TensorDType::F32,
+            shape: vec![config.linear_num_value_heads as u64],
+            bytes: f32_bytes(&a_log_values),
+        });
+        tensors.push(PackedTensor {
+            name: "layer0.linear.dt_bias".into(),
+            dtype: TensorDType::F32,
+            shape: vec![config.linear_num_value_heads as u64],
+            bytes: f32_bytes(&dt_bias_values),
         });
         ArtifactBuilder {
             model: "test/qwen38-shared-arena".into(),
@@ -7475,6 +7771,46 @@ mod tests {
                 convolution_kernel,
             )
             .expect("prepare graph convolution without activation buffers");
+        let delta_prepare = runtime
+            .prepare_mapped_gated_delta_prepare_graph_io(
+                &mapping,
+                artifact
+                    .float_tensor("layer0.linear.A_log")
+                    .expect("resolve graph A_log"),
+                artifact
+                    .float_tensor("layer0.linear.dt_bias")
+                    .expect("resolve graph dt_bias"),
+                config.linear_num_key_heads,
+                config.linear_num_value_heads,
+                config.linear_key_head_dim,
+            )
+            .expect("prepare graph GatedDelta inputs without activation buffers");
+        assert!(runtime
+            .prepare_mapped_gated_delta_prepare_graph_io(
+                &mapping,
+                norm_weight,
+                artifact
+                    .float_tensor("layer0.linear.dt_bias")
+                    .expect("resolve graph dt_bias"),
+                config.linear_num_key_heads,
+                config.linear_num_value_heads,
+                config.linear_key_head_dim,
+            )
+            .is_err());
+        assert!(runtime
+            .prepare_mapped_gated_delta_prepare_graph_io(
+                &mapping,
+                artifact
+                    .float_tensor("layer0.linear.A_log")
+                    .expect("resolve graph A_log"),
+                artifact
+                    .float_tensor("layer0.linear.dt_bias")
+                    .expect("resolve graph dt_bias"),
+                8,
+                config.linear_num_value_heads,
+                config.linear_key_head_dim,
+            )
+            .is_err());
         assert_eq!(
             embedding.transient_bytes(),
             MetalFusedMatVecParams::BYTE_LEN
@@ -7491,6 +7827,11 @@ mod tests {
         assert_eq!(
             convolution.transient_bytes(),
             MetalCausalConvParams::BYTE_LEN
+        );
+        assert_eq!(delta_prepare.copied_model_bytes(), 0);
+        assert_eq!(
+            delta_prepare.transient_bytes(),
+            MetalGatedDeltaPrepareParams::BYTE_LEN
         );
         assert!(convolution
             .write_input(&vec![0.0; convolution_channels])
@@ -7517,6 +7858,13 @@ mod tests {
             &program.steps()[2].writes()[2],
             &program.steps()[2].writes()[3],
         ];
+        let delta_outputs = [
+            &program.steps()[4].writes()[0],
+            &program.steps()[4].writes()[1],
+            &program.steps()[4].writes()[2],
+            &program.steps()[4].writes()[3],
+            &program.steps()[4].writes()[4],
+        ];
         let projection_refs = [
             &prepared_projections[0],
             &prepared_projections[1],
@@ -7530,6 +7878,7 @@ mod tests {
                 &norm,
                 projection_refs,
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 [
@@ -7540,6 +7889,29 @@ mod tests {
                 ],
             )
             .is_err());
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((
+                    &delta_prepare,
+                    [
+                        delta_outputs[1],
+                        delta_outputs[0],
+                        delta_outputs[2],
+                        delta_outputs[3],
+                        delta_outputs[4],
+                    ],
+                )),
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .is_err());
+        assert!(!convolution.poisoned);
 
         let hidden = cpu
             .recovered_row(
@@ -7590,11 +7962,12 @@ mod tests {
                 &norm,
                 projection_refs,
                 Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
             )
-            .expect("dispatch first four decode steps through shared arena");
+            .expect("dispatch first five decode steps through shared arena");
         assert_eq!(
             convolution.verifier_read_state(),
             expected_convolution_state
@@ -7605,6 +7978,56 @@ mod tests {
                 assert!(
                     (expected - actual).abs() <= tolerance,
                     "shared-arena branch {branch} row {row}: expected {expected}, got {actual}"
+                );
+            }
+        }
+        let compact_qk_values = config.linear_num_key_heads * config.linear_key_head_dim;
+        let expanded_qk_values = config.linear_num_value_heads * config.linear_key_head_dim;
+        let expected_query: Vec<f32> = (0..expanded_qk_values)
+            .map(|index| {
+                let head = index / config.linear_key_head_dim;
+                let column = index % config.linear_key_head_dim;
+                expected[0][(head / 3) * config.linear_key_head_dim + column]
+            })
+            .collect();
+        let expected_key: Vec<f32> = (0..expanded_qk_values)
+            .map(|index| {
+                let head = index / config.linear_key_head_dim;
+                let column = index % config.linear_key_head_dim;
+                expected[0][compact_qk_values + (head / 3) * config.linear_key_head_dim + column]
+            })
+            .collect();
+        let expected_value =
+            expected[0][2 * compact_qk_values..2 * compact_qk_values + expanded_qk_values].to_vec();
+        let expected_log_decay: Vec<f32> = expected[2]
+            .iter()
+            .zip(&a_log_values)
+            .zip(&dt_bias_values)
+            .map(|((raw_a, a_log), dt_bias)| {
+                let a = raw_a + dt_bias;
+                let softplus = if a > 20.0 { a } else { a.exp().ln_1p() };
+                -a_log.exp() * softplus
+            })
+            .collect();
+        let expected_beta: Vec<f32> = expected[3]
+            .iter()
+            .map(|raw_b| 1.0 / (1.0 + (-raw_b).exp()))
+            .collect();
+        for (slot, expected) in [
+            (MetalBufferSlot::Query, expected_query),
+            (MetalBufferSlot::Key, expected_key),
+            (MetalBufferSlot::Value, expected_value),
+            (MetalBufferSlot::LogDecay, expected_log_decay),
+            (MetalBufferSlot::Beta, expected_beta),
+        ] {
+            let actual = workspace
+                .read_f32(slot)
+                .expect("read GatedDelta arena output");
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 3.0e-5_f32.max(expected.abs() * 5.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "GatedDelta {slot:?} value {index}: expected {expected}, got {actual}"
                 );
             }
         }

@@ -28,6 +28,7 @@ pub const RMS_NORM_GATED_KERNEL_NAME: &str = "qwen_rms_norm_gated_f32";
 pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
 pub const PAGED_GQA_DECODE_KERNEL_NAME: &str = "qwen_paged_q2q4_gqa_decode_f32";
 pub const GATED_DELTA_F16_KERNEL_NAME: &str = "qwen_gated_delta_recurrent_f16";
+pub const GATED_DELTA_PREP_F32_KERNEL_NAME: &str = "qwen_gated_delta_prepare_f32";
 pub const CAUSAL_CONV_F16_KERNEL_NAME: &str = "qwen_causal_conv_silu_f16";
 pub const ARGMAX_F32_PARTIAL_KERNEL_NAME: &str = "qwen_argmax_f32_partial";
 pub const ARGMAX_F32_FINAL_KERNEL_NAME: &str = "qwen_argmax_f32_final";
@@ -117,6 +118,23 @@ impl MetalGatedDeltaBufferAbi {
     pub const STATE: u32 = 5;
     pub const OUTPUT: u32 = 6;
     pub const PARAMS: u32 = 7;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGatedDeltaPrepareBufferAbi;
+
+impl MetalGatedDeltaPrepareBufferAbi {
+    pub const CONVOLVED_QKV: u32 = 0;
+    pub const RAW_A: u32 = 1;
+    pub const RAW_B: u32 = 2;
+    pub const A_LOG: u32 = 3;
+    pub const DT_BIAS: u32 = 4;
+    pub const QUERY: u32 = 5;
+    pub const KEY: u32 = 6;
+    pub const VALUE: u32 = 7;
+    pub const LOG_DECAY: u32 = 8;
+    pub const BETA: u32 = 9;
+    pub const PARAMS: u32 = 10;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +317,34 @@ impl MetalGatedDeltaParams {
             self.key_dim,
             self.value_dim,
             self.epsilon.to_bits(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGatedDeltaPrepareParams {
+    pub key_heads: u32,
+    pub value_heads: u32,
+    pub key_dim: u32,
+    pub reserved0: u32,
+}
+
+impl MetalGatedDeltaPrepareParams {
+    pub const BYTE_LEN: usize = 16;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.key_heads,
+            self.value_heads,
+            self.key_dim,
+            self.reserved0,
         ]
         .iter()
         .enumerate()
@@ -850,6 +896,22 @@ mod tests {
         );
         assert_eq!(
             [
+                MetalGatedDeltaPrepareBufferAbi::CONVOLVED_QKV,
+                MetalGatedDeltaPrepareBufferAbi::RAW_A,
+                MetalGatedDeltaPrepareBufferAbi::RAW_B,
+                MetalGatedDeltaPrepareBufferAbi::A_LOG,
+                MetalGatedDeltaPrepareBufferAbi::DT_BIAS,
+                MetalGatedDeltaPrepareBufferAbi::QUERY,
+                MetalGatedDeltaPrepareBufferAbi::KEY,
+                MetalGatedDeltaPrepareBufferAbi::VALUE,
+                MetalGatedDeltaPrepareBufferAbi::LOG_DECAY,
+                MetalGatedDeltaPrepareBufferAbi::BETA,
+                MetalGatedDeltaPrepareBufferAbi::PARAMS,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        );
+        assert_eq!(
+            [
                 MetalCausalConvBufferAbi::INPUT,
                 MetalCausalConvBufferAbi::WEIGHT,
                 MetalCausalConvBufferAbi::STATE,
@@ -897,6 +959,10 @@ mod tests {
         assert!(PARTIAL_ROPE_KERNEL_NAME.starts_with("qwen_partial_rope"));
         assert!(PAGED_GQA_DECODE_KERNEL_NAME.contains("paged_q2q4_gqa"));
         assert!(GATED_DELTA_F16_KERNEL_NAME.contains("gated_delta_recurrent_f16"));
+        assert_eq!(
+            GATED_DELTA_PREP_F32_KERNEL_NAME,
+            "qwen_gated_delta_prepare_f32"
+        );
         assert!(CAUSAL_CONV_F16_KERNEL_NAME.contains("causal_conv_silu_f16"));
         assert_eq!(ARGMAX_F32_PARTIAL_KERNEL_NAME, "qwen_argmax_f32_partial");
         assert_eq!(ARGMAX_F32_FINAL_KERNEL_NAME, "qwen_argmax_f32_final");
@@ -994,6 +1060,20 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![48, 128, 128, 1.0e-6_f32.to_bits()]);
+
+        let gated_delta_prepare = MetalGatedDeltaPrepareParams {
+            key_heads: 16,
+            value_heads: 48,
+            key_dim: 128,
+            reserved0: 0,
+        };
+        let encoded = gated_delta_prepare.encode();
+        assert_eq!(encoded.len(), MetalGatedDeltaPrepareParams::BYTE_LEN);
+        let words: Vec<u32> = encoded
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![16, 48, 128, 0]);
 
         let convolution = MetalCausalConvParams {
             channels: 10_240,
@@ -1248,6 +1328,7 @@ mod tests {
             PARTIAL_ROPE_KERNEL_NAME,
             PAGED_GQA_DECODE_KERNEL_NAME,
             GATED_DELTA_F16_KERNEL_NAME,
+            GATED_DELTA_PREP_F32_KERNEL_NAME,
             CAUSAL_CONV_F16_KERNEL_NAME,
             ARGMAX_F32_PARTIAL_KERNEL_NAME,
             ARGMAX_F32_FINAL_KERNEL_NAME,

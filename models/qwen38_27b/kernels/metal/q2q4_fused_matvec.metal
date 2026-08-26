@@ -91,6 +91,13 @@ struct GatedDeltaParams {
     float epsilon;
 };
 
+struct GatedDeltaPrepareParams {
+    uint key_heads;
+    uint value_heads;
+    uint key_dim;
+    uint reserved0;
+};
+
 struct CausalConvParams {
     uint channels;
     uint kernel_width;
@@ -677,6 +684,47 @@ kernel void qwen_paged_q2q4_gqa_decode_f32(
     for (uint slot = 0u; slot < params.head_dim / 32u; ++slot) {
         uint dim = lane + slot * 32u;
         output[query_base + dim] = accumulated[slot];
+    }
+}
+
+// Exact Qwen3.8 single-token GatedDelta preparation. The convolved projection
+// is compact [Q:16x128, K:16x128, V:48x128]; Q/K are repeated three times to
+// the 48 value heads. A_log and dt_bias remain mmap-backed f32 parameters.
+// ref: ggml/src/ggml-cuda/gated_delta_net.cu:36-90
+kernel void qwen_gated_delta_prepare_f32(
+    device const float* convolved_qkv [[buffer(0)]],
+    device const float* raw_a [[buffer(1)]],
+    device const float* raw_b [[buffer(2)]],
+    device const float* a_log [[buffer(3)]],
+    device const float* dt_bias [[buffer(4)]],
+    device float* query [[buffer(5)]],
+    device float* key [[buffer(6)]],
+    device float* value [[buffer(7)]],
+    device float* log_decay [[buffer(8)]],
+    device float* beta [[buffer(9)]],
+    constant GatedDeltaPrepareParams& params [[buffer(10)]],
+    uint output_index [[thread_position_in_grid]]) {
+    if (params.key_heads != 16u || params.value_heads != 48u
+        || params.key_dim != 128u) {
+        return;
+    }
+    uint compact_values = params.key_heads * params.key_dim;
+    uint qk_values = params.value_heads * params.key_dim;
+    if (output_index < qk_values) {
+        uint output_head = output_index / params.key_dim;
+        uint column = output_index - output_head * params.key_dim;
+        uint source_head = output_head / (params.value_heads / params.key_heads);
+        uint source_index = source_head * params.key_dim + column;
+        query[output_index] = convolved_qkv[source_index];
+        key[output_index] = convolved_qkv[compact_values + source_index];
+        value[output_index] = convolved_qkv[compact_values * 2u + output_index];
+    }
+    if (output_index < params.value_heads) {
+        float a = raw_a[output_index] + dt_bias[output_index];
+        float softplus = a > 20.0f ? a
+            : (a < -20.0f ? exp(a) : log(1.0f + exp(a)));
+        log_decay[output_index] = -exp(a_log[output_index]) * softplus;
+        beta[output_index] = 1.0f / (1.0f + exp(-raw_b[output_index]));
     }
 }
 
