@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::metal_schedule::{
-    MetalDecodeOperation, MetalDecodeSchedule, MetalDecodeStep, MetalNormBinding,
+    MetalBufferSlot, MetalDecodeOperation, MetalDecodeSchedule, MetalDecodeStep, MetalNormBinding,
 };
 use crate::config::LayerKind;
 use crate::fanout::qwen38_fanout_groups;
@@ -53,6 +53,35 @@ pub struct MetalBoundDecodeStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetalDecodeBindingPlan {
     steps: Vec<MetalBoundDecodeStep>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalDecodeBufferBinding {
+    pub slot: MetalBufferSlot,
+    pub values: usize,
+    pub offset: usize,
+    pub bytes: usize,
+}
+
+/// Static alias plan for every decode activation in one shared Metal buffer.
+///
+/// Persistent weights, KV pages, convolution/recurrent state, and tiny kernel
+/// parameter blocks are not part of this arena. The plan covers exactly the
+/// device-resident values named by [`MetalDecodeSchedule`]. Slots alias only
+/// when none of their produced-value live intervals overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetalDecodeWorkspacePlan {
+    bindings: BTreeMap<MetalBufferSlot, MetalDecodeBufferBinding>,
+    total_bytes: usize,
+    independent_bytes: usize,
+    alignment: usize,
+    mtp_draft_vocabulary_rows: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveInterval {
+    start: usize,
+    end: usize,
 }
 
 /// Fail-closed progress tracker for one Metal token command buffer.
@@ -198,6 +227,298 @@ impl MetalProjectionPlan {
         }
         Ok(())
     }
+}
+
+impl MetalDecodeWorkspacePlan {
+    pub const ALIGNMENT: usize = 256;
+
+    pub fn qwen38(
+        schedule: &MetalDecodeSchedule,
+        config: &Qwen38Config,
+        mtp_draft_vocabulary_rows: usize,
+    ) -> Result<Self> {
+        schedule.validate()?;
+        if config != &Qwen38Config::default() {
+            return Err(EngineError::Shape(
+                "Metal decode workspace requires the frozen Qwen3.8-27B topology".into(),
+            ));
+        }
+        if mtp_draft_vocabulary_rows == 0 || mtp_draft_vocabulary_rows > config.vocab_size {
+            return Err(EngineError::Shape(format!(
+                "Metal MTP draft vocabulary has {mtp_draft_vocabulary_rows} rows, expected 1..={}",
+                config.vocab_size
+            )));
+        }
+
+        let widths = decode_slot_widths(config, mtp_draft_vocabulary_rows)?;
+        let intervals = decode_live_intervals(schedule)?;
+        let scheduled_slots: BTreeSet<_> = schedule
+            .steps
+            .iter()
+            .flat_map(|step| step.reads.iter().chain(&step.writes).copied())
+            .collect();
+        if scheduled_slots != widths.keys().copied().collect()
+            || scheduled_slots != intervals.keys().copied().collect()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal workspace widths or liveness omit a scheduled slot".into(),
+            ));
+        }
+
+        let mut ordered = widths
+            .iter()
+            .map(|(&slot, &values)| {
+                let bytes = values
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget(format!(
+                            "Metal workspace byte count overflows for {slot:?}"
+                        ))
+                    })?;
+                Ok((slot, values, bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ordered.sort_by_key(|(slot, _values, bytes)| (std::cmp::Reverse(*bytes), *slot));
+
+        let mut bindings: BTreeMap<MetalBufferSlot, MetalDecodeBufferBinding> = BTreeMap::new();
+        for (slot, values, bytes) in ordered {
+            let mut offset = 0_usize;
+            loop {
+                offset = align_up(offset, Self::ALIGNMENT)?;
+                let end = offset.checked_add(bytes).ok_or_else(|| {
+                    EngineError::MemoryBudget("Metal workspace range overflows".into())
+                })?;
+                let mut conflict_end = None;
+                for (&other_slot, other) in &bindings {
+                    let other_end = other.offset.checked_add(other.bytes).ok_or_else(|| {
+                        EngineError::MemoryBudget("Metal workspace binding end overflows".into())
+                    })?;
+                    if intervals_overlap(&intervals[&slot], &intervals[&other_slot])
+                        && byte_ranges_overlap(offset, end, other.offset, other_end)
+                    {
+                        conflict_end = Some(conflict_end.unwrap_or(0_usize).max(other_end));
+                    }
+                }
+                if let Some(next) = conflict_end {
+                    offset = next;
+                    continue;
+                }
+                bindings.insert(
+                    slot,
+                    MetalDecodeBufferBinding {
+                        slot,
+                        values,
+                        offset,
+                        bytes,
+                    },
+                );
+                break;
+            }
+        }
+        let total_bytes = bindings.values().try_fold(0_usize, |maximum, binding| {
+            binding
+                .offset
+                .checked_add(binding.bytes)
+                .map(|end| maximum.max(end))
+                .ok_or_else(|| EngineError::MemoryBudget("Metal workspace end overflows".into()))
+        })?;
+        let total_bytes = align_up(total_bytes, Self::ALIGNMENT)?;
+        let independent_bytes = bindings.values().try_fold(0_usize, |total, binding| {
+            total.checked_add(binding.bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("Metal independent workspace bytes overflow".into())
+            })
+        })?;
+        let plan = Self {
+            bindings,
+            total_bytes,
+            independent_bytes,
+            alignment: Self::ALIGNMENT,
+            mtp_draft_vocabulary_rows,
+        };
+        plan.validate(&intervals)?;
+        Ok(plan)
+    }
+
+    pub fn binding(&self, slot: MetalBufferSlot) -> Result<MetalDecodeBufferBinding> {
+        self.bindings.get(&slot).copied().ok_or_else(|| {
+            EngineError::InvalidState(format!("Metal workspace does not bind {slot:?}"))
+        })
+    }
+
+    pub fn bindings(&self) -> impl Iterator<Item = MetalDecodeBufferBinding> + '_ {
+        self.bindings.values().copied()
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn independent_bytes(&self) -> usize {
+        self.independent_bytes
+    }
+
+    pub fn alignment(&self) -> usize {
+        self.alignment
+    }
+
+    pub fn mtp_draft_vocabulary_rows(&self) -> usize {
+        self.mtp_draft_vocabulary_rows
+    }
+
+    fn validate(&self, intervals: &BTreeMap<MetalBufferSlot, Vec<LiveInterval>>) -> Result<()> {
+        if self.bindings.len() != 21
+            || self.total_bytes == 0
+            || !self.total_bytes.is_multiple_of(self.alignment)
+            || self.total_bytes > self.independent_bytes
+        {
+            return Err(EngineError::MemoryBudget(
+                "Metal shared decode workspace has an invalid geometry".into(),
+            ));
+        }
+        let bindings: Vec<_> = self.bindings.values().collect();
+        for (index, left) in bindings.iter().enumerate() {
+            let left_end = left.offset.checked_add(left.bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("Metal workspace binding end overflows".into())
+            })?;
+            if left.bytes == 0
+                || !left.offset.is_multiple_of(self.alignment)
+                || left_end > self.total_bytes
+            {
+                return Err(EngineError::MemoryBudget(format!(
+                    "Metal workspace binding {:?} is invalid",
+                    left.slot
+                )));
+            }
+            for right in &bindings[index + 1..] {
+                let right_end = right.offset.checked_add(right.bytes).ok_or_else(|| {
+                    EngineError::MemoryBudget("Metal workspace binding end overflows".into())
+                })?;
+                if intervals_overlap(&intervals[&left.slot], &intervals[&right.slot])
+                    && byte_ranges_overlap(left.offset, left_end, right.offset, right_end)
+                {
+                    return Err(EngineError::InvalidState(format!(
+                        "live Metal slots {:?} and {:?} alias",
+                        left.slot, right.slot
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn decode_slot_widths(
+    config: &Qwen38Config,
+    mtp_draft_vocabulary_rows: usize,
+) -> Result<BTreeMap<MetalBufferSlot, usize>> {
+    let checked = |left: usize, right: usize, label: &str| {
+        left.checked_mul(right)
+            .ok_or_else(|| EngineError::MemoryBudget(format!("Metal {label} width overflows")))
+    };
+    let query = checked(config.num_attention_heads, config.head_dim, "query")?;
+    let query_gate = checked(query, 2, "query/gate")?;
+    let full_key_value = checked(config.num_key_value_heads, config.head_dim, "full K/V")?;
+    let linear_key = checked(
+        config.linear_num_value_heads,
+        config.linear_key_head_dim,
+        "linear repeated key",
+    )?;
+    let linear_value = checked(
+        config.linear_num_value_heads,
+        config.linear_value_head_dim,
+        "linear value",
+    )?;
+    let linear_native_key = checked(
+        config.linear_num_key_heads,
+        config.linear_key_head_dim,
+        "linear native key",
+    )?;
+    let linear_qkv = checked(linear_native_key, 2, "linear Q/K")?
+        .checked_add(linear_value)
+        .ok_or_else(|| EngineError::MemoryBudget("Metal linear QKV width overflows".into()))?;
+    Ok(BTreeMap::from([
+        (MetalBufferSlot::HiddenA, config.hidden_size),
+        (MetalBufferSlot::HiddenB, config.hidden_size),
+        (MetalBufferSlot::Normalized, config.hidden_size),
+        (MetalBufferSlot::QueryGate, query_gate),
+        (MetalBufferSlot::Query, query.max(linear_key)),
+        (MetalBufferSlot::Key, full_key_value.max(linear_key)),
+        (MetalBufferSlot::Value, full_key_value.max(linear_value)),
+        (MetalBufferSlot::AttentionGate, query),
+        (MetalBufferSlot::AttentionOutput, query.max(linear_value)),
+        (MetalBufferSlot::MixerOutput, config.hidden_size),
+        (MetalBufferSlot::LinearQkv, linear_qkv),
+        (MetalBufferSlot::LinearZ, linear_value),
+        (MetalBufferSlot::LinearA, config.linear_num_value_heads),
+        (MetalBufferSlot::LinearB, config.linear_num_value_heads),
+        (MetalBufferSlot::LogDecay, config.linear_num_value_heads),
+        (MetalBufferSlot::Beta, config.linear_num_value_heads),
+        (MetalBufferSlot::FfnGate, config.intermediate_size),
+        (MetalBufferSlot::FfnUp, config.intermediate_size),
+        (MetalBufferSlot::FfnDown, config.hidden_size),
+        (MetalBufferSlot::TargetLogits, config.vocab_size),
+        (MetalBufferSlot::MtpDraft, mtp_draft_vocabulary_rows),
+    ]))
+}
+
+fn decode_live_intervals(
+    schedule: &MetalDecodeSchedule,
+) -> Result<BTreeMap<MetalBufferSlot, Vec<LiveInterval>>> {
+    let mut intervals: BTreeMap<MetalBufferSlot, Vec<LiveInterval>> = BTreeMap::new();
+    let mut active: BTreeMap<MetalBufferSlot, usize> = BTreeMap::new();
+    for (step_index, step) in schedule.steps.iter().enumerate() {
+        let reads: BTreeSet<_> = step.reads.iter().copied().collect();
+        for slot in &step.reads {
+            let interval_index = active.get(slot).copied().ok_or_else(|| {
+                EngineError::InvalidState(format!(
+                    "Metal workspace sees read-before-write for {slot:?} at step {step_index}"
+                ))
+            })?;
+            intervals.get_mut(slot).expect("active interval exists")[interval_index].end =
+                step_index;
+        }
+        for slot in &step.writes {
+            if reads.contains(slot) {
+                continue;
+            }
+            let slot_intervals = intervals.entry(*slot).or_default();
+            slot_intervals.push(LiveInterval {
+                start: step_index,
+                end: step_index,
+            });
+            active.insert(*slot, slot_intervals.len() - 1);
+        }
+    }
+    Ok(intervals)
+}
+
+fn intervals_overlap(left: &[LiveInterval], right: &[LiveInterval]) -> bool {
+    left.iter().any(|left| {
+        right
+            .iter()
+            .any(|right| left.start <= right.end && right.start <= left.end)
+    })
+}
+
+fn byte_ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+fn align_up(value: usize, alignment: usize) -> Result<usize> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(EngineError::MemoryBudget(
+            "Metal workspace alignment must be a power of two".into(),
+        ));
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| rounded & !(alignment - 1))
+        .ok_or_else(|| EngineError::MemoryBudget("Metal workspace alignment overflows".into()))
 }
 
 impl MetalDecodeBindingPlan {
@@ -830,5 +1151,45 @@ mod tests {
         let bindings = MetalDecodeBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
         assert!(bindings.execution_cursor(9, 8, 128).is_err());
         assert!(bindings.execution_cursor(128, 128, 128).is_err());
+    }
+
+    #[test]
+    fn decode_workspace_aliases_only_dead_slots_and_keeps_logits_live() {
+        let config = Qwen38Config::default();
+        let schedule = MetalDecodeSchedule::qwen38(&config).unwrap();
+        let workspace = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000).unwrap();
+        assert_eq!(workspace.bindings().count(), 21);
+        assert_eq!(workspace.alignment(), 256);
+        assert_eq!(workspace.mtp_draft_vocabulary_rows(), 40_000);
+        assert_eq!(workspace.total_bytes(), 1_173_760);
+        assert_eq!(workspace.independent_bytes(), 1_633_280);
+        assert_eq!(
+            workspace
+                .binding(MetalBufferSlot::TargetLogits)
+                .unwrap()
+                .bytes,
+            config.vocab_size * std::mem::size_of::<f32>()
+        );
+        assert_eq!(
+            workspace.binding(MetalBufferSlot::MtpDraft).unwrap().bytes,
+            40_000 * std::mem::size_of::<f32>()
+        );
+        assert_ne!(
+            workspace
+                .binding(MetalBufferSlot::TargetLogits)
+                .unwrap()
+                .offset,
+            workspace.binding(MetalBufferSlot::MtpDraft).unwrap().offset
+        );
+    }
+
+    #[test]
+    fn decode_workspace_rejects_invalid_mtp_vocabulary() {
+        let config = Qwen38Config::default();
+        let schedule = MetalDecodeSchedule::qwen38(&config).unwrap();
+        assert!(MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 0).is_err());
+        assert!(
+            MetalDecodeWorkspacePlan::qwen38(&schedule, &config, config.vocab_size + 1).is_err()
+        );
     }
 }

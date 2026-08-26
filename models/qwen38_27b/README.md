@@ -205,7 +205,13 @@ four regular norms, and 130 residual norms. This closes the logical binding
 contract; it does not yet provide the complete Metal executor or hardware
 promotion evidence. A fail-closed execution cursor admits only the current
 committed token position, records those bound operations in exact order, and
-returns the next committed position only after all 645 steps.
+returns the next committed position only after all 645 steps. A deterministic
+liveness pass now packs all 21 named f32 decode activation slots into one
+256-byte-aligned arena: the frozen 40,000-row MTP-draft profile needs 1,173,760
+bytes instead of 1,633,280 bytes with independent buffers. Aliasing is admitted
+only for non-overlapping produced-value intervals; target and MTP logits remain
+simultaneously live and therefore distinct. This is an exact allocation
+contract, not yet a device allocation or complete executor.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

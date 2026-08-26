@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use crate::config::LayerKind;
 use crate::{EngineError, Qwen38Config, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MetalBufferSlot {
     HiddenA,
     HiddenB,

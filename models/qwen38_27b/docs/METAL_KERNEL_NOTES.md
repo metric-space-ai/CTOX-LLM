@@ -35,6 +35,17 @@ skipped, duplicated, reordered, or wrong-layer dispatch. An incomplete cursor
 cannot advance the committed token count; accelerator-state rollback remains
 an explicit prerequisite for the complete executor.
 
+`MetalDecodeWorkspacePlan` derives produced-value live intervals directly
+from the validated schedule and assigns all 21 named f32 activation slots to
+one 256-byte-aligned arena. For the frozen 40,000-row restricted MTP draft
+vocabulary the arena is exactly 1,173,760 bytes versus 1,633,280 bytes for
+independent buffers, saving 459,520 bytes. Byte aliasing is rejected whenever
+any live interval overlaps; target logits and MTP draft logits consequently
+remain distinct through the final commit. Persistent weights, packed KV,
+causal-convolution/recurrent state, and kernel parameter blocks are explicitly
+outside this transient plan. Device allocation and step-to-view binding remain
+executor work.
+
 ## Entry points
 
 | Kernel | DType | Block layout |
@@ -357,8 +368,9 @@ dequantization array before this source was accepted.
   decode GQA, causal convolution, and FP16 recurrent GatedDeltaNet exist as
   verifier candidates. GQA still
   duplicates its packed pages in a CPU correctness mirror; neither attention
-  path has controlled performance evidence. The MTP block, sampling, shared
-  full-graph transient allocation, and complete model-graph Metal execution do
-  not exist yet.
+  path has controlled performance evidence. The MTP block and sampling do not
+  exist yet. A deterministic shared decode-arena plan exists, but the actual
+  Metal buffer, per-step view binding, prefill arena, transactional state, and
+  complete model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.
