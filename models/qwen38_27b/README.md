@@ -209,6 +209,11 @@ For the FFN path, a fused CUDA candidate now combines `SiLU(gate) * up`, the
 down-projection recovery input scale, and A8 block quantization without a
 separate f32 SwiGLU allocation. Hardware numerical evidence remains required
 before it can be used by the production executor.
+The CUDA assembly contract is now a frozen 645-step device schedule covering
+all 64 target layers, final logits, and MTP verification with exactly one host
+barrier at token completion. It validates device-slot dataflow and rejects any
+topology other than the exact Qwen3.8-27B configuration. Binding every planned
+step to prepared artifact-backed operators remains in progress.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight

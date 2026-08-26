@@ -110,6 +110,18 @@ the NVIDIA Driver API, requires compute capability 8.6, keeps the projection
 buffers resident across launches, and compares device output with the scalar
 CPU oracle before timing.
 
+## Frozen decode schedule
+
+`src/backend/cuda_schedule.rs` now freezes the complete single-token target
+schedule as 645 explicit steps over all 64 layers: 16 paged-GQA layers, 48
+GatedDeltaNet layers, two residual/norm fusions per layer, FFN fan-out/down
+edges, final LM head, MTP draft/target verification, and one final token
+barrier. A dataflow validator rejects reads from unavailable device slots,
+non-frozen topology, missing residual fusions, or any intermediate host
+barrier. The schedule deliberately exposes the still-unimplemented fused
+attention-gate/A8/output-projection edge instead of hiding it behind a CPU or
+unverified fallback.
+
 The recurrent candidate accepts only Qwen3.8-27B's frozen 48-head,
 128-key-dimension, 128-value-dimension profile. Its state is exactly 1,572,864
 bytes of FP16 and has no FP32 shadow; query, key, value, decay, beta, and output
