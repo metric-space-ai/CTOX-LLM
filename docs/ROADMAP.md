@@ -317,12 +317,13 @@ wire contract is implemented, and the bring-up server rejects inference until
 it can own a promoted executor.
 
 Metal parallel bring-up has now replaced operation-local activations for the
-first exact decode chain. Frozen steps 0-4 dispatch embedding, layer-0 RMSNorm,
+first exact decode chain. Frozen steps 0-5 dispatch embedding, layer-0 RMSNorm,
 and all four linear-attention projections directly through typed views of the
 single 1,173,760-byte arena, then update `LinearQkv` in place through the
-stateful causal convolution and prepare the expanded Q/K/V plus LogDecay/Beta
-arena views, with one command encoder/wait. This is verified on Apple Silicon
-but is not backend promotion: the remaining 640 steps, complete
+stateful causal convolution, prepare expanded Q/K/V plus LogDecay/Beta arena
+views, and execute the recurrent update against checkpointed FP16 state, with
+one command encoder/wait. This is verified on Apple Silicon but is not backend
+promotion: the remaining 639 steps, complete
 target+MTP execution, prefill arena, lifecycle measurements, and Golden suite
 remain open.
 

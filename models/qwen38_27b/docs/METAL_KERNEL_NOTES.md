@@ -234,8 +234,13 @@ block. The next fused kernel consumes that convolved QKV plus `LinearA` and
 `LinearB`, repeats Q/K from 16 to 48 heads, and writes `Query`, `Key`, `Value`,
 `LogDecay`, and `Beta` directly into their five schedule slots. `A_log` and
 `dt_bias` stay at mmap offsets and only a 16-byte parameter block is allocated.
-The Apple-device Golden test executes steps 0-4 with one command encoder and
-one wait, reading activations only after completion.
+The recurrent kernel then reads those exact step-5 views, mutates only its
+checkpointed 1,572,864-byte FP16 state, and writes the 6,144-value
+`AttentionOutput` arena slot. Its graph preparation retains only FP16 state,
+an equally sized rollback checkpoint, and a 16-byte parameter block. The
+Apple-device Golden test executes steps 0-5 with one command encoder and one
+wait; failure leaves state poisoned and recoverable through the active device
+checkpoint.
 
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
@@ -452,9 +457,10 @@ dequantization array before this source was accepted.
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
   target+MTP state transaction. All 645 steps have real shared-buffer views;
-  exact kernel dispatch now covers steps 0-4 (embedding, layer-0 RMSNorm, all
+  exact kernel dispatch now covers steps 0-5 (embedding, layer-0 RMSNorm, all
   four linear-attention projections, in-place causal convolution, and the
-  five-output GatedDelta preparation). The remaining 640 schedule steps,
+  five-output GatedDelta preparation plus recurrent FP16-state update). The
+  remaining 639 schedule steps,
   the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;

@@ -363,18 +363,28 @@ pub struct MetalGatedDeltaConfig {
     pub epsilon: f32,
 }
 
-/// Persistent FP16 GatedDeltaNet recurrence state plus reusable f32 inputs and
-/// output. State never has an f32 device duplicate.
+impl MetalGatedDeltaConfig {
+    pub const QWEN38_27B: Self = Self {
+        heads: 48,
+        key_dim: 128,
+        value_dim: 128,
+        epsilon: 1.0e-6,
+    };
+}
+
+/// Persistent FP16 GatedDeltaNet recurrence state. Standalone verification may
+/// own reusable f32 inputs/output; graph execution binds shared-arena views.
+/// State never has an f32 device duplicate.
 pub struct PreparedMetalGatedDelta {
     config: MetalGatedDeltaConfig,
-    query_buffer: Buffer,
-    key_buffer: Buffer,
-    value_buffer: Buffer,
-    log_decay_buffer: Buffer,
-    beta_buffer: Buffer,
+    query_buffer: Option<Buffer>,
+    key_buffer: Option<Buffer>,
+    value_buffer: Option<Buffer>,
+    log_decay_buffer: Option<Buffer>,
+    beta_buffer: Option<Buffer>,
     state_buffer: Buffer,
     checkpoint_buffer: Buffer,
-    output_buffer: Buffer,
+    output_buffer: Option<Buffer>,
     params_buffer: Buffer,
     resident_state_bytes: usize,
     transient_bytes: usize,
@@ -1355,6 +1365,15 @@ impl PreparedMetalGatedDelta {
         self.transient_bytes
     }
 
+    pub fn has_owned_io(&self) -> bool {
+        self.query_buffer.is_some()
+            && self.key_buffer.is_some()
+            && self.value_buffer.is_some()
+            && self.log_decay_buffer.is_some()
+            && self.beta_buffer.is_some()
+            && self.output_buffer.is_some()
+    }
+
     pub fn write_step(
         &self,
         query: &[f32],
@@ -1379,12 +1398,17 @@ impl PreparedMetalGatedDelta {
         validate_metal_input(log_decay, self.config.heads)?;
         validate_metal_input(beta, self.config.heads)?;
         for (source, target) in [
-            (query, &self.query_buffer),
-            (key, &self.key_buffer),
-            (value, &self.value_buffer),
-            (log_decay, &self.log_decay_buffer),
-            (beta, &self.beta_buffer),
+            (query, self.query_buffer.as_ref()),
+            (key, self.key_buffer.as_ref()),
+            (value, self.value_buffer.as_ref()),
+            (log_decay, self.log_decay_buffer.as_ref()),
+            (beta, self.beta_buffer.as_ref()),
         ] {
+            let target = target.ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal graph recurrence has no operation-local input buffers".into(),
+                )
+            })?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     source.as_ptr(),
@@ -1400,7 +1424,9 @@ impl PreparedMetalGatedDelta {
         zero_buffer(&self.state_buffer, self.resident_state_bytes);
         zero_buffer(&self.checkpoint_buffer, self.resident_state_bytes);
         let output_bytes = self.config.heads * self.config.value_dim * size_of_val(&[0.0_f32]);
-        zero_buffer(&self.output_buffer, output_bytes);
+        if let Some(output_buffer) = &self.output_buffer {
+            zero_buffer(output_buffer, output_bytes);
+        }
         self.checkpoint_valid = false;
         self.poisoned = false;
     }
@@ -3530,6 +3556,28 @@ impl MetalCandidateRuntime {
         &self,
         config: MetalGatedDeltaConfig,
     ) -> Result<PreparedMetalGatedDelta> {
+        self.prepare_gated_delta_f16_internal(config, true)
+    }
+
+    /// Allocate only persistent FP16 recurrence/checkpoint state for graph
+    /// execution. All five inputs and the output remain shared-arena views.
+    pub fn prepare_gated_delta_f16_graph_io(
+        &self,
+        config: MetalGatedDeltaConfig,
+    ) -> Result<PreparedMetalGatedDelta> {
+        if config != MetalGatedDeltaConfig::QWEN38_27B {
+            return Err(EngineError::Shape(
+                "Metal graph recurrence requires exact Qwen3.8-27B geometry".into(),
+            ));
+        }
+        self.prepare_gated_delta_f16_internal(config, false)
+    }
+
+    fn prepare_gated_delta_f16_internal(
+        &self,
+        config: MetalGatedDeltaConfig,
+        own_io: bool,
+    ) -> Result<PreparedMetalGatedDelta> {
         if config.heads == 0
             || config.key_dim == 0
             || config.value_dim == 0
@@ -3575,10 +3623,15 @@ impl MetalCandidateRuntime {
         let resident_state_bytes = state_values
             .checked_mul(std::mem::size_of::<half::f16>())
             .ok_or_else(|| EngineError::MemoryBudget("Metal delta state bytes overflow".into()))?;
-        let transient_bytes = qk_bytes
+        let io_bytes = qk_bytes
             .checked_mul(2)
             .and_then(|bytes| bytes.checked_add(value_bytes.checked_mul(2)?))
             .and_then(|bytes| bytes.checked_add(head_bytes.checked_mul(2)?))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal delta graph I/O bytes overflow".into())
+            })?;
+        let transient_bytes = io_bytes
+            .checked_mul(usize::from(own_io))
             .and_then(|bytes| bytes.checked_add(MetalGatedDeltaParams::BYTE_LEN))
             .ok_or_else(|| {
                 EngineError::MemoryBudget("Metal delta transient bytes overflow".into())
@@ -3591,14 +3644,26 @@ impl MetalCandidateRuntime {
         };
         Ok(PreparedMetalGatedDelta {
             config,
-            query_buffer: new_zeroed_buffer(&self.device, qk_bytes)?,
-            key_buffer: new_zeroed_buffer(&self.device, qk_bytes)?,
-            value_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
-            log_decay_buffer: new_zeroed_buffer(&self.device, head_bytes)?,
-            beta_buffer: new_zeroed_buffer(&self.device, head_bytes)?,
+            query_buffer: own_io
+                .then(|| new_zeroed_buffer(&self.device, qk_bytes))
+                .transpose()?,
+            key_buffer: own_io
+                .then(|| new_zeroed_buffer(&self.device, qk_bytes))
+                .transpose()?,
+            value_buffer: own_io
+                .then(|| new_zeroed_buffer(&self.device, value_bytes))
+                .transpose()?,
+            log_decay_buffer: own_io
+                .then(|| new_zeroed_buffer(&self.device, head_bytes))
+                .transpose()?,
+            beta_buffer: own_io
+                .then(|| new_zeroed_buffer(&self.device, head_bytes))
+                .transpose()?,
             state_buffer: new_zeroed_buffer(&self.device, resident_state_bytes)?,
             checkpoint_buffer: new_zeroed_buffer(&self.device, resident_state_bytes)?,
-            output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
+            output_buffer: own_io
+                .then(|| new_zeroed_buffer(&self.device, value_bytes))
+                .transpose()?,
             params_buffer: buffer_with_data(&self.device, &params.encode()),
             resident_state_bytes,
             transient_bytes,
@@ -4745,22 +4810,33 @@ impl MetalCandidateRuntime {
                 "Metal gated-delta state is poisoned; reset is required".into(),
             ));
         }
+        if !prepared.has_owned_io() {
+            return Err(EngineError::InvalidState(
+                "Metal graph recurrence requires an explicit shared-arena dispatch".into(),
+            ));
+        }
+        let query_buffer = prepared.query_buffer.as_ref().expect("owned I/O checked");
+        let key_buffer = prepared.key_buffer.as_ref().expect("owned I/O checked");
+        let value_buffer = prepared.value_buffer.as_ref().expect("owned I/O checked");
+        let log_decay_buffer = prepared
+            .log_decay_buffer
+            .as_ref()
+            .expect("owned I/O checked");
+        let beta_buffer = prepared.beta_buffer.as_ref().expect("owned I/O checked");
+        let output_buffer = prepared.output_buffer.as_ref().expect("owned I/O checked");
         prepared.poisoned = true;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-gated-delta-f16-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.gated_delta_f16_pipeline);
         for (binding, buffer) in [
-            (MetalGatedDeltaBufferAbi::QUERY, &prepared.query_buffer),
-            (MetalGatedDeltaBufferAbi::KEY, &prepared.key_buffer),
-            (MetalGatedDeltaBufferAbi::VALUE, &prepared.value_buffer),
-            (
-                MetalGatedDeltaBufferAbi::LOG_DECAY,
-                &prepared.log_decay_buffer,
-            ),
-            (MetalGatedDeltaBufferAbi::BETA, &prepared.beta_buffer),
+            (MetalGatedDeltaBufferAbi::QUERY, query_buffer),
+            (MetalGatedDeltaBufferAbi::KEY, key_buffer),
+            (MetalGatedDeltaBufferAbi::VALUE, value_buffer),
+            (MetalGatedDeltaBufferAbi::LOG_DECAY, log_decay_buffer),
+            (MetalGatedDeltaBufferAbi::BETA, beta_buffer),
             (MetalGatedDeltaBufferAbi::STATE, &prepared.state_buffer),
-            (MetalGatedDeltaBufferAbi::OUTPUT, &prepared.output_buffer),
+            (MetalGatedDeltaBufferAbi::OUTPUT, output_buffer),
             (MetalGatedDeltaBufferAbi::PARAMS, &prepared.params_buffer),
         ] {
             encoder.set_buffer(binding as u64, Some(buffer), 0);
@@ -4792,11 +4868,7 @@ impl MetalCandidateRuntime {
             .checked_mul(prepared.config.value_dim)
             .ok_or_else(|| EngineError::Shape("Metal delta output shape overflows".into()))?;
         let output = unsafe {
-            slice::from_raw_parts(
-                prepared.output_buffer.contents().cast::<f32>(),
-                output_values,
-            )
-            .to_vec()
+            slice::from_raw_parts(output_buffer.contents().cast::<f32>(), output_values).to_vec()
         };
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
@@ -4983,6 +5055,54 @@ impl MetalCandidateRuntime {
             },
         );
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gated_delta_f16_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMetalGatedDelta,
+        arena: &Buffer,
+        query_offset: u64,
+        key_offset: u64,
+        value_offset: u64,
+        log_decay_offset: u64,
+        beta_offset: u64,
+        output_offset: u64,
+    ) {
+        encoder.set_compute_pipeline_state(&self.gated_delta_f16_pipeline);
+        for (binding, offset) in [
+            (MetalGatedDeltaBufferAbi::QUERY, query_offset),
+            (MetalGatedDeltaBufferAbi::KEY, key_offset),
+            (MetalGatedDeltaBufferAbi::VALUE, value_offset),
+            (MetalGatedDeltaBufferAbi::LOG_DECAY, log_decay_offset),
+            (MetalGatedDeltaBufferAbi::BETA, beta_offset),
+            (MetalGatedDeltaBufferAbi::OUTPUT, output_offset),
+        ] {
+            encoder.set_buffer(binding as u64, Some(arena), offset);
+        }
+        encoder.set_buffer(
+            MetalGatedDeltaBufferAbi::STATE as u64,
+            Some(&prepared.state_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalGatedDeltaBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: prepared.config.heads as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: prepared.config.value_dim as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
     }
 
     fn validate_mapped_norm_projection(
@@ -5312,9 +5432,9 @@ impl MetalCandidateRuntime {
             .collect()
     }
 
-    /// Dispatch up to the exact first five operations of the frozen decode graph:
+    /// Dispatch up to the exact first six operations of the frozen decode graph:
     /// embedding, layer-0 RMSNorm, four-way linear-attention fan-out, in-place
-    /// convolution, and the five-output GatedDelta preparation.
+    /// convolution, five-output GatedDelta preparation, and recurrent update.
     /// All activations are typed views into one schedule-derived arena. The
     /// prepared graph resources own only immutable parameters and tiny command
     /// metadata; no operation-local input or output activation is allocated.
@@ -5329,6 +5449,10 @@ impl MetalCandidateRuntime {
         gated_delta_prepare: Option<(
             &PreparedMappedMetalGatedDeltaPrepare,
             [&PreparedMetalDecodeBufferView<'_>; 5],
+        )>,
+        mut recurrence: Option<(
+            &mut PreparedMetalGatedDelta,
+            &PreparedMetalDecodeStepView<'_>,
         )>,
         embedding_output: &PreparedMetalDecodeBufferView<'_>,
         normalized_output: &PreparedMetalDecodeBufferView<'_>,
@@ -5505,6 +5629,56 @@ impl MetalCandidateRuntime {
                 }
             }
         }
+        if let Some((recurrence, step)) = recurrence.as_ref() {
+            let reads = step.reads();
+            let writes = step.writes();
+            let (_, prepared_outputs) = gated_delta_prepare.as_ref().ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal graph recurrence requires GatedDelta preparation".into(),
+                )
+            })?;
+            if recurrence.poisoned
+                || recurrence.has_owned_io()
+                || !recurrence.checkpoint_valid
+                || !convolution
+                    .as_deref()
+                    .is_some_and(|convolution| convolution.checkpoint_valid)
+                || recurrence.config != MetalGatedDeltaConfig::QWEN38_27B
+                || step.step().schedule_index != 5
+                || step.step().layer != Some(0)
+                || step.step().operation != MetalDecodeOperation::GatedDeltaRecurrent
+                || reads.len() != 5
+                || writes.len() != 1
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph recurrence does not match frozen schedule step 5".into(),
+                ));
+            }
+            for ((read, prepared_output), expected_slot) in reads
+                .iter()
+                .zip(prepared_outputs.iter())
+                .zip(DELTA_OUTPUT_SLOTS)
+            {
+                if read.slot() != expected_slot
+                    || read.offset() != prepared_output.offset()
+                    || read.values() != prepared_output.values()
+                    || !std::ptr::eq(arena, read.buffer())
+                {
+                    return Err(EngineError::InvalidState(
+                        "Metal graph recurrence reads do not match preparation outputs".into(),
+                    ));
+                }
+            }
+            let output = &writes[0];
+            if output.slot() != MetalBufferSlot::AttentionOutput
+                || output.values() != recurrence.config.heads * recurrence.config.value_dim
+                || !std::ptr::eq(arena, output.buffer())
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph recurrence output does not match AttentionOutput".into(),
+                ));
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-embedding-norm-linear-fanout");
@@ -5560,6 +5734,22 @@ impl MetalCandidateRuntime {
                 outputs[4].offset(),
             )?;
         }
+        if let Some((recurrence, step)) = recurrence.as_mut() {
+            let reads = step.reads();
+            let output = &step.writes()[0];
+            self.encode_gated_delta_f16_between(
+                encoder,
+                recurrence,
+                arena,
+                reads[0].offset(),
+                reads[1].offset(),
+                reads[2].offset(),
+                reads[3].offset(),
+                reads[4].offset(),
+                output.offset(),
+            );
+            recurrence.poisoned = true;
+        }
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -5570,47 +5760,75 @@ impl MetalCandidateRuntime {
             )));
         }
 
-        let outputs = projection_outputs
-            .iter()
-            .map(|output| {
-                let offset = usize::try_from(output.offset()).map_err(|_| {
-                    EngineError::MemoryBudget("Metal output view offset exceeds usize".into())
-                })?;
-                let values = unsafe {
-                    slice::from_raw_parts(
-                        arena.contents().cast::<u8>().add(offset).cast::<f32>(),
-                        output.values(),
-                    )
-                    .to_vec()
-                };
-                if values.iter().any(|value| !value.is_finite()) {
-                    return Err(EngineError::InvalidState(
-                        "Metal shared-arena graph chain produced non-finite output".into(),
-                    ));
+        let outputs = if recurrence.is_none() {
+            projection_outputs
+                .iter()
+                .map(|output| {
+                    let offset = usize::try_from(output.offset()).map_err(|_| {
+                        EngineError::MemoryBudget("Metal output view offset exceeds usize".into())
+                    })?;
+                    let values = unsafe {
+                        slice::from_raw_parts(
+                            arena.contents().cast::<u8>().add(offset).cast::<f32>(),
+                            output.values(),
+                        )
+                        .to_vec()
+                    };
+                    if values.iter().any(|value| !value.is_finite()) {
+                        return Err(EngineError::InvalidState(
+                            "Metal shared-arena graph chain produced non-finite output".into(),
+                        ));
+                    }
+                    Ok(values)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        if recurrence.is_none() {
+            if let Some((_, delta_outputs)) = gated_delta_prepare {
+                for output in delta_outputs {
+                    let offset = usize::try_from(output.offset()).map_err(|_| {
+                        EngineError::MemoryBudget(
+                            "Metal GatedDelta output offset exceeds usize".into(),
+                        )
+                    })?;
+                    let values = unsafe {
+                        slice::from_raw_parts(
+                            arena.contents().cast::<u8>().add(offset).cast::<f32>(),
+                            output.values(),
+                        )
+                    };
+                    if values.iter().any(|value| !value.is_finite()) {
+                        return Err(EngineError::InvalidState(
+                            "Metal GatedDelta preparation produced non-finite output".into(),
+                        ));
+                    }
                 }
-                Ok(values)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if let Some((_, delta_outputs)) = gated_delta_prepare {
-            for output in delta_outputs {
-                let offset = usize::try_from(output.offset()).map_err(|_| {
-                    EngineError::MemoryBudget("Metal GatedDelta output offset exceeds usize".into())
-                })?;
-                let values = unsafe {
-                    slice::from_raw_parts(
-                        arena.contents().cast::<u8>().add(offset).cast::<f32>(),
-                        output.values(),
-                    )
-                };
-                if values.iter().any(|value| !value.is_finite()) {
-                    return Err(EngineError::InvalidState(
-                        "Metal GatedDelta preparation produced non-finite output".into(),
-                    ));
-                }
+            }
+        }
+        if let Some((_, step)) = recurrence.as_ref() {
+            let output = &step.writes()[0];
+            let offset = usize::try_from(output.offset()).map_err(|_| {
+                EngineError::MemoryBudget("Metal recurrence output offset exceeds usize".into())
+            })?;
+            let values = unsafe {
+                slice::from_raw_parts(
+                    arena.contents().cast::<u8>().add(offset).cast::<f32>(),
+                    output.values(),
+                )
+            };
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(EngineError::InvalidState(
+                    "Metal graph recurrence produced non-finite output".into(),
+                ));
             }
         }
         if let Some(convolution) = convolution {
             convolution.poisoned = false;
+        }
+        if let Some((recurrence, _)) = recurrence {
+            recurrence.poisoned = false;
         }
         Ok(outputs)
     }
@@ -7785,6 +8003,15 @@ mod tests {
                 config.linear_key_head_dim,
             )
             .expect("prepare graph GatedDelta inputs without activation buffers");
+        let recurrence_config = MetalGatedDeltaConfig {
+            heads: config.linear_num_value_heads,
+            key_dim: config.linear_key_head_dim,
+            value_dim: config.linear_value_head_dim,
+            epsilon: config.rms_norm_epsilon,
+        };
+        let mut recurrence = runtime
+            .prepare_gated_delta_f16_graph_io(recurrence_config)
+            .expect("prepare graph recurrence without activation buffers");
         assert!(runtime
             .prepare_mapped_gated_delta_prepare_graph_io(
                 &mapping,
@@ -7833,6 +8060,15 @@ mod tests {
             delta_prepare.transient_bytes(),
             MetalGatedDeltaPrepareParams::BYTE_LEN
         );
+        assert_eq!(
+            recurrence.transient_bytes(),
+            MetalGatedDeltaParams::BYTE_LEN
+        );
+        assert!(!recurrence.has_owned_io());
+        assert!(recurrence
+            .write_step(&[0.0; 1], &[0.0; 1], &[0.0; 1], &[0.0; 1], &[0.0; 1])
+            .is_err());
+        assert!(runtime.dispatch_gated_delta_f16(&mut recurrence).is_err());
         assert!(convolution
             .write_input(&vec![0.0; convolution_channels])
             .is_err());
@@ -7865,6 +8101,7 @@ mod tests {
             &program.steps()[4].writes()[3],
             &program.steps()[4].writes()[4],
         ];
+        let recurrence_step = &program.steps()[5];
         let projection_refs = [
             &prepared_projections[0],
             &prepared_projections[1],
@@ -7877,6 +8114,7 @@ mod tests {
                 1,
                 &norm,
                 projection_refs,
+                None,
                 None,
                 None,
                 embedding_output,
@@ -7906,12 +8144,29 @@ mod tests {
                         delta_outputs[4],
                     ],
                 )),
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
             )
             .is_err());
         assert!(!convolution.poisoned);
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .is_err());
+        assert!(!convolution.poisoned);
+        assert!(!recurrence.poisoned);
 
         let hidden = cpu
             .recovered_row(
@@ -7955,6 +8210,12 @@ mod tests {
             convolution_kernel,
         )
         .expect("execute graph convolution oracle");
+        convolution
+            .begin_speculative(&runtime)
+            .expect("snapshot graph convolution state");
+        recurrence
+            .begin_speculative(&runtime)
+            .expect("snapshot graph recurrence state");
         let actual = runtime
             .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
                 &embedding,
@@ -7963,24 +8224,17 @@ mod tests {
                 projection_refs,
                 Some(&mut convolution),
                 Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
             )
-            .expect("dispatch first five decode steps through shared arena");
+            .expect("dispatch first six decode steps through shared arena");
         assert_eq!(
             convolution.verifier_read_state(),
             expected_convolution_state
         );
-        for (branch, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-            for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-                let tolerance = 4.0e-4_f32.max(expected.abs() * 7.0e-5);
-                assert!(
-                    (expected - actual).abs() <= tolerance,
-                    "shared-arena branch {branch} row {row}: expected {expected}, got {actual}"
-                );
-            }
-        }
+        assert!(actual.is_empty());
         let compact_qk_values = config.linear_num_key_heads * config.linear_key_head_dim;
         let expanded_qk_values = config.linear_num_value_heads * config.linear_key_head_dim;
         let expected_query: Vec<f32> = (0..expanded_qk_values)
@@ -8013,24 +8267,50 @@ mod tests {
             .iter()
             .map(|raw_b| 1.0 / (1.0 + (-raw_b).exp()))
             .collect();
-        for (slot, expected) in [
-            (MetalBufferSlot::Query, expected_query),
-            (MetalBufferSlot::Key, expected_key),
-            (MetalBufferSlot::Value, expected_value),
-            (MetalBufferSlot::LogDecay, expected_log_decay),
-            (MetalBufferSlot::Beta, expected_beta),
-        ] {
-            let actual = workspace
-                .read_f32(slot)
-                .expect("read GatedDelta arena output");
-            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-                let tolerance = 3.0e-5_f32.max(expected.abs() * 5.0e-5);
-                assert!(
-                    (expected - actual).abs() <= tolerance,
-                    "GatedDelta {slot:?} value {index}: expected {expected}, got {actual}"
-                );
-            }
+        let mut expected_recurrence_state =
+            vec![
+                f16::ZERO;
+                recurrence_config.heads * recurrence_config.key_dim * recurrence_config.value_dim
+            ];
+        let expected_attention = crate::reference::recurrent_gated_delta_step_f16_state(
+            &expected_query,
+            &expected_key,
+            &expected_value,
+            &expected_log_decay,
+            &expected_beta,
+            &mut expected_recurrence_state,
+            recurrence_config.heads,
+            recurrence_config.key_dim,
+            recurrence_config.value_dim,
+        )
+        .expect("execute graph recurrence oracle");
+        let actual_attention = workspace
+            .read_f32(MetalBufferSlot::AttentionOutput)
+            .expect("read graph recurrence output");
+        for (index, (expected, actual)) in
+            expected_attention.iter().zip(actual_attention).enumerate()
+        {
+            let tolerance = 5.0e-4_f32.max(expected.abs() * 3.0e-4);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "graph recurrence output {index}: expected {expected}, got {actual}"
+            );
         }
+        assert_eq!(recurrence.verifier_read_state(), expected_recurrence_state);
+        recurrence
+            .restore_speculative(&runtime)
+            .expect("restore graph recurrence checkpoint");
+        convolution
+            .restore_speculative(&runtime)
+            .expect("restore graph convolution checkpoint");
+        assert!(recurrence
+            .verifier_read_state()
+            .iter()
+            .all(|value| *value == f16::ZERO));
+        assert!(convolution
+            .verifier_read_state()
+            .iter()
+            .all(|value| *value == f16::ZERO));
     }
 
     #[test]
