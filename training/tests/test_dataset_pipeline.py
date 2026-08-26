@@ -55,6 +55,7 @@ from collect_activation_stats import (  # noqa: E402
     checkpoint_weight_name,
     prefill_ranges,
     quantized_source_names,
+    save_file_atomic,
 )
 from ctox_artifact import CtoxArtifact, ENDIAN_MARKER, HEADER, MAGIC  # noqa: E402
 from materialize_prompts import load_local_materialized, load_manifests  # noqa: E402
@@ -136,7 +137,14 @@ from teacher_cache_dataset import VerifiedTeacherCache  # noqa: E402
 from verify_vendor_manifest import verify  # noqa: E402
 from verify_local_model import root_digest  # noqa: E402
 from verify_teacher_cache import expected_tensor_specs  # noqa: E402
+from verify_activation_stats import (  # noqa: E402
+    expected_batch as expected_activation_batch,
+    expected_keys as expected_activation_keys,
+)
 from run_teacher_batches import cache_environment, completed_batch_matches  # noqa: E402
+from run_activation_batches import (  # noqa: E402
+    completed_batch_matches as completed_activation_batch_matches,
+)
 
 
 class DatasetPipelineTests(unittest.TestCase):
@@ -324,6 +332,121 @@ class DatasetPipelineTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "sequence limit"):
             activation_batches(records, token_counts, 3, 70, 59)
+
+    def test_activation_statistics_save_is_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "stats.safetensors"
+
+            def save_file(_tensors, path, metadata):
+                Path(path).write_bytes(json.dumps(metadata).encode())
+
+            save_file_atomic(save_file, {"tensor": object()}, output, {"format": "test"})
+            self.assertEqual(json.loads(output.read_text()), {"format": "test"})
+            self.assertFalse((output.parent / f".{output.name}.tmp").exists())
+
+    def test_activation_statistics_failed_save_leaves_no_partial_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "stats.safetensors"
+
+            def fail(_tensors, path, metadata):
+                Path(path).write_bytes(b"partial")
+                raise RuntimeError(metadata["reason"])
+
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                save_file_atomic(fail, {}, output, {"reason": "injected"})
+            self.assertFalse(output.exists())
+            self.assertFalse((output.parent / f".{output.name}.tmp").exists())
+
+    def test_activation_verifier_derives_the_complete_tensor_contract(self) -> None:
+        entries = {
+            "model.language_model.embed_tokens.weight": {},
+            "lm_head.weight": {},
+            "model.language_model.layers.0.mlp.gate_proj.weight": {},
+        }
+        self.assertEqual(
+            expected_activation_keys(entries),
+            {
+                "model.language_model.embed_tokens.weight.row_count",
+                "lm_head.weight.input_mean_sq",
+                "lm_head.weight.token_count",
+                "model.language_model.layers.0.mlp.gate_proj.weight.input_mean_sq",
+                "model.language_model.layers.0.mlp.gate_proj.weight.output_mean_sq",
+                "model.language_model.layers.0.mlp.gate_proj.weight.token_count",
+            },
+        )
+
+    def test_activation_verifier_binds_batch_boundaries_to_input_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input.jsonl"
+            source.write_text(
+                "".join(json.dumps({"id": sample_id}) + "\n" for sample_id in "abc")
+            )
+            batch_plan = root / "batches.json"
+            batch_plan.write_text(
+                json.dumps(
+                    {
+                        "format": "ctox.activation-batch-plan.v1",
+                        "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                        "batches": [
+                            {
+                                "batch_index": 0,
+                                "start_sample": 1,
+                                "samples": 2,
+                                "first_id": "b",
+                                "last_id": "c",
+                            }
+                        ],
+                    }
+                )
+            )
+            batch, ids = expected_activation_batch(batch_plan, source, 0)
+            self.assertEqual(batch["samples"], 2)
+            self.assertEqual(ids, ["b", "c"])
+            source.write_text(json.dumps({"id": "changed"}) + "\n")
+            with self.assertRaisesRegex(ValueError, "hash"):
+                expected_activation_batch(batch_plan, source, 0)
+
+    def test_activation_runner_skip_requires_current_artifact_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "stats.safetensors"
+            artifact.write_bytes(b"sealed")
+            batch = {"batch_index": 2, "samples": 3, "sequence_tokens": 5}
+            verification = {
+                "status": "passed",
+                "artifact_sha256": hashlib.sha256(b"sealed").hexdigest(),
+                "batch_plan_sha256": "batches",
+                "quant_plan_sha256": "quant",
+                "model": "model",
+                "revision": "revision",
+                "local_model_provenance_sha256": "provenance",
+                **batch,
+            }
+            self.assertTrue(
+                completed_activation_batch_matches(
+                    artifact,
+                    verification,
+                    batch,
+                    "batches",
+                    "quant",
+                    "model",
+                    "revision",
+                    "provenance",
+                )
+            )
+            artifact.write_bytes(b"changed")
+            self.assertFalse(
+                completed_activation_batch_matches(
+                    artifact,
+                    verification,
+                    batch,
+                    "batches",
+                    "quant",
+                    "model",
+                    "revision",
+                    "provenance",
+                )
+            )
 
     def test_teacher_cache_batch_group_binds_plan_and_contiguous_verifications(
         self,

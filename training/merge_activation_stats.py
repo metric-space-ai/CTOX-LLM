@@ -13,6 +13,8 @@ from typing import Any
 SEMANTIC_METADATA_FIELDS = (
     "model",
     "revision",
+    "local_model_provenance_sha256",
+    "quant_plan_sha256",
     "observed_modules",
     "target_tensors",
     "unobserved_tensors",
@@ -63,7 +65,7 @@ def merged_metadata(
 ) -> dict[str, str]:
     return {
         "format": "ctox.activation-diagonal.v1",
-        **{field: reference[field] for field in SEMANTIC_METADATA_FIELDS},
+        **{field: reference.get(field, "") for field in SEMANTIC_METADATA_FIELDS},
         "sample_ids": json.dumps(sample_ids, separators=(",", ":")),
         "samples": str(len(sample_ids)),
         "tokens": str(total_tokens),

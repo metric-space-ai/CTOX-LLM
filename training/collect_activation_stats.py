@@ -8,6 +8,7 @@ activations never enter the output artifact.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -19,6 +20,7 @@ from mtp_teacher import (
     load_mtp_teacher,
     mtp_checkpoint_weight_name,
 )
+from cache_teacher import validate_local_model_provenance
 from prompt_format import render_record
 from run_ledger import GpuRun, require_budget
 from teacher_runtime import (
@@ -30,6 +32,31 @@ from teacher_runtime import (
 
 
 QUANTIZED_DTYPES = frozenset({"q2_b64", "q4_b64", "mixed_q2_q4_b64"})
+
+
+def save_file_atomic(
+    save_file: Any,
+    tensors: dict[str, Any],
+    output: Path,
+    metadata: dict[str, str],
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    if temporary.exists():
+        raise RuntimeError(f"stale activation-statistics temporary exists: {temporary}")
+    try:
+        save_file(tensors, temporary, metadata=metadata)
+        with temporary.open("rb") as artifact:
+            os.fsync(artifact.fileno())
+        temporary.replace(output)
+        directory = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def checkpoint_weight_name(module_name: str) -> str:
@@ -89,7 +116,17 @@ def collect(
 ) -> None:
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
-    plan = json.loads(args.plan.read_text(encoding="utf-8"))
+    try:
+        _local_provenance, local_provenance_sha256 = validate_local_model_provenance(
+            Path(args.model),
+            args.revision,
+            args.local_model_provenance,
+        )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
+    plan_bytes = args.plan.read_bytes()
+    plan = json.loads(plan_bytes)
+    plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
     targets = quantized_source_names(plan)
     tokenizer = auto_tokenizer.from_pretrained(args.model, revision=args.revision)
     kernel_evidence = install_pinned_fla_kernel() if args.use_fla_kernel else None
@@ -359,14 +396,16 @@ def collect(
     observed_names.update(row_frequency_tensors)
     unobserved = sorted(targets - observed_names)
     cuda_memory = cuda_memory_evidence(torch, args.gpus)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    save_file(
+    save_file_atomic(
+        save_file,
         tensors,
         args.output,
-        metadata={
+        {
             "format": "ctox.activation-diagonal.v1",
             "model": args.model,
             "revision": args.revision,
+            "local_model_provenance_sha256": str(local_provenance_sha256 or ""),
+            "quant_plan_sha256": plan_sha256,
             "sample_ids": json.dumps(sample_ids, separators=(",", ":")),
             "samples": str(len(sample_ids)),
             "tokens": str(total_tokens),
@@ -408,6 +447,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--local-model-provenance", type=Path)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
