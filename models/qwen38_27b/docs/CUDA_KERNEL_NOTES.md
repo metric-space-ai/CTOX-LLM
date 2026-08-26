@@ -116,7 +116,7 @@ one thread owns one value column. Decay and update stores round immediately to
 FP16, matching the Rust and Metal oracle. CUDA 12.6 compiled the candidate for
 SM86 with 24 registers, 40 bytes shared memory, and zero stack/spill bytes
 (current unified cubin SHA-256
-`4cdaaeb0683d0c19c20a7eadbe6112168d8086276b4142b490f2010f0929b5d8`).
+`1ecb57894af1e019d3dc6d4767f651b28c565758bf94a917578c92530a608b12`).
 The numerical verifier is built for a later physical-GPU-2 run after the
 teacher/evaluation/activation pipeline releases GPU 1+2; GPU 0 remains
 reserved for Greppy. No numerical or performance promotion is claimed yet.
@@ -140,8 +140,9 @@ the two 48-value A/B projection views, repeats Q/K to the 48 recurrence heads,
 and computes `-exp(A_log) * softplus(A + dt_bias)` and `sigmoid(B)` entirely on
 device. Its verifier compares all four prepared outputs with the Rust oracle
 before feeding them directly into the recurrence; graph execution itself does
-not use verifier staging owners. Physical-GPU numerical evidence is still
-required before either candidate can be promoted.
+not use verifier staging owners. CUDA 12.6 compiles this preparation kernel
+with 18 registers and no stack or spill traffic. Physical-GPU numerical
+evidence is still required before either candidate can be promoted.
 
 The general Qwen `(1 + weight)` RMSNorm candidate uses one 256-thread block
 per row and an eight-warp reduction, so hidden width 5,120 does not serialize
@@ -179,7 +180,7 @@ output scans. CUDA 12.6 reports 15 registers/76 bytes shared memory for Q4
 packing, 16 registers/no shared memory for demotion, and 128 registers/no
 shared memory for GQA; all three have zero stack/spill bytes. GQA's
 16-warps-per-SM launch bound is explicit. The current unified cubin SHA-256 is
-`222a866b60571691860d3a31fd33860bc80a08d6ca0f8b739dfff970e6ff6f1b`.
+`1ecb57894af1e019d3dc6d4767f651b28c565758bf94a917578c92530a608b12`.
 Its numerical/demotion/reset/unload verifier is queued on physical GPU 2 after
 the teacher, evaluation, activation and earlier verifier chain; GPU 0 is never
 eligible. The CPU `PagedKvCache` exists only in the separate verifier as an
