@@ -289,6 +289,17 @@ execution. Unit fixtures cover exact pure Q2, exact mixed Q2/Q4, and rejection
 of non-finite recovery data; complete-artifact residency remains a hardware
 gate.
 
+The model-specific projection graph now assigns all 505 non-embedding target
+and MTP matrices to exactly 262 activation owners: the 130 recovery-bound
+fan-outs share one packed `s_in`/A8 transient each, while every independent
+down/output/LM-head/MTP-fusion edge retains its own correction identity. Load
+fails before dispatch when any member differs in columns or packed `s_in`
+bytes. The `qwen38-cuda-graph-load-verify` binary checks every tensor digest,
+uploads that complete projection graph, reports immutable model versus graph
+bytes, drops all 767 prepared objects, and requires driver free memory to
+return exactly to its pre-load value. This does not yet include embedding,
+float token-mixer parameters, KV/session state, or execution.
+
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not
 be conflated. The CUDA implementation differs from a CPU A8 oracle by at most

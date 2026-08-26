@@ -217,7 +217,10 @@ step to prepared artifact-backed operators remains in progress. The CUDA
 projection loader now validates and uploads pure or mixed Q2/Q4 matrices and
 packed FP16 recovery scales directly from mmap-backed `RecoveredMatrixView`
 objects, without widening/repacking model state or allocating a redundant f32
-input buffer per matrix. The previously
+input buffer per matrix. A deterministic artifact graph covers all 505
+non-embedding target/MTP projections with exactly 262 activation owners and a
+full-load/unload verifier; its queued GPU3 run is a residency gate, not an
+end-to-end inference claim. The previously
 open full-attention gate edge now has a fused sigmoid-gate/recovery/A8/output-
 projection CUDA candidate and dedicated hardware verifier.
 
