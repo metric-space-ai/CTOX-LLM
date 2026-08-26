@@ -3046,6 +3046,21 @@ impl CudaCandidateRuntime {
         &self,
         prepared: &mut PreparedCudaPagedGqa,
         query_ptr: CuDevicePtr,
+        key_ptr: CuDevicePtr,
+        value_ptr: CuDevicePtr,
+    ) -> Result<()> {
+        self.append_paged_q2q4_kv_inner(prepared, key_ptr, value_ptr)?;
+        self.launch_paged_q2q4_gqa(
+            prepared,
+            query_ptr,
+            prepared.output.ptr(),
+            "paged Q2/Q4 GQA context synchronization",
+        )
+    }
+
+    fn append_paged_q2q4_kv_inner(
+        &self,
+        prepared: &mut PreparedCudaPagedGqa,
         mut key_ptr: CuDevicePtr,
         mut value_ptr: CuDevicePtr,
     ) -> Result<()> {
@@ -3215,14 +3230,7 @@ impl CudaCandidateRuntime {
             cuda_u32(prepared.q4_page_bytes, "CUDA Q4 page bytes")?,
             (1.0 / (prepared.config.head_dim as f32).sqrt()).to_bits(),
         ];
-        prepared.params.write(as_bytes(&params_words))?;
-
-        self.launch_paged_q2q4_gqa(
-            prepared,
-            query_ptr,
-            prepared.output.ptr(),
-            "paged Q2/Q4 GQA context synchronization",
-        )
+        prepared.params.write(as_bytes(&params_words))
     }
 
     fn launch_paged_q2q4_gqa(
@@ -3275,6 +3283,66 @@ impl CudaCandidateRuntime {
             ));
         }
         Ok(result)
+    }
+
+    /// Seeds a verifier cache from finite f32 K/V rows without running the
+    /// quadratic attention scan after every append. Quantization, Q4-to-Q2
+    /// demotion, descriptors, and persistent storage are the same device path
+    /// used by decode. The f32 inputs are benchmark fixtures only and are not
+    /// retained by the prepared cache.
+    pub fn seed_paged_q2q4_gqa_verifier(
+        &self,
+        prepared: &mut PreparedCudaPagedGqa,
+        keys: &[f32],
+        values: &[f32],
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA paged GQA seed belongs to another context".into(),
+            ));
+        }
+        if prepared.poisoned || prepared.tokens != 0 || prepared.speculative_checkpoint.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA paged GQA seed requires a reset, healthy cache".into(),
+            ));
+        }
+        let component_values = prepared.component_values;
+        if keys.is_empty()
+            || keys.len() != values.len()
+            || !keys.len().is_multiple_of(component_values)
+            || keys.iter().chain(values).any(|item| !item.is_finite())
+        {
+            return Err(EngineError::Shape(
+                "CUDA paged GQA seed requires equal finite complete K/V rows".into(),
+            ));
+        }
+        let tokens = keys.len() / component_values;
+        if tokens > prepared.config.maximum_tokens {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA paged GQA seed has {tokens} tokens but capacity is {}",
+                prepared.config.maximum_tokens
+            )));
+        }
+
+        prepared.poisoned = true;
+        let result = self.run_token_submission("CUDA paged GQA verifier seed", || {
+            for token in 0..tokens {
+                let start = token * component_values;
+                let end = start + component_values;
+                prepared.key.write(as_bytes(&keys[start..end]))?;
+                prepared.value.write(as_bytes(&values[start..end]))?;
+                self.append_paged_q2q4_kv_inner(
+                    prepared,
+                    prepared.key.ptr(),
+                    prepared.value.ptr(),
+                )?;
+            }
+            Ok(())
+        });
+        if result.is_ok() {
+            prepared.poisoned = false;
+        }
+        result
     }
 
     pub fn prepare_paged_q2q4_gqa_split(

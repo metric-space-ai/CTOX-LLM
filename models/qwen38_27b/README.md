@@ -275,7 +275,9 @@ state entirely on device. The byte-identical Apache-2.0 upstream patch is
 pinned beside the existing CUDA references. Scheduler integration remains
 closed until the GPU3 numerical/lifecycle verifier and representative-context
 latency sweep pass; the verifier now reports a one-barrier comparison with
-five sequential full-cache attention launches.
+five sequential full-cache attention launches at short, 1,536-token, and
+16,384-token contexts. Long-context fixtures use the same device pack/demotion
+path but skip per-append attention so benchmark setup remains linear.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight

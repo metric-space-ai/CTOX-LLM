@@ -268,8 +268,12 @@ numerics and latency versus five sequential launches remain pending. The
 verifier now alternates both paths with one final context barrier per block
 and reports their mean latency and speedup; the sequential comparison scans
 the full cache for every query and is therefore a conservative traffic
-baseline, not the causality oracle. A short-context result cannot promote the
-kernel, so the
+baseline, not the causality oracle. A verifier-only seed path runs the real
+device Q4 pack and Q4-to-Q2 demotion without the otherwise quadratic attention
+scan after every append. It therefore adds 1,536- and 16,384-token latency
+points to the numerically checked short-context result without introducing a
+host packed-cache mirror. These measurements still require controlled clocks
+and a broader context sweep before promotion, so the
 production scheduler still uses the verified sequential structure.
 
 The first GPU3 run is recorded in

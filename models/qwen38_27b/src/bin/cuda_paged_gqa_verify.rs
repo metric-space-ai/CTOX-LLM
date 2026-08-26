@@ -25,6 +25,21 @@ struct Args {
     relative_tolerance: f32,
     #[arg(long, default_value_t = 20)]
     benchmark_iterations: usize,
+    #[arg(long, value_delimiter = ',', default_value = "1536,16384")]
+    latency_contexts: Vec<usize>,
+}
+
+#[derive(Serialize)]
+struct LatencyPoint {
+    context_tokens: usize,
+    packed_device_bytes: usize,
+    split_transient_bytes: usize,
+    q2_tokens: usize,
+    q4_tokens: usize,
+    iterations: usize,
+    sequential_full_context_microseconds: f64,
+    split_causal_microseconds: f64,
+    split_speedup: f64,
 }
 
 #[derive(Serialize)]
@@ -56,6 +71,7 @@ struct Report<'a> {
     sequential_full_context_microseconds: f64,
     split_causal_microseconds: f64,
     split_speedup: f64,
+    latency_sweep: Vec<LatencyPoint>,
     device_view_path_verified: bool,
     demotion_verified: bool,
     reset_verified: bool,
@@ -71,6 +87,14 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(
         (24..=128).contains(&args.tokens),
         "tokens must be between 24 and 128 so the verifier exercises Q4-to-Q2 demotion and non-empty split-KV segments"
+    );
+    anyhow::ensure!(
+        !args.latency_contexts.is_empty()
+            && args
+                .latency_contexts
+                .iter()
+                .all(|tokens| (256..=131_072).contains(tokens)),
+        "latency contexts must be non-empty and within 256..=131072"
     );
     let module = fs::read(&args.module)
         .with_context(|| format!("failed to read CUDA module {}", args.module.display()))?;
@@ -100,6 +124,7 @@ fn main() -> anyhow::Result<()> {
     let free_after_prepare;
     let reset_verified;
     let benchmark;
+    let mut latency_sweep = Vec::with_capacity(args.latency_contexts.len());
     {
         let mut prepared = runtime.prepare_paged_q2q4_gqa(config)?;
         let mut split = runtime.prepare_paged_q2q4_gqa_split(&prepared)?;
@@ -250,6 +275,64 @@ fn main() -> anyhow::Result<()> {
             PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
             args.benchmark_iterations,
         )?;
+
+        for &context_tokens in &args.latency_contexts {
+            let latency_config = CudaPagedGqaConfig {
+                query_heads: config.query_heads,
+                key_value_heads: config.key_value_heads,
+                head_dim: config.head_dim,
+                maximum_tokens: context_tokens,
+                page_tokens: 128,
+                sink_tokens: 128,
+                recent_tokens: 256.min(context_tokens),
+            };
+            let mut latency_cache = runtime.prepare_paged_q2q4_gqa(latency_config)?;
+            let mut latency_split = runtime.prepare_paged_q2q4_gqa_split(&latency_cache)?;
+            let component_values = latency_config.key_value_heads * latency_config.head_dim;
+            let fixture_values = context_tokens
+                .checked_mul(component_values)
+                .context("latency fixture shape overflows")?;
+            let latency_keys: Vec<f32> = (0..fixture_values)
+                .map(|index| ((index.wrapping_mul(13) % 257) as f32 - 128.0) * 0.0015)
+                .collect();
+            let latency_values: Vec<f32> = (0..fixture_values)
+                .map(|index| ((index.wrapping_mul(29) % 263) as f32 - 131.0) * 0.00125)
+                .collect();
+            runtime.seed_paged_q2q4_gqa_verifier(
+                &mut latency_cache,
+                &latency_keys,
+                &latency_values,
+            )?;
+            drop(latency_keys);
+            drop(latency_values);
+
+            let latency_query_values = PAGED_GQA_SPLIT_MAX_QUERY_TOKENS
+                * latency_config.query_heads
+                * latency_config.head_dim;
+            let latency_queries: Vec<f32> = (0..latency_query_values)
+                .map(|index| ((index.wrapping_mul(17) % 251) as f32 - 125.0) * 0.00175)
+                .collect();
+            let latency_staging = runtime.prepare_verifier_f32_tensor(&latency_queries)?;
+            let latency_benchmark = runtime.benchmark_paged_q2q4_gqa_split(
+                &latency_cache,
+                &mut latency_split,
+                latency_staging.device_view()?,
+                PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+                args.benchmark_iterations,
+            )?;
+            latency_sweep.push(LatencyPoint {
+                context_tokens,
+                packed_device_bytes: latency_cache.packed_device_bytes(),
+                split_transient_bytes: latency_split.transient_bytes(),
+                q2_tokens: latency_cache.q2_tokens(),
+                q4_tokens: latency_cache.q4_tokens(),
+                iterations: latency_benchmark.iterations,
+                sequential_full_context_microseconds: latency_benchmark
+                    .sequential_full_context_microseconds,
+                split_causal_microseconds: latency_benchmark.split_causal_microseconds,
+                split_speedup: latency_benchmark.speedup,
+            });
+        }
         verifier_cpu_packed_bytes = oracle.packed_bytes();
         q4_tokens = prepared.q4_tokens();
         anyhow::ensure!(
@@ -305,6 +388,7 @@ fn main() -> anyhow::Result<()> {
                 .sequential_full_context_microseconds,
             split_causal_microseconds: benchmark.split_causal_microseconds,
             split_speedup: benchmark.speedup,
+            latency_sweep,
             device_view_path_verified: true,
             demotion_verified: true,
             reset_verified,
