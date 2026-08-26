@@ -47,13 +47,16 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports three explicitly unpromoted
-  A8/dp4a candidates:
+- The same verifier cubin additionally exports five explicitly unpromoted
+  candidates: an A8 quantizer, two A8/dp4a projections, and two recovered-row
+  decoders:
   - `ctox_quantize_a8_b64_sm86`
   - `ctox_q2_b64_a8_matvec_sm86`
   - `ctox_q4_b64_a8_matvec_sm86`
+  - `ctox_q2_b64_recovered_row_sm86`
+  - `ctox_q4_b64_recovered_row_sm86`
   These symbols are intentionally excluded from the production module ABI
-  until the activation-quality gates pass.
+  until their quality and complete-graph gates pass.
 - One launch fuses dequant, dot product, `s_in`, `s_out`, bias, and
   activation (Identity/Silu). Parameter buffer is 60 bytes, tightly packed:
   six device pointers (weights, input, s_in, s_out, bias, output) then
@@ -120,6 +123,15 @@ mixed projection. Its maximum CUDA-vs-A8-oracle error was `2.63e-5`.
 The A8 path is therefore computationally validated but not promoted. Its
 quality must be measured after recovery on full-model logits and the held-out
 multilingual, general, coding, agentic, tool-calling, and long-context suite.
+
+The loader-resolved embedding-row candidate now decodes one canonical Q2 or
+Q4 row and fuses packed FP16 `s_in` plus scalar `s_out` on device. The
+5120-column verifier matched the scalar recovered-row oracle exactly for Q2
+and within `5.97e-8` for Q4. Five repeated-launch replicates had median kernel
+intervals of 2.96 microseconds (Q2) and 3.02 microseconds (Q4). The verifier
+copies output back for comparison; production graph wiring must instead keep
+the activation device-resident. Full evidence is in
+`benchmarks/cuda/sm86-recovered-row-20260826.json`.
 
 ## Promotion evidence still required (per `docs/PROMOTION_GATES.md`)
 

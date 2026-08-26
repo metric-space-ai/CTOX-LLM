@@ -14,10 +14,11 @@ use std::slice;
 use libloading::Library;
 
 use super::cuda::{
-    validate_mixed_operation, validate_operation, CudaMixedRowSegment, A8_QUANTIZE_SYMBOL,
-    Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
+    validate_mixed_operation, validate_operation, validate_recovered_row, CudaMixedRowSegment,
+    A8_QUANTIZE_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL,
+    Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL,
 };
-use super::{Activation, FusedMatVec, ScaleSlice};
+use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
 use crate::{EngineError, Result};
 
@@ -148,6 +149,8 @@ pub struct CudaCandidateRuntime {
     a8_quantize_function: CuFunction,
     q2_a8_function: CuFunction,
     q4_a8_function: CuFunction,
+    q2_recovered_row_function: CuFunction,
+    q4_recovered_row_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
 }
@@ -195,6 +198,19 @@ pub struct PreparedCudaMixedA8MatVec<'runtime> {
     output: DeviceBuffer<'runtime>,
     q8_codes: DeviceBuffer<'runtime>,
     q8_scales: DeviceBuffer<'runtime>,
+    resident_bytes: usize,
+}
+
+/// One loader-resolved embedding row with both recovery corrections and its
+/// decoded activation resident on the device.
+pub struct PreparedCudaRecoveredRow<'runtime> {
+    runtime: &'runtime CudaCandidateRuntime,
+    dtype: TensorDType,
+    columns: u32,
+    s_out: f32,
+    weights: DeviceBuffer<'runtime>,
+    s_in: DeviceBuffer<'runtime>,
+    output: DeviceBuffer<'runtime>,
     resident_bytes: usize,
 }
 
@@ -328,6 +344,28 @@ impl CudaCandidateRuntime {
                 return Err(error);
             }
         };
+        let q2_recovered_row_function =
+            match resolve_function(&driver, module, Q2_B64_RECOVERED_ROW_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let q4_recovered_row_function =
+            match resolve_function(&driver, module, Q4_B64_RECOVERED_ROW_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         Ok(Self {
             driver,
             context,
@@ -337,6 +375,8 @@ impl CudaCandidateRuntime {
             a8_quantize_function,
             q2_a8_function,
             q4_a8_function,
+            q2_recovered_row_function,
+            q4_recovered_row_function,
             device_name,
             compute_capability,
         })
@@ -348,6 +388,115 @@ impl CudaCandidateRuntime {
 
     pub fn compute_capability(&self) -> (u32, u32) {
         self.compute_capability
+    }
+
+    pub fn prepare_recovered_row<'runtime>(
+        &'runtime self,
+        operation: &RecoveredRow<'_>,
+    ) -> Result<PreparedCudaRecoveredRow<'runtime>> {
+        let descriptor = validate_recovered_row(operation)?;
+        self.make_current()?;
+        let weights = DeviceBuffer::from_bytes(self, operation.weights)?;
+        let ScaleSlice::F16Le(s_in_bytes) = operation.s_in else {
+            unreachable!("validated CUDA recovered-row s_in is FP16")
+        };
+        let s_in = DeviceBuffer::from_bytes(self, s_in_bytes)?;
+        let output_bytes = operation
+            .columns
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("CUDA recovered-row output size overflows".into()))?;
+        let output = DeviceBuffer::allocate(self, output_bytes)?;
+        let resident_bytes = weights
+            .len()
+            .checked_add(s_in.len())
+            .and_then(|total| total.checked_add(output.len()))
+            .ok_or_else(|| EngineError::Shape("CUDA recovered-row residency overflows".into()))?;
+        Ok(PreparedCudaRecoveredRow {
+            runtime: self,
+            dtype: descriptor.dtype,
+            columns: operation.columns as u32,
+            s_out: operation.s_out,
+            weights,
+            s_in,
+            output,
+            resident_bytes,
+        })
+    }
+
+    pub fn dispatch_recovered_row(
+        &self,
+        prepared: &PreparedCudaRecoveredRow<'_>,
+    ) -> Result<Vec<f32>> {
+        self.dispatch_prepared_recovered_row_repeated(prepared, 1)
+    }
+
+    pub fn dispatch_prepared_recovered_row_repeated(
+        &self,
+        prepared: &PreparedCudaRecoveredRow<'_>,
+        dispatches: usize,
+    ) -> Result<Vec<f32>> {
+        if dispatches == 0 {
+            return Err(EngineError::Shape(
+                "CUDA recovered-row dispatch count must be positive".into(),
+            ));
+        }
+        if !ptr::eq(self, prepared.runtime) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA recovered row belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        let function = match prepared.dtype {
+            TensorDType::Q2B64 => self.q2_recovered_row_function,
+            TensorDType::Q4B64 => self.q4_recovered_row_function,
+            _ => unreachable!("validated CUDA recovered row is Q2 or Q4"),
+        };
+        for _ in 0..dispatches {
+            let mut weights = prepared.weights.ptr();
+            let mut s_in = prepared.s_in.ptr();
+            let mut s_out = prepared.s_out;
+            let mut output = prepared.output.ptr();
+            let mut columns = prepared.columns;
+            let mut params = [
+                (&mut weights as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut s_in as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut s_out as *mut f32).cast::<c_void>(),
+                (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut columns as *mut u32).cast::<c_void>(),
+            ];
+            unsafe {
+                self.driver.check(
+                    (self.driver.launch_kernel)(
+                        function,
+                        prepared.columns.div_ceil(THREADS_PER_BLOCK),
+                        1,
+                        1,
+                        THREADS_PER_BLOCK,
+                        1,
+                        1,
+                        0,
+                        ptr::null_mut(),
+                        params.as_mut_ptr(),
+                        ptr::null_mut(),
+                    ),
+                    "recovered-row launch",
+                )?;
+            }
+        }
+        unsafe {
+            self.driver.check(
+                (self.driver.ctx_synchronize)(),
+                "recovered-row context synchronization",
+            )?;
+        }
+        let mut output = vec![0.0_f32; prepared.columns as usize];
+        prepared.output.copy_to(as_bytes_mut(&mut output))?;
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA recovered-row candidate produced non-finite output".into(),
+            ));
+        }
+        Ok(output)
     }
 
     pub fn dispatch_fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<Vec<f32>> {
@@ -924,6 +1073,20 @@ impl PreparedCudaMixedA8MatVec<'_> {
     }
 }
 
+impl PreparedCudaRecoveredRow<'_> {
+    pub fn dtype(&self) -> TensorDType {
+        self.dtype
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+}
+
 impl Drop for CudaCandidateRuntime {
     fn drop(&mut self) {
         unsafe {
@@ -1145,6 +1308,13 @@ mod tests {
     fn checked_device_pointer_offsets_fail_closed() {
         assert_eq!(device_ptr_offset(1_024, 256).unwrap(), 1_280);
         assert!(device_ptr_offset(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn recovered_row_launch_covers_partial_thread_block() {
+        assert_eq!(64_u32.div_ceil(THREADS_PER_BLOCK), 1);
+        assert_eq!(256_u32.div_ceil(THREADS_PER_BLOCK), 2);
+        assert_eq!(5_120_u32.div_ceil(THREADS_PER_BLOCK), 40);
     }
 
     #[test]

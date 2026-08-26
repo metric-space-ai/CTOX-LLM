@@ -323,3 +323,47 @@ void ctox_q4_b64_a8_matvec_sm86(const unsigned char* __restrict__ weights,
             shifted * load_optional_f16(s_out, row), activation);
     }
 }
+
+// One packed embedding row is resolved by the artifact loader. Decode and
+// both recovery corrections stay fused so the graph receives only the final
+// resident activation vector. The code extraction mirrors the pinned
+// upstream dequantization organization, specialized to CTOX B64 blocks.
+// ref: ggml/src/ggml-cuda/dequantize.cuh:25-38
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_q2_b64_recovered_row_sm86(const unsigned char* __restrict__ weights,
+                                    const __half* __restrict__ s_in,
+                                    float s_out,
+                                    float* __restrict__ output,
+                                    unsigned columns) {
+    const unsigned column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= columns) {
+        return;
+    }
+    const unsigned block = column / kBlockLen;
+    const unsigned local = column % kBlockLen;
+    const unsigned char* packed = weights + block * kQ2BlockBytes;
+    const unsigned code = (packed[2u + local / 4u] >> ((local % 4u) * 2u)) & 0x3u;
+    const float value = static_cast<float>(static_cast<int>(code) * 2 - 3)
+        * (1.0f / 3.0f) * load_f16(packed);
+    output[column] = value * load_optional_f16(s_in, column) * s_out;
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_q4_b64_recovered_row_sm86(const unsigned char* __restrict__ weights,
+                                    const __half* __restrict__ s_in,
+                                    float s_out,
+                                    float* __restrict__ output,
+                                    unsigned columns) {
+    const unsigned column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= columns) {
+        return;
+    }
+    const unsigned block = column / kBlockLen;
+    const unsigned local = column % kBlockLen;
+    const unsigned char* packed = weights + block * kQ4BlockBytes;
+    const unsigned byte = packed[2u + local / 2u];
+    const unsigned code = (byte >> ((local % 2u) * 4u)) & 0xfu;
+    const float value = static_cast<float>(static_cast<int>(code) * 2 - 15)
+        * (1.0f / 15.0f) * load_f16(packed);
+    output[column] = value * load_optional_f16(s_in, column) * s_out;
+}

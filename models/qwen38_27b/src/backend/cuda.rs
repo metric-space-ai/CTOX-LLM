@@ -156,6 +156,8 @@ pub const Q4_B64_FUSED_MATVEC: CudaKernelAbi = CudaKernelAbi {
 pub const A8_QUANTIZE_SYMBOL: &str = "ctox_quantize_a8_b64_sm86";
 pub const Q2_B64_A8_MATVEC_SYMBOL: &str = "ctox_q2_b64_a8_matvec_sm86";
 pub const Q4_B64_A8_MATVEC_SYMBOL: &str = "ctox_q4_b64_a8_matvec_sm86";
+pub const Q2_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q2_b64_recovered_row_sm86";
+pub const Q4_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q4_b64_recovered_row_sm86";
 
 /// Module-level ABI contract for the SM86 kernel image: the compute
 /// capability the cubin must target and every kernel it must export.
@@ -339,6 +341,48 @@ pub(crate) fn validate_mixed_operation(
         )));
     }
     Ok(launches)
+}
+
+pub(crate) fn validate_recovered_row(
+    operation: &RecoveredRow<'_>,
+) -> Result<&'static CudaKernelAbi> {
+    let descriptor = SM86_MODULE_ABI.descriptor_for(operation.dtype)?;
+    if operation.columns == 0 || !operation.columns.is_multiple_of(BLOCK_LEN) {
+        return Err(EngineError::Shape(
+            "CUDA recovered row columns must be non-zero and divisible by 64".into(),
+        ));
+    }
+    let expected_weights = operation
+        .columns
+        .checked_div(BLOCK_LEN)
+        .and_then(|blocks| blocks.checked_mul(descriptor.block_bytes))
+        .ok_or_else(|| EngineError::Shape("CUDA recovered row size overflows usize".into()))?;
+    if operation.weights.len() != expected_weights {
+        return Err(EngineError::Shape(format!(
+            "CUDA recovered row has {} weight bytes, expected {expected_weights}",
+            operation.weights.len()
+        )));
+    }
+    if !matches!(operation.s_in, ScaleSlice::F16Le(_)) {
+        return Err(EngineError::UnsupportedDType(
+            "CUDA recovered-row s_in must remain packed FP16".into(),
+        ));
+    }
+    if operation.s_in.len() != operation.columns {
+        return Err(EngineError::Shape(format!(
+            "CUDA recovered-row s_in has {} values, expected {}",
+            operation.s_in.len(),
+            operation.columns
+        )));
+    }
+    if !operation.s_out.is_finite() {
+        return Err(EngineError::InvalidArtifact(
+            "CUDA recovered-row s_out is non-finite".into(),
+        ));
+    }
+    u32::try_from(operation.columns)
+        .map_err(|_| EngineError::Shape("recovered-row columns exceed CUDA u32".into()))?;
+    Ok(descriptor)
 }
 
 impl CudaModuleAbi {
@@ -560,6 +604,8 @@ mod tests {
         assert!(!symbols.contains(&A8_QUANTIZE_SYMBOL));
         assert!(!symbols.contains(&Q2_B64_A8_MATVEC_SYMBOL));
         assert!(!symbols.contains(&Q4_B64_A8_MATVEC_SYMBOL));
+        assert!(!symbols.contains(&Q2_B64_RECOVERED_ROW_SYMBOL));
+        assert!(!symbols.contains(&Q4_B64_RECOVERED_ROW_SYMBOL));
         for kernel in abi.kernels {
             assert_eq!(kernel.block_len, BLOCK_LEN);
             assert_eq!(kernel.max_threads_per_block % SM86_WARP_SIZE, 0);
@@ -715,6 +761,33 @@ mod tests {
             validate_mixed_operation(&operation),
             Err(EngineError::InvalidArtifact(_))
         ));
+    }
+
+    #[test]
+    fn recovered_row_validation_binds_one_packed_row_and_fp16_scales() {
+        for dtype in [TensorDType::Q2B64, TensorDType::Q4B64] {
+            let columns = 128;
+            let weights = packed_weights(dtype, 1, columns);
+            let s_in = f16_bytes(columns);
+            let operation = RecoveredRow {
+                dtype,
+                weights: &weights,
+                columns,
+                s_in: ScaleSlice::F16Le(&s_in),
+                s_out: 0.875,
+            };
+            assert_eq!(validate_recovered_row(&operation).unwrap().dtype, dtype);
+
+            let truncated = &weights[..weights.len() - 1];
+            let invalid = RecoveredRow {
+                weights: truncated,
+                ..operation
+            };
+            assert!(matches!(
+                validate_recovered_row(&invalid),
+                Err(EngineError::Shape(_))
+            ));
+        }
     }
 
     #[test]

@@ -1,0 +1,71 @@
+{
+  "format": "ctox.cuda-sm86-recovered-row-candidate-evidence.v1",
+  "status": "verifier_only_not_promotion_evidence",
+  "captured_at": "2026-08-26",
+  "host": "gpu3",
+  "device": {
+    "physical_index": 1,
+    "name": "NVIDIA RTX A4500",
+    "compute_capability": "8.6",
+    "cuda_toolkit": "12.6.85",
+    "rust_toolchain": "1.93.0"
+  },
+  "module": {
+    "source": "kernels/cuda/q2q4_fused_matvec_sm86.cu",
+    "source_sha256": "d8f1fdc5daf6fed0240015fbc14c2937c2d9ad2c79441a53542fc23b86450aa3",
+    "cubin_sha256": "48fb79dee741c06dd2330a3b08ee966ee2d27f766e6e1534fbe720e54e6ac5ce",
+    "target": "sm_86",
+    "q2_recovered_row_registers": 12,
+    "q4_recovered_row_registers": 12,
+    "spill_load_bytes": 0,
+    "spill_store_bytes": 0
+  },
+  "runtime_sources": {
+    "src/backend/cuda.rs": "4b6f2bb56ab3ea28a20dbab174164a54b942507aa4eb443ab6eea26846ec0a38",
+    "src/backend/cuda_runtime.rs": "49b7bb769cfedef5d3d307b54c563e2881e196e225b24130ae3da8cae2706e03",
+    "src/bin/cuda_row_bench.rs": "84baca4f5c8764c45ad69816c348b81637b03fefd6846a30082678e86f2d3137"
+  },
+  "semantic_contract": {
+    "operation": "loader_resolved_embedding_row",
+    "logical_weight_codes": "unchanged_q2_b64_or_q4_b64",
+    "recovery_order": "dequantize_weight_then_multiply_packed_fp16_s_in_and_f32_s_out",
+    "host_output": "verifier_only; production graph must retain the decoded vector on device",
+    "weight_requantization": false
+  },
+  "measurements": [
+    {
+      "dtype": "q2_b64",
+      "columns": 5120,
+      "warmup_syncs_per_replicate": 5,
+      "measured_syncs_per_replicate": 100,
+      "dispatches_per_sync": 20,
+      "replicates": 5,
+      "packed_weight_bytes": 1440,
+      "requested_resident_buffer_bytes": 32160,
+      "mean_dispatch_milliseconds": [0.0029496195, 0.002964062, 0.003355531, 0.0031477085, 0.002930224],
+      "median_mean_dispatch_milliseconds": 0.002964062,
+      "maximum_absolute_error": 0.0
+    },
+    {
+      "dtype": "q4_b64",
+      "columns": 5120,
+      "warmup_syncs_per_replicate": 5,
+      "measured_syncs_per_replicate": 100,
+      "dispatches_per_sync": 20,
+      "replicates": 5,
+      "packed_weight_bytes": 2720,
+      "requested_resident_buffer_bytes": 33440,
+      "mean_dispatch_milliseconds": [0.00334493, 0.0031911765, 0.0028418425, 0.002951459, 0.0030247705],
+      "median_mean_dispatch_milliseconds": 0.0030247705,
+      "maximum_absolute_error": 0.000000059604645
+    }
+  ],
+  "limitations": [
+    "The candidate ran on physical GPU 1 while the BF16 teacher remained resident on all three GPUs.",
+    "The timing interval repeats one resident row and amortizes synchronization and verifier output-copy overhead.",
+    "Embedding-row execution is launch-latency-bound; no bandwidth roofline is claimed.",
+    "The verifier copies the decoded vector to host for comparison; the production graph must retain it on device.",
+    "The candidate symbols remain outside the production CUDA module ABI until complete graph and end-to-end gates pass."
+  ],
+  "conclusion": "Both Q2 and Q4 embedding-row candidates reproduce the scalar recovered-row oracle within 5.97e-8 while fusing dequantization and both recovery corrections."
+}
