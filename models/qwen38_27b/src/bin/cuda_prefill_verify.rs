@@ -60,6 +60,7 @@ struct Report<'a> {
     batch_rows: usize,
     cpu_oracle_executed: bool,
     resident_bytes: usize,
+    resident_graph_workspace_bytes: usize,
     baseline_mean_batch_milliseconds: f64,
     mmq_mean_batch_milliseconds: f64,
     mmq_speedup: f64,
@@ -70,6 +71,8 @@ struct Report<'a> {
     mmq_maximum_relative_error: Option<f32>,
     baseline_mmq_maximum_absolute_delta: f32,
     baseline_mmq_maximum_relative_delta: f32,
+    mmq_graph_maximum_absolute_delta: f32,
+    mmq_graph_maximum_relative_delta: f32,
     note: &'static str,
 }
 
@@ -172,6 +175,32 @@ fn main() -> anyhow::Result<()> {
         args.absolute_tolerance,
         args.relative_tolerance,
     )?;
+    let graph_input = runtime.prepare_verifier_f32_tensor(&inputs)?;
+    let graph_activation =
+        runtime.prepare_batched_shared_a8_activation(&operation, args.batch_rows)?;
+    let graph_projection = runtime.prepare_shared_a8_projection(&operation)?;
+    let graph_output = runtime.prepare_batched_a8_output(&graph_projection, args.batch_rows)?;
+    let graph_view = runtime
+        .dispatch_batched_shared_a8_fanout_device(
+            &graph_activation,
+            graph_input.device_view()?,
+            args.batch_rows,
+            &[(&graph_projection, &graph_output)],
+        )?
+        .into_iter()
+        .next()
+        .context("batched CUDA graph fan-out returned no output")?;
+    let graph_values = runtime.verifier_read_f32(graph_view)?;
+    let (mmq_graph_maximum_absolute_delta, mmq_graph_maximum_relative_delta) = compare(
+        &mmq_output,
+        &graph_values,
+        args.absolute_tolerance,
+        args.relative_tolerance,
+    )?;
+    let resident_graph_workspace_bytes = graph_activation
+        .resident_bytes()
+        .checked_add(graph_output.resident_bytes())
+        .context("CUDA graph workspace residency overflows")?;
     for _ in 0..args.warmup {
         std::hint::black_box(runtime.dispatch_batched_a8_matmul(&prepared)?);
         std::hint::black_box(runtime.dispatch_batched_a8_mmq(&prepared)?);
@@ -208,6 +237,7 @@ fn main() -> anyhow::Result<()> {
             batch_rows: prepared.batch_rows(),
             cpu_oracle_executed: !args.skip_cpu_oracle,
             resident_bytes: prepared.resident_bytes(),
+            resident_graph_workspace_bytes,
             baseline_mean_batch_milliseconds: baseline_mean_batch_seconds * 1_000.0,
             mmq_mean_batch_milliseconds: mmq_mean_batch_seconds * 1_000.0,
             mmq_speedup: baseline_mean_batch_seconds / mmq_mean_batch_seconds,
@@ -218,7 +248,9 @@ fn main() -> anyhow::Result<()> {
             mmq_maximum_relative_error,
             baseline_mmq_maximum_absolute_delta,
             baseline_mmq_maximum_relative_delta,
-            note: "Verifier-only same-buffer comparison of the 2-D dp4a baseline and upstream-derived SM86 tensor-core MMQ tile. Production promotion still requires representative Qwen shapes, stable roofline evidence, and full graph integration.",
+            mmq_graph_maximum_absolute_delta,
+            mmq_graph_maximum_relative_delta,
+            note: "Verifier-only comparison of the 2-D dp4a baseline, standalone SM86 MMQ tile, and the device-resident graph workspace path. The graph path shares immutable projection weights and keeps activation/output transients separate. Production promotion still requires complete layer-major chunk scheduling, recurrent/attention scans, representative Qwen shapes, and stable roofline evidence.",
         })?
     );
     Ok(())

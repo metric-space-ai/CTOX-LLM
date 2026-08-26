@@ -277,6 +277,17 @@ verification, a sendable adapter
 owns this deliberately thread-affine CUDA executor on one dedicated worker;
 the socket threads exchange typed commands and never move driver objects.
 
+Chunked CUDA prefill now also has a layer-major 613-step schedule contract and
+single-copy graph workspace primitives. The schedule batches every large
+Q2/Q4 projection, retains causal device scans for paged GQA, convolution,
+GatedDelta recurrence, and MTP state, computes the target LM head only for the
+last prompt token, and exposes one cancellation/commit barrier per bounded
+chunk. Batched activation/output workspaces are separate from resident matrix
+owners, so enabling a 512-token chunk does not duplicate model weights. The
+standalone MMQ verifier exercises this same graph-facing path; complete
+batched RMSNorm/token-mixer kernels and executor replacement of the current
+sequential prefill loop are still open.
+
 An isolated mixed-Q2/Q4 split-KV attention candidate now covers the five
 causal tail queries used by MTP4 verification. Sixteen KV segments expose
 1,920 partial blocks on SM86 and a second kernel combines their online-softmax

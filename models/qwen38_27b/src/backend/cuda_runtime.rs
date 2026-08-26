@@ -414,6 +414,21 @@ pub struct PreparedCudaA8Activation {
     resident_bytes: usize,
 }
 
+/// Device-only A8 workspace for one row-major prefill chunk. It owns no model
+/// weights and can therefore be shared by every projection whose packed
+/// `s_in` identity matches. Only the active prefix of `batch_capacity` is
+/// touched by a dispatch.
+pub struct PreparedCudaBatchedA8Activation {
+    context: Rc<CudaContextInner>,
+    batch_capacity: u32,
+    columns: u32,
+    correction_identity: A8CorrectionIdentity,
+    s_in: Option<DeviceBuffer>,
+    q8_codes: DeviceBuffer,
+    q8_scales: DeviceBuffer,
+    resident_bytes: usize,
+}
+
 enum CudaA8ProjectionLayout {
     Pure(TensorDType),
     Mixed(Vec<CudaMixedRowSegment>),
@@ -432,6 +447,17 @@ pub struct PreparedCudaA8Projection {
     weights: DeviceBuffer,
     s_out: Option<DeviceBuffer>,
     bias: Option<DeviceBuffer>,
+    output: DeviceBuffer,
+    resident_bytes: usize,
+}
+
+/// Transient row-major output for a batched projection. Immutable weights and
+/// recovery scales remain in [`PreparedCudaA8Projection`], so growing or
+/// replacing a prefill workspace never duplicates model state.
+pub struct PreparedCudaBatchedA8Output {
+    context: Rc<CudaContextInner>,
+    batch_capacity: u32,
+    rows: u32,
     output: DeviceBuffer,
     resident_bytes: usize,
 }
@@ -4226,6 +4252,47 @@ impl CudaCandidateRuntime {
         })
     }
 
+    /// Verifier constructor for a bounded batched activation workspace. It
+    /// accepts host-described matrix metadata but deliberately does not stage
+    /// the activation values; those arrive through a device view at dispatch.
+    pub fn prepare_batched_shared_a8_activation(
+        &self,
+        operation: &FusedMatVec<'_>,
+        batch_capacity: usize,
+    ) -> Result<PreparedCudaBatchedA8Activation> {
+        validate_a8_projection_layout(operation)?;
+        let batch_capacity = validate_a8_batch_capacity(batch_capacity)?;
+        let correction_identity = a8_correction_identity(operation.columns, operation.s_in)?;
+        self.make_current()?;
+        let s_in = optional_scale_buffer(self, operation.s_in)?;
+        let q8_codes_bytes = (batch_capacity as usize)
+            .checked_mul(operation.columns)
+            .ok_or_else(|| EngineError::Shape("batched CUDA A8 code bytes overflow".into()))?;
+        let q8_scale_bytes = (batch_capacity as usize)
+            .checked_mul(a8_scale_bytes(operation.columns)?)
+            .ok_or_else(|| EngineError::Shape("batched CUDA A8 scale bytes overflow".into()))?;
+        let q8_codes = DeviceBuffer::allocate(self, q8_codes_bytes)?;
+        let q8_scales = DeviceBuffer::allocate(self, q8_scale_bytes)?;
+        let resident_bytes = s_in
+            .as_ref()
+            .map_or(0, DeviceBuffer::len)
+            .checked_add(q8_codes.len())
+            .and_then(|total| total.checked_add(q8_scales.len()))
+            .ok_or_else(|| {
+                EngineError::Shape("batched CUDA A8 activation residency overflows".into())
+            })?;
+        Ok(PreparedCudaBatchedA8Activation {
+            context: Rc::clone(&self.inner),
+            batch_capacity,
+            columns: operation.columns as u32,
+            correction_identity,
+            s_in,
+            q8_codes,
+            q8_scales,
+            resident_bytes,
+        })
+    }
+
     /// Prepares the shared corrected activation buffers directly from one
     /// mmap-backed CTOXQ matrix. Model input is supplied later as a device
     /// view, so this path deliberately allocates no host-staged device input.
@@ -4253,6 +4320,49 @@ impl CudaCandidateRuntime {
             columns: recovered.matrix.columns as u32,
             correction_identity,
             input: None,
+            s_in,
+            q8_codes,
+            q8_scales,
+            resident_bytes,
+        })
+    }
+
+    /// Allocates one device-only activation workspace for a bounded prefill
+    /// chunk. The immutable `s_in` bytes are copied once from the canonical
+    /// CTOXQ tensor; activation values are supplied later by a producer-owned
+    /// device view and are never staged through host memory.
+    pub fn prepare_batched_shared_a8_activation_recovered(
+        &self,
+        recovered: RecoveredMatrixView<'_>,
+        batch_capacity: usize,
+    ) -> Result<PreparedCudaBatchedA8Activation> {
+        validate_recovered_a8_projection_layout(recovered)?;
+        let batch_capacity = validate_a8_batch_capacity(batch_capacity)?;
+        let s_in = recovered.s_in.as_recovery_scales()?;
+        let correction_identity = a8_correction_identity(recovered.matrix.columns, Some(s_in))?;
+        self.make_current()?;
+        let s_in = optional_scale_buffer(self, Some(s_in))?;
+        let q8_codes_bytes = (batch_capacity as usize)
+            .checked_mul(recovered.matrix.columns)
+            .ok_or_else(|| EngineError::Shape("batched CUDA A8 code bytes overflow".into()))?;
+        let q8_scale_bytes = (batch_capacity as usize)
+            .checked_mul(a8_scale_bytes(recovered.matrix.columns)?)
+            .ok_or_else(|| EngineError::Shape("batched CUDA A8 scale bytes overflow".into()))?;
+        let q8_codes = DeviceBuffer::allocate(self, q8_codes_bytes)?;
+        let q8_scales = DeviceBuffer::allocate(self, q8_scale_bytes)?;
+        let resident_bytes = s_in
+            .as_ref()
+            .map_or(0, DeviceBuffer::len)
+            .checked_add(q8_codes.len())
+            .and_then(|total| total.checked_add(q8_scales.len()))
+            .ok_or_else(|| {
+                EngineError::Shape("batched CUDA A8 activation residency overflows".into())
+            })?;
+        Ok(PreparedCudaBatchedA8Activation {
+            context: Rc::clone(&self.inner),
+            batch_capacity,
+            columns: recovered.matrix.columns as u32,
+            correction_identity,
             s_in,
             q8_codes,
             q8_scales,
@@ -4356,6 +4466,35 @@ impl CudaCandidateRuntime {
             bias: None,
             output,
             resident_bytes,
+        })
+    }
+
+    /// Allocates only the transient output needed to execute a resident
+    /// projection over a bounded prompt chunk. The projection's weight and
+    /// recovery buffers remain single-copy and are not repacked.
+    pub fn prepare_batched_a8_output(
+        &self,
+        projection: &PreparedCudaA8Projection,
+        batch_capacity: usize,
+    ) -> Result<PreparedCudaBatchedA8Output> {
+        if !Rc::ptr_eq(&self.inner, &projection.context) {
+            return Err(EngineError::InvalidState(
+                "batched CUDA output projection belongs to another context".into(),
+            ));
+        }
+        let batch_capacity = validate_a8_batch_capacity(batch_capacity)?;
+        let output_bytes = (batch_capacity as usize)
+            .checked_mul(projection.rows as usize)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| EngineError::Shape("batched CUDA output bytes overflow".into()))?;
+        self.make_current()?;
+        let output = DeviceBuffer::allocate(self, output_bytes)?;
+        Ok(PreparedCudaBatchedA8Output {
+            context: Rc::clone(&self.inner),
+            batch_capacity,
+            rows: projection.rows,
+            resident_bytes: output.len(),
+            output,
         })
     }
 
@@ -4612,6 +4751,88 @@ impl CudaCandidateRuntime {
             .collect()
     }
 
+    /// Quantizes one producer-owned row-major prompt chunk and executes an
+    /// identity-bound projection fan-out through the SM86 MMQ path. Model
+    /// weights stay in the ordinary resident projection owners; only bounded
+    /// activation/output workspaces scale with the chunk capacity.
+    pub fn dispatch_batched_shared_a8_fanout_device<'a>(
+        &self,
+        activation: &PreparedCudaBatchedA8Activation,
+        input: CudaDeviceF32View<'_>,
+        batch_rows: usize,
+        projections: &[(
+            &'a PreparedCudaA8Projection,
+            &'a PreparedCudaBatchedA8Output,
+        )],
+    ) -> Result<Vec<CudaDeviceF32View<'a>>> {
+        let batch_rows = validate_a8_batch_capacity(batch_rows)?;
+        if projections.is_empty() {
+            return Err(EngineError::Shape(
+                "batched shared CUDA A8 fan-out requires at least one projection".into(),
+            ));
+        }
+        if !Rc::ptr_eq(&self.inner, &activation.context) || !Rc::ptr_eq(&self.inner, input.context)
+        {
+            return Err(EngineError::InvalidState(
+                "batched shared CUDA A8 input belongs to another context".into(),
+            ));
+        }
+        if batch_rows > activation.batch_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA prefill chunk has {batch_rows} rows, activation capacity is {}",
+                activation.batch_capacity
+            )));
+        }
+        let input_values = (batch_rows as usize)
+            .checked_mul(activation.columns as usize)
+            .ok_or_else(|| EngineError::Shape("batched CUDA A8 input shape overflows".into()))?;
+        if input.values() != input_values {
+            return Err(EngineError::Shape(format!(
+                "batched shared CUDA A8 input has {} values, expected {input_values}",
+                input.values()
+            )));
+        }
+        for (projection, output) in projections {
+            if !Rc::ptr_eq(&self.inner, &projection.context)
+                || !Rc::ptr_eq(&self.inner, &output.context)
+            {
+                return Err(EngineError::InvalidState(
+                    "batched shared CUDA A8 fan-out crosses driver contexts".into(),
+                ));
+            }
+            if projection.columns != activation.columns
+                || projection.correction_identity != activation.correction_identity
+            {
+                return Err(EngineError::InvalidArtifact(
+                    "batched shared CUDA A8 projection s_in identity differs".into(),
+                ));
+            }
+            if output.rows != projection.rows || batch_rows > output.batch_capacity {
+                return Err(EngineError::MemoryBudget(format!(
+                    "CUDA batched output capacity/shape does not admit {batch_rows}x{} projection",
+                    projection.rows
+                )));
+            }
+        }
+
+        self.launch_batched_a8_quantization(
+            input.ptr()?,
+            activation.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            activation.q8_codes.ptr(),
+            activation.q8_scales.ptr(),
+            activation.columns,
+            batch_rows,
+        )?;
+        for (projection, output) in projections {
+            self.launch_batched_shared_a8_projection(activation, projection, output, batch_rows)?;
+        }
+        self.synchronize_after_launch("batched shared A8 MMQ fan-out context synchronization")?;
+        projections
+            .iter()
+            .map(|(_, output)| output.device_output(batch_rows as usize))
+            .collect()
+    }
+
     /// Executes only release-bound LM-head rows for an MTP proposal. The
     /// target head remains a separate complete projection and verifies every
     /// proposed token before commit.
@@ -4757,6 +4978,61 @@ impl CudaCandidateRuntime {
                         device_ptr_offset(projection.output.ptr(), row_start * 4)?,
                         segment.row_count,
                         projection.columns,
+                        projection.activation,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn launch_batched_shared_a8_projection(
+        &self,
+        activation: &PreparedCudaBatchedA8Activation,
+        projection: &PreparedCudaA8Projection,
+        output: &PreparedCudaBatchedA8Output,
+        batch_rows: u32,
+    ) -> Result<()> {
+        match &projection.layout {
+            CudaA8ProjectionLayout::Pure(dtype) => self.launch_batched_a8_mmq_projection(
+                *dtype,
+                projection.weights.ptr(),
+                activation.q8_codes.ptr(),
+                activation.q8_scales.ptr(),
+                projection.s_out.as_ref().map_or(0, DeviceBuffer::ptr),
+                projection.bias.as_ref().map_or(0, DeviceBuffer::ptr),
+                output.output.ptr(),
+                projection.rows,
+                projection.columns,
+                batch_rows,
+                projection.rows,
+                projection.activation,
+            ),
+            CudaA8ProjectionLayout::Mixed(segments) => {
+                for segment in segments {
+                    let row_start = segment.row_start as usize;
+                    self.launch_batched_a8_mmq_projection(
+                        segment.descriptor.dtype,
+                        device_ptr_offset(projection.weights.ptr(), segment.weight_offset)?,
+                        activation.q8_codes.ptr(),
+                        activation.q8_scales.ptr(),
+                        projection
+                            .s_out
+                            .as_ref()
+                            .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 2))
+                            .transpose()?
+                            .unwrap_or(0),
+                        projection
+                            .bias
+                            .as_ref()
+                            .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 4))
+                            .transpose()?
+                            .unwrap_or(0),
+                        device_ptr_offset(output.output.ptr(), row_start * 4)?,
+                        segment.row_count,
+                        projection.columns,
+                        batch_rows,
+                        projection.rows,
                         projection.activation,
                     )?;
                 }
@@ -5789,6 +6065,20 @@ impl PreparedCudaA8Activation {
     }
 }
 
+impl PreparedCudaBatchedA8Activation {
+    pub fn batch_capacity(&self) -> usize {
+        self.batch_capacity as usize
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+}
+
 impl PreparedCudaA8Projection {
     pub fn dtype(&self) -> TensorDType {
         self.dtype
@@ -5808,6 +6098,34 @@ impl PreparedCudaA8Projection {
 
     pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
         self.output.f32_view(0, self.rows())
+    }
+}
+
+impl PreparedCudaBatchedA8Output {
+    pub fn batch_capacity(&self) -> usize {
+        self.batch_capacity as usize
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows as usize
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn device_output(&self, batch_rows: usize) -> Result<CudaDeviceF32View<'_>> {
+        let batch_rows = validate_a8_batch_capacity(batch_rows)?;
+        if batch_rows > self.batch_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA batched output request has {batch_rows} rows, capacity is {}",
+                self.batch_capacity
+            )));
+        }
+        let values = (batch_rows as usize)
+            .checked_mul(self.rows())
+            .ok_or_else(|| EngineError::Shape("CUDA batched output view overflows".into()))?;
+        self.output.f32_view(0, values)
     }
 }
 
@@ -6766,18 +7084,7 @@ fn validate_batched_a8_inputs(
     batch_rows: usize,
 ) -> Result<(CudaA8ProjectionLayout, u32, usize)> {
     let layout = validate_a8_projection_layout(operation)?;
-    if batch_rows == 0 {
-        return Err(EngineError::Shape(
-            "CUDA batched A8 matmul requires at least one input row".into(),
-        ));
-    }
-    let batch_rows_u32 = u32::try_from(batch_rows)
-        .map_err(|_| EngineError::Shape("CUDA A8 batch rows exceed u32".into()))?;
-    if batch_rows_u32 > CUDA_GRID_Y_MAX {
-        return Err(EngineError::Shape(format!(
-            "CUDA A8 batch has {batch_rows} rows, maximum is {CUDA_GRID_Y_MAX}; chunk longer prefills"
-        )));
-    }
+    let batch_rows_u32 = validate_a8_batch_capacity(batch_rows)?;
     let input_values = batch_rows
         .checked_mul(operation.columns)
         .ok_or_else(|| EngineError::Shape("CUDA batched A8 input value count overflows".into()))?;
@@ -6793,6 +7100,22 @@ fn validate_batched_a8_inputs(
         ));
     }
     Ok((layout, batch_rows_u32, input_values))
+}
+
+fn validate_a8_batch_capacity(batch_rows: usize) -> Result<u32> {
+    if batch_rows == 0 {
+        return Err(EngineError::Shape(
+            "CUDA batched A8 matmul requires at least one input row".into(),
+        ));
+    }
+    let batch_rows_u32 = u32::try_from(batch_rows)
+        .map_err(|_| EngineError::Shape("CUDA A8 batch rows exceed u32".into()))?;
+    if batch_rows_u32 > CUDA_GRID_Y_MAX {
+        return Err(EngineError::Shape(format!(
+            "CUDA A8 batch has {batch_rows} rows, maximum is {CUDA_GRID_Y_MAX}; chunk longer prefills"
+        )));
+    }
+    Ok(batch_rows_u32)
 }
 
 fn embedding_row_location(
@@ -7339,13 +7662,26 @@ mod tests {
     }
 
     #[test]
+    fn prefill_chunk_capacity_is_bounded_by_cuda_grid_geometry() {
+        assert_eq!(validate_a8_batch_capacity(1).unwrap(), 1);
+        assert_eq!(
+            validate_a8_batch_capacity(CUDA_GRID_Y_MAX as usize).unwrap(),
+            CUDA_GRID_Y_MAX
+        );
+        assert!(validate_a8_batch_capacity(0).is_err());
+        assert!(validate_a8_batch_capacity(CUDA_GRID_Y_MAX as usize + 1).is_err());
+    }
+
+    #[test]
     fn prepared_graph_objects_own_their_context_without_borrowed_lifetimes() {
         fn assert_owned<T: 'static>() {}
         assert_owned::<PreparedCudaMatVec>();
         assert_owned::<PreparedCudaA8MatVec>();
         assert_owned::<PreparedCudaMixedA8MatVec>();
         assert_owned::<PreparedCudaA8Activation>();
+        assert_owned::<PreparedCudaBatchedA8Activation>();
         assert_owned::<PreparedCudaA8Projection>();
+        assert_owned::<PreparedCudaBatchedA8Output>();
         assert_owned::<PreparedCudaGatheredA8Projection>();
         assert_owned::<PreparedCudaArgmax>();
         assert_owned::<PreparedCudaRecoveredRow>();

@@ -84,6 +84,280 @@ pub struct CudaDecodeSchedule {
     pub token_barriers: usize,
 }
 
+/// Layer-major operations for one bounded prompt chunk. Matrix operations are
+/// explicitly batched; order-dependent state updates remain causal device
+/// scans. No operation denotes a host-side token loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaPrefillOperation {
+    EmbeddingBatch,
+    RmsNormBatch,
+    FullAttentionFanoutBatch,
+    QueryGateNormRopeBatch,
+    PagedGqaCausalScan,
+    AttentionGateOutputProjectionBatch,
+    LinearFanoutBatch,
+    CausalConvolutionScan,
+    GatedDeltaPrepareBatch,
+    GatedDeltaCausalScan,
+    GatedRmsNormBatch,
+    LinearOutputProjectionBatch,
+    ResidualRmsNormBatch,
+    FfnGateUpFanoutBatch,
+    SwiGluDownProjectionBatch,
+    LastTokenLmHead,
+    MtpPrefillCausalScan,
+    ChunkBarrier,
+}
+
+impl CudaPrefillOperation {
+    pub fn is_batched_projection(self) -> bool {
+        matches!(
+            self,
+            Self::FullAttentionFanoutBatch
+                | Self::AttentionGateOutputProjectionBatch
+                | Self::LinearFanoutBatch
+                | Self::LinearOutputProjectionBatch
+                | Self::FfnGateUpFanoutBatch
+                | Self::SwiGluDownProjectionBatch
+                | Self::LastTokenLmHead
+        )
+    }
+
+    pub fn is_causal_device_scan(self) -> bool {
+        matches!(
+            self,
+            Self::PagedGqaCausalScan
+                | Self::CausalConvolutionScan
+                | Self::GatedDeltaCausalScan
+                | Self::MtpPrefillCausalScan
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaPrefillStep {
+    pub layer: Option<usize>,
+    pub operation: CudaPrefillOperation,
+    pub host_barrier_after: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaPrefillChunk {
+    pub start_position: usize,
+    pub token_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaPrefillSchedule {
+    pub steps: Vec<CudaPrefillStep>,
+    pub max_chunk_tokens: usize,
+    pub full_attention_layers: usize,
+    pub linear_attention_layers: usize,
+}
+
+impl CudaPrefillSchedule {
+    pub fn qwen38(config: &Qwen38Config, max_chunk_tokens: usize) -> Result<Self> {
+        validate_frozen_geometry(config)?;
+        if max_chunk_tokens == 0 || max_chunk_tokens > 65_535 {
+            return Err(EngineError::Shape(
+                "CUDA prefill chunk capacity must be in 1..=65535".into(),
+            ));
+        }
+        let mut steps = Vec::with_capacity(613);
+        prefill_push(
+            &mut steps,
+            None,
+            CudaPrefillOperation::EmbeddingBatch,
+            false,
+        );
+        prefill_push(
+            &mut steps,
+            Some(0),
+            CudaPrefillOperation::RmsNormBatch,
+            false,
+        );
+        for layer in 0..config.num_hidden_layers {
+            match config.layer_kind(layer).expect("validated layer") {
+                LayerKind::FullAttention => {
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::FullAttentionFanoutBatch,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::QueryGateNormRopeBatch,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::PagedGqaCausalScan,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::AttentionGateOutputProjectionBatch,
+                        false,
+                    );
+                }
+                LayerKind::LinearAttention => {
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::LinearFanoutBatch,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::CausalConvolutionScan,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::GatedDeltaPrepareBatch,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::GatedDeltaCausalScan,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::GatedRmsNormBatch,
+                        false,
+                    );
+                    prefill_push(
+                        &mut steps,
+                        Some(layer),
+                        CudaPrefillOperation::LinearOutputProjectionBatch,
+                        false,
+                    );
+                }
+            }
+            for operation in [
+                CudaPrefillOperation::ResidualRmsNormBatch,
+                CudaPrefillOperation::FfnGateUpFanoutBatch,
+                CudaPrefillOperation::SwiGluDownProjectionBatch,
+                CudaPrefillOperation::ResidualRmsNormBatch,
+            ] {
+                prefill_push(&mut steps, Some(layer), operation, false);
+            }
+        }
+        prefill_push(
+            &mut steps,
+            None,
+            CudaPrefillOperation::LastTokenLmHead,
+            false,
+        );
+        prefill_push(
+            &mut steps,
+            None,
+            CudaPrefillOperation::MtpPrefillCausalScan,
+            false,
+        );
+        prefill_push(&mut steps, None, CudaPrefillOperation::ChunkBarrier, true);
+        let schedule = Self {
+            steps,
+            max_chunk_tokens,
+            full_attention_layers: config.full_attention_layers(),
+            linear_attention_layers: config.linear_attention_layers(),
+        };
+        schedule.validate()?;
+        Ok(schedule)
+    }
+
+    pub fn chunks(
+        &self,
+        prompt_tokens: usize,
+        admitted_context: usize,
+    ) -> Result<Vec<CudaPrefillChunk>> {
+        if prompt_tokens == 0 || prompt_tokens > admitted_context {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA prefill prompt has {prompt_tokens} tokens, admitted context is {admitted_context}"
+            )));
+        }
+        Ok((0..prompt_tokens)
+            .step_by(self.max_chunk_tokens)
+            .map(|start_position| CudaPrefillChunk {
+                start_position,
+                token_count: self.max_chunk_tokens.min(prompt_tokens - start_position),
+            })
+            .collect())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.steps.last().is_none_or(|step| {
+            step.operation != CudaPrefillOperation::ChunkBarrier || !step.host_barrier_after
+        }) || self
+            .steps
+            .iter()
+            .take(self.steps.len().saturating_sub(1))
+            .any(|step| step.host_barrier_after)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA prefill schedule requires one final chunk barrier".into(),
+            ));
+        }
+        for layer in 0..self.full_attention_layers + self.linear_attention_layers {
+            let layer_steps: Vec<_> = self
+                .steps
+                .iter()
+                .filter(|step| step.layer == Some(layer))
+                .collect();
+            if layer_steps
+                .iter()
+                .filter(|step| step.operation == CudaPrefillOperation::ResidualRmsNormBatch)
+                .count()
+                != 2
+            {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA prefill layer {layer} does not have two residual/norm batches"
+                )));
+            }
+            let causal_scans = layer_steps
+                .iter()
+                .filter(|step| step.operation.is_causal_device_scan())
+                .count();
+            let expected = if layer_steps
+                .iter()
+                .any(|step| step.operation == CudaPrefillOperation::FullAttentionFanoutBatch)
+            {
+                1
+            } else {
+                2
+            };
+            if causal_scans != expected {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA prefill layer {layer} has {causal_scans} causal scans, expected {expected}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn prefill_push(
+    steps: &mut Vec<CudaPrefillStep>,
+    layer: Option<usize>,
+    operation: CudaPrefillOperation,
+    host_barrier_after: bool,
+) {
+    steps.push(CudaPrefillStep {
+        layer,
+        operation,
+        host_barrier_after,
+    });
+}
+
 impl CudaDecodeSchedule {
     pub fn qwen38(config: &Qwen38Config) -> Result<Self> {
         validate_frozen_geometry(config)?;
@@ -507,5 +781,67 @@ mod tests {
             ..Qwen38Config::default()
         };
         assert!(CudaDecodeSchedule::qwen38(&config).is_err());
+    }
+
+    #[test]
+    fn prefill_schedule_is_layer_major_and_has_no_host_token_loop() {
+        let schedule = CudaPrefillSchedule::qwen38(&Qwen38Config::default(), 512).unwrap();
+        assert_eq!(schedule.steps.len(), 613);
+        assert_eq!(schedule.full_attention_layers, 16);
+        assert_eq!(schedule.linear_attention_layers, 48);
+        assert_eq!(
+            schedule
+                .steps
+                .iter()
+                .filter(|step| step.operation.is_causal_device_scan())
+                .count(),
+            113
+        );
+        assert_eq!(
+            schedule
+                .steps
+                .iter()
+                .filter(|step| step.operation == CudaPrefillOperation::LastTokenLmHead)
+                .count(),
+            1
+        );
+        assert_eq!(
+            schedule
+                .steps
+                .iter()
+                .filter(|step| step.host_barrier_after)
+                .count(),
+            1
+        );
+        assert!(schedule.steps.iter().any(|step| {
+            step.operation == CudaPrefillOperation::FullAttentionFanoutBatch
+                && step.operation.is_batched_projection()
+        }));
+    }
+
+    #[test]
+    fn prefill_chunks_cover_prompt_once_without_padding() {
+        let schedule = CudaPrefillSchedule::qwen38(&Qwen38Config::default(), 512).unwrap();
+        let chunks = schedule.chunks(1_025, 131_072).unwrap();
+        assert_eq!(
+            chunks,
+            vec![
+                CudaPrefillChunk {
+                    start_position: 0,
+                    token_count: 512,
+                },
+                CudaPrefillChunk {
+                    start_position: 512,
+                    token_count: 512,
+                },
+                CudaPrefillChunk {
+                    start_position: 1_024,
+                    token_count: 1,
+                },
+            ]
+        );
+        assert!(schedule.chunks(0, 131_072).is_err());
+        assert!(schedule.chunks(131_073, 131_072).is_err());
+        assert!(CudaPrefillSchedule::qwen38(&Qwen38Config::default(), 65_536).is_err());
     }
 }
