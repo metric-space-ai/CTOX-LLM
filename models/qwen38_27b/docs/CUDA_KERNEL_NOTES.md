@@ -315,9 +315,13 @@ attention, or norm ownership before hardware dispatch. Actual 645-step
 execution now has a first target-only device chain covering embedding, all 64
 hybrid layers, final norm, and LM head. `qwen38-cuda-target-token-verify`
 permits exactly one token-boundary logits readback and proves state reset plus
-allocator reclamation. Its SM86 run is pending; the current device entry points
-also synchronize per operation, so this code is not a production or roofline
-claim. MTP draft/verify and sampling remain unbound.
+allocator reclamation. The same verifier now feeds the valid-vocabulary target
+argmax into the native one-layer MTP graph. Its two normalized inputs are joined
+with two driver device-to-device copies; no host tensor or backend-specific
+requantization is introduced. The SM86 run is pending; the current device entry
+points also synchronize per operation, so this code is not a production or
+roofline claim. Target verification of the MTP proposal and sampling remain
+unbound.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not

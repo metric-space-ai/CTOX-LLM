@@ -7,6 +7,7 @@ use clap::Parser;
 use ctox_qwen38_27b::backend::cuda_graph::PreparedCudaProjectionGraph;
 use ctox_qwen38_27b::backend::cuda_runtime::CudaCandidateRuntime;
 use ctox_qwen38_27b::loader::{ChecksumPolicy, ModelArtifact};
+use ctox_qwen38_27b::tokenizer::TOKENIZER_VOCAB_SIZE;
 use ctox_qwen38_27b::Qwen38Config;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -43,11 +44,16 @@ struct Report<'a> {
     token_id: usize,
     position: usize,
     maximum_context_tokens: usize,
-    logits: usize,
-    logits_f32le_sha256: String,
-    top_logits: Vec<RankedLogit>,
+    target_logits: usize,
+    target_logits_f32le_sha256: String,
+    target_top_logits: Vec<RankedLogit>,
+    selected_target_token: usize,
+    mtp_logits: usize,
+    mtp_logits_f32le_sha256: String,
+    mtp_top_logits: Vec<RankedLogit>,
     graph_prepare_milliseconds: f64,
     target_dispatch_milliseconds: f64,
+    mtp_dispatch_milliseconds: f64,
     driver_free_bytes_before_prepare: usize,
     driver_free_bytes_after_prepare: usize,
     driver_free_bytes_after_drop: usize,
@@ -77,36 +83,46 @@ fn main() -> anyhow::Result<()> {
     let dispatch_started = Instant::now();
     let logits_view =
         graph.dispatch_target_token_device(&runtime, &Qwen38Config::default(), args.token_id, 0)?;
-    let logits = runtime.verifier_read_f32_device(logits_view)?;
+    let target_logits = runtime.verifier_read_f32_device(logits_view)?;
     let target_dispatch_milliseconds = dispatch_started.elapsed().as_secs_f64() * 1.0e3;
     anyhow::ensure!(
-        logits.len() == Qwen38Config::default().vocab_size,
+        target_logits.len() == Qwen38Config::default().vocab_size,
         "CUDA target logits have {} values, expected {}",
-        logits.len(),
+        target_logits.len(),
         Qwen38Config::default().vocab_size
     );
-    let mut ranking: Vec<_> = logits
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(token_id, value)| RankedLogit { token_id, value })
-        .collect();
-    ranking.sort_unstable_by(|left, right| right.value.total_cmp(&left.value));
-    ranking.truncate(16);
-    let mut logits_digest = Sha256::new();
-    for value in &logits {
-        logits_digest.update(value.to_le_bytes());
-    }
-    let logits_f32le_sha256 = format!("{:x}", logits_digest.finalize());
+    let target_top_logits = rank_valid_logits(&target_logits)?;
+    let selected_target_token = target_top_logits[0].token_id;
+    let target_logits_f32le_sha256 = digest_logits(&target_logits);
     anyhow::ensure!(
         graph.target_tokens() == 1,
         "CUDA target token did not commit"
     );
+
+    let mtp_started = Instant::now();
+    let mtp_view = graph.dispatch_mtp_draft_device(
+        &runtime,
+        &Qwen38Config::default(),
+        selected_target_token,
+        1,
+    )?;
+    let mtp_logits = runtime.verifier_read_f32_device(mtp_view)?;
+    let mtp_dispatch_milliseconds = mtp_started.elapsed().as_secs_f64() * 1.0e3;
+    anyhow::ensure!(
+        mtp_logits.len() == Qwen38Config::default().vocab_size,
+        "CUDA MTP logits have {} values, expected {}",
+        mtp_logits.len(),
+        Qwen38Config::default().vocab_size
+    );
+    let mtp_top_logits = rank_valid_logits(&mtp_logits)?;
+    let mtp_logits_f32le_sha256 = digest_logits(&mtp_logits);
+    anyhow::ensure!(graph.mtp_tokens() == 1, "CUDA MTP token did not commit");
     graph.reset_session()?;
     anyhow::ensure!(
         graph.target_tokens() == 0,
         "CUDA session reset did not commit"
     );
+    anyhow::ensure!(graph.mtp_tokens() == 0, "CUDA MTP reset did not commit");
     drop(graph);
     let (free_after_drop, _) = runtime.memory_info()?;
     anyhow::ensure!(
@@ -131,16 +147,45 @@ fn main() -> anyhow::Result<()> {
             token_id: args.token_id,
             position: 0,
             maximum_context_tokens: args.maximum_context_tokens,
-            logits: logits.len(),
-            logits_f32le_sha256,
-            top_logits: ranking,
+            target_logits: target_logits.len(),
+            target_logits_f32le_sha256,
+            target_top_logits,
+            selected_target_token,
+            mtp_logits: mtp_logits.len(),
+            mtp_logits_f32le_sha256,
+            mtp_top_logits,
             graph_prepare_milliseconds,
             target_dispatch_milliseconds,
+            mtp_dispatch_milliseconds,
             driver_free_bytes_before_prepare: free_before_prepare,
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
-            note: "Executes embedding, all 64 target layers, final norm, and LM head through device views with no tensor readback before the token boundary. Finite logits and exact unload are necessary but not sufficient: BF16/CPU logit comparison, removal of per-op synchronizations, MTP, sampling, and roofline promotion remain open.",
+            note: "Executes embedding, all 64 target layers, final norm, LM head, target-selected-token MTP draft, reset, and unload through device views. Logits cross the host only at explicit token boundaries. Finite logits and exact unload are necessary but not sufficient: BF16/CPU logit comparison, target verification of the draft, removal of per-op synchronizations, production sampling, and roofline promotion remain open.",
         })?
     );
     Ok(())
+}
+
+fn rank_valid_logits(logits: &[f32]) -> anyhow::Result<Vec<RankedLogit>> {
+    anyhow::ensure!(
+        logits.len() >= TOKENIZER_VOCAB_SIZE,
+        "logit vector is narrower than the tokenizer vocabulary"
+    );
+    let mut ranking: Vec<_> = logits[..TOKENIZER_VOCAB_SIZE]
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(token_id, value)| RankedLogit { token_id, value })
+        .collect();
+    ranking.sort_unstable_by(|left, right| right.value.total_cmp(&left.value));
+    ranking.truncate(16);
+    Ok(ranking)
+}
+
+fn digest_logits(logits: &[f32]) -> String {
+    let mut digest = Sha256::new();
+    for value in logits {
+        digest.update(value.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }

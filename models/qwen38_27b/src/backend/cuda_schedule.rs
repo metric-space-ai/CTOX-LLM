@@ -174,7 +174,7 @@ impl CudaDecodeSchedule {
             &mut steps,
             None,
             CudaDecodeOperation::MtpDraftAndTargetVerify,
-            &[CudaBufferSlot::HiddenA, CudaBufferSlot::TargetLogits],
+            &[CudaBufferSlot::Normalized, CudaBufferSlot::TargetLogits],
             &[CudaBufferSlot::MtpDraft],
             None,
             true,
@@ -486,6 +486,18 @@ mod tests {
             .steps
             .iter()
             .any(|step| { step.layer == Some(63) && step.norm == Some(CudaNormBinding::Final) }));
+    }
+
+    #[test]
+    fn mtp_consumes_the_final_normalized_target_hidden_state() {
+        let schedule = CudaDecodeSchedule::qwen38(&Qwen38Config::default()).unwrap();
+        let mtp = schedule
+            .steps
+            .iter()
+            .find(|step| step.operation == CudaDecodeOperation::MtpDraftAndTargetVerify)
+            .unwrap();
+        assert!(mtp.reads.contains(&CudaBufferSlot::Normalized));
+        assert!(!mtp.reads.contains(&CudaBufferSlot::HiddenA));
     }
 
     #[test]

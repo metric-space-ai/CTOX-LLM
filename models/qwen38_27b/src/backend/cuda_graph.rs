@@ -13,9 +13,10 @@ use crate::backend::cuda_runtime::{
     CudaCandidateRuntime, CudaCausalConvConfig, CudaDeviceF32View, CudaGatedDeltaConfig,
     CudaGatedRmsNormConfig, CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig,
     CudaRmsNormConfig, PreparedCudaA8Activation, PreparedCudaA8Projection, PreparedCudaCausalConv,
-    PreparedCudaEmbedding, PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs,
-    PreparedCudaGatedRmsNorm, PreparedCudaPagedGqa, PreparedCudaPartialRope, PreparedCudaQueryGate,
-    PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
+    PreparedCudaEmbedding, PreparedCudaF32Concat, PreparedCudaGatedDelta,
+    PreparedCudaGatedDeltaInputs, PreparedCudaGatedRmsNorm, PreparedCudaPagedGqa,
+    PreparedCudaPartialRope, PreparedCudaQueryGate, PreparedCudaResidualRmsNorm,
+    PreparedCudaRmsNorm,
 };
 use crate::backend::cuda_schedule::{
     CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaNormBinding,
@@ -621,11 +622,14 @@ pub struct PreparedCudaProjectionGraph {
     linear_mixers: BTreeMap<usize, PreparedCudaLinearMixerLayer>,
     full_attention: BTreeMap<String, PreparedCudaFullAttentionLayer>,
     norms: PreparedCudaNormGraph,
+    mtp_concat: PreparedCudaF32Concat,
     model_bytes: u64,
     graph_bytes: u64,
     session_bytes: u64,
     target_tokens: usize,
     poisoned: bool,
+    mtp_tokens: usize,
+    mtp_poisoned: bool,
 }
 
 pub struct PreparedCudaNormGraph {
@@ -1066,6 +1070,13 @@ impl PreparedCudaProjectionGraph {
         let norms = prepare_norms(runtime, artifact, config)?;
         model_bytes = checked_add(model_bytes, norms.model_bytes, "CUDA model bytes")?;
         graph_bytes = checked_add(graph_bytes, norms.graph_bytes, "CUDA graph bytes")?;
+        let mtp_concat = runtime.prepare_f32_concat(config.hidden_size, config.hidden_size)?;
+        graph_bytes = checked_add(
+            graph_bytes,
+            u64::try_from(mtp_concat.transient_bytes())
+                .map_err(|_| EngineError::MemoryBudget("CUDA MTP concat exceeds u64".into()))?,
+            "CUDA graph bytes",
+        )?;
         let graph = Self {
             artifact: artifact.clone(),
             plan,
@@ -1076,11 +1087,14 @@ impl PreparedCudaProjectionGraph {
             linear_mixers,
             full_attention,
             norms,
+            mtp_concat,
             model_bytes,
             graph_bytes,
             session_bytes,
             target_tokens: 0,
             poisoned: false,
+            mtp_tokens: 0,
+            mtp_poisoned: false,
         };
         graph.validate_bound_resources()?;
         Ok(graph)
@@ -1187,6 +1201,8 @@ impl PreparedCudaProjectionGraph {
         }
         self.target_tokens = 0;
         self.poisoned = false;
+        self.mtp_tokens = 0;
+        self.mtp_poisoned = false;
         Ok(())
     }
 
@@ -1363,6 +1379,148 @@ impl PreparedCudaProjectionGraph {
             .checked_add(1)
             .ok_or_else(|| EngineError::MemoryBudget("CUDA target token count overflows".into()))?;
         *poisoned = false;
+        Ok(logits)
+    }
+
+    pub fn mtp_tokens(&self) -> usize {
+        self.mtp_tokens
+    }
+
+    /// Executes the native one-layer MTP graph after the target model has
+    /// selected `next_token_id`. The returned logits draft the following
+    /// token; acceptance still requires a subsequent target-model step.
+    pub fn dispatch_mtp_draft_device<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        next_token_id: usize,
+        absolute_position: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if config != &Qwen38Config::default() {
+            return Err(EngineError::Shape(
+                "CUDA MTP dispatch requires the frozen Qwen3.8-27B topology".into(),
+            ));
+        }
+        if self.poisoned || self.mtp_poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA target or MTP session is poisoned; reset is required".into(),
+            ));
+        }
+        if self.target_tokens != absolute_position || absolute_position != self.mtp_tokens + 1 {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA MTP position {absolute_position} differs from target/MTP state {}/{}",
+                self.target_tokens, self.mtp_tokens
+            )));
+        }
+        if next_token_id >= self.embedding.rows() {
+            return Err(EngineError::Shape(format!(
+                "CUDA MTP token {next_token_id} exceeds embedding vocabulary {}",
+                self.embedding.rows()
+            )));
+        }
+        let embedding_scale = self.embedding_s_out(next_token_id)?;
+        let final_target_norm = format!("target:{}:post_ffn:final", config.num_hidden_layers - 1);
+
+        let Self {
+            plan,
+            embedding,
+            activations,
+            projections,
+            full_attention,
+            norms,
+            mtp_concat,
+            mtp_tokens,
+            mtp_poisoned,
+            ..
+        } = self;
+        *mtp_poisoned = true;
+        let embedded =
+            runtime.dispatch_embedding_row_device(embedding, next_token_id, embedding_scale)?;
+        let embedded = runtime
+            .dispatch_qwen_rms_norm_f16_device(norms.regular("mtp:pre_embedding")?, embedded)?;
+        let previous_hidden = norms.residual(&final_target_norm)?.normalized_output()?;
+        let previous_hidden = runtime
+            .dispatch_qwen_rms_norm_f16_device(norms.regular("mtp:pre_hidden")?, previous_hidden)?;
+        let projection_input =
+            runtime.dispatch_f32_concat_device(mtp_concat, embedded, previous_hidden)?;
+        let mut residual = dispatch_projection_device(
+            runtime,
+            plan,
+            activations,
+            projections,
+            projection_input,
+            "mtp.fc.weight",
+        )?;
+        let mut normalized =
+            runtime.dispatch_qwen_rms_norm_f16_device(norms.regular("mtp:input")?, residual)?;
+        let [query_gate, key, value] = dispatch_projection_fanout_device(
+            runtime,
+            plan,
+            activations,
+            projections,
+            normalized,
+            [
+                "mtp.layers.0.self_attn.q_proj.weight".to_owned(),
+                "mtp.layers.0.self_attn.k_proj.weight".to_owned(),
+                "mtp.layers.0.self_attn.v_proj.weight".to_owned(),
+            ],
+        )?;
+        let attention = full_attention.get_mut("mtp:0").ok_or_else(|| {
+            EngineError::InvalidState("CUDA MTP full-attention state is not resident".into())
+        })?;
+        let (attention_output, gate) =
+            attention.dispatch_device(runtime, query_gate, key, value, absolute_position as u64)?;
+        let attention_output = dispatch_sigmoid_gate_projection_device(
+            runtime,
+            plan,
+            activations,
+            projections,
+            attention_output,
+            gate,
+            "mtp.layers.0.self_attn.o_proj.weight",
+        )?;
+        (residual, normalized) = runtime.dispatch_residual_rms_norm_f16_device(
+            norms.residual("mtp:post_attention")?,
+            residual,
+            attention_output,
+        )?;
+        let [gate, up] = dispatch_projection_fanout_device(
+            runtime,
+            plan,
+            activations,
+            projections,
+            normalized,
+            [
+                "mtp.layers.0.mlp.gate_proj.weight".to_owned(),
+                "mtp.layers.0.mlp.up_proj.weight".to_owned(),
+            ],
+        )?;
+        let down = dispatch_swiglu_projection_device(
+            runtime,
+            plan,
+            activations,
+            projections,
+            gate,
+            up,
+            "mtp.layers.0.mlp.down_proj.weight",
+        )?;
+        let (_, final_hidden) = runtime.dispatch_residual_rms_norm_f16_device(
+            norms.residual("mtp:final")?,
+            residual,
+            down,
+        )?;
+        let logits = dispatch_projection_device(
+            runtime,
+            plan,
+            activations,
+            projections,
+            final_hidden,
+            "lm_head.weight",
+        )?;
+        *mtp_tokens = mtp_tokens
+            .checked_add(1)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA MTP token count overflows".into()))?;
+        *mtp_poisoned = false;
         Ok(logits)
     }
 

@@ -235,7 +235,10 @@ embedding, all 64 hybrid layers, final normalization, and the LM head pass
 device views directly with no tensor readback before the token boundary. The
 dedicated SM86 verifier is still pending, and the candidate retains per-op
 driver synchronizations that must be removed before performance promotion.
-MTP draft execution and target verification also remain open.
+The one-layer MTP draft is now connected to the final normalized target hidden
+state through a device-only concatenation buffer and reuses the same embedding,
+attention, FFN, norm, and LM-head operators. Its hardware run and subsequent
+target verification of every draft token remain open.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight

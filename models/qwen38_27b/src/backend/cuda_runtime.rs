@@ -67,6 +67,7 @@ type CuMemsetD8 = unsafe extern "C" fn(CuDevicePtr, u8, usize) -> CuResult;
 type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CuResult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> CuResult;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> CuResult;
+type CuMemcpyDtoD = unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize) -> CuResult;
 type CuLaunchKernel = unsafe extern "C" fn(
     CuFunction,
     u32,
@@ -102,6 +103,7 @@ struct CudaDriver {
     mem_get_info: CuMemGetInfo,
     memcpy_htod: CuMemcpyHtoD,
     memcpy_dtoh: CuMemcpyDtoH,
+    memcpy_dtod: CuMemcpyDtoD,
     launch_kernel: CuLaunchKernel,
     get_error_name: CuGetErrorName,
     get_error_string: CuGetErrorString,
@@ -131,6 +133,7 @@ impl CudaDriver {
                 mem_get_info: symbol(&library, b"cuMemGetInfo_v2\0")?,
                 memcpy_htod: symbol(&library, b"cuMemcpyHtoD_v2\0")?,
                 memcpy_dtoh: symbol(&library, b"cuMemcpyDtoH_v2\0")?,
+                memcpy_dtod: symbol(&library, b"cuMemcpyDtoD_v2\0")?,
                 launch_kernel: symbol(&library, b"cuLaunchKernel\0")?,
                 get_error_name: symbol(&library, b"cuGetErrorName\0")?,
                 get_error_string: symbol(&library, b"cuGetErrorString\0")?,
@@ -246,6 +249,16 @@ impl<'a> CudaDeviceF32View<'a> {
 pub struct CudaVerifierF32Tensor {
     buffer: DeviceBuffer,
     values: usize,
+}
+
+/// Reusable device-only concatenation buffer for the exact MTP
+/// `[normalized_embedding, normalized_hidden]` input. It introduces no host
+/// tensor and owns no model data.
+pub struct PreparedCudaF32Concat {
+    context: Rc<CudaContextInner>,
+    left_values: usize,
+    right_values: usize,
+    output: DeviceBuffer,
 }
 
 /// Device-resident buffers for one pure Q2 or Q4 projection. Immutable model
@@ -942,6 +955,78 @@ impl CudaCandidateRuntime {
             )?;
         }
         Ok((free, total))
+    }
+
+    pub fn prepare_f32_concat(
+        &self,
+        left_values: usize,
+        right_values: usize,
+    ) -> Result<PreparedCudaF32Concat> {
+        let values = left_values
+            .checked_add(right_values)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA concat width overflows".into()))?;
+        if left_values == 0 || right_values == 0 {
+            return Err(EngineError::Shape(
+                "CUDA concat inputs must both be non-empty".into(),
+            ));
+        }
+        let bytes = values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA concat bytes overflow".into()))?;
+        Ok(PreparedCudaF32Concat {
+            context: Rc::clone(&self.inner),
+            left_values,
+            right_values,
+            output: DeviceBuffer::allocate(self, bytes)?,
+        })
+    }
+
+    pub fn dispatch_f32_concat_device<'a>(
+        &self,
+        prepared: &'a PreparedCudaF32Concat,
+        left: CudaDeviceF32View<'_>,
+        right: CudaDeviceF32View<'_>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, left.context)
+            || !Rc::ptr_eq(&self.inner, right.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA concat input belongs to another context".into(),
+            ));
+        }
+        if left.values() != prepared.left_values || right.values() != prepared.right_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA concat has {}+{} values, expected {}+{}",
+                left.values(),
+                right.values(),
+                prepared.left_values,
+                prepared.right_values
+            )));
+        }
+        self.make_current()?;
+        let left_bytes = prepared
+            .left_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA concat left bytes overflow".into()))?;
+        let right_bytes = prepared
+            .right_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA concat right bytes overflow".into()))?;
+        let right_target = device_ptr_offset(prepared.output.ptr(), left_bytes)?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod)(prepared.output.ptr(), left.ptr()?, left_bytes),
+                "MTP left device concatenation",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod)(right_target, right.ptr()?, right_bytes),
+                "MTP right device concatenation",
+            )?;
+        }
+        prepared
+            .output
+            .f32_view(0, prepared.left_values + prepared.right_values)
     }
 
     /// Explicit token-boundary readback for verifier binaries. Production
@@ -4404,6 +4489,20 @@ impl CudaVerifierF32Tensor {
 
     pub fn device_view(&self) -> Result<CudaDeviceF32View<'_>> {
         self.buffer.f32_view(0, self.values)
+    }
+}
+
+impl PreparedCudaF32Concat {
+    pub fn values(&self) -> usize {
+        self.left_values + self.right_values
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.output.len()
+    }
+
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.output.f32_view(0, self.values())
     }
 }
 
