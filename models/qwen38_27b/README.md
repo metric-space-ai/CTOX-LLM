@@ -187,8 +187,10 @@ evidence. Historical artifact hashes and byte counts are unchanged.
 the same logical Q2/Q4 cache into CUDA, Metal, and Snapdragon Vulkan kernels.
 
 [`docs/WIRE_PROTOCOL_V1.md`](docs/WIRE_PROTOCOL_V1.md) defines the matching
-versioned Unix-socket/named-pipe control and token-stream contract. The bring-up
-binary negotiates and reports health but remains fail-closed with
-`engine_not_ready` until a complete executor is installed. The reusable server
-adapter already implements token-ID and Responses generation, cancellation,
-MTP token ordering, reset, and unload around that future executor.
+versioned Unix-socket/named-pipe control and token-stream contract. Artifact
+bring-up negotiates and reports health but remains fail-closed with
+`engine_not_ready`. An explicit signed-release CPU-verifier mode now exercises
+the real loader, tokenizer, token-ID and Responses generation, cancellation,
+MTP token ordering, reset, and unload through the same reusable server adapter.
+Its verifier promotion state cannot pass production admission; the optimized
+CUDA/Metal executor assembly remains unfinished.

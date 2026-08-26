@@ -57,8 +57,28 @@ buffers incomplete UTF-8 suffixes and emits each token exactly once; a
 completion record follows `stop`, length, or cancellation. Normal completion
 resets the session before the server accepts another generation.
 
-The current `qwen38-server` binary remains the artifact-inspection bring-up
-owner and returns `engine_not_ready`: it is not wired to `EngineServer` until a
-complete backend passes promotion and a signed release exists. Thus the wire
-adapter and Responses frontend are implemented, but their presence is not
-evidence that a production executor is ready.
+`qwen38-server --artifact ...` remains the artifact-inspection bring-up owner
+and returns `engine_not_ready`. An explicit `--verification-cpu` mode now
+wires the complete signed-release loader, pinned tokenizer, Responses frontend,
+engine lifecycle, and correctness decoder into the same Unix-socket service.
+It requires the release root, manifest, CPU pack/profile identity, expected
+signing-key ID, and a raw or lowercase-hex Ed25519 public-key file. The mode is
+loaded with `ExecutionPolicy::Verifier`; the correctness executor's permanent
+`Verifier` promotion state and hidden scalar token mixers make production
+admission impossible. This supplies an end-to-end ABI integration target
+without representing the unfinished optimized backends as ready.
+
+Example verifier launch:
+
+```sh
+cargo run --manifest-path models/qwen38_27b/Cargo.toml \
+  --bin qwen38-server -- \
+  --socket /tmp/qwen38.sock \
+  --verification-cpu \
+  --release-root /models/qwen38-release \
+  --release-manifest /models/qwen38-release/release.json \
+  --pack-id cpu-avx2 \
+  --memory-profile-id cpu-verifier-4k \
+  --expected-key-id metric-space-release-v1 \
+  --trusted-public-key /etc/ctox/model-release.pub
+```

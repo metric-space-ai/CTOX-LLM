@@ -116,7 +116,9 @@ does not own alternate sampling or model state: the server mutex owns one
 `Engine<E>`, streams accepted MTP tokens before the target bonus/fallback,
 allows cancellation from a separate connection, and reports unload residue
 through the engine health contract. The Responses text renderer/detokenizer and
-the final promoted executor construction in the server binary remain open.
+the pinned chat-template frontend are implemented. The server binary exposes a
+fully signed CPU-verifier assembly for ABI tests; constructing the final
+promoted CUDA/Metal executors remains open.
 `EngineServer::load_signed` is the single production assembly boundary: it
 verifies one manifest trust root and loads the selected backend pack, memory
 profile, MTP vocabulary, model container, tokenizer, and chat template from
