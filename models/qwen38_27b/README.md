@@ -325,7 +325,11 @@ sequential CUDA path, CPU-equation scale error stayed below `1.12e-8`, and all
 109,051,904 observed bytes were reclaimed. Evidence is in
 `benchmarks/cuda/sm86-batched-fused-a8-512-20260826.json`; graph-wide binding
 now exposes all three arena-backed projection forms, while the 645-step
-executor transaction remains open. A pinned-`get_rows`-structured batched embedding
+target-only executor transaction now dispatches them layer-major with one
+barrier per chunk. MTP-enabled prefill deliberately retains the sequential
+causal path until the native MTP chunk scan is implemented; complete-model
+hardware evidence for the new target-only path remains open. A
+pinned-`get_rows`-structured batched embedding
 candidate now keeps FP16 `s_in`/`s_out` resident and gathers a whole token-ID
 chunk in at most one launch per canonical Q2/Q4 segment. The final 857-Q2/
 113-Q4 embedding assignment is bit-identical to sequential CUDA row lookup on

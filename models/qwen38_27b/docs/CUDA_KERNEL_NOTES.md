@@ -594,6 +594,16 @@ CUDA on rows 0, 1, 256, and 511; CPU-equation scale errors stayed below
 the unified cubin SHA-256 is
 `aa2ff687f159dad69da7b85086a9b359494b375d25eb0b7b8faed4b8800af3f4`.
 Evidence is in `benchmarks/cuda/sm86-batched-fused-a8-512-20260826.json`.
+
+The CUDA executor now selects the layer-major chunk graph for target-only
+prefill, bounded to 512 tokens. It uses the graph-owned embedding, norm,
+projection, attention, and linear-mixer workspaces, executes the final LM head
+only for the last row, and exposes one commit barrier per chunk. Its fail-
+closed cursor permits only the explicitly disabled MTP step to be skipped.
+MTP-enabled prefill retains the already correct sequential causal path until a
+batched MTP scan preserves the target-one-ahead invariant. This is source and
+unit-test integration; complete-model SM86 numerical, memory, and latency
+evidence remains required before promotion.
 `PreparedCudaProjectionGraph` binds the ordinary fan-out, attention-gate, and
 SwiGLU forms to its single admitted activation/output arena. The complete
 645-step executor transaction and one-barrier failure policy remain open.

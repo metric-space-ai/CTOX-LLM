@@ -735,6 +735,25 @@ impl<'a> CudaPrefillExecutionCursor<'a> {
         Ok(())
     }
 
+    /// Records the one schedule step that is intentionally inactive when the
+    /// caller requested target-only prefill. No other CUDA operation may be
+    /// skipped through this boundary.
+    pub fn skip_disabled_mtp(&mut self) -> Result<()> {
+        let expected = self.next_step().ok_or_else(|| {
+            EngineError::InvalidState("CUDA prefill chunk is already complete".into())
+        })?;
+        if expected.layer.is_some()
+            || expected.operation != CudaPrefillOperation::MtpPrefillCausalScan
+        {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA prefill can skip only disabled MTP, next step is {:?} layer {:?}",
+                expected.operation, expected.layer
+            )));
+        }
+        self.next_step += 1;
+        Ok(())
+    }
+
     /// Return the new committed token position only after all 645 operations
     /// and the final host-visible barrier have completed in order.
     pub fn finish(self) -> Result<usize> {
@@ -2881,6 +2900,313 @@ impl PreparedCudaProjectionGraph {
         Ok(())
     }
 
+    /// Executes one target-only prompt chunk through the frozen 645-step
+    /// program. MTP is the sole explicitly disabled schedule step; callers
+    /// that request MTP continue to use the state-aligned path until its
+    /// batched causal scan is implemented.
+    pub fn dispatch_target_prefill_chunk_without_mtp_device<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        token_ids: &[u32],
+        start_position: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if config != &Qwen38Config::default() {
+            return Err(EngineError::Shape(
+                "CUDA target prefill requires the frozen Qwen3.8-27B topology".into(),
+            ));
+        }
+        if self.poisoned || self.speculative_base.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA target prefill requires a healthy graph without a speculative branch".into(),
+            ));
+        }
+        if token_ids.is_empty()
+            || token_ids.len() > self.prefill_workspaces.max_chunk_tokens()
+            || token_ids
+                .iter()
+                .any(|token| (*token as usize) >= self.embedding.rows())
+        {
+            return Err(EngineError::Shape(
+                "CUDA target prefill token chunk is empty, oversized, or out of vocabulary".into(),
+            ));
+        }
+        let chunk = CudaPrefillChunk {
+            start_position,
+            token_count: token_ids.len(),
+        };
+        let Self {
+            plan,
+            prefill_bindings,
+            embedding,
+            activations,
+            projections,
+            linear_mixers,
+            full_attention,
+            norms,
+            prefill_workspaces,
+            target_tokens,
+            poisoned,
+            ..
+        } = self;
+        let mut cursor = prefill_bindings.execution_cursor(
+            chunk,
+            *target_tokens,
+            config.max_position_embeddings,
+        )?;
+        *poisoned = true;
+        let tokens = token_ids.len();
+        let dispatch = runtime.run_token_submission(
+            "target prefill chunk commit synchronization",
+            || -> Result<CudaDeviceF32View<'a>> {
+                let embedded = runtime.dispatch_embedding_rows_device(
+                    embedding,
+                    prefill_workspaces.embedding(),
+                    token_ids,
+                )?;
+                advance_prefill(&mut cursor, None, CudaPrefillOperation::EmbeddingBatch)?;
+                let mut residual = embedded;
+                let mut normalized = runtime.dispatch_batched_qwen_rms_norm_f16_device(
+                    norms.regular("target:initial")?,
+                    prefill_workspaces.hidden_norm(),
+                    residual,
+                    tokens,
+                )?;
+                advance_prefill(&mut cursor, Some(0), CudaPrefillOperation::RmsNormBatch)?;
+
+                for layer in 0..config.num_hidden_layers {
+                    let prefix = format!("model.language_model.layers.{layer}");
+                    let mixer_output = match config.layer_kind(layer).expect("frozen layer") {
+                        LayerKind::FullAttention => {
+                            let [query_gate, key, value] =
+                                dispatch_prefill_projection_fanout_parts(
+                                    runtime,
+                                    plan,
+                                    activations,
+                                    projections,
+                                    prefill_workspaces,
+                                    normalized,
+                                    tokens,
+                                    [
+                                        format!("{prefix}.self_attn.q_proj.weight"),
+                                        format!("{prefix}.self_attn.k_proj.weight"),
+                                        format!("{prefix}.self_attn.v_proj.weight"),
+                                    ],
+                                )?;
+                            advance_prefill(
+                                &mut cursor,
+                                Some(layer),
+                                CudaPrefillOperation::FullAttentionFanoutBatch,
+                            )?;
+                            let attention = full_attention
+                                .get_mut(&format!("target:{layer}"))
+                                .ok_or_else(|| {
+                                    EngineError::InvalidState(format!(
+                                        "CUDA full-attention layer {layer} is not resident"
+                                    ))
+                                })?;
+                            let (attention_output, gate) = attention.dispatch_prefill_device(
+                                runtime,
+                                prefill_workspaces.key_norm(),
+                                prefill_workspaces.rope(),
+                                prefill_workspaces.query_gate(),
+                                prefill_workspaces.paged_gqa_output(),
+                                query_gate,
+                                key,
+                                value,
+                                start_position,
+                                tokens,
+                            )?;
+                            for operation in [
+                                CudaPrefillOperation::QueryGateNormRopeBatch,
+                                CudaPrefillOperation::KeyRopeBatch,
+                                CudaPrefillOperation::PagedKvAppendBatch,
+                                CudaPrefillOperation::PagedGqaCausalScan,
+                            ] {
+                                advance_prefill(&mut cursor, Some(layer), operation)?;
+                            }
+                            let output = dispatch_prefill_fused_projection_parts(
+                                runtime,
+                                plan,
+                                activations,
+                                projections,
+                                prefill_workspaces,
+                                attention_output,
+                                gate,
+                                tokens,
+                                &format!("{prefix}.self_attn.o_proj.weight"),
+                                PrefillFusedEdge::AttentionGate,
+                            )?;
+                            advance_prefill(
+                                &mut cursor,
+                                Some(layer),
+                                CudaPrefillOperation::AttentionGateOutputProjectionBatch,
+                            )?;
+                            output
+                        }
+                        LayerKind::LinearAttention => {
+                            let [mixed_qkv, gate, raw_a, raw_b] =
+                                dispatch_prefill_projection_fanout_parts(
+                                    runtime,
+                                    plan,
+                                    activations,
+                                    projections,
+                                    prefill_workspaces,
+                                    normalized,
+                                    tokens,
+                                    [
+                                        format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                                        format!("{prefix}.linear_attn.in_proj_z.weight"),
+                                        format!("{prefix}.linear_attn.in_proj_a.weight"),
+                                        format!("{prefix}.linear_attn.in_proj_b.weight"),
+                                    ],
+                                )?;
+                            advance_prefill(
+                                &mut cursor,
+                                Some(layer),
+                                CudaPrefillOperation::LinearFanoutBatch,
+                            )?;
+                            let mixer = linear_mixers.get_mut(&layer).ok_or_else(|| {
+                                EngineError::InvalidState(format!(
+                                    "CUDA linear-attention layer {layer} is not resident"
+                                ))
+                            })?;
+                            let mixed = mixer.dispatch_prefill_device(
+                                runtime,
+                                prefill_workspaces.causal_conv_output(),
+                                prefill_workspaces.gated_delta_inputs(),
+                                prefill_workspaces.gated_delta_output(),
+                                prefill_workspaces.gated_rms_norm_output(),
+                                mixed_qkv,
+                                gate,
+                                raw_a,
+                                raw_b,
+                                tokens,
+                            )?;
+                            for operation in [
+                                CudaPrefillOperation::CausalConvolutionScan,
+                                CudaPrefillOperation::GatedDeltaPrepareBatch,
+                                CudaPrefillOperation::GatedDeltaCausalScan,
+                                CudaPrefillOperation::GatedRmsNormBatch,
+                            ] {
+                                advance_prefill(&mut cursor, Some(layer), operation)?;
+                            }
+                            let [output] = dispatch_prefill_projection_fanout_parts(
+                                runtime,
+                                plan,
+                                activations,
+                                projections,
+                                prefill_workspaces,
+                                mixed,
+                                tokens,
+                                [format!("{prefix}.linear_attn.out_proj.weight")],
+                            )?;
+                            advance_prefill(
+                                &mut cursor,
+                                Some(layer),
+                                CudaPrefillOperation::LinearOutputProjectionBatch,
+                            )?;
+                            output
+                        }
+                    };
+
+                    (residual, normalized) = runtime
+                        .dispatch_batched_residual_rms_norm_f16_device(
+                            norms.residual(&format!("target:{layer}:post_attention"))?,
+                            prefill_workspaces.hidden_norm(),
+                            residual,
+                            mixer_output,
+                            tokens,
+                        )?;
+                    advance_prefill(
+                        &mut cursor,
+                        Some(layer),
+                        CudaPrefillOperation::ResidualRmsNormBatch,
+                    )?;
+
+                    let [gate, up] = dispatch_prefill_projection_fanout_parts(
+                        runtime,
+                        plan,
+                        activations,
+                        projections,
+                        prefill_workspaces,
+                        normalized,
+                        tokens,
+                        [
+                            format!("{prefix}.mlp.gate_proj.weight"),
+                            format!("{prefix}.mlp.up_proj.weight"),
+                        ],
+                    )?;
+                    advance_prefill(
+                        &mut cursor,
+                        Some(layer),
+                        CudaPrefillOperation::FfnGateUpFanoutBatch,
+                    )?;
+                    let down = dispatch_prefill_fused_projection_parts(
+                        runtime,
+                        plan,
+                        activations,
+                        projections,
+                        prefill_workspaces,
+                        gate,
+                        up,
+                        tokens,
+                        &format!("{prefix}.mlp.down_proj.weight"),
+                        PrefillFusedEdge::SwiGlu,
+                    )?;
+                    advance_prefill(
+                        &mut cursor,
+                        Some(layer),
+                        CudaPrefillOperation::SwiGluDownProjectionBatch,
+                    )?;
+                    let post_ffn = if layer + 1 == config.num_hidden_layers {
+                        format!("target:{layer}:post_ffn:final")
+                    } else {
+                        format!("target:{layer}:post_ffn:layer_{}", layer + 1)
+                    };
+                    (residual, normalized) = runtime
+                        .dispatch_batched_residual_rms_norm_f16_device(
+                            norms.residual(&post_ffn)?,
+                            prefill_workspaces.hidden_norm(),
+                            residual,
+                            down,
+                            tokens,
+                        )?;
+                    advance_prefill(
+                        &mut cursor,
+                        Some(layer),
+                        CudaPrefillOperation::ResidualRmsNormBatch,
+                    )?;
+                }
+
+                let last_row = normalized.slice(
+                    (tokens - 1)
+                        .checked_mul(config.hidden_size)
+                        .ok_or_else(|| {
+                            EngineError::Shape("CUDA final prompt row offset overflows".into())
+                        })?,
+                    config.hidden_size,
+                )?;
+                let logits = dispatch_projection_device(
+                    runtime,
+                    plan,
+                    activations,
+                    projections,
+                    last_row,
+                    "lm_head.weight",
+                )?;
+                advance_prefill(&mut cursor, None, CudaPrefillOperation::LastTokenLmHead)?;
+                cursor.skip_disabled_mtp()?;
+                Ok(logits)
+            },
+        );
+        let logits = dispatch?;
+        advance_prefill(&mut cursor, None, CudaPrefillOperation::ChunkBarrier)?;
+        *target_tokens = cursor.finish()?;
+        *poisoned = false;
+        Ok(logits)
+    }
+
     pub fn dispatch_target_token_device<'a>(
         &'a mut self,
         runtime: &CudaCandidateRuntime,
@@ -3324,6 +3650,114 @@ impl PreparedCudaProjectionGraph {
         }
         Ok(())
     }
+}
+
+fn advance_prefill(
+    cursor: &mut CudaPrefillExecutionCursor<'_>,
+    layer: Option<usize>,
+    operation: CudaPrefillOperation,
+) -> Result<()> {
+    let schedule_index = cursor
+        .next_step()
+        .ok_or_else(|| EngineError::InvalidState("CUDA prefill schedule ended early".into()))?
+        .schedule_index;
+    cursor.advance(schedule_index, layer, operation)
+}
+
+#[derive(Clone, Copy)]
+enum PrefillFusedEdge {
+    AttentionGate,
+    SwiGlu,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_prefill_projection_fanout_parts<'a, const N: usize>(
+    runtime: &CudaCandidateRuntime,
+    plan: &CudaProjectionPlan,
+    activations: &BTreeMap<String, PreparedCudaA8Activation>,
+    projections: &'a BTreeMap<String, PreparedCudaA8Projection>,
+    workspaces: &'a PreparedCudaPrefillWorkspaces,
+    input: CudaDeviceF32View<'_>,
+    tokens: usize,
+    names: [String; N],
+) -> Result<[CudaDeviceF32View<'a>; N]> {
+    let first = names.first().ok_or_else(|| {
+        EngineError::InvalidState("CUDA prefill projection fan-out cannot be empty".into())
+    })?;
+    let group = plan.group_for_projection(first)?;
+    let activation = activations.get(group).ok_or_else(|| {
+        EngineError::InvalidState(format!("CUDA activation group {group} is not resident"))
+    })?;
+    let mut prepared = Vec::with_capacity(N);
+    for name in &names {
+        if plan.group_for_projection(name)? != group {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA prefill projection fan-out mixes activation groups at {name}"
+            )));
+        }
+        let projection = projections.get(name).ok_or_else(|| {
+            EngineError::InvalidState(format!("CUDA projection {name} is not resident"))
+        })?;
+        prepared.push((projection, prefill_projection_output_slot(name)?));
+    }
+    runtime
+        .dispatch_batched_a8_arena_fanout_device(
+            activation,
+            workspaces.projection_activation(),
+            workspaces.projection_outputs(),
+            input,
+            tokens,
+            &prepared,
+        )?
+        .try_into()
+        .map_err(|_| EngineError::InvalidState("CUDA prefill fan-out count changed".into()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_prefill_fused_projection_parts<'a>(
+    runtime: &CudaCandidateRuntime,
+    plan: &CudaProjectionPlan,
+    activations: &BTreeMap<String, PreparedCudaA8Activation>,
+    projections: &'a BTreeMap<String, PreparedCudaA8Projection>,
+    workspaces: &'a PreparedCudaPrefillWorkspaces,
+    left: CudaDeviceF32View<'_>,
+    right: CudaDeviceF32View<'_>,
+    tokens: usize,
+    name: &str,
+    edge: PrefillFusedEdge,
+) -> Result<CudaDeviceF32View<'a>> {
+    let group = plan.group_for_projection(name)?;
+    let activation = activations.get(group).ok_or_else(|| {
+        EngineError::InvalidState(format!("CUDA activation group {group} is not resident"))
+    })?;
+    let projection = projections.get(name).ok_or_else(|| {
+        EngineError::InvalidState(format!("CUDA projection {name} is not resident"))
+    })?;
+    let slot = prefill_projection_output_slot(name)?;
+    let mut outputs = match edge {
+        PrefillFusedEdge::AttentionGate => runtime
+            .dispatch_batched_a8_arena_sigmoid_gate_fanout_device(
+                activation,
+                workspaces.projection_activation(),
+                workspaces.projection_outputs(),
+                left,
+                right,
+                tokens,
+                &[(projection, slot)],
+            )?,
+        PrefillFusedEdge::SwiGlu => runtime.dispatch_batched_a8_arena_swiglu_fanout_device(
+            activation,
+            workspaces.projection_activation(),
+            workspaces.projection_outputs(),
+            left,
+            right,
+            tokens,
+            &[(projection, slot)],
+        )?,
+    };
+    outputs.pop().ok_or_else(|| {
+        EngineError::InvalidState("CUDA prefill fused projection has no output".into())
+    })
 }
 
 fn dispatch_projection_fanout_device<'a, const N: usize>(
@@ -3993,6 +4427,40 @@ mod tests {
                 512,
             )
             .is_err());
+    }
+
+    #[test]
+    fn target_only_prefill_can_skip_exactly_the_optional_mtp_step() {
+        let config = Qwen38Config::default();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let schedule = CudaPrefillSchedule::qwen38(&config, 512).unwrap();
+        let bindings = CudaPrefillBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
+        let mut cursor = bindings
+            .execution_cursor(
+                CudaPrefillChunk {
+                    start_position: 0,
+                    token_count: 8,
+                },
+                0,
+                128,
+            )
+            .unwrap();
+        assert!(cursor.skip_disabled_mtp().is_err());
+        while cursor
+            .next_step()
+            .is_some_and(|step| step.operation != CudaPrefillOperation::MtpPrefillCausalScan)
+        {
+            let step = cursor.next_step().unwrap().clone();
+            cursor
+                .advance(step.schedule_index, step.layer, step.operation)
+                .unwrap();
+        }
+        cursor.skip_disabled_mtp().unwrap();
+        assert_eq!(
+            cursor.next_step().unwrap().operation,
+            CudaPrefillOperation::ChunkBarrier
+        );
+        assert!(cursor.skip_disabled_mtp().is_err());
     }
 
     #[test]
