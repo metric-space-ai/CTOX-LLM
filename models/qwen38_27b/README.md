@@ -214,7 +214,14 @@ simultaneously live and therefore distinct. `MetalCandidateRuntime` now
 materializes that plan as exactly one shared Metal buffer, exposes only the
 validated buffer/offset pairs, and passes write/read plus drop/recreate device
 tests. Per-step encoder binding, persistent-state rollback, and the complete
-executor remain open.
+executor remain open. A bounded f32 checkpoint can now snapshot and restore an
+exact arena slot through a Metal device-to-device blit with no host mirror. It
+is single-use and fail-closed across snapshot/restore/commit, providing the
+target-hidden primitive needed by MTP replay. FP16 causal-convolution and
+GatedDelta state owners now have the same device-only snapshot/restore/commit
+lifecycle and account one checkpoint equal to their active-state bytes. Paged
+KV rollback and graph-wide all-or-nothing orchestration remain required before
+the complete speculative branch is safe.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

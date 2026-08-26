@@ -126,6 +126,14 @@ pub struct PreparedMetalDecodeWorkspace {
     buffer: Buffer,
 }
 
+/// Bounded device-only snapshot used to restore one f32 arena slot after a
+/// rejected speculative branch. The checkpoint has no host mirror.
+pub struct PreparedMetalF32Checkpoint {
+    values: usize,
+    snapshot: Buffer,
+    active: bool,
+}
+
 /// One shared Metal view over the complete immutable CTOXQ file mapping.
 ///
 /// `new_buffer_with_bytes_no_copy` does not retain the Rust mmap owner. The
@@ -311,10 +319,12 @@ pub struct PreparedMetalGatedDelta {
     log_decay_buffer: Buffer,
     beta_buffer: Buffer,
     state_buffer: Buffer,
+    checkpoint_buffer: Buffer,
     output_buffer: Buffer,
     params_buffer: Buffer,
     resident_state_bytes: usize,
     transient_bytes: usize,
+    checkpoint_valid: bool,
     poisoned: bool,
 }
 
@@ -327,10 +337,12 @@ pub struct PreparedMappedMetalCausalConv {
     weight_offset: u64,
     input_buffer: Buffer,
     state_buffer: Buffer,
+    checkpoint_buffer: Buffer,
     output_buffer: Buffer,
     params_buffer: Buffer,
     resident_state_bytes: usize,
     transient_bytes: usize,
+    checkpoint_valid: bool,
     poisoned: bool,
 }
 
@@ -537,6 +549,35 @@ impl PreparedMetalDecodeWorkspace {
             )
         };
         Ok(values.to_vec())
+    }
+}
+
+impl PreparedMetalF32Checkpoint {
+    pub fn values(&self) -> usize {
+        self.values
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.values * std::mem::size_of::<f32>()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn commit(&mut self) -> Result<()> {
+        if !self.active {
+            return Err(EngineError::InvalidState(
+                "Metal f32 checkpoint is not active".into(),
+            ));
+        }
+        self.active = false;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        zero_buffer(&self.snapshot, self.resident_bytes());
+        self.active = false;
     }
 }
 
@@ -902,6 +943,58 @@ impl PreparedMetalGatedDelta {
         self.resident_state_bytes
     }
 
+    pub fn speculative_checkpoint_bytes(&self) -> usize {
+        self.resident_state_bytes
+    }
+
+    pub fn begin_speculative(&mut self, runtime: &MetalCandidateRuntime) -> Result<()> {
+        if self.poisoned || self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "Metal gated-delta checkpoint requires healthy state without an active branch"
+                    .into(),
+            ));
+        }
+        runtime.copy_buffer_range_sync(
+            &self.state_buffer,
+            0,
+            &self.checkpoint_buffer,
+            0,
+            self.resident_state_bytes,
+            "gated-delta checkpoint snapshot",
+        )?;
+        self.checkpoint_valid = true;
+        Ok(())
+    }
+
+    pub fn restore_speculative(&mut self, runtime: &MetalCandidateRuntime) -> Result<()> {
+        if !self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "Metal gated-delta has no speculative checkpoint".into(),
+            ));
+        }
+        runtime.copy_buffer_range_sync(
+            &self.checkpoint_buffer,
+            0,
+            &self.state_buffer,
+            0,
+            self.resident_state_bytes,
+            "gated-delta checkpoint restore",
+        )?;
+        self.checkpoint_valid = false;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn commit_speculative(&mut self) -> Result<()> {
+        if !self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "Metal gated-delta has no speculative checkpoint".into(),
+            ));
+        }
+        self.checkpoint_valid = false;
+        Ok(())
+    }
+
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
     }
@@ -949,8 +1042,10 @@ impl PreparedMetalGatedDelta {
 
     pub fn reset(&mut self) {
         zero_buffer(&self.state_buffer, self.resident_state_bytes);
+        zero_buffer(&self.checkpoint_buffer, self.resident_state_bytes);
         let output_bytes = self.config.heads * self.config.value_dim * size_of_val(&[0.0_f32]);
         zero_buffer(&self.output_buffer, output_bytes);
+        self.checkpoint_valid = false;
         self.poisoned = false;
     }
 
@@ -981,6 +1076,58 @@ impl PreparedMappedMetalCausalConv {
         self.resident_state_bytes
     }
 
+    pub fn speculative_checkpoint_bytes(&self) -> usize {
+        self.resident_state_bytes
+    }
+
+    pub fn begin_speculative(&mut self, runtime: &MetalCandidateRuntime) -> Result<()> {
+        if self.poisoned || self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "Metal convolution checkpoint requires healthy state without an active branch"
+                    .into(),
+            ));
+        }
+        runtime.copy_buffer_range_sync(
+            &self.state_buffer,
+            0,
+            &self.checkpoint_buffer,
+            0,
+            self.resident_state_bytes,
+            "convolution checkpoint snapshot",
+        )?;
+        self.checkpoint_valid = true;
+        Ok(())
+    }
+
+    pub fn restore_speculative(&mut self, runtime: &MetalCandidateRuntime) -> Result<()> {
+        if !self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "Metal convolution has no speculative checkpoint".into(),
+            ));
+        }
+        runtime.copy_buffer_range_sync(
+            &self.checkpoint_buffer,
+            0,
+            &self.state_buffer,
+            0,
+            self.resident_state_bytes,
+            "convolution checkpoint restore",
+        )?;
+        self.checkpoint_valid = false;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn commit_speculative(&mut self) -> Result<()> {
+        if !self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "Metal convolution has no speculative checkpoint".into(),
+            ));
+        }
+        self.checkpoint_valid = false;
+        Ok(())
+    }
+
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
     }
@@ -999,10 +1146,12 @@ impl PreparedMappedMetalCausalConv {
 
     pub fn reset(&mut self) {
         zero_buffer(&self.state_buffer, self.resident_state_bytes);
+        zero_buffer(&self.checkpoint_buffer, self.resident_state_bytes);
         zero_buffer(
             &self.output_buffer,
             self.channels * std::mem::size_of::<f32>(),
         );
+        self.checkpoint_valid = false;
         self.poisoned = false;
     }
 
@@ -1281,6 +1430,122 @@ impl MetalCandidateRuntime {
             plan: plan.clone(),
             buffer: new_zeroed_buffer(&self.device, plan.total_bytes())?,
         })
+    }
+
+    pub fn prepare_f32_checkpoint(&self, values: usize) -> Result<PreparedMetalF32Checkpoint> {
+        let bytes = values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal checkpoint bytes overflow".into()))?;
+        if bytes == 0 {
+            return Err(EngineError::Shape(
+                "Metal checkpoint must contain at least one value".into(),
+            ));
+        }
+        Ok(PreparedMetalF32Checkpoint {
+            values,
+            snapshot: new_zeroed_buffer(&self.device, bytes)?,
+            active: false,
+        })
+    }
+
+    /// Snapshot one exact decode-arena slot through a device-to-device blit.
+    /// No f32 values are materialized on the host.
+    pub fn snapshot_workspace_f32(
+        &self,
+        checkpoint: &mut PreparedMetalF32Checkpoint,
+        workspace: &PreparedMetalDecodeWorkspace,
+        slot: MetalBufferSlot,
+    ) -> Result<()> {
+        let binding = workspace.binding(slot)?;
+        if checkpoint.active || checkpoint.values != binding.values {
+            return Err(EngineError::InvalidState(format!(
+                "Metal checkpoint is active or has {} values for {slot:?} with {} values",
+                checkpoint.values, binding.values
+            )));
+        }
+        let (source, source_offset) = workspace.buffer_and_offset(slot)?;
+        self.copy_buffer_range_sync(
+            source,
+            source_offset,
+            &checkpoint.snapshot,
+            0,
+            binding.bytes,
+            "decode checkpoint snapshot",
+        )?;
+        checkpoint.active = true;
+        Ok(())
+    }
+
+    /// Restore one exact decode-arena slot through a device-to-device blit.
+    /// Successful restore consumes the checkpoint.
+    pub fn restore_workspace_f32(
+        &self,
+        checkpoint: &mut PreparedMetalF32Checkpoint,
+        workspace: &PreparedMetalDecodeWorkspace,
+        slot: MetalBufferSlot,
+    ) -> Result<()> {
+        let binding = workspace.binding(slot)?;
+        if !checkpoint.active || checkpoint.values != binding.values {
+            return Err(EngineError::InvalidState(format!(
+                "Metal checkpoint is absent or has {} values for {slot:?} with {} values",
+                checkpoint.values, binding.values
+            )));
+        }
+        let (destination, destination_offset) = workspace.buffer_and_offset(slot)?;
+        self.copy_buffer_range_sync(
+            &checkpoint.snapshot,
+            0,
+            destination,
+            destination_offset,
+            binding.bytes,
+            "decode checkpoint restore",
+        )?;
+        checkpoint.active = false;
+        Ok(())
+    }
+
+    fn copy_buffer_range_sync(
+        &self,
+        source: &Buffer,
+        source_offset: u64,
+        destination: &Buffer,
+        destination_offset: u64,
+        bytes: usize,
+        label: &'static str,
+    ) -> Result<()> {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| EngineError::MemoryBudget("Metal blit length exceeds u64".into()))?;
+        let source_end = source_offset
+            .checked_add(bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal blit source range overflows".into()))?;
+        let destination_end = destination_offset.checked_add(bytes).ok_or_else(|| {
+            EngineError::MemoryBudget("Metal blit destination range overflows".into())
+        })?;
+        if bytes == 0 || source_end > source.length() || destination_end > destination.length() {
+            return Err(EngineError::MemoryBudget(format!(
+                "Metal {label} range exceeds its source or destination buffer"
+            )));
+        }
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label(label);
+        let encoder = command_buffer.new_blit_command_encoder();
+        encoder.copy_from_buffer(
+            source,
+            source_offset,
+            destination,
+            destination_offset,
+            bytes,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal {label} failed with status {:?}",
+                command_buffer.status()
+            )));
+        }
+        Ok(())
     }
 
     pub fn prepare_argmax_f32(&self, input: &[f32]) -> Result<PreparedMetalArgMax> {
@@ -2227,10 +2492,12 @@ impl MetalCandidateRuntime {
             weight_offset,
             input_buffer: buffer_with_data(&self.device, as_bytes(input)),
             state_buffer: new_zeroed_buffer(&self.device, weight_bytes_expected)?,
+            checkpoint_buffer: new_zeroed_buffer(&self.device, weight_bytes_expected)?,
             output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
             params_buffer: buffer_with_data(&self.device, &params.encode()),
             resident_state_bytes: weight_bytes_expected,
             transient_bytes,
+            checkpoint_valid: false,
             poisoned: false,
         })
     }
@@ -2464,10 +2731,12 @@ impl MetalCandidateRuntime {
             log_decay_buffer: new_zeroed_buffer(&self.device, head_bytes)?,
             beta_buffer: new_zeroed_buffer(&self.device, head_bytes)?,
             state_buffer: new_zeroed_buffer(&self.device, resident_state_bytes)?,
+            checkpoint_buffer: new_zeroed_buffer(&self.device, resident_state_bytes)?,
             output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
             params_buffer: buffer_with_data(&self.device, &params.encode()),
             resident_state_bytes,
             transient_bytes,
+            checkpoint_valid: false,
             poisoned: false,
         })
     }
@@ -4694,6 +4963,78 @@ mod tests {
     }
 
     #[test]
+    fn decode_workspace_checkpoint_restores_on_device_and_is_single_use() {
+        let config = Qwen38Config::default();
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("decode workspace plan");
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let mut workspace = runtime
+            .prepare_decode_workspace(&plan)
+            .expect("allocate one decode arena");
+        let hidden = workspace
+            .binding(MetalBufferSlot::HiddenA)
+            .expect("hidden binding");
+        let original: Vec<f32> = (0..hidden.values)
+            .map(|index| index as f32 * 0.0625 - 11.0)
+            .collect();
+        let changed = vec![7.25_f32; hidden.values];
+        workspace
+            .write_f32(MetalBufferSlot::HiddenA, &original)
+            .expect("write committed hidden state");
+
+        let mut checkpoint = runtime
+            .prepare_f32_checkpoint(hidden.values)
+            .expect("allocate bounded f32 checkpoint");
+        assert_eq!(checkpoint.values(), hidden.values);
+        assert_eq!(checkpoint.resident_bytes(), hidden.bytes);
+        assert!(!checkpoint.is_active());
+        runtime
+            .snapshot_workspace_f32(&mut checkpoint, &workspace, MetalBufferSlot::HiddenA)
+            .expect("device snapshot");
+        assert!(checkpoint.is_active());
+        assert!(runtime
+            .snapshot_workspace_f32(&mut checkpoint, &workspace, MetalBufferSlot::HiddenA)
+            .is_err());
+        workspace
+            .write_f32(MetalBufferSlot::HiddenA, &changed)
+            .expect("mutate speculative hidden state");
+        runtime
+            .restore_workspace_f32(&mut checkpoint, &workspace, MetalBufferSlot::HiddenA)
+            .expect("device restore");
+        assert!(!checkpoint.is_active());
+        assert_eq!(
+            workspace
+                .read_f32(MetalBufferSlot::HiddenA)
+                .expect("read restored hidden state"),
+            original
+        );
+        assert!(runtime
+            .restore_workspace_f32(&mut checkpoint, &workspace, MetalBufferSlot::HiddenA)
+            .is_err());
+
+        runtime
+            .snapshot_workspace_f32(&mut checkpoint, &workspace, MetalBufferSlot::HiddenA)
+            .expect("second device snapshot");
+        workspace
+            .write_f32(MetalBufferSlot::HiddenA, &changed)
+            .expect("mutate committed branch");
+        checkpoint.commit().expect("commit speculative branch");
+        assert_eq!(
+            workspace
+                .read_f32(MetalBufferSlot::HiddenA)
+                .expect("read committed hidden state"),
+            changed
+        );
+        assert!(checkpoint.commit().is_err());
+        assert!(runtime
+            .snapshot_workspace_f32(&mut checkpoint, &workspace, MetalBufferSlot::TargetLogits)
+            .is_err());
+        checkpoint.clear();
+        assert!(!checkpoint.is_active());
+    }
+
+    #[test]
     fn device_argmax_matches_full_vocab_oracle_reuses_buffers_and_rejects_nonfinite() {
         let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
         let values = crate::tokenizer::TOKENIZER_VOCAB_SIZE;
@@ -6023,6 +6364,60 @@ mod tests {
             }
         }
 
+        assert_eq!(
+            prepared.speculative_checkpoint_bytes(),
+            prepared.resident_state_bytes()
+        );
+        let committed_state = prepared.verifier_read_state();
+        let speculative_query = vec![0.17_f32; config.heads * config.key_dim];
+        let speculative_key = vec![-0.11_f32; config.heads * config.key_dim];
+        let speculative_value = vec![0.23_f32; config.heads * config.value_dim];
+        let speculative_decay = vec![-0.02_f32; config.heads];
+        let speculative_beta = vec![0.55_f32; config.heads];
+        prepared
+            .begin_speculative(&runtime)
+            .expect("snapshot gated-delta state on device");
+        assert!(prepared.begin_speculative(&runtime).is_err());
+        prepared
+            .write_step(
+                &speculative_query,
+                &speculative_key,
+                &speculative_value,
+                &speculative_decay,
+                &speculative_beta,
+            )
+            .expect("write speculative gated-delta step");
+        runtime
+            .dispatch_gated_delta_f16(&mut prepared)
+            .expect("advance speculative gated-delta state");
+        assert_ne!(prepared.verifier_read_state(), committed_state);
+        prepared
+            .restore_speculative(&runtime)
+            .expect("restore gated-delta state on device");
+        assert_eq!(prepared.verifier_read_state(), committed_state);
+        assert!(prepared.restore_speculative(&runtime).is_err());
+
+        prepared
+            .begin_speculative(&runtime)
+            .expect("snapshot committed gated-delta branch");
+        prepared
+            .write_step(
+                &speculative_query,
+                &speculative_key,
+                &speculative_value,
+                &speculative_decay,
+                &speculative_beta,
+            )
+            .expect("rewrite speculative gated-delta step");
+        runtime
+            .dispatch_gated_delta_f16(&mut prepared)
+            .expect("advance committed gated-delta branch");
+        prepared
+            .commit_speculative()
+            .expect("commit gated-delta state");
+        assert_ne!(prepared.verifier_read_state(), committed_state);
+        assert!(prepared.commit_speculative().is_err());
+
         assert!(prepared
             .write_step(&[0.0; 64], &[0.0; 128], &[0.0; 128], &[0.0; 2], &[0.0; 2])
             .is_err());
@@ -6123,6 +6518,46 @@ mod tests {
             }
             assert_eq!(prepared.verifier_read_state(), expected_state);
         }
+
+        assert_eq!(
+            prepared.speculative_checkpoint_bytes(),
+            prepared.resident_state_bytes()
+        );
+        let committed_state = prepared.verifier_read_state();
+        let speculative_input: Vec<f32> = (0..channels)
+            .map(|channel| (channel as f32 * 0.047).cos() * 0.52)
+            .collect();
+        prepared
+            .begin_speculative(&runtime)
+            .expect("snapshot convolution state on device");
+        assert!(prepared.begin_speculative(&runtime).is_err());
+        prepared
+            .write_input(&speculative_input)
+            .expect("write speculative convolution input");
+        runtime
+            .dispatch_mapped_causal_conv_f16(&mut prepared)
+            .expect("advance speculative convolution state");
+        assert_ne!(prepared.verifier_read_state(), committed_state);
+        prepared
+            .restore_speculative(&runtime)
+            .expect("restore convolution state on device");
+        assert_eq!(prepared.verifier_read_state(), committed_state);
+        assert!(prepared.restore_speculative(&runtime).is_err());
+
+        prepared
+            .begin_speculative(&runtime)
+            .expect("snapshot committed convolution branch");
+        prepared
+            .write_input(&speculative_input)
+            .expect("rewrite speculative convolution input");
+        runtime
+            .dispatch_mapped_causal_conv_f16(&mut prepared)
+            .expect("advance committed convolution branch");
+        prepared
+            .commit_speculative()
+            .expect("commit convolution state");
+        assert_ne!(prepared.verifier_read_state(), committed_state);
+        assert!(prepared.commit_speculative().is_err());
 
         prepared.reset();
         assert!(prepared

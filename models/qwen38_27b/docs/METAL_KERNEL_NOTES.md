@@ -52,6 +52,20 @@ evidence for the decode arena, not yet a complete allocator high-watermark or
 zero-residue unload measurement; per-step encoder binding remains executor
 work.
 
+`PreparedMetalF32Checkpoint` adds a bounded device-only snapshot for one arena
+slot. Snapshot and restore use a native Metal blit between the shared arena and
+one same-sized checkpoint buffer; no f32 state is copied through Rust memory.
+The checkpoint becomes active only after a completed blit, is consumed by
+restore or explicit commit, and rejects width mismatches and repeated lifecycle
+operations. The verifier proves restore and commit semantics on the target
+hidden-width slot. This covers the target-hidden replay primitive only: paged
+KV metadata/pages plus the graph-level transaction still need to be completed
+before speculative MTP can be claimed. Individual FP16 causal-convolution and
+GatedDelta owners now also allocate one same-sized device checkpoint and expose
+fail-closed begin/restore/commit operations. Their Apple-device verifiers prove
+that a speculative state advance restores bit-exactly, while commit preserves
+the advance; no state payload crosses the host.
+
 ## Entry points
 
 | Kernel | DType | Block layout |
@@ -376,7 +390,9 @@ dequantization array before this source was accepted.
   duplicates its packed pages in a CPU correctness mirror; neither attention
   path has controlled performance evidence. The MTP block and sampling do not
   exist yet. A deterministic shared decode arena and its single Metal buffer
-  exist, but per-step encoder binding, the prefill arena, transactional state,
-  and complete model-graph execution remain unfinished.
+  exist, and target-hidden plus per-owner linear-state checkpoint/restore is
+  available, but per-step encoder binding, the prefill arena, transactional KV,
+  graph-wide atomic orchestration, and complete model-graph execution remain
+  unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.
