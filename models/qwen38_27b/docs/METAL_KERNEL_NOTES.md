@@ -113,6 +113,16 @@ packed `s_out` half as offsets into the shared mapping. Q2 threads decode four
 adjacent columns and Q4 threads decode two; the only new allocation is the
 f32 hidden vector plus the fixed parameter block.
 
+The complete embedding owner now retains every pure or mixed Q2/Q4 row through
+the same artifact mapping and selects a token by changing only the packed row
+and scalar `s_out` offsets. It allocates one reusable hidden vector and one
+32-byte parameter block regardless of vocabulary size. The first resident
+decode chain encodes embedding lookup, Qwen RMSNorm, and an external-input
+mixed projection in one command encoder; neither the embedding nor normalized
+hidden vector returns to the host between operations. The same prepared table
+selects Q2 and Q4 tokens repeatedly and remains valid after the original loader
+handles are dropped.
+
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
 complete row, reduces the f32 sum of squares without threadgroup scratch, and

@@ -201,6 +201,32 @@ pub struct PreparedMappedMetalRecoveredRow {
     transient_bytes: usize,
 }
 
+/// Complete recovered embedding table retained through one no-copy artifact
+/// mapping. Token changes select a row by binding a different byte offset;
+/// quantized weights and recovery scales are never repacked or duplicated.
+pub struct PreparedMappedMetalEmbedding {
+    rows: usize,
+    columns: usize,
+    mapping: MappedMetalArtifact,
+    weights_base: u64,
+    s_in_offset: u64,
+    s_out_base: u64,
+    segments: Vec<MappedMetalEmbeddingSegment>,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    transient_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MappedMetalEmbeddingSegment {
+    dtype: TensorDType,
+    row_start: usize,
+    row_end: usize,
+    weights_offset: u64,
+    row_bytes: usize,
+    thread_width: usize,
+}
+
 /// Qwen `(1 + weight)` RMSNorm with an mmap-backed FP16 weight vector.
 /// Input/output remain reusable f32 graph buffers; no expanded f32 weight
 /// copy is created at load time.
@@ -573,6 +599,24 @@ impl PreparedMappedMetalGatheredMatVec {
 impl PreparedMappedMetalRecoveredRow {
     pub fn dtype(&self) -> TensorDType {
         self.dtype
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.mapping.copied_model_bytes()
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+}
+
+impl PreparedMappedMetalEmbedding {
+    pub fn rows(&self) -> usize {
+        self.rows
     }
 
     pub fn columns(&self) -> usize {
@@ -1779,6 +1823,114 @@ impl MetalCandidateRuntime {
         })
     }
 
+    /// Prepare the complete embedding table once. Unlike
+    /// [`Self::prepare_mapped_recovered_row`], this owner can select any token
+    /// row at dispatch time without constructing another Metal object.
+    pub fn prepare_mapped_embedding(
+        &self,
+        mapping: &MappedMetalArtifact,
+        matrix: RecoveredMatrixView<'_>,
+    ) -> Result<PreparedMappedMetalEmbedding> {
+        let validation_input = vec![0.0_f32; matrix.matrix.columns];
+        let operation = matrix.operation(&validation_input, Activation::Identity)?;
+        let contracts = if operation.dtype == TensorDType::MixedQ2Q4B64 {
+            validate_mixed_operation(&operation)?
+                .into_iter()
+                .map(|segment| {
+                    let row_end = segment
+                        .row_start
+                        .checked_add(segment.params.rows as usize)
+                        .ok_or_else(|| {
+                            EngineError::Shape("Metal embedding segment rows overflow".into())
+                        })?;
+                    Ok((
+                        segment.layout.dtype,
+                        segment.row_start,
+                        row_end,
+                        segment.weight_offset,
+                        segment.layout.block_bytes,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            let (layout, _) = validate_operation(&operation)?;
+            vec![(layout.dtype, 0, operation.rows, 0, layout.block_bytes)]
+        };
+        let ScaleSlice::F16Le(s_in) = operation
+            .s_in
+            .ok_or_else(|| EngineError::InvalidArtifact("Metal embedding has no s_in".into()))?
+        else {
+            unreachable!("validated Metal embedding s_in is FP16")
+        };
+        let ScaleSlice::F16Le(s_out) = operation
+            .s_out
+            .ok_or_else(|| EngineError::InvalidArtifact("Metal embedding has no s_out".into()))?
+        else {
+            unreachable!("validated Metal embedding s_out is FP16")
+        };
+        let weights_base = mapping.byte_offset(operation.weights, "embedding weights")?;
+        let s_in_offset = mapping.byte_offset(s_in, "embedding s_in")?;
+        let s_out_base = mapping.byte_offset(s_out, "embedding s_out")?;
+        let blocks_per_row = operation.columns / BLOCK_LEN;
+        let mut segments = Vec::with_capacity(contracts.len());
+        for (dtype, row_start, row_end, weight_offset, block_bytes) in contracts {
+            let pipeline = match dtype {
+                TensorDType::Q2B64 => &self.q2_recovered_row_pipeline,
+                TensorDType::Q4B64 => &self.q4_recovered_row_pipeline,
+                _ => unreachable!("validated Metal embedding segment is Q2/Q4"),
+            };
+            let row_bytes = blocks_per_row.checked_mul(block_bytes).ok_or_else(|| {
+                EngineError::Shape("Metal embedding row byte size overflows".into())
+            })?;
+            segments.push(MappedMetalEmbeddingSegment {
+                dtype,
+                row_start,
+                row_end,
+                weights_offset: u64::try_from(weight_offset).map_err(|_| {
+                    EngineError::Shape("Metal embedding weight offset exceeds u64".into())
+                })?,
+                row_bytes,
+                thread_width: dispatch_width(pipeline, DEFAULT_SIMDGROUPS)?,
+            });
+        }
+        let output_bytes = operation
+            .columns
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("Metal embedding output bytes overflow".into()))?;
+        let output_buffer = self
+            .device
+            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let params = MetalFusedMatVecParams {
+            rows: 1,
+            columns: u32::try_from(operation.columns)
+                .map_err(|_| EngineError::Shape("Metal embedding width exceeds u32".into()))?,
+            blocks_per_row: u32::try_from(blocks_per_row).map_err(|_| {
+                EngineError::Shape("Metal embedding block count exceeds u32".into())
+            })?,
+            has_s_in: 1,
+            has_s_out: 1,
+            has_bias: 0,
+            activation: 0,
+            reserved0: 0,
+        };
+        let params_buffer = buffer_with_data(&self.device, &params.encode());
+        let transient_bytes = output_bytes
+            .checked_add(MetalFusedMatVecParams::BYTE_LEN)
+            .ok_or_else(|| EngineError::Shape("Metal embedding transient bytes overflow".into()))?;
+        Ok(PreparedMappedMetalEmbedding {
+            rows: operation.rows,
+            columns: operation.columns,
+            mapping: mapping.clone(),
+            weights_base,
+            s_in_offset,
+            s_out_base,
+            segments,
+            output_buffer,
+            params_buffer,
+            transient_bytes,
+        })
+    }
+
     /// Prepare Qwen's `(1 + weight)` RMSNorm with an exact mmap-backed FP16
     /// weight vector. The candidate supports one decode row and multi-row
     /// prefill without changing the weight representation.
@@ -2783,6 +2935,136 @@ impl MetalCandidateRuntime {
         Ok(output)
     }
 
+    fn encode_mapped_embedding(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalEmbedding,
+        token: usize,
+    ) -> Result<()> {
+        if token >= prepared.rows {
+            return Err(EngineError::Shape(format!(
+                "Metal embedding token {token} exceeds {} rows",
+                prepared.rows
+            )));
+        }
+        let segment = prepared
+            .segments
+            .iter()
+            .find(|segment| token >= segment.row_start && token < segment.row_end)
+            .ok_or_else(|| {
+                EngineError::InvalidArtifact(format!(
+                    "Metal embedding token {token} has no quantized segment"
+                ))
+            })?;
+        let local_row = token - segment.row_start;
+        let local_weight_offset = local_row
+            .checked_mul(segment.row_bytes)
+            .ok_or_else(|| EngineError::Shape("Metal embedding row offset overflows".into()))?;
+        let weights_offset = prepared
+            .weights_base
+            .checked_add(segment.weights_offset)
+            .and_then(|offset| offset.checked_add(u64::try_from(local_weight_offset).ok()?))
+            .ok_or_else(|| EngineError::Shape("Metal embedding weight binding overflows".into()))?;
+        let s_out_offset = prepared
+            .s_out_base
+            .checked_add(
+                u64::try_from(token)
+                    .map_err(|_| EngineError::Shape("Metal embedding token exceeds u64".into()))?
+                    .checked_mul(std::mem::size_of::<half::f16>() as u64)
+                    .ok_or_else(|| {
+                        EngineError::Shape("Metal embedding s_out index overflows".into())
+                    })?,
+            )
+            .ok_or_else(|| EngineError::Shape("Metal embedding s_out binding overflows".into()))?;
+        let (pipeline, values_per_thread) = match segment.dtype {
+            TensorDType::Q2B64 => (&self.q2_recovered_row_pipeline, 4_usize),
+            TensorDType::Q4B64 => (&self.q4_recovered_row_pipeline, 2_usize),
+            _ => unreachable!("prepared Metal embedding segment is Q2/Q4"),
+        };
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(
+            MetalBufferAbi::WEIGHTS as u64,
+            Some(&prepared.mapping.inner.buffer),
+            weights_offset,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::S_IN as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.s_in_offset,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::S_OUT as u64,
+            Some(&prepared.mapping.inner.buffer),
+            s_out_offset,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::OUTPUT as u64,
+            Some(&prepared.output_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        let work_items = prepared.columns / values_per_thread;
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: work_items.div_ceil(segment.thread_width) as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: segment.thread_width as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// Select and decode one token from a complete resident embedding table.
+    /// Only the row offsets change between calls; the table remains one shared
+    /// mmap-backed Metal allocation.
+    pub fn dispatch_mapped_embedding(
+        &self,
+        prepared: &PreparedMappedMetalEmbedding,
+        token: usize,
+    ) -> Result<Vec<f32>> {
+        if token >= prepared.rows {
+            return Err(EngineError::Shape(format!(
+                "Metal embedding token {token} exceeds {} rows",
+                prepared.rows
+            )));
+        }
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-resident-embedding-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_embedding(encoder, prepared, token)?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal resident embedding command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(
+                prepared.output_buffer.contents().cast::<f32>(),
+                prepared.columns,
+            )
+            .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal resident embedding produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
     pub fn dispatch_mapped_rms_norm_1p(
         &self,
         prepared: &PreparedMappedMetalRmsNorm,
@@ -3471,12 +3753,23 @@ impl MetalCandidateRuntime {
         norm: &PreparedMappedMetalRmsNorm,
         projection: &PreparedMappedMetalMatVec,
     ) {
-        encoder.set_compute_pipeline_state(&self.rms_norm_1p_pipeline);
-        encoder.set_buffer(
-            MetalRmsNormBufferAbi::INPUT as u64,
-            Some(&norm.input_buffer),
-            0,
+        self.encode_mapped_norm_projection_with_input(
+            encoder,
+            norm,
+            projection,
+            &norm.input_buffer,
         );
+    }
+
+    fn encode_mapped_norm_projection_with_input(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        norm: &PreparedMappedMetalRmsNorm,
+        projection: &PreparedMappedMetalMatVec,
+        input_buffer: &Buffer,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rms_norm_1p_pipeline);
+        encoder.set_buffer(MetalRmsNormBufferAbi::INPUT as u64, Some(input_buffer), 0);
         encoder.set_buffer(
             MetalRmsNormBufferAbi::WEIGHT as u64,
             Some(&norm.mapping.inner.buffer),
@@ -3558,6 +3851,63 @@ impl MetalCandidateRuntime {
             };
             encoder.dispatch_thread_groups(grid, threads);
         }
+    }
+
+    /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
+    /// projection in a single command encoder. The projection consumes the
+    /// RMSNorm output buffer directly and therefore owns no second activation
+    /// allocation and performs no host readback between operations.
+    pub fn dispatch_mapped_embedding_rms_norm_projection(
+        &self,
+        embedding: &PreparedMappedMetalEmbedding,
+        token: usize,
+        norm: &PreparedMappedMetalRmsNorm,
+        projection: &PreparedMappedMetalMatVec,
+    ) -> Result<Vec<f32>> {
+        self.validate_mapped_norm_projection(norm, projection)?;
+        if token >= embedding.rows
+            || embedding.columns != norm.columns
+            || norm.rows != 1
+            || !Rc::ptr_eq(&embedding.mapping.inner, &norm.mapping.inner)
+        {
+            return Err(EngineError::InvalidState(
+                "Metal embedding/norm/projection chain has incompatible token, shape, or mapping"
+                    .into(),
+            ));
+        }
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-embedding-norm-projection-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_embedding(encoder, embedding, token)?;
+        self.encode_mapped_norm_projection_with_input(
+            encoder,
+            norm,
+            projection,
+            &embedding.output_buffer,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal embedding/norm/projection command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(
+                projection.output_buffer.contents().cast::<f32>(),
+                projection.rows,
+            )
+            .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal embedding/norm/projection chain produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
     }
 
     /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
@@ -4685,6 +5035,156 @@ mod tests {
                 assert!(
                     (expected - actual).abs() <= tolerance,
                     "{dtype:?} embedding column {column}: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complete_embedding_table_selects_q2_and_q4_rows_without_reprepare() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let rows_q2 = 3;
+        let rows_q4 = 5;
+        let columns = 3 * BLOCK_LEN;
+        let directory = tempdir().expect("temporary resident embedding directory");
+        let path = directory.path().join("resident-embedding.ctoxq");
+        write_mixed_fixture(&path, rows_q2, rows_q4, columns);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open resident embedding fixture");
+        let matrix = artifact
+            .recovered_matrix("matrix.weight")
+            .expect("resolve resident embedding matrix");
+        let selected_rows = [0_usize, rows_q2 - 1, rows_q2, rows_q2 + rows_q4 - 1];
+        let expected = selected_rows
+            .iter()
+            .map(|row| {
+                cpu.recovered_row(&matrix.row_operation(*row).expect("resolve embedding row"))
+                    .expect("decode resident embedding oracle")
+            })
+            .collect::<Vec<_>>();
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import resident embedding mapping");
+        let prepared = runtime
+            .prepare_mapped_embedding(&mapping, matrix)
+            .expect("prepare complete resident embedding");
+        assert_eq!(prepared.rows(), rows_q2 + rows_q4);
+        assert_eq!(prepared.columns(), columns);
+        assert_eq!(prepared.segments.len(), 2);
+        assert_eq!(prepared.segments[0].dtype, TensorDType::Q2B64);
+        assert_eq!(prepared.segments[1].dtype, TensorDType::Q4B64);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert_eq!(
+            prepared.transient_bytes(),
+            columns * std::mem::size_of::<f32>() + MetalFusedMatVecParams::BYTE_LEN
+        );
+        assert!(runtime
+            .dispatch_mapped_embedding(&prepared, rows_q2 + rows_q4)
+            .is_err());
+        drop(mapping);
+        drop(artifact);
+
+        for (row, expected) in selected_rows.into_iter().zip(expected) {
+            let actual = runtime
+                .dispatch_mapped_embedding(&prepared, row)
+                .expect("dispatch resident embedding after loader drop");
+            for (column, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 2.0e-5_f32.max(expected.abs() * 3.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "resident embedding row {row} column {column}: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resident_embedding_norm_projection_chain_stays_on_device() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let rows_q2 = 3;
+        let rows_q4 = 5;
+        let columns = 3 * BLOCK_LEN;
+        let epsilon = 1.0e-6;
+        let directory = tempdir().expect("temporary embedding chain directory");
+        let path = directory.path().join("embedding-chain.ctoxq");
+        write_mixed_fixture(&path, rows_q2, rows_q4, columns);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open embedding chain fixture");
+        let matrix = artifact
+            .recovered_matrix("matrix.weight")
+            .expect("resolve embedding chain matrix");
+        let norm_weight = artifact
+            .float_tensor("matrix.weight.s_in")
+            .expect("resolve embedding chain norm weight");
+        let norm_weight_f32 = norm_weight
+            .to_f32_vec()
+            .expect("widen embedding chain norm weight");
+        let placeholder = vec![0.0_f32; columns];
+        let projection_contract = matrix
+            .operation(&placeholder, Activation::Identity)
+            .expect("construct embedding chain projection contract");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import embedding chain mapping");
+        let embedding = runtime
+            .prepare_mapped_embedding(&mapping, matrix)
+            .expect("prepare resident embedding chain table");
+        let norm = runtime
+            .prepare_mapped_rms_norm_1p(&mapping, norm_weight, &placeholder, 1, columns, epsilon)
+            .expect("prepare embedding chain norm");
+        let projection = runtime
+            .prepare_mapped_fused_matvec_external_input(&mapping, &projection_contract)
+            .expect("prepare embedding chain projection");
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_projection(
+                &embedding,
+                rows_q2 + rows_q4,
+                &norm,
+                &projection,
+            )
+            .is_err());
+        let selected_rows = [1_usize, rows_q2 + 2];
+        let expected = selected_rows
+            .iter()
+            .map(|token| {
+                let hidden = cpu
+                    .recovered_row(&matrix.row_operation(*token).expect("resolve chain row"))
+                    .expect("decode chain embedding oracle");
+                let normalized = crate::reference::rms_norm_1p_weight(
+                    &hidden,
+                    1,
+                    columns,
+                    &norm_weight_f32,
+                    epsilon,
+                )
+                .expect("normalize chain embedding oracle");
+                cpu.fused_matvec(
+                    &matrix
+                        .operation(&normalized, Activation::Identity)
+                        .expect("construct chain projection oracle"),
+                )
+                .expect("execute chain projection oracle")
+            })
+            .collect::<Vec<_>>();
+        drop(mapping);
+        drop(artifact);
+
+        for (token, expected) in selected_rows.into_iter().zip(expected) {
+            let actual = runtime
+                .dispatch_mapped_embedding_rms_norm_projection(
+                    &embedding,
+                    token,
+                    &norm,
+                    &projection,
+                )
+                .expect("dispatch resident embedding chain after loader drop");
+            for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 3.0e-4_f32.max(expected.abs() * 5.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "embedding chain token {token} row {row}: expected {expected}, got {actual}"
                 );
             }
         }
