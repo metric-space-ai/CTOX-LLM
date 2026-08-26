@@ -39,9 +39,10 @@ The minimum 2-bit/4-bit reference set:
 | `ggml/src/ggml-cuda/norm.cu` | RMSNorm block reduction and fused multiply organization |
 | `ggml/src/ggml-cuda/rope.cu` | non-interleaved/NeoX rotary pairing and launch organization |
 | `ggml/src/ggml-cuda/ssm-conv.cu` | width-4 depthwise convolution and fused SiLU organization |
+| `ggml/src/ggml-cuda/fattn*.{cu,cuh}` | online-softmax, vector, tile, MMA and WMMA flash-attention organization |
 
-All fourteen vendored files are byte-identical to the same immutable revision and
-are verified by `training/verify_vendor_manifest.py`. The three newly pinned
+All twenty-three vendored files are byte-identical to the same immutable
+revision and are verified by `training/verify_vendor_manifest.py`. The pinned
 operator families are reference baselines, not compiled ggml dependencies.
 Their CTOX adaptations must preserve `// ref:` anchors while changing state
 storage to FP16 where the signed memory profile requires it, keeping immutable
@@ -58,7 +59,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports ten explicitly unpromoted
+- The same verifier cubin additionally exports eleven explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
@@ -72,6 +73,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
   - `ctox_gated_rms_norm_f16_sm86`
   - `ctox_qwen_rms_norm_f16_sm86`
   - `ctox_partial_rope_f32_sm86`
+  - `ctox_paged_q2q4_gqa_decode_f32_sm86`
   These symbols are intentionally excluded from the production module ABI
   until their quality and complete-graph gates pass.
 - One launch fuses dequant, dot product, `s_in`, `s_out`, bias, and
@@ -141,6 +143,24 @@ trigonometric tables are prepared per position. SM86 compilation uses 18
 registers with no stack, spills, or shared memory; the chained verifier checks
 position 131,071 against the Rust oracle and requires an exactly unchanged
 tail.
+
+The first packed paged-GQA correctness candidate fixes Qwen3.8-27B's exact
+24-query-head, 4-KV-head, 256-wide geometry. Persistent device storage consists
+only of canonical Q2_B64/Q4_B64 page arenas plus 16-byte page descriptors; it
+never allocates an expanded FP16/FP32 KV cache. Sink, recent, and current pages
+remain Q4 while completed middle pages are demoted to Q2. A verifier-only CPU
+`PagedKvCache` currently performs append quantization and is therefore an
+explicit production-promotion blocker. The kernel directly decodes packed K/V
+and matches the quantized scalar oracle by construction, but its initial
+three-pass softmax scans the cache three times. CUDA 12.6 reports 116 registers
+and zero stack/spill/shared-memory bytes for the SM86 candidate. The current
+unified cubin SHA-256 is
+`43d2fe525dde15495adf26c33d4f4cd5461a3e06fd1cde3d3f920434edcaca4f`.
+Its numerical/demotion/reset/unload verifier is queued on physical GPU 2 after
+the teacher, evaluation, activation and earlier verifier chain; GPU 0 is never
+eligible. Promotion requires a device-side page pack/demotion path and an
+upstream-anchored online-softmax/tiled rewrite with controlled roofline
+evidence.
 
 The first GPU3 run is recorded in
 `benchmarks/cuda/sm86-q2q4-fused-matvec-20260826.json`. It proved both formats

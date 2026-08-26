@@ -20,12 +20,15 @@ use super::cuda::{
     A8_QUANTIZE_SYMBOL, CAUSAL_CONV_F16_SYMBOL, GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS,
     GATED_DELTA_KEY_DIM, GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
     GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
-    LINEAR_CONV_STATE_BYTES, PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
-    Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
+    LINEAR_CONV_STATE_BYTES, PAGED_GQA_DESCRIPTOR_BYTES, PAGED_GQA_PARAMS_BYTES,
+    PAGED_Q2Q4_GQA_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
+    Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
     Q4_B64_RECOVERED_ROW_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
+use crate::kv_cache::{KvPrecision, PagedKvCache};
+use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
 
 type CuResult = i32;
@@ -173,6 +176,7 @@ struct CudaContextInner {
     gated_rms_norm_f16_function: CuFunction,
     qwen_rms_norm_f16_function: CuFunction,
     partial_rope_f32_function: CuFunction,
+    paged_q2q4_gqa_f32_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
 }
@@ -399,6 +403,44 @@ pub struct PreparedCudaPartialRope {
     transient_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaPagedGqaConfig {
+    pub query_heads: usize,
+    pub key_value_heads: usize,
+    pub head_dim: usize,
+    pub maximum_tokens: usize,
+    pub page_tokens: usize,
+    pub sink_tokens: usize,
+    pub recent_tokens: usize,
+}
+
+pub struct PreparedCudaPagedGqa {
+    context: Rc<CudaContextInner>,
+    config: CudaPagedGqaConfig,
+    q2_token_bytes: usize,
+    q4_token_bytes: usize,
+    q2_page_bytes: usize,
+    q4_page_bytes: usize,
+    q4_slots: usize,
+    cache: PagedKvCache,
+    page_to_q4_slot: Vec<Option<usize>>,
+    free_q4_slots: Vec<usize>,
+    q2_pages: DeviceBuffer,
+    q4_pages: DeviceBuffer,
+    descriptors: DeviceBuffer,
+    query: DeviceBuffer,
+    output: DeviceBuffer,
+    params: DeviceBuffer,
+    packed_device_bytes: usize,
+    transient_bytes: usize,
+    poisoned: bool,
+}
+
+struct CudaKvPageSnapshot {
+    precision: KvPrecision,
+    bytes: Vec<u8>,
+}
+
 impl CudaCandidateRuntime {
     /// Creates a private driver context on one exact device and loads the
     /// caller-supplied cubin. Only compute capability 8.6 is accepted.
@@ -606,6 +648,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let paged_q2q4_gqa_f32_function =
+            match resolve_function(&driver, module, PAGED_Q2Q4_GQA_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         Ok(Self {
             inner: Rc::new(CudaContextInner {
                 driver,
@@ -623,6 +676,7 @@ impl CudaCandidateRuntime {
                 gated_rms_norm_f16_function,
                 qwen_rms_norm_f16_function,
                 partial_rope_f32_function,
+                paged_q2q4_gqa_f32_function,
                 device_name,
                 compute_capability,
             }),
@@ -1201,6 +1255,295 @@ impl CudaCandidateRuntime {
         if result.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
                 "CUDA partial RoPE produced a non-finite output".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn prepare_paged_q2q4_gqa(
+        &self,
+        config: CudaPagedGqaConfig,
+    ) -> Result<PreparedCudaPagedGqa> {
+        if config.query_heads != 24
+            || config.key_value_heads != 4
+            || config.head_dim != 256
+            || config.maximum_tokens == 0
+            || config.page_tokens == 0
+            || !config.sink_tokens.is_multiple_of(config.page_tokens)
+            || config.sink_tokens > config.maximum_tokens
+            || config.recent_tokens > config.maximum_tokens
+        {
+            return Err(EngineError::Shape(
+                "CUDA paged GQA requires Qwen's 24/4/256 heads and a valid page policy".into(),
+            ));
+        }
+        let component_values = config.key_value_heads * config.head_dim;
+        let combined_values = component_values * 2;
+        if !combined_values.is_multiple_of(BLOCK_LEN) {
+            return Err(EngineError::Shape(
+                "CUDA combined KV width must be divisible by 64".into(),
+            ));
+        }
+        let cache = PagedKvCache::new(
+            config.maximum_tokens,
+            component_values,
+            config.page_tokens,
+            config.sink_tokens,
+            config.recent_tokens,
+        )?;
+        let maximum_pages = config.maximum_tokens.div_ceil(config.page_tokens);
+        let blocks_per_token = combined_values / BLOCK_LEN;
+        let q2_token_bytes = blocks_per_token * Q2_BLOCK_BYTES;
+        let q4_token_bytes = blocks_per_token * Q4_BLOCK_BYTES;
+        let q2_page_bytes = config
+            .page_tokens
+            .checked_mul(q2_token_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA Q2 page bytes overflow".into()))?;
+        let q4_page_bytes = config
+            .page_tokens
+            .checked_mul(q4_token_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA Q4 page bytes overflow".into()))?;
+        let q4_slots = config
+            .sink_tokens
+            .checked_div(config.page_tokens)
+            .and_then(|slots| slots.checked_add(config.recent_tokens.div_ceil(config.page_tokens)))
+            .and_then(|slots| slots.checked_add(1))
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA Q4 slot count overflows".into()))?
+            .clamp(1, maximum_pages);
+        let q2_arena_bytes = maximum_pages
+            .checked_mul(q2_page_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA Q2 arena overflows".into()))?;
+        let q4_arena_bytes = q4_slots
+            .checked_mul(q4_page_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA Q4 arena overflows".into()))?;
+        let descriptor_bytes = maximum_pages
+            .checked_mul(PAGED_GQA_DESCRIPTOR_BYTES)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA KV descriptors overflow".into()))?;
+        let value_bytes = config
+            .query_heads
+            .checked_mul(config.head_dim)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA GQA values overflow".into()))?;
+        let q2_pages = DeviceBuffer::allocate(self, q2_arena_bytes)?;
+        let q4_pages = DeviceBuffer::allocate(self, q4_arena_bytes)?;
+        let descriptors = DeviceBuffer::allocate(self, descriptor_bytes)?;
+        let query = DeviceBuffer::allocate(self, value_bytes)?;
+        let output = DeviceBuffer::allocate(self, value_bytes)?;
+        let params = DeviceBuffer::allocate(self, PAGED_GQA_PARAMS_BYTES)?;
+        q2_pages.zero()?;
+        q4_pages.zero()?;
+        descriptors.zero()?;
+        query.zero()?;
+        output.zero()?;
+        params.zero()?;
+        Ok(PreparedCudaPagedGqa {
+            context: Rc::clone(&self.inner),
+            config,
+            q2_token_bytes,
+            q4_token_bytes,
+            q2_page_bytes,
+            q4_page_bytes,
+            q4_slots,
+            cache,
+            page_to_q4_slot: vec![None; maximum_pages],
+            free_q4_slots: (0..q4_slots).rev().collect(),
+            q2_pages,
+            q4_pages,
+            descriptors,
+            query,
+            output,
+            params,
+            packed_device_bytes: q2_arena_bytes + q4_arena_bytes + descriptor_bytes,
+            transient_bytes: value_bytes * 2 + PAGED_GQA_PARAMS_BYTES,
+            poisoned: false,
+        })
+    }
+
+    pub fn append_and_dispatch_paged_q2q4_gqa(
+        &self,
+        prepared: &mut PreparedCudaPagedGqa,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<Vec<f32>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA paged GQA belongs to another context".into(),
+            ));
+        }
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA paged GQA state is poisoned; reset is required".into(),
+            ));
+        }
+        let query_values = prepared.config.query_heads * prepared.config.head_dim;
+        let component_values = prepared.config.key_value_heads * prepared.config.head_dim;
+        for (name, values, expected) in [
+            ("query", query, query_values),
+            ("key", key, component_values),
+            ("value", value, component_values),
+        ] {
+            if values.len() != expected || values.iter().any(|item| !item.is_finite()) {
+                return Err(EngineError::Shape(format!(
+                    "CUDA paged GQA {name} has invalid length or values"
+                )));
+            }
+        }
+        if prepared.cache.tokens() >= prepared.config.maximum_tokens {
+            return Err(EngineError::MemoryBudget(
+                "CUDA paged GQA reached its token capacity".into(),
+            ));
+        }
+        prepared.poisoned = true;
+        let result = self.append_and_dispatch_paged_q2q4_gqa_inner(prepared, query, key, value);
+        if result.is_ok() {
+            prepared.poisoned = false;
+        }
+        result
+    }
+
+    fn append_and_dispatch_paged_q2q4_gqa_inner(
+        &self,
+        prepared: &mut PreparedCudaPagedGqa,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<Vec<f32>> {
+        let update = prepared.cache.push(key, value)?;
+        for page_index in update.demoted_pages {
+            let page = cuda_kv_page_snapshot(&prepared.cache, page_index)?;
+            if page.precision != KvPrecision::Q2 {
+                return Err(EngineError::InvalidState(
+                    "CUDA demoted KV page did not become Q2".into(),
+                ));
+            }
+            prepared.q2_pages.write_range(
+                page_index
+                    .checked_mul(prepared.q2_page_bytes)
+                    .ok_or_else(|| EngineError::MemoryBudget("CUDA Q2 slot overflows".into()))?,
+                &page.bytes,
+            )?;
+            let slot = prepared.page_to_q4_slot[page_index].take().ok_or_else(|| {
+                EngineError::InvalidState("CUDA demoted page has no Q4 slot".into())
+            })?;
+            prepared.q4_pages.zero_range(
+                slot.checked_mul(prepared.q4_page_bytes)
+                    .ok_or_else(|| EngineError::MemoryBudget("CUDA Q4 slot overflows".into()))?,
+                prepared.q4_page_bytes,
+            )?;
+            prepared.free_q4_slots.push(slot);
+        }
+
+        let current = cuda_kv_page_snapshot(&prepared.cache, update.page_index)?;
+        if current.precision != KvPrecision::Q4 {
+            return Err(EngineError::InvalidState(
+                "CUDA current KV page is not Q4".into(),
+            ));
+        }
+        let q4_slot = match prepared.page_to_q4_slot[update.page_index] {
+            Some(slot) => slot,
+            None => {
+                let slot = prepared.free_q4_slots.pop().ok_or_else(|| {
+                    EngineError::MemoryBudget("CUDA Q4 arena has no free slot".into())
+                })?;
+                prepared.page_to_q4_slot[update.page_index] = Some(slot);
+                slot
+            }
+        };
+        prepared.q4_pages.write_range(
+            q4_slot
+                .checked_mul(prepared.q4_page_bytes)
+                .ok_or_else(|| EngineError::MemoryBudget("CUDA Q4 slot overflows".into()))?,
+            &current.bytes,
+        )?;
+
+        let mut descriptor_words = Vec::with_capacity(
+            prepared.cache.page_views().len() * (PAGED_GQA_DESCRIPTOR_BYTES / 4),
+        );
+        for page in prepared.cache.page_views() {
+            let (precision, slot) = match page.precision {
+                KvPrecision::Q2 => (0_u32, page.page_index),
+                KvPrecision::Q4 => (
+                    1_u32,
+                    prepared.page_to_q4_slot[page.page_index].ok_or_else(|| {
+                        EngineError::InvalidState("CUDA Q4 page has no arena slot".into())
+                    })?,
+                ),
+            };
+            descriptor_words.extend_from_slice(&[
+                precision,
+                u32::try_from(slot)
+                    .map_err(|_| EngineError::Shape("CUDA KV slot exceeds u32".into()))?,
+                u32::try_from(page.tokens)
+                    .map_err(|_| EngineError::Shape("CUDA page tokens exceed u32".into()))?,
+                u32::try_from(page.first_token)
+                    .map_err(|_| EngineError::Shape("CUDA token index exceeds u32".into()))?,
+            ]);
+        }
+        prepared
+            .descriptors
+            .write_range(0, as_bytes(&descriptor_words))?;
+        prepared.query.write(as_bytes(query))?;
+        let page_count = prepared.cache.page_views().len();
+        let combined_values = prepared.config.key_value_heads * prepared.config.head_dim * 2;
+        let params_words = [
+            prepared.config.query_heads as u32,
+            prepared.config.key_value_heads as u32,
+            prepared.config.head_dim as u32,
+            prepared.cache.tokens() as u32,
+            prepared.config.page_tokens as u32,
+            page_count as u32,
+            combined_values as u32,
+            prepared.q2_token_bytes as u32,
+            prepared.q4_token_bytes as u32,
+            prepared.q2_page_bytes as u32,
+            prepared.q4_page_bytes as u32,
+            (1.0 / (prepared.config.head_dim as f32).sqrt()).to_bits(),
+        ];
+        prepared.params.write(as_bytes(&params_words))?;
+
+        self.make_current()?;
+        let mut query_ptr = prepared.query.ptr();
+        let mut q2_pages = prepared.q2_pages.ptr();
+        let mut q4_pages = prepared.q4_pages.ptr();
+        let mut descriptors = prepared.descriptors.ptr();
+        let mut output = prepared.output.ptr();
+        let mut params_ptr = prepared.params.ptr();
+        let mut kernel_params = [
+            (&mut query_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q2_pages as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q4_pages as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut descriptors as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut params_ptr as *mut CuDevicePtr).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.paged_q2q4_gqa_f32_function,
+                    prepared.config.query_heads as u32,
+                    1,
+                    1,
+                    WARP_SIZE,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    kernel_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "paged Q2/Q4 GQA kernel launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "paged Q2/Q4 GQA context synchronization",
+            )?;
+        }
+        let mut result = vec![0.0_f32; prepared.config.query_heads * prepared.config.head_dim];
+        prepared.output.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|item| !item.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA paged GQA produced a non-finite output".into(),
             ));
         }
         Ok(result)
@@ -2359,6 +2702,62 @@ impl PreparedCudaPartialRope {
     }
 }
 
+impl PreparedCudaPagedGqa {
+    pub fn config(&self) -> CudaPagedGqaConfig {
+        self.config
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.cache.tokens()
+    }
+
+    pub fn maximum_tokens(&self) -> usize {
+        self.config.maximum_tokens
+    }
+
+    /// Fixed device allocation for canonical Q2/Q4 pages and descriptors.
+    /// Query/output/parameter buffers are reported separately as transient.
+    pub fn packed_device_bytes(&self) -> usize {
+        self.packed_device_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn q4_tokens(&self) -> usize {
+        self.cache.q4_tokens()
+    }
+
+    pub fn verifier_cpu_packed_bytes(&self) -> usize {
+        self.cache.packed_bytes()
+    }
+
+    pub fn verifier_flattened_key(&self) -> Result<Vec<f32>> {
+        self.cache
+            .flattened_key(self.config.key_value_heads, self.config.head_dim)
+    }
+
+    pub fn verifier_flattened_value(&self) -> Result<Vec<f32>> {
+        self.cache
+            .flattened_value(self.config.key_value_heads, self.config.head_dim)
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        self.cache.reset();
+        self.page_to_q4_slot.fill(None);
+        self.free_q4_slots = (0..self.q4_slots).rev().collect();
+        self.q2_pages.zero()?;
+        self.q4_pages.zero()?;
+        self.descriptors.zero()?;
+        self.query.zero()?;
+        self.output.zero()?;
+        self.params.zero()?;
+        self.poisoned = false;
+        Ok(())
+    }
+}
+
 impl Drop for CudaContextInner {
     fn drop(&mut self) {
         unsafe {
@@ -2420,6 +2819,29 @@ impl DeviceBuffer {
         }
     }
 
+    fn write_range(&self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| EngineError::Shape("CUDA ranged copy overflows".into()))?;
+        if end > self.len {
+            return Err(EngineError::Shape(format!(
+                "CUDA ranged copy ends at {end}, buffer has {} bytes",
+                self.len
+            )));
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.context.make_current()?;
+        let target = device_ptr_offset(self.ptr, offset)?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.memcpy_htod)(target, bytes.as_ptr().cast(), bytes.len()),
+                "ranged host-to-device copy",
+            )
+        }
+    }
+
     fn copy_to(&self, bytes: &mut [u8]) -> Result<()> {
         if bytes.len() != self.len {
             return Err(EngineError::Shape(format!(
@@ -2447,6 +2869,29 @@ impl DeviceBuffer {
         }
     }
 
+    fn zero_range(&self, offset: usize, len: usize) -> Result<()> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| EngineError::Shape("CUDA ranged zero overflows".into()))?;
+        if end > self.len {
+            return Err(EngineError::Shape(format!(
+                "CUDA ranged zero ends at {end}, buffer has {} bytes",
+                self.len
+            )));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        self.context.make_current()?;
+        let target = device_ptr_offset(self.ptr, offset)?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.memset_d8)(target, 0, len),
+                "ranged device-buffer zero",
+            )
+        }
+    }
+
     fn ptr(&self) -> CuDevicePtr {
         self.ptr
     }
@@ -2463,6 +2908,21 @@ impl Drop for DeviceBuffer {
             let _ = (self.context.driver.mem_free)(self.ptr);
         }
     }
+}
+
+fn cuda_kv_page_snapshot(cache: &PagedKvCache, page_index: usize) -> Result<CudaKvPageSnapshot> {
+    let page = cache
+        .page_views()
+        .find(|page| page.page_index == page_index)
+        .ok_or_else(|| {
+            EngineError::InvalidState(format!(
+                "CUDA KV update refers to missing page {page_index}"
+            ))
+        })?;
+    Ok(CudaKvPageSnapshot {
+        precision: page.precision,
+        bytes: page.bytes.to_vec(),
+    })
 }
 
 fn optional_scale_buffer(

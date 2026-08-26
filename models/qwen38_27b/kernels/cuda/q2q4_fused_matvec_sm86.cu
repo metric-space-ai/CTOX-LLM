@@ -606,3 +606,162 @@ void ctox_partial_rope_f32_sm86(
     values[base + index] = left * cosine[index] - right * sine[index];
     values[base + index + half_dim] = right * cosine[index] + left * sine[index];
 }
+
+struct CtoxPagedKvDescriptor {
+    unsigned precision;
+    unsigned physical_slot;
+    unsigned tokens;
+    unsigned first_token;
+};
+
+struct CtoxPagedGqaParams {
+    unsigned query_heads;
+    unsigned key_value_heads;
+    unsigned head_dim;
+    unsigned tokens;
+    unsigned page_tokens;
+    unsigned page_count;
+    unsigned combined_values;
+    unsigned q2_token_bytes;
+    unsigned q4_token_bytes;
+    unsigned q2_page_bytes;
+    unsigned q4_page_bytes;
+    float scale;
+};
+
+__device__ __forceinline__ float decode_paged_kv(
+    const unsigned char* q2_pages,
+    const unsigned char* q4_pages,
+    const CtoxPagedKvDescriptor& descriptor,
+    unsigned token_in_page,
+    unsigned value_index,
+    const CtoxPagedGqaParams& params) {
+    if (descriptor.precision == 0u) {
+        const unsigned char* token_base = q2_pages
+            + static_cast<unsigned long long>(descriptor.physical_slot)
+                * params.q2_page_bytes
+            + static_cast<unsigned long long>(token_in_page)
+                * params.q2_token_bytes;
+        const unsigned block = value_index / kBlockLen;
+        const unsigned index = value_index - block * kBlockLen;
+        const unsigned char* packed = token_base + block * kQ2BlockBytes;
+        const unsigned code = (packed[2u + index / 4u]
+            >> ((index & 3u) * 2u)) & 3u;
+        return load_f16(packed)
+            * (static_cast<float>(static_cast<int>(code) * 2 - 3) * (1.0f / 3.0f));
+    }
+    const unsigned char* token_base = q4_pages
+        + static_cast<unsigned long long>(descriptor.physical_slot)
+            * params.q4_page_bytes
+        + static_cast<unsigned long long>(token_in_page)
+            * params.q4_token_bytes;
+    const unsigned block = value_index / kBlockLen;
+    const unsigned index = value_index - block * kBlockLen;
+    const unsigned char* packed = token_base + block * kQ4BlockBytes;
+    const unsigned byte = packed[2u + index / 2u];
+    const unsigned code = (byte >> ((index & 1u) * 4u)) & 15u;
+    return load_f16(packed)
+        * (static_cast<float>(static_cast<int>(code) * 2 - 15) * (1.0f / 15.0f));
+}
+
+// Decode-only grouped-query attention over persistent mixed Q2/Q4 pages.
+// One warp owns one query head and decodes packed K/V values directly into
+// registers. This correctness candidate uses three cache scans (max,
+// denominator, value accumulation); promotion requires replacing it with the
+// pinned online-softmax/tiled organization and proving the roofline gate.
+// ref: ggml/src/ggml-cuda/fattn-vec.cuh:1-611
+// ref: ggml/src/ggml-cuda/fattn-common.cuh:1-1274
+extern "C" __global__ __launch_bounds__(32, 8)
+void ctox_paged_q2q4_gqa_decode_f32_sm86(
+    const float* __restrict__ query,
+    const unsigned char* __restrict__ q2_pages,
+    const unsigned char* __restrict__ q4_pages,
+    const CtoxPagedKvDescriptor* __restrict__ descriptors,
+    float* __restrict__ output,
+    const CtoxPagedGqaParams* __restrict__ params_ptr) {
+    const CtoxPagedGqaParams params = *params_ptr;
+    const unsigned query_head = blockIdx.x;
+    const unsigned lane = threadIdx.x;
+    if (query_head >= params.query_heads || params.tokens == 0u
+        || params.query_heads != 24u || params.key_value_heads != 4u
+        || params.head_dim != 256u) {
+        return;
+    }
+    const unsigned query_heads_per_kv = params.query_heads / params.key_value_heads;
+    const unsigned key_value_head = query_head / query_heads_per_kv;
+    const unsigned query_base = query_head * params.head_dim;
+    const unsigned key_base = key_value_head * params.head_dim;
+    const unsigned value_base = params.combined_values / 2u + key_base;
+
+    float maximum = -3.402823466e+38f;
+    for (unsigned page = 0u; page < params.page_count; ++page) {
+        const CtoxPagedKvDescriptor descriptor = descriptors[page];
+        for (unsigned token = 0u; token < descriptor.tokens; ++token) {
+            float partial = 0.0f;
+#pragma unroll
+            for (unsigned slot = 0u; slot < 8u; ++slot) {
+                const unsigned dim = lane + slot * kWarpSize;
+                partial = fmaf(query[query_base + dim],
+                               decode_paged_kv(q2_pages, q4_pages, descriptor,
+                                               token, key_base + dim, params),
+                               partial);
+            }
+            const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
+                * params.scale;
+            maximum = fmaxf(maximum, score);
+        }
+    }
+
+    float denominator = 0.0f;
+    for (unsigned page = 0u; page < params.page_count; ++page) {
+        const CtoxPagedKvDescriptor descriptor = descriptors[page];
+        for (unsigned token = 0u; token < descriptor.tokens; ++token) {
+            float partial = 0.0f;
+#pragma unroll 1
+            for (unsigned slot = 0u; slot < 8u; ++slot) {
+                const unsigned dim = lane + slot * kWarpSize;
+                partial = fmaf(query[query_base + dim],
+                               decode_paged_kv(q2_pages, q4_pages, descriptor,
+                                               token, key_base + dim, params),
+                               partial);
+            }
+            const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
+                * params.scale;
+            denominator += expf(score - maximum);
+        }
+    }
+
+    float accumulated[8] = {0.0f, 0.0f, 0.0f, 0.0f,
+                            0.0f, 0.0f, 0.0f, 0.0f};
+    for (unsigned page = 0u; page < params.page_count; ++page) {
+        const CtoxPagedKvDescriptor descriptor = descriptors[page];
+        for (unsigned token = 0u; token < descriptor.tokens; ++token) {
+            float partial = 0.0f;
+#pragma unroll 1
+            for (unsigned slot = 0u; slot < 8u; ++slot) {
+                const unsigned dim = lane + slot * kWarpSize;
+                partial = fmaf(query[query_base + dim],
+                               decode_paged_kv(q2_pages, q4_pages, descriptor,
+                                               token, key_base + dim, params),
+                               partial);
+            }
+            const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
+                * params.scale;
+            const float probability = expf(score - maximum) / denominator;
+#pragma unroll 1
+            for (unsigned slot = 0u; slot < 8u; ++slot) {
+                const unsigned dim = lane + slot * kWarpSize;
+                accumulated[slot] = fmaf(
+                    probability,
+                    decode_paged_kv(q2_pages, q4_pages, descriptor,
+                                    token, value_base + dim, params),
+                    accumulated[slot]);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        const unsigned dim = lane + slot * kWarpSize;
+        output[query_base + dim] = accumulated[slot];
+    }
+}

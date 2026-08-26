@@ -243,6 +243,7 @@ pub const CAUSAL_CONV_F16_SYMBOL: &str = "ctox_causal_conv_silu_f16_sm86";
 pub const GATED_RMS_NORM_F16_SYMBOL: &str = "ctox_gated_rms_norm_f16_sm86";
 pub const QWEN_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_rms_norm_f16_sm86";
 pub const PARTIAL_ROPE_F32_SYMBOL: &str = "ctox_partial_rope_f32_sm86";
+pub const PAGED_Q2Q4_GQA_F32_SYMBOL: &str = "ctox_paged_q2q4_gqa_decode_f32_sm86";
 pub const LINEAR_CONV_CHANNELS: usize = 10_240;
 pub const LINEAR_CONV_KERNEL_WIDTH: usize = 4;
 pub const LINEAR_CONV_STATE_BYTES: usize = LINEAR_CONV_CHANNELS * LINEAR_CONV_KERNEL_WIDTH * 2;
@@ -389,6 +390,42 @@ pub const PARTIAL_ROPE_F32_PARAMS: &[KernelParam] = &[
     },
 ];
 pub const PARTIAL_ROPE_F32_PARAM_BYTES: u32 = 36;
+
+pub const PAGED_GQA_DESCRIPTOR_BYTES: usize = 16;
+pub const PAGED_GQA_PARAMS_BYTES: usize = 48;
+pub const PAGED_Q2Q4_GQA_F32_PARAMS: &[KernelParam] = &[
+    KernelParam {
+        name: "query",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 0,
+    },
+    KernelParam {
+        name: "q2_pages",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 8,
+    },
+    KernelParam {
+        name: "q4_pages",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 16,
+    },
+    KernelParam {
+        name: "descriptors",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 24,
+    },
+    KernelParam {
+        name: "output",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 32,
+    },
+    KernelParam {
+        name: "params",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 40,
+    },
+];
+pub const PAGED_Q2Q4_GQA_F32_PARAM_BYTES: u32 = 48;
 
 /// Module-level ABI contract for the SM86 kernel image: the compute
 /// capability the cubin must target and every kernel it must export.
@@ -890,11 +927,17 @@ mod tests {
         assert_eq!(QWEN_RMS_NORM_F16_PARAM_BYTES, 36);
         assert_eq!(PARTIAL_ROPE_F32_PARAMS.len(), 6);
         assert_eq!(PARTIAL_ROPE_F32_PARAM_BYTES, 36);
+        assert_eq!(PAGED_GQA_DESCRIPTOR_BYTES, 16);
+        assert_eq!(PAGED_GQA_PARAMS_BYTES, 48);
+        assert_eq!(PAGED_Q2Q4_GQA_F32_PARAMS.len(), 6);
+        assert_eq!(PAGED_Q2Q4_GQA_F32_PARAMS[5].offset_bytes, 40);
+        assert_eq!(PAGED_Q2Q4_GQA_F32_PARAM_BYTES, 48);
         for symbol in [
             CAUSAL_CONV_F16_SYMBOL,
             GATED_RMS_NORM_F16_SYMBOL,
             QWEN_RMS_NORM_F16_SYMBOL,
             PARTIAL_ROPE_F32_SYMBOL,
+            PAGED_Q2Q4_GQA_F32_SYMBOL,
         ] {
             assert!(!SM86_MODULE_ABI
                 .kernels

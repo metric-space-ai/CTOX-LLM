@@ -94,6 +94,69 @@
       "purpose": "Unmodified public host declaration paired with rope.cu."
     },
     {
+      "path": "ggml/src/ggml-cuda/fattn-common.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/fattn-common.cuh",
+      "sha256": "47537d7980d81f7dc9daa18698f5fdbb990ef6b916fa75fed4bc0bbfd1aa08cb",
+      "lines": 1274,
+      "purpose": "Shared flash-attention reductions, masks, addressing, and softmax primitives used by all CUDA FATTN profiles."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/fattn-mma-f16.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/fattn-mma-f16.cuh",
+      "sha256": "08977d8e6e26ce2c8554c85c97e1fa07c1c4e3bdbe454eaf9b9b53c677fa4038",
+      "lines": 2033,
+      "purpose": "Ampere MMA FP16 flash-attention tile and online-softmax organization for the future SM86 prefill path."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/fattn-tile.cu",
+      "upstream_path": "ggml/src/ggml-cuda/fattn-tile.cu",
+      "sha256": "f57657daf3c5209a32d182bb888ead02b1e806a26273cfa4df8b0a6345ae8247",
+      "lines": 61,
+      "purpose": "Host dispatch for tiled flash-attention profiles."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/fattn-tile.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/fattn-tile.cuh",
+      "sha256": "a7f895b618b579b3069d80bb7ea86d8b51fc46829af7bd58986d3af391b6b17c",
+      "lines": 1361,
+      "purpose": "Tiled flash-attention decode/prefill kernels, online softmax, and head-dimension specialization."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/fattn-vec.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/fattn-vec.cuh",
+      "sha256": "f6305c9a667f438565ee0afff0e854cce335ddbd67e30fbee466cbc5672a9577",
+      "lines": 611,
+      "purpose": "Vectorized flash-attention implementation and warp reductions relevant to single-token decode."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/fattn-wmma-f16.cu",
+      "upstream_path": "ggml/src/ggml-cuda/fattn-wmma-f16.cu",
+      "sha256": "cd3376a730117d5f31399581033e0cc47f8c48dcca41a48c6f483ee6607fbc61",
+      "lines": 705,
+      "purpose": "Host dispatch and architecture gates for the WMMA FP16 flash-attention family."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/fattn-wmma-f16.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/fattn-wmma-f16.cuh",
+      "sha256": "f51678b8cec6b46107cf3c958e5edd4df925a408dc80b0fc5180176a8c692b3b",
+      "lines": 51,
+      "purpose": "WMMA FP16 flash-attention declarations paired with the host dispatcher."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/fattn.cu",
+      "upstream_path": "ggml/src/ggml-cuda/fattn.cu",
+      "sha256": "003afde0510c67a31c4d0b5fd7490416487f2246aaf2bbb80567e655dba95df6",
+      "lines": 597,
+      "purpose": "Top-level CUDA flash-attention selection and per-architecture/profile eligibility."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/fattn.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/fattn.cuh",
+      "sha256": "e3a56f9e753b3994a086f668903e9c960ade092e134df9ff55b351d84828d7b6",
+      "lines": 7,
+      "purpose": "Unmodified public host declaration paired with fattn.cu."
+    },
+    {
       "path": "ggml/src/ggml-cuda/ssm-conv.cu",
       "upstream_path": "ggml/src/ggml-cuda/ssm-conv.cu",
       "sha256": "684ef5e8180ba88bb1f389310b28f8a694cb107a924492c43682a5c5c1754424",
