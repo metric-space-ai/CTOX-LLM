@@ -184,8 +184,9 @@ still required before this changes backend promotion state.
 Metal target selection now also has a finite-checking full-vocabulary argmax
 candidate. It returns only the selected token and invalid-count words, matches
 the engine's larger-token tie rule on Apple Silicon, and rejects non-finite
-logits; the complete Metal executor still needs to bind it directly to the
-resident LM-head output.
+logits. A composed final RMSNorm -> recovered Q2/Q4 LM-head -> argmax verifier
+now binds the selector directly to resident logits in one command encoder; the
+complete Metal decoder executor remains open.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

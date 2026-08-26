@@ -10,8 +10,8 @@ use std::rc::Rc;
 use std::slice;
 
 use metal_driver::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
-    MTLResourceOptions, MTLSize,
+    Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
 use sha2::{Digest, Sha256};
 
@@ -296,22 +296,45 @@ pub struct PreparedMappedMetalCausalConv {
     poisoned: bool,
 }
 
-/// Standalone verifier owner for deterministic device-resident target
-/// selection. Production graph assembly will bind the argmax pipeline directly
-/// to the mapped LM-head output instead of owning this input buffer.
-pub struct PreparedMetalArgMax {
+/// Reusable bounded state for deterministic device-resident target selection.
+/// It deliberately owns no logit input; graph execution binds it directly to
+/// the resident LM-head output.
+pub struct PreparedMetalArgMaxScratch {
     values: usize,
     groups: usize,
-    input_buffer: Buffer,
     partials_buffer: Buffer,
     result_buffer: Buffer,
     params_buffer: Buffer,
+    transient_bytes: usize,
+}
+
+impl PreparedMetalArgMaxScratch {
+    pub fn values(&self) -> usize {
+        self.values
+    }
+
+    pub fn groups(&self) -> usize {
+        self.groups
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+}
+
+/// Standalone verifier owner for deterministic device-resident target
+/// selection. Complete graph assembly instead uses
+/// [`PreparedMetalArgMaxScratch`] and binds the same pipelines directly to the
+/// mapped LM-head output.
+pub struct PreparedMetalArgMax {
+    input_buffer: Buffer,
+    scratch: PreparedMetalArgMaxScratch,
     resident_bytes: usize,
 }
 
 impl PreparedMetalArgMax {
     pub fn values(&self) -> usize {
-        self.values
+        self.scratch.values
     }
 
     pub fn resident_bytes(&self) -> usize {
@@ -319,22 +342,22 @@ impl PreparedMetalArgMax {
     }
 
     pub fn groups(&self) -> usize {
-        self.groups
+        self.scratch.groups
     }
 
     pub fn write_input(&mut self, input: &[f32]) -> Result<()> {
-        if input.len() != self.values {
+        if input.len() != self.scratch.values {
             return Err(EngineError::Shape(format!(
                 "Metal argmax input has {} values, expected {}",
                 input.len(),
-                self.values
+                self.scratch.values
             )));
         }
         write_buffer_range(
             &self.input_buffer,
             0,
             as_bytes(input),
-            self.values * std::mem::size_of::<f32>(),
+            self.scratch.values * std::mem::size_of::<f32>(),
         )
     }
 }
@@ -1145,12 +1168,36 @@ impl MetalCandidateRuntime {
         input: &[f32],
         groups: usize,
     ) -> Result<PreparedMetalArgMax> {
-        if input.is_empty() {
+        let scratch = self.prepare_argmax_f32_scratch_with_groups(input.len(), groups)?;
+        let input_bytes = input
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal argmax input bytes overflow".into()))?;
+        let resident_bytes = input_bytes
+            .checked_add(scratch.transient_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal argmax bytes overflow".into()))?;
+        Ok(PreparedMetalArgMax {
+            input_buffer: buffer_with_data(&self.device, as_bytes(input)),
+            scratch,
+            resident_bytes,
+        })
+    }
+
+    pub fn prepare_argmax_f32_scratch(&self, values: usize) -> Result<PreparedMetalArgMaxScratch> {
+        self.prepare_argmax_f32_scratch_with_groups(values, 32)
+    }
+
+    pub fn prepare_argmax_f32_scratch_with_groups(
+        &self,
+        values: usize,
+        groups: usize,
+    ) -> Result<PreparedMetalArgMaxScratch> {
+        if values == 0 {
             return Err(EngineError::Shape(
                 "Metal argmax input must be non-empty".into(),
             ));
         }
-        let values = u32::try_from(input.len())
+        let encoded_values = u32::try_from(values)
             .map_err(|_| EngineError::Shape("Metal argmax input exceeds u32".into()))?;
         if groups == 0 || groups > 256 || !groups.is_power_of_two() {
             return Err(EngineError::Shape(format!(
@@ -1159,34 +1206,27 @@ impl MetalCandidateRuntime {
         }
         let threads = 256_u32;
         let params = MetalArgMaxParams {
-            values,
+            values: encoded_values,
             threads,
             groups: groups as u32,
             reserved1: 0,
         };
-        let input_bytes = input
-            .len()
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| EngineError::MemoryBudget("Metal argmax input bytes overflow".into()))?;
         let result_bytes = 2 * std::mem::size_of::<u32>();
         let partials_bytes = groups * 4 * std::mem::size_of::<u32>();
-        let input_buffer = buffer_with_data(&self.device, as_bytes(input));
         let partials_buffer = new_zeroed_buffer(&self.device, partials_bytes)?;
         let result_buffer = new_zeroed_buffer(&self.device, result_bytes)?;
         let params_buffer = buffer_with_data(&self.device, &params.encode());
-        let resident_bytes = input_bytes
-            .checked_add(result_bytes)
-            .and_then(|bytes| bytes.checked_add(partials_bytes))
+        let transient_bytes = result_bytes
+            .checked_add(partials_bytes)
             .and_then(|bytes| bytes.checked_add(MetalArgMaxParams::BYTE_LEN))
             .ok_or_else(|| EngineError::MemoryBudget("Metal argmax bytes overflow".into()))?;
-        Ok(PreparedMetalArgMax {
-            values: input.len(),
+        Ok(PreparedMetalArgMaxScratch {
+            values,
             groups,
-            input_buffer,
             partials_buffer,
             result_buffer,
             params_buffer,
-            resident_bytes,
+            transient_bytes,
         })
     }
 
@@ -1208,67 +1248,15 @@ impl MetalCandidateRuntime {
                 "Metal argmax dispatch count must be positive".into(),
             ));
         }
-        zero_buffer(&prepared.result_buffer, 2 * std::mem::size_of::<u32>());
+        zero_buffer(
+            &prepared.scratch.result_buffer,
+            2 * std::mem::size_of::<u32>(),
+        );
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-argmax-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
         for _ in 0..dispatches {
-            encoder.set_compute_pipeline_state(&self.argmax_f32_partial_pipeline);
-            encoder.set_buffer(
-                MetalArgMaxPartialBufferAbi::INPUT as u64,
-                Some(&prepared.input_buffer),
-                0,
-            );
-            encoder.set_buffer(
-                MetalArgMaxPartialBufferAbi::PARTIALS as u64,
-                Some(&prepared.partials_buffer),
-                0,
-            );
-            encoder.set_buffer(
-                MetalArgMaxPartialBufferAbi::PARAMS as u64,
-                Some(&prepared.params_buffer),
-                0,
-            );
-            encoder.dispatch_thread_groups(
-                MTLSize {
-                    width: prepared.groups as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            encoder.set_compute_pipeline_state(&self.argmax_f32_final_pipeline);
-            encoder.set_buffer(
-                MetalArgMaxFinalBufferAbi::PARTIALS as u64,
-                Some(&prepared.partials_buffer),
-                0,
-            );
-            encoder.set_buffer(
-                MetalArgMaxFinalBufferAbi::RESULT as u64,
-                Some(&prepared.result_buffer),
-                0,
-            );
-            encoder.set_buffer(
-                MetalArgMaxFinalBufferAbi::PARAMS as u64,
-                Some(&prepared.params_buffer),
-                0,
-            );
-            encoder.dispatch_thread_groups(
-                MTLSize {
-                    width: 1,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            self.encode_argmax_f32(encoder, &prepared.input_buffer, &prepared.scratch);
         }
         encoder.end_encoding();
         command_buffer.commit();
@@ -1279,18 +1267,82 @@ impl MetalCandidateRuntime {
                 command_buffer.status()
             )));
         }
+        self.read_argmax_result(&prepared.scratch)
+    }
+
+    fn encode_argmax_f32(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input: &Buffer,
+        scratch: &PreparedMetalArgMaxScratch,
+    ) {
+        encoder.set_compute_pipeline_state(&self.argmax_f32_partial_pipeline);
+        encoder.set_buffer(MetalArgMaxPartialBufferAbi::INPUT as u64, Some(input), 0);
+        encoder.set_buffer(
+            MetalArgMaxPartialBufferAbi::PARTIALS as u64,
+            Some(&scratch.partials_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalArgMaxPartialBufferAbi::PARAMS as u64,
+            Some(&scratch.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: scratch.groups as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.set_compute_pipeline_state(&self.argmax_f32_final_pipeline);
+        encoder.set_buffer(
+            MetalArgMaxFinalBufferAbi::PARTIALS as u64,
+            Some(&scratch.partials_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalArgMaxFinalBufferAbi::RESULT as u64,
+            Some(&scratch.result_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalArgMaxFinalBufferAbi::PARAMS as u64,
+            Some(&scratch.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    fn read_argmax_result(&self, scratch: &PreparedMetalArgMaxScratch) -> Result<u32> {
         let result =
-            unsafe { slice::from_raw_parts(prepared.result_buffer.contents().cast::<u32>(), 2) };
+            unsafe { slice::from_raw_parts(scratch.result_buffer.contents().cast::<u32>(), 2) };
         if result[1] != 0 {
             return Err(EngineError::InvalidArtifact(format!(
                 "Metal argmax rejected {} non-finite logits",
                 result[1]
             )));
         }
-        if result[0] as usize >= prepared.values {
+        if result[0] as usize >= scratch.values {
             return Err(EngineError::InvalidState(format!(
                 "Metal argmax selected {}, input has {} values",
-                result[0], prepared.values
+                result[0], scratch.values
             )));
         }
         Ok(result[0])
@@ -3389,15 +3441,11 @@ impl MetalCandidateRuntime {
         Ok(output)
     }
 
-    /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
-    /// projection in a single command encoder. The projection consumes the
-    /// RMSNorm output buffer directly and therefore owns no second activation
-    /// allocation and performs no host readback between operations.
-    pub fn dispatch_mapped_rms_norm_then_projection(
+    fn validate_mapped_norm_projection(
         &self,
         norm: &PreparedMappedMetalRmsNorm,
         projection: &PreparedMappedMetalMatVec,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<()> {
         if norm.rows != 1 || norm.columns != projection.columns {
             return Err(EngineError::Shape(format!(
                 "Metal norm/projection chain has norm {}x{} and projection width {}",
@@ -3414,10 +3462,15 @@ impl MetalCandidateRuntime {
                 "Metal norm and projection do not share one artifact mapping".into(),
             ));
         }
+        Ok(())
+    }
 
-        let command_buffer = self.queue.new_command_buffer();
-        command_buffer.set_label("ctox-qwen38-mmap-rmsnorm-projection-verifier");
-        let encoder = command_buffer.new_compute_command_encoder();
+    fn encode_mapped_norm_projection(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        norm: &PreparedMappedMetalRmsNorm,
+        projection: &PreparedMappedMetalMatVec,
+    ) {
         encoder.set_compute_pipeline_state(&self.rms_norm_1p_pipeline);
         encoder.set_buffer(
             MetalRmsNormBufferAbi::INPUT as u64,
@@ -3505,6 +3558,23 @@ impl MetalCandidateRuntime {
             };
             encoder.dispatch_thread_groups(grid, threads);
         }
+    }
+
+    /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
+    /// projection in a single command encoder. The projection consumes the
+    /// RMSNorm output buffer directly and therefore owns no second activation
+    /// allocation and performs no host readback between operations.
+    pub fn dispatch_mapped_rms_norm_then_projection(
+        &self,
+        norm: &PreparedMappedMetalRmsNorm,
+        projection: &PreparedMappedMetalMatVec,
+    ) -> Result<Vec<f32>> {
+        self.validate_mapped_norm_projection(norm, projection)?;
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-rmsnorm-projection-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_norm_projection(encoder, norm, projection);
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -3527,6 +3597,42 @@ impl MetalCandidateRuntime {
             ));
         }
         Ok(output)
+    }
+
+    /// Execute final RMSNorm, the complete recovered LM-head projection, and
+    /// deterministic target selection in one command encoder. The selector
+    /// may cover fewer values than the physical matrix has rows so padded
+    /// vocabulary rows remain permanently unselectable. No logits are read by
+    /// the host; only `{token_id, invalid_count}` is observed after completion.
+    pub fn dispatch_mapped_rms_norm_projection_argmax(
+        &self,
+        norm: &PreparedMappedMetalRmsNorm,
+        projection: &PreparedMappedMetalMatVec,
+        selector: &PreparedMetalArgMaxScratch,
+    ) -> Result<u32> {
+        self.validate_mapped_norm_projection(norm, projection)?;
+        if selector.values > projection.rows {
+            return Err(EngineError::Shape(format!(
+                "Metal selector has {} valid values, projection has {} rows",
+                selector.values, projection.rows
+            )));
+        }
+        zero_buffer(&selector.result_buffer, 2 * std::mem::size_of::<u32>());
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-lm-head-selection-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_norm_projection(encoder, norm, projection);
+        self.encode_argmax_f32(encoder, &projection.output_buffer, selector);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal LM-head selection command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        self.read_argmax_result(selector)
     }
 
     /// Records the same resident operation repeatedly into one command
@@ -4746,7 +4852,7 @@ mod tests {
     }
 
     #[test]
-    fn mapped_rms_norm_feeds_mixed_projection_without_host_intermediate() {
+    fn mapped_rms_norm_lm_head_argmax_chain_stays_on_device() {
         let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
         let cpu = CpuBackend::scalar_verifier();
         let rows_q2 = 3;
@@ -4818,12 +4924,47 @@ mod tests {
                 "chained projection row {row}: expected {expected}, got {actual}"
             );
         }
+        let expected_token = expected
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(row, _)| row as u32)
+            .expect("non-empty LM-head oracle");
+        let selector = runtime
+            .prepare_argmax_f32_scratch(rows_q2 + rows_q4)
+            .expect("prepare graph-resident selector scratch");
+        assert_eq!(selector.values(), rows_q2 + rows_q4);
+        assert_eq!(selector.groups(), 32);
+        assert_eq!(
+            selector.transient_bytes(),
+            32 * 4 * std::mem::size_of::<u32>()
+                + 2 * std::mem::size_of::<u32>()
+                + MetalArgMaxParams::BYTE_LEN
+        );
+        assert_eq!(
+            runtime
+                .dispatch_mapped_rms_norm_projection_argmax(&norm, &projection, &selector)
+                .expect("select directly from mapped LM-head output"),
+            expected_token
+        );
+        let oversized_selector = runtime
+            .prepare_argmax_f32_scratch(rows_q2 + rows_q4 + 1)
+            .expect("prepare oversized selector contract");
+        assert!(runtime
+            .dispatch_mapped_rms_norm_projection_argmax(&norm, &projection, &oversized_selector,)
+            .is_err());
         norm.write_input(&vec![0.0; columns])
             .expect("update chained norm input");
         let zero = runtime
             .dispatch_mapped_rms_norm_then_projection(&norm, &projection)
             .expect("dispatch zero chained input");
         assert!(zero.iter().all(|value| value.abs() <= f32::EPSILON));
+        assert_eq!(
+            runtime
+                .dispatch_mapped_rms_norm_projection_argmax(&norm, &projection, &selector)
+                .expect("select tied zero logits without host readback"),
+            (rows_q2 + rows_q4 - 1) as u32
+        );
     }
 
     #[test]

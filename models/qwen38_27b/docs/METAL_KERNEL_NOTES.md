@@ -187,10 +187,10 @@ with 32 parallel threadgroups, reduces their 512-byte partial array in a second
 kernel, and returns only `{token_id, invalid_count}`. The target matrix has
 248,320 padded rows, but padded rows are never selectable. Equal scores select
 the larger valid token ID, matching the pinned Rust sampler. Its reusable
-standalone verifier owns one logit buffer, but complete graph assembly will
-bind the same kernels directly to the mapped LM-head output and retain only
-536 bytes of partial/result/parameter state. Any NaN or infinity fails
-closed.
+standalone verifier owns one logit buffer. The composed final RMSNorm,
+recovered Q2/Q4 LM-head, and argmax verifier instead binds the same kernels
+directly to the mapped LM-head output in one command encoder and retains only
+536 bytes of partial/result/parameter state. Any NaN or infinity fails closed.
 
 On Apple M5, an interleaved five-run comparison measured the selected 32-group
 profile at a median 14.580 microseconds per resident selection (68.060 logical
@@ -273,6 +273,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   dispatches the complete 248,077-token vocabulary, proves the larger-token
   tie rule, reuses the resident buffers for a changed winner, returns only two
   u32 values, and rejects a device-observed NaN.
+- `mapped_rms_norm_lm_head_argmax_chain_stays_on_device` encodes final RMSNorm,
+  a mixed Q2/Q4 LM head, and deterministic selection into one command encoder,
+  proves the selected token against the scalar chain, rejects a selector wider
+  than the physical output, and never copies the logit vector to the host.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
