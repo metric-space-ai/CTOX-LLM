@@ -176,6 +176,9 @@ both one-row decode and multi-row prefill.
 Decode RMSNorm and a following mixed Q2/Q4 projection can now be encoded in
 one command encoder: the projection reads the norm output directly and omits
 its otherwise duplicated activation allocation.
+Qwen's non-interleaved partial RoPE is a native in-place Metal candidate for
+the exact 24-query/4-key-head, 256-wide, 64-rotary-dimension topology. Query
+and key transforms share one command encoder and one synchronization.
 Complete-graph residency and unload measurements on the 7.8-GiB artifact are
 still required before this changes backend promotion state.
 

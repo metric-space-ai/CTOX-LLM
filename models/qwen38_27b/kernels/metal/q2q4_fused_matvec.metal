@@ -51,6 +51,17 @@ struct RmsNormParams {
     uint reserved0;
 };
 
+struct PartialRopeParams {
+    uint heads;
+    uint head_dim;
+    uint rotary_dim;
+    uint position;
+    float theta;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
 inline float apply_activation(float value, uint activation) {
     if (activation == 1u) {
         // SiLU: x / (1 + exp(-x)), matching the Rust oracle.
@@ -456,4 +467,27 @@ kernel void qwen_rms_norm_1p_f32(
         float value = input[row_offset + column];
         output[row_offset + column] = value * inverse * (1.0f + float(weight[column]));
     }
+}
+
+// Qwen uses non-interleaved partial RoPE: the first rotary_dim/2 values are
+// paired with the following rotary_dim/2 values. Dimensions at and above
+// rotary_dim remain byte-identical in this in-place kernel.
+kernel void qwen_partial_rope_f32(
+    device float* values [[buffer(0)]],
+    device const float* cosine [[buffer(1)]],
+    device const float* sine [[buffer(2)]],
+    constant PartialRopeParams& params [[buffer(3)]],
+    uint pair_index [[thread_position_in_grid]]) {
+    uint half_dim = params.rotary_dim / 2u;
+    uint pair_count = params.heads * half_dim;
+    if (pair_index >= pair_count) {
+        return;
+    }
+    uint head = pair_index / half_dim;
+    uint index = pair_index - head * half_dim;
+    uint base = head * params.head_dim;
+    float left = values[base + index];
+    float right = values[base + index + half_dim];
+    values[base + index] = left * cosine[index] - right * sine[index];
+    values[base + index + half_dim] = right * cosine[index] + left * sine[index];
 }

@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256};
 
 use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row, MetalBufferAbi,
-    MetalFusedMatVecParams, MetalRmsNormBufferAbi, MetalRmsNormParams,
-    MAX_SIMDGROUPS_PER_THREADGROUP, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
+    MetalFusedMatVecParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
+    MetalRmsNormBufferAbi, MetalRmsNormParams, MAX_SIMDGROUPS_PER_THREADGROUP,
+    PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
     Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
     Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
 };
@@ -48,6 +49,7 @@ pub struct MetalCandidateRuntime {
     q2_recovered_row_pipeline: ComputePipelineState,
     q4_recovered_row_pipeline: ComputePipelineState,
     rms_norm_1p_pipeline: ComputePipelineState,
+    partial_rope_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -195,6 +197,20 @@ pub struct PreparedMappedMetalRmsNorm {
     weight_offset: u64,
     input_buffer: Buffer,
     output_buffer: Buffer,
+    params_buffer: Buffer,
+    transient_bytes: usize,
+}
+
+/// Reusable in-place Qwen partial-RoPE operation for one flattened set of
+/// heads. Position can be updated without reallocating the activation buffer.
+pub struct PreparedMetalPartialRope {
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f32,
+    values_buffer: Buffer,
+    cosine_buffer: Buffer,
+    sine_buffer: Buffer,
     params_buffer: Buffer,
     transient_bytes: usize,
 }
@@ -431,6 +447,70 @@ impl PreparedMappedMetalRmsNorm {
     }
 }
 
+impl PreparedMetalPartialRope {
+    pub fn heads(&self) -> usize {
+        self.heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn rotary_dim(&self) -> usize {
+        self.rotary_dim
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_values(&self, values: &[f32]) -> Result<()> {
+        let expected = self
+            .heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| EngineError::Shape("Metal RoPE value shape overflows".into()))?;
+        validate_metal_input(values, expected)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr(),
+                self.values_buffer.contents().cast::<f32>(),
+                values.len(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        let params = partial_rope_params(
+            self.heads,
+            self.head_dim,
+            self.rotary_dim,
+            position,
+            self.theta,
+        )?;
+        let (cosine, sine) = partial_rope_tables(self.rotary_dim, position, self.theta)?;
+        let encoded = params.encode();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cosine.as_ptr(),
+                self.cosine_buffer.contents().cast::<f32>(),
+                cosine.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                sine.as_ptr(),
+                self.sine_buffer.contents().cast::<f32>(),
+                sine.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                encoded.as_ptr(),
+                self.params_buffer.contents().cast::<u8>(),
+                encoded.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -492,6 +572,13 @@ impl MetalCandidateRuntime {
                     "Metal Qwen RMSNorm function lookup failed: {message}"
                 ))
             })?;
+        let partial_rope_function = library
+            .get_function(PARTIAL_ROPE_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Qwen partial-RoPE function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -543,6 +630,13 @@ impl MetalCandidateRuntime {
                 rms_norm_1p_pipeline.thread_execution_width()
             )));
         }
+        let partial_rope_pipeline = device
+            .new_compute_pipeline_state_with_function(&partial_rope_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Qwen partial-RoPE pipeline creation failed: {message}"
+                ))
+            })?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -554,6 +648,7 @@ impl MetalCandidateRuntime {
             q2_recovered_row_pipeline,
             q4_recovered_row_pipeline,
             rms_norm_1p_pipeline,
+            partial_rope_pipeline,
         })
     }
 
@@ -1065,6 +1160,43 @@ impl MetalCandidateRuntime {
             weight_offset,
             input_buffer,
             output_buffer,
+            params_buffer,
+            transient_bytes,
+        })
+    }
+
+    pub fn prepare_partial_rope(
+        &self,
+        values: &[f32],
+        heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        position: u64,
+        theta: f32,
+    ) -> Result<PreparedMetalPartialRope> {
+        let value_count = heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| EngineError::Shape("Metal RoPE value shape overflows".into()))?;
+        validate_metal_input(values, value_count)?;
+        let params = partial_rope_params(heads, head_dim, rotary_dim, position, theta)?;
+        let (cosine, sine) = partial_rope_tables(rotary_dim, position, theta)?;
+        let values_buffer = buffer_with_data(&self.device, as_bytes(values));
+        let cosine_buffer = buffer_with_data(&self.device, as_bytes(&cosine));
+        let sine_buffer = buffer_with_data(&self.device, as_bytes(&sine));
+        let params_buffer = buffer_with_data(&self.device, &params.encode());
+        let transient_bytes = size_of_val(values)
+            .checked_add(size_of_val(cosine.as_slice()))
+            .and_then(|bytes| bytes.checked_add(size_of_val(sine.as_slice())))
+            .and_then(|bytes| bytes.checked_add(MetalPartialRopeParams::BYTE_LEN))
+            .ok_or_else(|| EngineError::Shape("Metal RoPE transient bytes overflow".into()))?;
+        Ok(PreparedMetalPartialRope {
+            heads,
+            head_dim,
+            rotary_dim,
+            theta,
+            values_buffer,
+            cosine_buffer,
+            sine_buffer,
             params_buffer,
             transient_bytes,
         })
@@ -1695,6 +1827,117 @@ impl MetalCandidateRuntime {
         Ok(output)
     }
 
+    pub fn dispatch_partial_rope(&self, prepared: &PreparedMetalPartialRope) -> Result<Vec<f32>> {
+        self.dispatch_partial_rope_many(&[prepared])?
+            .pop()
+            .ok_or_else(|| EngineError::InvalidState("Metal RoPE output is missing".into()))
+    }
+
+    /// Apply the independent query/key RoPE transforms in one command encoder
+    /// and synchronize once. Output buffers are updated in place.
+    pub fn dispatch_partial_rope_pair(
+        &self,
+        query: &PreparedMetalPartialRope,
+        key: &PreparedMetalPartialRope,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut outputs = self.dispatch_partial_rope_many(&[query, key])?;
+        let key = outputs
+            .pop()
+            .ok_or_else(|| EngineError::InvalidState("Metal key RoPE output is missing".into()))?;
+        let query = outputs.pop().ok_or_else(|| {
+            EngineError::InvalidState("Metal query RoPE output is missing".into())
+        })?;
+        Ok((query, key))
+    }
+
+    fn dispatch_partial_rope_many(
+        &self,
+        prepared: &[&PreparedMetalPartialRope],
+    ) -> Result<Vec<Vec<f32>>> {
+        if prepared.is_empty() {
+            return Err(EngineError::Shape(
+                "Metal RoPE dispatch requires at least one tensor".into(),
+            ));
+        }
+        let thread_width = dispatch_width(&self.partial_rope_pipeline, DEFAULT_SIMDGROUPS)?;
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-partial-rope-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.partial_rope_pipeline);
+        for operation in prepared {
+            encoder.set_buffer(
+                MetalPartialRopeBufferAbi::VALUES as u64,
+                Some(&operation.values_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalPartialRopeBufferAbi::COSINE as u64,
+                Some(&operation.cosine_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalPartialRopeBufferAbi::SINE as u64,
+                Some(&operation.sine_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalPartialRopeBufferAbi::PARAMS as u64,
+                Some(&operation.params_buffer),
+                0,
+            );
+            let pair_count = operation
+                .heads
+                .checked_mul(operation.rotary_dim / 2)
+                .ok_or_else(|| EngineError::Shape("Metal RoPE pair count overflows".into()))?;
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: pair_count.div_ceil(thread_width) as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: thread_width as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal partial-RoPE command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        prepared
+            .iter()
+            .map(|operation| {
+                let value_count =
+                    operation
+                        .heads
+                        .checked_mul(operation.head_dim)
+                        .ok_or_else(|| {
+                            EngineError::Shape("Metal RoPE output shape overflows".into())
+                        })?;
+                let output = unsafe {
+                    slice::from_raw_parts(
+                        operation.values_buffer.contents().cast::<f32>(),
+                        value_count,
+                    )
+                    .to_vec()
+                };
+                if output.iter().any(|value| !value.is_finite()) {
+                    return Err(EngineError::InvalidState(
+                        "Metal partial RoPE produced a non-finite output".into(),
+                    ));
+                }
+                Ok(output)
+            })
+            .collect()
+    }
+
     /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
     /// projection in a single command encoder. The projection consumes the
     /// RMSNorm output buffer directly and therefore owns no second activation
@@ -1928,6 +2171,63 @@ impl MetalCandidateRuntime {
         }
         Ok(output)
     }
+}
+
+fn partial_rope_params(
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    position: u64,
+    theta: f32,
+) -> Result<MetalPartialRopeParams> {
+    if heads == 0
+        || head_dim == 0
+        || rotary_dim == 0
+        || rotary_dim > head_dim
+        || !rotary_dim.is_multiple_of(2)
+        || !theta.is_finite()
+        || theta <= 0.0
+    {
+        return Err(EngineError::Shape(
+            "invalid Metal partial-RoPE contract".into(),
+        ));
+    }
+    Ok(MetalPartialRopeParams {
+        heads: u32::try_from(heads)
+            .map_err(|_| EngineError::Shape("Metal RoPE heads exceed u32".into()))?,
+        head_dim: u32::try_from(head_dim)
+            .map_err(|_| EngineError::Shape("Metal RoPE head dimension exceeds u32".into()))?,
+        rotary_dim: u32::try_from(rotary_dim)
+            .map_err(|_| EngineError::Shape("Metal RoPE dimension exceeds u32".into()))?,
+        position: u32::try_from(position)
+            .map_err(|_| EngineError::Shape("Metal RoPE position exceeds u32".into()))?,
+        theta,
+        reserved0: 0,
+        reserved1: 0,
+        reserved2: 0,
+    })
+}
+
+fn partial_rope_tables(
+    rotary_dim: usize,
+    position: u64,
+    theta: f32,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) || !theta.is_finite() || theta <= 0.0 {
+        return Err(EngineError::Shape(
+            "invalid Metal partial-RoPE table contract".into(),
+        ));
+    }
+    let half_dim = rotary_dim / 2;
+    let mut cosine = Vec::with_capacity(half_dim);
+    let mut sine = Vec::with_capacity(half_dim);
+    for index in 0..half_dim {
+        let inverse_frequency = theta.powf(-((2 * index) as f32) / rotary_dim as f32);
+        let angle = position as f32 * inverse_frequency;
+        cosine.push(angle.cos());
+        sine.push(angle.sin());
+    }
+    Ok((cosine, sine))
 }
 
 fn validate_metal_input(input: &[f32], columns: usize) -> Result<()> {
@@ -2863,5 +3163,92 @@ mod tests {
             .dispatch_mapped_rms_norm_then_projection(&norm, &projection)
             .expect("dispatch zero chained input");
         assert!(zero.iter().all(|value| value.abs() <= f32::EPSILON));
+    }
+
+    #[test]
+    fn partial_rope_pair_matches_qwen_oracle_and_preserves_tail() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let query_heads = 24;
+        let key_heads = 4;
+        let head_dim = 256;
+        let rotary_dim = 64;
+        let position = 12_345;
+        let theta = 10_000_000.0;
+        let query: Vec<f32> = (0..query_heads * head_dim)
+            .map(|index| (index as f32 * 0.013).sin() * 0.8)
+            .collect();
+        let key: Vec<f32> = (0..key_heads * head_dim)
+            .map(|index| (index as f32 * 0.019).cos() * 0.7)
+            .collect();
+        let mut expected_query = query.clone();
+        let mut expected_key = key.clone();
+        crate::reference::apply_partial_rope(
+            &mut expected_query,
+            &mut expected_key,
+            query_heads,
+            key_heads,
+            head_dim,
+            rotary_dim,
+            position,
+            theta,
+        )
+        .expect("partial-RoPE scalar oracle");
+        let prepared_query = runtime
+            .prepare_partial_rope(&query, query_heads, head_dim, rotary_dim, position, theta)
+            .expect("prepare query RoPE");
+        let prepared_key = runtime
+            .prepare_partial_rope(&key, key_heads, head_dim, rotary_dim, position, theta)
+            .expect("prepare key RoPE");
+        assert_eq!(prepared_query.heads(), query_heads);
+        assert_eq!(prepared_query.head_dim(), head_dim);
+        assert_eq!(prepared_query.rotary_dim(), rotary_dim);
+        assert_eq!(
+            prepared_query.transient_bytes(),
+            size_of_val(query.as_slice())
+                + rotary_dim * std::mem::size_of::<f32>()
+                + MetalPartialRopeParams::BYTE_LEN
+        );
+        assert!(runtime
+            .prepare_partial_rope(&query, query_heads, head_dim, 63, position, theta)
+            .is_err());
+        assert!(runtime
+            .prepare_partial_rope(
+                &query,
+                query_heads,
+                head_dim,
+                rotary_dim,
+                u64::from(u32::MAX) + 1,
+                theta,
+            )
+            .is_err());
+        let (actual_query, actual_key) = runtime
+            .dispatch_partial_rope_pair(&prepared_query, &prepared_key)
+            .expect("dispatch query/key RoPE pair");
+        for (kind, expected, actual) in [
+            ("query", &expected_query, &actual_query),
+            ("key", &expected_key, &actual_key),
+        ] {
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 3.0e-5_f32.max(expected.abs() * 4.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "{kind} RoPE value {index}: expected {expected}, got {actual}"
+                );
+            }
+        }
+        for head in 0..query_heads {
+            let tail = head * head_dim + rotary_dim..(head + 1) * head_dim;
+            assert_eq!(&actual_query[tail.clone()], &query[tail]);
+        }
+        prepared_query
+            .write_values(&query)
+            .expect("restore query values");
+        prepared_query
+            .write_position(0)
+            .expect("update RoPE position");
+        let identity = runtime
+            .dispatch_partial_rope(&prepared_query)
+            .expect("dispatch position-zero RoPE");
+        assert_eq!(identity, query);
     }
 }

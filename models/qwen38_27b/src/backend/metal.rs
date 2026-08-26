@@ -24,6 +24,7 @@ pub const Q4_GATHERED_KERNEL_NAME: &str = "q4_b64_gathered_matvec";
 pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
 pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
 pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
+pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -62,6 +63,16 @@ impl MetalRmsNormBufferAbi {
     pub const INPUT: u32 = 0;
     pub const WEIGHT: u32 = 1;
     pub const OUTPUT: u32 = 2;
+    pub const PARAMS: u32 = 3;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalPartialRopeBufferAbi;
+
+impl MetalPartialRopeBufferAbi {
+    pub const VALUES: u32 = 0;
+    pub const COSINE: u32 = 1;
+    pub const SINE: u32 = 2;
     pub const PARAMS: u32 = 3;
 }
 
@@ -114,6 +125,42 @@ impl MetalRmsNormParams {
         encoded[4..8].copy_from_slice(&self.columns.to_le_bytes());
         encoded[8..12].copy_from_slice(&self.epsilon.to_bits().to_le_bytes());
         encoded[12..16].copy_from_slice(&self.reserved0.to_le_bytes());
+        encoded
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalPartialRopeParams {
+    pub heads: u32,
+    pub head_dim: u32,
+    pub rotary_dim: u32,
+    pub position: u32,
+    pub theta: f32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+}
+
+impl MetalPartialRopeParams {
+    pub const BYTE_LEN: usize = 32;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.heads,
+            self.head_dim,
+            self.rotary_dim,
+            self.position,
+            self.theta.to_bits(),
+            self.reserved0,
+            self.reserved1,
+            self.reserved2,
+        ]
+        .iter()
+        .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
         encoded
     }
 }
@@ -607,6 +654,7 @@ mod tests {
         assert!(Q2_RECOVERED_ROW_KERNEL_NAME.starts_with("q2_b64"));
         assert!(Q4_RECOVERED_ROW_KERNEL_NAME.starts_with("q4_b64"));
         assert!(RMS_NORM_1P_KERNEL_NAME.starts_with("qwen_rms_norm"));
+        assert!(PARTIAL_ROPE_KERNEL_NAME.starts_with("qwen_partial_rope"));
     }
 
     #[test]
@@ -668,6 +716,29 @@ mod tests {
             1.0e-6
         );
         assert_eq!(u32::from_le_bytes(encoded[12..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn partial_rope_params_encode_matches_msl_struct() {
+        let params = MetalPartialRopeParams {
+            heads: 24,
+            head_dim: 256,
+            rotary_dim: 64,
+            position: 131_071,
+            theta: 10_000_000.0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
+        };
+        let words: Vec<u32> = params
+            .encode()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            words,
+            vec![24, 256, 64, 131_071, 10_000_000.0_f32.to_bits(), 0, 0, 0]
+        );
     }
 
     #[test]
@@ -847,6 +918,7 @@ mod tests {
             Q2_RECOVERED_ROW_KERNEL_NAME,
             Q4_RECOVERED_ROW_KERNEL_NAME,
             RMS_NORM_1P_KERNEL_NAME,
+            PARTIAL_ROPE_KERNEL_NAME,
         ] {
             assert!(
                 text.contains(&format!("kernel void {name}")),

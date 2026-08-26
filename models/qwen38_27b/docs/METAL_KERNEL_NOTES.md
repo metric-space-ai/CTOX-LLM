@@ -23,6 +23,7 @@ usage, no scalar fallback.
 | `q2_b64_recovered_row` | Q2_B64 embedding row | one packed byte/four corrected outputs per thread |
 | `q4_b64_recovered_row` | Q4_B64 embedding row | one packed byte/two corrected outputs per thread |
 | `qwen_rms_norm_1p_f32` | FP16 weight, f32 activation | one 32-wide simdgroup per row |
+| `qwen_partial_rope_f32` | f32 Q/K heads in place | one thread per non-interleaved rotary pair |
 
 64 values per block, row-major block order, codebook matching
 `src/quant.rs` (Q2: {-1, -1/3, 1/3, 1}; Q4: (code - 7.5) / 7.5). Q3 does not
@@ -118,6 +119,15 @@ buffer as the mixed Q2/Q4 projection input in the same command encoder. Direct
 dispatch of such a projection fails closed because only an explicit upstream
 graph operation can supply its input.
 
+Partial RoPE rotates Qwen's non-interleaved halves in place and never touches
+dimensions at or above `rotary_dim`. Query and key buffers are encoded in one
+command encoder. An initial candidate computed `pow/cos/sin` independently in
+MSL and differed from the f32 reference by roughly `1.65e-4` at position
+12,345, so it was rejected. The accepted path creates the 32 f32 cosine/sine
+pairs with the pinned reference equation, retains those 256 bytes in reusable
+Metal buffers, and performs all head rotations on the GPU. Updating position
+rewrites only these tables and the 32-byte parameter block.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -166,6 +176,11 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   oracles, proves the external-input projection saves exactly one activation
   vector, rejects incorrect standalone use, and updates only the upstream norm
   input for a second zero-output dispatch.
+- `partial_rope_pair_matches_qwen_oracle_and_preserves_tail` uses the exact
+  24-query/4-key-head, 256-wide, 64-rotary-dimension topology at position
+  12,345, encodes Q and K in one command, checks every value against the
+  scalar oracle, proves every non-rotary tail value is bit-identical, rejects
+  invalid contracts, and reuses buffers at position zero.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
@@ -208,8 +223,8 @@ dequantization array before this source was accepted.
   evidence.
 - No controlled size/residue/thermal sweep or hardware-counter roofline
   evidence exists yet.
-- Recovered embedding rows and Qwen RMSNorm exist as verifier candidates; no
-  full attention, GatedDeltaNet, MTP block, sampling, or model-graph Metal
-  execution exists yet.
+- Recovered embedding rows, Qwen RMSNorm, and partial RoPE exist as verifier
+  candidates; no full GQA attention, GatedDeltaNet, MTP block, sampling, or
+  complete model-graph Metal execution exists yet.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.
