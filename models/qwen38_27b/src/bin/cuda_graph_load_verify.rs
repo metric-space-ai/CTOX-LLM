@@ -38,6 +38,8 @@ struct Report<'a> {
     embedding_rows: usize,
     linear_mixer_layers: usize,
     full_attention_states: usize,
+    regular_norms: usize,
+    residual_norms: usize,
     maximum_context_tokens: usize,
     requested_model_bytes: u64,
     requested_graph_bytes: u64,
@@ -76,6 +78,8 @@ fn main() -> anyhow::Result<()> {
     let embedding_rows = graph.embedding().rows();
     let linear_mixer_layers = graph.linear_mixer_count();
     let full_attention_states = graph.full_attention_count();
+    let regular_norms = graph.norms().regular_count();
+    let residual_norms = graph.norms().residual_count();
     let requested_model_bytes = graph.model_bytes();
     let requested_graph_bytes = graph.graph_bytes();
     let requested_session_bytes = graph.session_bytes();
@@ -112,6 +116,8 @@ fn main() -> anyhow::Result<()> {
             embedding_rows,
             linear_mixer_layers,
             full_attention_states,
+            regular_norms,
+            residual_norms,
             maximum_context_tokens: args.maximum_context_tokens,
             requested_model_bytes,
             requested_graph_bytes,
@@ -124,7 +130,7 @@ fn main() -> anyhow::Result<()> {
             observed_allocation_bytes: free_before_prepare.saturating_sub(free_after_prepare),
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
             checksum_and_prepare_milliseconds: elapsed_milliseconds,
-            note: "Full checksum, resident 248320-row embedding, all 505 remaining target/MTP projections, 48 linear-attention state groups, and 16 target plus one MTP packed Q2/Q4 KV state. This proves artifact binding/residency/unload only; decoder execution, logits, and roofline promotion remain separate gates.",
+            note: "Full checksum, resident 248320-row embedding, all 505 remaining target/MTP projections, 48 linear-attention state groups, 17 packed Q2/Q4 KV states, and all 134 decoder/MTP norm operators. This proves artifact binding/residency/unload only; decoder execution, logits, and roofline promotion remain separate gates.",
         })?
     );
     Ok(())

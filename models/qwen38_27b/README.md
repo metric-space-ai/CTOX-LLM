@@ -14,7 +14,7 @@ profile is 131,072 positions.
 |---|---|---|
 | CPU scalar | verifier | forbidden |
 | CPU AVX2/NEON | experimental dot kernels | none |
-| CUDA | contract | none |
+| CUDA | complete resident load-graph candidate plus per-op verifiers | none |
 | Metal | contract plus direct same-device Q2/Q4 verifier | none |
 | Snapdragon HTP/Vulkan | contract | none |
 
@@ -223,9 +223,12 @@ full-load/unload verifier. The packed 248,320-row embedding is resident and
 selected in place without per-token weight upload. The graph also binds every
 linear-attention parameter and persistent FP16 state plus context-sized Q2/Q4
 KV arenas for 16 target and one MTP full-attention layer; the queued GPU3 run
-uses 128K and is a residency gate, not an end-to-end inference claim. The previously
-open full-attention gate edge now has a fused sigmoid-gate/recovery/A8/output-
-projection CUDA candidate and dedicated hardware verifier.
+uses 128K and is a residency gate, not an end-to-end inference claim. All 134
+target/MTP normalization operators are also owned by the load graph: four
+standalone input norms and 130 fused residual/RMSNorm edges. The previously
+open full-attention gate edge has a fused sigmoid-gate/recovery/A8/output-
+projection CUDA candidate and dedicated hardware verifier. Binding the frozen
+645-step schedule to these resident operators remains open.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight

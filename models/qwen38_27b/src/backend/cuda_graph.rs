@@ -15,7 +15,7 @@ use crate::backend::cuda_runtime::{
     PreparedCudaA8Activation, PreparedCudaA8Projection, PreparedCudaCausalConv,
     PreparedCudaEmbedding, PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs,
     PreparedCudaGatedRmsNorm, PreparedCudaPagedGqa, PreparedCudaPartialRope, PreparedCudaQueryGate,
-    PreparedCudaRmsNorm,
+    PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
 };
 use crate::backend::{Activation, ScaleSlice};
 use crate::config::LayerKind;
@@ -177,9 +177,47 @@ pub struct PreparedCudaProjectionGraph {
     projections: BTreeMap<String, PreparedCudaA8Projection>,
     linear_mixers: BTreeMap<usize, PreparedCudaLinearMixerLayer>,
     full_attention: BTreeMap<String, PreparedCudaFullAttentionLayer>,
+    norms: PreparedCudaNormGraph,
     model_bytes: u64,
     graph_bytes: u64,
     session_bytes: u64,
+}
+
+pub struct PreparedCudaNormGraph {
+    regular: BTreeMap<String, PreparedCudaRmsNorm>,
+    residual: BTreeMap<String, PreparedCudaResidualRmsNorm>,
+    model_bytes: u64,
+    graph_bytes: u64,
+}
+
+impl PreparedCudaNormGraph {
+    pub fn regular_count(&self) -> usize {
+        self.regular.len()
+    }
+
+    pub fn residual_count(&self) -> usize {
+        self.residual.len()
+    }
+
+    pub fn regular(&self, key: &str) -> Result<&PreparedCudaRmsNorm> {
+        self.regular
+            .get(key)
+            .ok_or_else(|| EngineError::InvalidState(format!("prepared CUDA norm {key} not found")))
+    }
+
+    pub fn residual(&self, key: &str) -> Result<&PreparedCudaResidualRmsNorm> {
+        self.residual.get(key).ok_or_else(|| {
+            EngineError::InvalidState(format!("prepared CUDA residual norm {key} not found"))
+        })
+    }
+
+    pub fn model_bytes(&self) -> u64 {
+        self.model_bytes
+    }
+
+    pub fn graph_bytes(&self) -> u64 {
+        self.graph_bytes
+    }
 }
 
 pub struct PreparedCudaFullAttentionLayer {
@@ -510,6 +548,9 @@ impl PreparedCudaProjectionGraph {
                 full_attention.len()
             )));
         }
+        let norms = prepare_norms(runtime, artifact, config)?;
+        model_bytes = checked_add(model_bytes, norms.model_bytes, "CUDA model bytes")?;
+        graph_bytes = checked_add(graph_bytes, norms.graph_bytes, "CUDA graph bytes")?;
         Ok(Self {
             artifact: artifact.clone(),
             plan,
@@ -518,6 +559,7 @@ impl PreparedCudaProjectionGraph {
             projections,
             linear_mixers,
             full_attention,
+            norms,
             model_bytes,
             graph_bytes,
             session_bytes,
@@ -591,6 +633,10 @@ impl PreparedCudaProjectionGraph {
         })
     }
 
+    pub fn norms(&self) -> &PreparedCudaNormGraph {
+        &self.norms
+    }
+
     pub fn model_bytes(&self) -> u64 {
         self.model_bytes
     }
@@ -610,6 +656,184 @@ impl PreparedCudaProjectionGraph {
             "CUDA resident bytes",
         )
     }
+}
+
+fn prepare_norms(
+    runtime: &CudaCandidateRuntime,
+    artifact: &ModelArtifact,
+    config: &Qwen38Config,
+) -> Result<PreparedCudaNormGraph> {
+    let mut regular = BTreeMap::new();
+    let mut residual = BTreeMap::new();
+    let mut model_bytes = 0_u64;
+    let mut graph_bytes = 0_u64;
+    let norm_config = CudaRmsNormConfig {
+        rows: 1,
+        columns: config.hidden_size,
+        epsilon: config.rms_norm_epsilon,
+    };
+
+    add_regular_norm(
+        runtime,
+        artifact,
+        norm_config,
+        "target:initial",
+        "model.language_model.layers.0.input_layernorm.weight",
+        &mut regular,
+        &mut model_bytes,
+        &mut graph_bytes,
+    )?;
+    for layer in 0..config.num_hidden_layers {
+        let prefix = format!("model.language_model.layers.{layer}");
+        add_residual_norm(
+            runtime,
+            artifact,
+            norm_config,
+            &format!("target:{layer}:post_attention"),
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            &mut residual,
+            &mut model_bytes,
+            &mut graph_bytes,
+        )?;
+        let (key, tensor) = if layer + 1 == config.num_hidden_layers {
+            (
+                format!("target:{layer}:post_ffn:final"),
+                "model.language_model.norm.weight".to_owned(),
+            )
+        } else {
+            (
+                format!("target:{layer}:post_ffn:layer_{}", layer + 1),
+                format!(
+                    "model.language_model.layers.{}.input_layernorm.weight",
+                    layer + 1
+                ),
+            )
+        };
+        add_residual_norm(
+            runtime,
+            artifact,
+            norm_config,
+            &key,
+            &tensor,
+            &mut residual,
+            &mut model_bytes,
+            &mut graph_bytes,
+        )?;
+    }
+    for (key, tensor) in [
+        ("mtp:pre_embedding", "mtp.pre_fc_norm_embedding.weight"),
+        ("mtp:pre_hidden", "mtp.pre_fc_norm_hidden.weight"),
+        ("mtp:input", "mtp.layers.0.input_layernorm.weight"),
+    ] {
+        add_regular_norm(
+            runtime,
+            artifact,
+            norm_config,
+            key,
+            tensor,
+            &mut regular,
+            &mut model_bytes,
+            &mut graph_bytes,
+        )?;
+    }
+    for (key, tensor) in [
+        (
+            "mtp:post_attention",
+            "mtp.layers.0.post_attention_layernorm.weight",
+        ),
+        ("mtp:final", "mtp.norm.weight"),
+    ] {
+        add_residual_norm(
+            runtime,
+            artifact,
+            norm_config,
+            key,
+            tensor,
+            &mut residual,
+            &mut model_bytes,
+            &mut graph_bytes,
+        )?;
+    }
+    if regular.len() != 4 || residual.len() != config.num_hidden_layers * 2 + 2 {
+        return Err(EngineError::InvalidState(format!(
+            "CUDA norm graph has {} regular and {} residual operators",
+            regular.len(),
+            residual.len()
+        )));
+    }
+    Ok(PreparedCudaNormGraph {
+        regular,
+        residual,
+        model_bytes,
+        graph_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_regular_norm(
+    runtime: &CudaCandidateRuntime,
+    artifact: &ModelArtifact,
+    config: CudaRmsNormConfig,
+    key: &str,
+    tensor: &str,
+    norms: &mut BTreeMap<String, PreparedCudaRmsNorm>,
+    model_bytes: &mut u64,
+    graph_bytes: &mut u64,
+) -> Result<()> {
+    let prepared = runtime.prepare_qwen_rms_norm_f16(config, artifact_f16(artifact, tensor)?)?;
+    *model_bytes = checked_add(
+        *model_bytes,
+        u64::try_from(prepared.model_bytes())
+            .map_err(|_| EngineError::MemoryBudget("CUDA norm model bytes exceed u64".into()))?,
+        "CUDA norm model bytes",
+    )?;
+    *graph_bytes = checked_add(
+        *graph_bytes,
+        u64::try_from(prepared.transient_bytes())
+            .map_err(|_| EngineError::MemoryBudget("CUDA norm graph bytes exceed u64".into()))?,
+        "CUDA norm graph bytes",
+    )?;
+    if norms.insert(key.to_owned(), prepared).is_some() {
+        return Err(EngineError::InvalidState(format!(
+            "duplicate CUDA norm {key}"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_residual_norm(
+    runtime: &CudaCandidateRuntime,
+    artifact: &ModelArtifact,
+    config: CudaRmsNormConfig,
+    key: &str,
+    tensor: &str,
+    norms: &mut BTreeMap<String, PreparedCudaResidualRmsNorm>,
+    model_bytes: &mut u64,
+    graph_bytes: &mut u64,
+) -> Result<()> {
+    let prepared =
+        runtime.prepare_residual_rms_norm_f16(config, artifact_f16(artifact, tensor)?)?;
+    *model_bytes = checked_add(
+        *model_bytes,
+        u64::try_from(prepared.model_bytes()).map_err(|_| {
+            EngineError::MemoryBudget("CUDA residual norm model bytes exceed u64".into())
+        })?,
+        "CUDA norm model bytes",
+    )?;
+    *graph_bytes = checked_add(
+        *graph_bytes,
+        u64::try_from(prepared.transient_bytes()).map_err(|_| {
+            EngineError::MemoryBudget("CUDA residual norm graph bytes exceed u64".into())
+        })?,
+        "CUDA norm graph bytes",
+    )?;
+    if norms.insert(key.to_owned(), prepared).is_some() {
+        return Err(EngineError::InvalidState(format!(
+            "duplicate CUDA residual norm {key}"
+        )));
+    }
+    Ok(())
 }
 
 fn prepare_full_attention(

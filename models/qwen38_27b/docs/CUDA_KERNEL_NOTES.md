@@ -306,8 +306,10 @@ verifier defaults to 128K and reports model, reusable graph and session bytes
 separately. The complete packed embedding table and shared FP16 `s_in` are now
 resident too. Token lookup selects the correct pure or mixed row inside that
 allocation and reuses the recovered-row kernel, while only the requested
-scalar `s_out` is read from the immutable mapping. Decoder residual/input
-norms, remaining MTP norms and actual schedule execution are not yet included.
+scalar `s_out` is read from the immutable mapping. The graph additionally owns
+all 134 target/MTP normalization operators: four standalone input norms and
+130 fused residual/RMSNorm edges, with each following-layer input norm loaded
+exactly once. Actual 645-step schedule execution is not yet included.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not
