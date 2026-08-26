@@ -59,7 +59,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports sixteen explicitly unpromoted
+- The same verifier cubin additionally exports seventeen explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
@@ -74,6 +74,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
   - `ctox_causal_conv_silu_f16_sm86`
   - `ctox_gated_rms_norm_f16_sm86`
   - `ctox_qwen_rms_norm_f16_sm86`
+  - `ctox_qwen_residual_rms_norm_f16_sm86`
   - `ctox_partial_rope_f32_sm86`
   - `ctox_qwen_query_gate_norm_rope_f32_sm86`
   - `ctox_pack_paged_kv_q4_f32_sm86`
@@ -163,6 +164,13 @@ linear-op verifier now feeds both this operation and the direct-weight gated
 RMSNorm from producer-owned device views, includes a two-row 5,120-wide oracle
 comparison, and accounts for model, transient, and explicit verifier-staging
 buffers in the unload proof.
+
+The residual variant fuses `residual + sublayer_update` with the following
+Qwen RMSNorm in the same 256-thread block. It writes both the updated residual
+and normalized activation, so the scheduler can preserve the skip connection
+while feeding the next projection without a standalone add kernel or a second
+read of the sum. The expanded linear-op verifier requires an exact residual
+sum plus the existing RMSNorm tolerance before this edge may be promoted.
 
 Qwen partial RoPE is implemented as an in-place non-interleaved/NeoX-pairing
 candidate anchored to the newly pinned upstream `rope.cu`/`rope.cuh`. Query

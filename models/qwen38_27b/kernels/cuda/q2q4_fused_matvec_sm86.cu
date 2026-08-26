@@ -671,6 +671,58 @@ void ctox_qwen_rms_norm_f16_sm86(
     }
 }
 
+// Fuse the transformer residual edge with the following Qwen RMSNorm. The
+// updated residual remains available for the next sublayer while the second
+// output feeds its projection directly, avoiding a standalone vector-add
+// launch and a second read of the summed activation.
+// ref: ggml/src/ggml-cuda/norm.cu:76-151
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_qwen_residual_rms_norm_f16_sm86(
+    const float* __restrict__ residual,
+    const float* __restrict__ update,
+    const __half* __restrict__ weight,
+    float* __restrict__ residual_output,
+    float* __restrict__ normalized_output,
+    unsigned rows,
+    unsigned columns,
+    float epsilon) {
+    const unsigned row = blockIdx.x;
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned warp = threadIdx.x / kWarpSize;
+    if (row >= rows || columns == 0u || (columns & 31u) != 0u) {
+        return;
+    }
+    const unsigned row_offset = row * columns;
+    float sum_squares = 0.0f;
+    for (unsigned column = threadIdx.x; column < columns; column += blockDim.x) {
+        const unsigned index = row_offset + column;
+        const float sum = residual[index] + update[index];
+        residual_output[index] = sum;
+        sum_squares = fmaf(sum, sum, sum_squares);
+    }
+    sum_squares = warp_sum(sum_squares);
+    __shared__ float warp_sums[8];
+    __shared__ float inverse;
+    if (lane == 0u) {
+        warp_sums[warp] = sum_squares;
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        sum_squares = lane < 8u ? warp_sums[lane] : 0.0f;
+        sum_squares = warp_sum(sum_squares);
+        if (lane == 0u) {
+            inverse = rsqrtf(sum_squares
+                * (1.0f / static_cast<float>(columns)) + epsilon);
+        }
+    }
+    __syncthreads();
+    for (unsigned column = threadIdx.x; column < columns; column += blockDim.x) {
+        const unsigned index = row_offset + column;
+        normalized_output[index] = residual_output[index] * inverse
+            * (1.0f + __half2float(weight[column]));
+    }
+}
+
 // Qwen uses NeoX/non-interleaved pairing: the first rotary_dim/2 values are
 // paired with the following rotary_dim/2 values. Cosine/sine values are tiny
 // per-position control buffers prepared by the host; the tail remains exactly

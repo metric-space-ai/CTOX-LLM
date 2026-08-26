@@ -53,6 +53,9 @@ struct Report<'a> {
     qwen_norm_model_bytes: usize,
     qwen_norm_transient_bytes: usize,
     qwen_norm_device_view_staging_bytes: usize,
+    residual_norm_model_bytes: usize,
+    residual_norm_transient_bytes: usize,
+    residual_norm_device_view_staging_bytes: usize,
     partial_rope_transient_bytes: usize,
     partial_rope_device_view_staging_bytes: usize,
     maximum_convolution_absolute_error: f32,
@@ -61,6 +64,9 @@ struct Report<'a> {
     maximum_gated_norm_relative_error: f32,
     maximum_qwen_norm_absolute_error: f32,
     maximum_qwen_norm_relative_error: f32,
+    maximum_residual_norm_absolute_error: f32,
+    maximum_residual_norm_relative_error: f32,
+    residual_add_exact: bool,
     maximum_partial_rope_absolute_error: f32,
     partial_rope_tail_exact: bool,
     norm_device_view_paths_verified: bool,
@@ -232,6 +238,58 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    let residual_norm =
+        runtime.prepare_residual_rms_norm_f16(qwen_norm_config, &qwen_norm_weight_bytes)?;
+    let residual: Vec<f32> = (0..qwen_norm_config.rows * qwen_norm_config.columns)
+        .map(|index| ((index + 31) as f32 * 0.005).cos() * 0.8)
+        .collect();
+    let update: Vec<f32> = (0..qwen_norm_config.rows * qwen_norm_config.columns)
+        .map(|index| ((index + 17) as f32 * 0.009).sin() * 0.35)
+        .collect();
+    let expected_residual: Vec<f32> = residual
+        .iter()
+        .zip(&update)
+        .map(|(residual, update)| residual + update)
+        .collect();
+    let expected_residual_norm = rms_norm_1p_weight(
+        &expected_residual,
+        qwen_norm_config.rows,
+        qwen_norm_config.columns,
+        &qwen_norm_weight,
+        qwen_norm_config.epsilon,
+    )?;
+    let residual_staging = runtime.prepare_verifier_f32_tensor(&residual)?;
+    let update_staging = runtime.prepare_verifier_f32_tensor(&update)?;
+    let (actual_residual_view, actual_residual_norm_view) = runtime
+        .dispatch_residual_rms_norm_f16_device(
+            &residual_norm,
+            residual_staging.device_view()?,
+            update_staging.device_view()?,
+        )?;
+    let actual_residual = runtime.verifier_read_f32(actual_residual_view)?;
+    let actual_residual_norm = runtime.verifier_read_f32(actual_residual_norm_view)?;
+    let residual_add_exact = actual_residual == expected_residual;
+    anyhow::ensure!(residual_add_exact, "fused residual output differs");
+    let mut maximum_residual_norm_absolute_error = 0.0_f32;
+    let mut maximum_residual_norm_relative_error = 0.0_f32;
+    track_error(
+        &expected_residual_norm,
+        &actual_residual_norm,
+        &mut maximum_residual_norm_absolute_error,
+        &mut maximum_residual_norm_relative_error,
+    );
+    for (index, (expected, actual)) in expected_residual_norm
+        .iter()
+        .zip(&actual_residual_norm)
+        .enumerate()
+    {
+        anyhow::ensure!(
+            (expected - actual).abs()
+                <= args.absolute_tolerance + args.relative_tolerance * expected.abs(),
+            "residual RMSNorm output {index}: expected {expected}, got {actual}"
+        );
+    }
+
     let query_rope_config = CudaPartialRopeConfig {
         heads: 24,
         head_dim: 256,
@@ -314,6 +372,10 @@ fn main() -> anyhow::Result<()> {
     let qwen_norm_model_bytes = qwen_norm.model_bytes();
     let qwen_norm_transient_bytes = qwen_norm.transient_bytes();
     let qwen_norm_device_view_staging_bytes = qwen_norm_input_staging.resident_bytes();
+    let residual_norm_model_bytes = residual_norm.model_bytes();
+    let residual_norm_transient_bytes = residual_norm.transient_bytes();
+    let residual_norm_device_view_staging_bytes =
+        residual_staging.resident_bytes() + update_staging.resident_bytes();
     let partial_rope_transient_bytes = query_rope.transient_bytes() + key_rope.transient_bytes();
     let partial_rope_device_view_staging_bytes =
         query_rope_staging.resident_bytes() + key_rope_staging.resident_bytes();
@@ -325,6 +387,9 @@ fn main() -> anyhow::Result<()> {
     drop(norm_gate_staging);
     drop(qwen_norm);
     drop(qwen_norm_input_staging);
+    drop(residual_norm);
+    drop(residual_staging);
+    drop(update_staging);
     drop(query_rope);
     drop(key_rope);
     drop(query_rope_staging);
@@ -341,6 +406,9 @@ fn main() -> anyhow::Result<()> {
         + qwen_norm_model_bytes
         + qwen_norm_transient_bytes
         + qwen_norm_device_view_staging_bytes
+        + residual_norm_model_bytes
+        + residual_norm_transient_bytes
+        + residual_norm_device_view_staging_bytes
         + partial_rope_transient_bytes
         + partial_rope_device_view_staging_bytes;
     anyhow::ensure!(
@@ -351,7 +419,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v4",
+            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v5",
             status: "pass",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -377,6 +445,9 @@ fn main() -> anyhow::Result<()> {
             qwen_norm_model_bytes,
             qwen_norm_transient_bytes,
             qwen_norm_device_view_staging_bytes,
+            residual_norm_model_bytes,
+            residual_norm_transient_bytes,
+            residual_norm_device_view_staging_bytes,
             partial_rope_transient_bytes,
             partial_rope_device_view_staging_bytes,
             maximum_convolution_absolute_error,
@@ -385,6 +456,9 @@ fn main() -> anyhow::Result<()> {
             maximum_gated_norm_relative_error,
             maximum_qwen_norm_absolute_error,
             maximum_qwen_norm_relative_error,
+            maximum_residual_norm_absolute_error,
+            maximum_residual_norm_relative_error,
+            residual_add_exact,
             maximum_partial_rope_absolute_error,
             partial_rope_tail_exact,
             norm_device_view_paths_verified: true,
@@ -395,7 +469,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes,
-            note: "Verifier-only candidates; causal convolution, Qwen RMSNorm, and gated RMSNorm consume producer-owned CUDA device views, while partial RoPE mutates its producer-owned view in place. Readback is restricted to the verifier. No CPU fallback and not promoted into the production CUDA ABI.",
+            note: "Verifier-only candidates; causal convolution, Qwen RMSNorm, fused residual-plus-Qwen-RMSNorm, and gated RMSNorm consume producer-owned CUDA device views, while partial RoPE mutates its producer-owned view in place. Readback is restricted to the verifier. No CPU fallback and not promoted into the production CUDA ABI.",
         })?
     );
     Ok(())

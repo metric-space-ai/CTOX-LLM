@@ -346,6 +346,7 @@ pub const GATED_DELTA_PREP_F32_PARAM_BYTES: u32 = 84;
 pub const CAUSAL_CONV_F16_SYMBOL: &str = "ctox_causal_conv_silu_f16_sm86";
 pub const GATED_RMS_NORM_F16_SYMBOL: &str = "ctox_gated_rms_norm_f16_sm86";
 pub const QWEN_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_rms_norm_f16_sm86";
+pub const RESIDUAL_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_residual_rms_norm_f16_sm86";
 pub const PARTIAL_ROPE_F32_SYMBOL: &str = "ctox_partial_rope_f32_sm86";
 pub const QUERY_GATE_NORM_ROPE_F32_SYMBOL: &str = "ctox_qwen_query_gate_norm_rope_f32_sm86";
 pub const PACK_PAGED_KV_Q4_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_f32_sm86";
@@ -463,6 +464,50 @@ pub const QWEN_RMS_NORM_F16_PARAMS: &[KernelParam] = &[
     },
 ];
 pub const QWEN_RMS_NORM_F16_PARAM_BYTES: u32 = 36;
+
+pub const RESIDUAL_RMS_NORM_F16_PARAMS: &[KernelParam] = &[
+    KernelParam {
+        name: "residual",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 0,
+    },
+    KernelParam {
+        name: "update",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 8,
+    },
+    KernelParam {
+        name: "weight",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 16,
+    },
+    KernelParam {
+        name: "residual_output",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 24,
+    },
+    KernelParam {
+        name: "normalized_output",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 32,
+    },
+    KernelParam {
+        name: "rows",
+        size_bytes: 4,
+        offset_bytes: 40,
+    },
+    KernelParam {
+        name: "columns",
+        size_bytes: 4,
+        offset_bytes: 44,
+    },
+    KernelParam {
+        name: "epsilon",
+        size_bytes: 4,
+        offset_bytes: 48,
+    },
+];
+pub const RESIDUAL_RMS_NORM_F16_PARAM_BYTES: u32 = 52;
 
 pub const PARTIAL_ROPE_F32_PARAMS: &[KernelParam] = &[
     KernelParam {
@@ -1174,6 +1219,9 @@ mod tests {
         assert_eq!(GATED_RMS_NORM_F16_PARAM_BYTES, 44);
         assert_eq!(QWEN_RMS_NORM_F16_PARAMS.len(), 6);
         assert_eq!(QWEN_RMS_NORM_F16_PARAM_BYTES, 36);
+        assert_eq!(RESIDUAL_RMS_NORM_F16_PARAMS.len(), 8);
+        assert_eq!(RESIDUAL_RMS_NORM_F16_PARAMS[7].offset_bytes, 48);
+        assert_eq!(RESIDUAL_RMS_NORM_F16_PARAM_BYTES, 52);
         assert_eq!(PARTIAL_ROPE_F32_PARAMS.len(), 6);
         assert_eq!(PARTIAL_ROPE_F32_PARAM_BYTES, 36);
         assert_eq!(QUERY_GATE_NORM_ROPE_F32_PARAMS.len(), 10);
@@ -1193,6 +1241,7 @@ mod tests {
             CAUSAL_CONV_F16_SYMBOL,
             GATED_RMS_NORM_F16_SYMBOL,
             QWEN_RMS_NORM_F16_SYMBOL,
+            RESIDUAL_RMS_NORM_F16_SYMBOL,
             PARTIAL_ROPE_F32_SYMBOL,
             QUERY_GATE_NORM_ROPE_F32_SYMBOL,
             PACK_PAGED_KV_Q4_F32_SYMBOL,

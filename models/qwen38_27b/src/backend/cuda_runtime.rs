@@ -26,7 +26,7 @@ use super::cuda::{
     PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
     Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
     Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
-    SWIGLU_A8_QUANTIZE_SYMBOL,
+    RESIDUAL_RMS_NORM_F16_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -180,6 +180,7 @@ struct CudaContextInner {
     causal_conv_f16_function: CuFunction,
     gated_rms_norm_f16_function: CuFunction,
     qwen_rms_norm_f16_function: CuFunction,
+    residual_rms_norm_f16_function: CuFunction,
     partial_rope_f32_function: CuFunction,
     query_gate_norm_rope_f32_function: CuFunction,
     pack_paged_kv_q4_f32_function: CuFunction,
@@ -467,6 +468,16 @@ pub struct PreparedCudaRmsNorm {
     input: DeviceBuffer,
     weight: DeviceBuffer,
     output: DeviceBuffer,
+    model_bytes: usize,
+    transient_bytes: usize,
+}
+
+pub struct PreparedCudaResidualRmsNorm {
+    context: Rc<CudaContextInner>,
+    config: CudaRmsNormConfig,
+    weight: DeviceBuffer,
+    residual_output: DeviceBuffer,
+    normalized_output: DeviceBuffer,
     model_bytes: usize,
     transient_bytes: usize,
 }
@@ -783,6 +794,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let residual_rms_norm_f16_function =
+            match resolve_function(&driver, module, RESIDUAL_RMS_NORM_F16_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let partial_rope_f32_function =
             match resolve_function(&driver, module, PARTIAL_ROPE_F32_SYMBOL) {
                 Ok(function) => function,
@@ -856,6 +878,7 @@ impl CudaCandidateRuntime {
                 causal_conv_f16_function,
                 gated_rms_norm_f16_function,
                 qwen_rms_norm_f16_function,
+                residual_rms_norm_f16_function,
                 partial_rope_f32_function,
                 query_gate_norm_rope_f32_function,
                 pack_paged_kv_q4_f32_function,
@@ -1665,6 +1688,120 @@ impl CudaCandidateRuntime {
             )?;
         }
         Ok(())
+    }
+
+    pub fn prepare_residual_rms_norm_f16(
+        &self,
+        config: CudaRmsNormConfig,
+        weight_f16_le: &[u8],
+    ) -> Result<PreparedCudaResidualRmsNorm> {
+        if config.rows == 0
+            || config.columns == 0
+            || !config.columns.is_multiple_of(WARP_SIZE as usize)
+            || !config.epsilon.is_finite()
+            || config.epsilon <= 0.0
+            || u32::try_from(config.rows).is_err()
+            || u32::try_from(config.columns).is_err()
+        {
+            return Err(EngineError::Shape(
+                "CUDA residual RMSNorm requires positive u32 geometry, 32-aligned columns, and positive epsilon"
+                    .into(),
+            ));
+        }
+        let weight_bytes = config
+            .columns
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA residual RMSNorm weight overflows".into())
+            })?;
+        validate_f16_buffer(weight_f16_le, weight_bytes, "residual RMSNorm weight")?;
+        let values = config.rows.checked_mul(config.columns).ok_or_else(|| {
+            EngineError::MemoryBudget("CUDA residual RMSNorm shape overflows".into())
+        })?;
+        let value_bytes = values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA residual RMSNorm values overflow".into())
+            })?;
+        Ok(PreparedCudaResidualRmsNorm {
+            context: Rc::clone(&self.inner),
+            config,
+            weight: DeviceBuffer::from_bytes(self, weight_f16_le)?,
+            residual_output: DeviceBuffer::allocate(self, value_bytes)?,
+            normalized_output: DeviceBuffer::allocate(self, value_bytes)?,
+            model_bytes: weight_f16_le.len(),
+            transient_bytes: value_bytes * 2,
+        })
+    }
+
+    pub fn dispatch_residual_rms_norm_f16_device<'a>(
+        &self,
+        prepared: &'a PreparedCudaResidualRmsNorm,
+        residual: CudaDeviceF32View<'_>,
+        update: CudaDeviceF32View<'_>,
+    ) -> Result<(CudaDeviceF32View<'a>, CudaDeviceF32View<'a>)> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, residual.context)
+            || !Rc::ptr_eq(&self.inner, update.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA residual RMSNorm device input belongs to another context".into(),
+            ));
+        }
+        let expected = prepared.config.rows * prepared.config.columns;
+        for (name, view) in [("residual", residual), ("update", update)] {
+            if view.values() != expected {
+                return Err(EngineError::Shape(format!(
+                    "CUDA residual RMSNorm {name} has {} values, expected {expected}",
+                    view.values()
+                )));
+            }
+        }
+        self.make_current()?;
+        let mut residual_ptr = residual.ptr()?;
+        let mut update_ptr = update.ptr()?;
+        let mut weight_ptr = prepared.weight.ptr();
+        let mut residual_output_ptr = prepared.residual_output.ptr();
+        let mut normalized_output_ptr = prepared.normalized_output.ptr();
+        let mut rows = prepared.config.rows as u32;
+        let mut columns = prepared.config.columns as u32;
+        let mut epsilon = prepared.config.epsilon;
+        let mut params = [
+            (&mut residual_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut update_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut weight_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut residual_output_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut normalized_output_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rows as *mut u32).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut epsilon as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.residual_rms_norm_f16_function,
+                    rows,
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "residual RMSNorm kernel launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "residual RMSNorm context synchronization",
+            )?;
+        }
+        Ok((
+            prepared.residual_output.f32_view(0, expected)?,
+            prepared.normalized_output.f32_view(0, expected)?,
+        ))
     }
 
     pub fn prepare_partial_rope_f32(
@@ -3676,6 +3813,20 @@ impl PreparedCudaRmsNorm {
             ));
         }
         self.input.write(as_bytes(input))
+    }
+}
+
+impl PreparedCudaResidualRmsNorm {
+    pub fn config(&self) -> CudaRmsNormConfig {
+        self.config
+    }
+
+    pub fn model_bytes(&self) -> usize {
+        self.model_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
     }
 }
 
