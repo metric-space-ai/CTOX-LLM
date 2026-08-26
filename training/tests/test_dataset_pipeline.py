@@ -76,7 +76,7 @@ from plan_activation_batches import activation_batches  # noqa: E402
 from prompt_format import normalize_content, normalize_messages, normalize_tool_call  # noqa: E402
 from filter_recovery_cohort import filter_records  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
-from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
+from fit_recovery_scales import quant_dtype_ranges, validate_recovery_inputs  # noqa: E402
 from fanout_recovery import (  # noqa: E402
     INDEPENDENT_POLICY,
     QWEN38_FANOUT_POLICY,
@@ -554,6 +554,27 @@ class DatasetPipelineTests(unittest.TestCase):
                     {**assignment, "budget_bytes": FOLD_RESIDENT_LIMIT + 1},
                     source,
                 )
+
+    def test_recovery_fit_binds_plan_stats_and_bf16_identity(self) -> None:
+        plan = {
+            "revision": "revision",
+            "local_model_provenance_sha256": "teacher",
+        }
+        metadata = {
+            "format": "ctox.activation-diagonal.v1",
+            "revision": "revision",
+            "local_model_provenance_sha256": "teacher",
+        }
+        validate_recovery_inputs(plan, metadata, "revision", "teacher")
+        with self.assertRaisesRegex(ValueError, "plan does not match"):
+            validate_recovery_inputs(plan, metadata, "revision", "other")
+        with self.assertRaisesRegex(ValueError, "statistics revision"):
+            validate_recovery_inputs(
+                plan,
+                {**metadata, "revision": "other"},
+                "revision",
+                "teacher",
+            )
 
     def test_teacher_cache_batch_group_binds_plan_and_contiguous_verifications(
         self,

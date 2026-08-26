@@ -13,13 +13,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 from quantization import quantize_dequantize
+from cache_teacher import validate_local_model_provenance
 from run_ledger import GpuRun, require_budget
+from select_activation_calibration import write_bytes_atomic
 
 
 QUANTIZED_DTYPES = frozenset({"q2_b64", "q4_b64", "mixed_q2_q4_b64"})
@@ -39,6 +42,24 @@ def quantized_entries(plan: dict[str, Any]) -> list[dict[str, Any]]:
         for entry in plan["tensors"]
         if entry["source_shard"] is not None and entry["dtype"] in QUANTIZED_DTYPES
     ]
+
+
+def validate_recovery_inputs(
+    plan: dict[str, Any],
+    stats_metadata: dict[str, str],
+    revision: str,
+    provenance_sha256: str,
+) -> None:
+    if plan.get("revision") != revision:
+        raise ValueError("recovery plan revision does not match --revision")
+    if plan.get("local_model_provenance_sha256") != provenance_sha256:
+        raise ValueError("recovery plan does not match the verified BF16 provenance")
+    if stats_metadata.get("format") != "ctox.activation-diagonal.v1":
+        raise ValueError("unsupported activation-statistics format")
+    if stats_metadata.get("revision") != revision:
+        raise ValueError("activation statistics revision does not match")
+    if stats_metadata.get("local_model_provenance_sha256") != provenance_sha256:
+        raise ValueError("activation statistics do not match the verified BF16 provenance")
 
 
 def quant_dtype_ranges(
@@ -290,6 +311,16 @@ def fit_matrix(
 def run(args: argparse.Namespace, torch: Any, safe_open: Any, save_file: Any) -> None:
     if args.output.exists() or args.report.exists():
         raise SystemExit("refusing to overwrite recovery output or report")
+    try:
+        _provenance, provenance_sha256 = validate_local_model_provenance(
+            args.checkpoint,
+            args.revision,
+            args.local_model_provenance,
+        )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
+    if provenance_sha256 is None:
+        raise SystemExit("recovery fitting requires verified local BF16 provenance")
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
     entries = quantized_entries(plan)
     stop = len(entries) if args.max_tensors is None else args.start_index + args.max_tensors
@@ -299,8 +330,19 @@ def run(args: argparse.Namespace, torch: Any, safe_open: Any, save_file: Any) ->
     shards = sorted({entry["source_shard"] for entry in selected})
     corrections = {}
     reports = []
+    stats_metadata: dict[str, str] = {}
     with ExitStack() as stack:
         stats = stack.enter_context(safe_open(args.stats, framework="pt", device="cpu"))
+        stats_metadata = stats.metadata()
+        try:
+            validate_recovery_inputs(
+                plan,
+                stats_metadata,
+                args.revision,
+                provenance_sha256,
+            )
+        except (ValueError, KeyError) as error:
+            raise SystemExit(str(error)) from error
         sources = {
             shard: stack.enter_context(
                 safe_open(args.checkpoint / shard, framework="pt", device="cpu")
@@ -330,6 +372,8 @@ def run(args: argparse.Namespace, torch: Any, safe_open: Any, save_file: Any) ->
             )
 
     complete = args.start_index == 0 and len(selected) == len(entries)
+    if complete and not plan.get("assignment"):
+        raise RuntimeError("complete recovery fitting requires an assigned Q2/Q4 plan")
     expected = {
         f"{entry['name']}.{suffix}"
         for entry in entries
@@ -344,6 +388,8 @@ def run(args: argparse.Namespace, torch: Any, safe_open: Any, save_file: Any) ->
         "revision": plan["revision"],
         "plan_sha256": sha256(args.plan),
         "activation_stats_sha256": sha256(args.stats),
+        "local_model_provenance_sha256": provenance_sha256,
+        "activation_source_plan_sha256": stats_metadata.get("quant_plan_sha256", ""),
         "algorithm": "activation-weighted-positive-alternating-least-squares",
         "iterations": args.iterations,
         "scale_min": args.scale_min,
@@ -360,28 +406,46 @@ def run(args: argparse.Namespace, torch: Any, safe_open: Any, save_file: Any) ->
     args.report.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = args.output.with_name(f".{args.output.name}.tmp")
     temporary_report = args.report.with_name(f".{args.report.name}.tmp")
-    save_file(
-        corrections,
-        temporary_output,
-        metadata={
-            "format": "ctox.recovery.channel-scales.v2",
-            "status": "complete" if complete else "partial_smoke",
-            "model": plan["model"],
-            "revision": plan["revision"],
-            "plan_sha256": report_document["plan_sha256"],
-            "activation_stats_sha256": report_document["activation_stats_sha256"],
-            "report_sha256": report_sha256,
-            "fixed_logical_qcodes": "true",
-        },
-    )
-    temporary_report.write_bytes(report_bytes)
-    temporary_output.replace(args.output)
-    temporary_report.replace(args.report)
+    if temporary_output.exists() or temporary_report.exists():
+        raise RuntimeError("stale recovery temporary output exists")
+    try:
+        save_file(
+            corrections,
+            temporary_output,
+            metadata={
+                "format": "ctox.recovery.channel-scales.v2",
+                "status": "complete" if complete else "partial_smoke",
+                "model": plan["model"],
+                "revision": plan["revision"],
+                "plan_sha256": report_document["plan_sha256"],
+                "activation_stats_sha256": report_document["activation_stats_sha256"],
+                "local_model_provenance_sha256": provenance_sha256,
+                "report_sha256": report_sha256,
+                "fixed_logical_qcodes": "true",
+            },
+        )
+        with temporary_output.open("rb") as output:
+            os.fsync(output.fileno())
+        write_bytes_atomic(temporary_report, report_bytes)
+        temporary_report.replace(args.report)
+        temporary_output.replace(args.output)
+        for directory_path in {args.output.parent, args.report.parent}:
+            directory = os.open(directory_path, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except BaseException:
+        temporary_output.unlink(missing_ok=True)
+        temporary_report.unlink(missing_ok=True)
+        raise
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--local-model-provenance", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--stats", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
