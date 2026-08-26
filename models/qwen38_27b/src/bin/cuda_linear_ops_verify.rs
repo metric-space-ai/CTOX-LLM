@@ -4,10 +4,11 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use ctox_qwen38_27b::backend::cuda_runtime::{
-    CudaCandidateRuntime, CudaCausalConvConfig, CudaGatedRmsNormConfig, CudaRmsNormConfig,
+    CudaCandidateRuntime, CudaCausalConvConfig, CudaGatedRmsNormConfig, CudaPartialRopeConfig,
+    CudaRmsNormConfig,
 };
 use ctox_qwen38_27b::reference::{
-    causal_conv_silu_update_f16_state, rms_norm_1p_weight, rms_norm_gated,
+    apply_partial_rope, causal_conv_silu_update_f16_state, rms_norm_1p_weight, rms_norm_gated,
 };
 use half::f16;
 use serde::Serialize;
@@ -49,12 +50,15 @@ struct Report<'a> {
     qwen_norm_columns: usize,
     qwen_norm_model_bytes: usize,
     qwen_norm_transient_bytes: usize,
+    partial_rope_transient_bytes: usize,
     maximum_convolution_absolute_error: f32,
     maximum_convolution_relative_error: f32,
     maximum_gated_norm_absolute_error: f32,
     maximum_gated_norm_relative_error: f32,
     maximum_qwen_norm_absolute_error: f32,
     maximum_qwen_norm_relative_error: f32,
+    maximum_partial_rope_absolute_error: f32,
+    partial_rope_tail_exact: bool,
     state_matches_oracle_exactly: bool,
     reset_zero_state_verified: bool,
     driver_free_bytes_before_prepare: usize,
@@ -211,6 +215,73 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    let query_rope_config = CudaPartialRopeConfig {
+        heads: 24,
+        head_dim: 256,
+        rotary_dim: 64,
+        theta: 10_000_000.0,
+    };
+    let key_rope_config = CudaPartialRopeConfig {
+        heads: 4,
+        ..query_rope_config
+    };
+    let query_input: Vec<f32> = (0..query_rope_config.heads * query_rope_config.head_dim)
+        .map(|index| ((index + 19) as f32 * 0.013).sin() * 0.7)
+        .collect();
+    let key_input: Vec<f32> = (0..key_rope_config.heads * key_rope_config.head_dim)
+        .map(|index| ((index + 23) as f32 * 0.021).cos() * 0.6)
+        .collect();
+    let mut expected_query = query_input.clone();
+    let mut expected_key = key_input.clone();
+    apply_partial_rope(
+        &mut expected_query,
+        &mut expected_key,
+        query_rope_config.heads,
+        key_rope_config.heads,
+        query_rope_config.head_dim,
+        query_rope_config.rotary_dim,
+        131_071,
+        query_rope_config.theta,
+    )?;
+    let query_rope = runtime.prepare_partial_rope_f32(query_rope_config)?;
+    let key_rope = runtime.prepare_partial_rope_f32(key_rope_config)?;
+    query_rope.write_values(&query_input)?;
+    key_rope.write_values(&key_input)?;
+    query_rope.write_position(131_071)?;
+    key_rope.write_position(131_071)?;
+    let actual_query = runtime.dispatch_partial_rope_f32(&query_rope)?;
+    let actual_key = runtime.dispatch_partial_rope_f32(&key_rope)?;
+    let mut maximum_partial_rope_absolute_error = 0.0_f32;
+    let mut unused_relative = 0.0_f32;
+    track_error(
+        &expected_query,
+        &actual_query,
+        &mut maximum_partial_rope_absolute_error,
+        &mut unused_relative,
+    );
+    track_error(
+        &expected_key,
+        &actual_key,
+        &mut maximum_partial_rope_absolute_error,
+        &mut unused_relative,
+    );
+    anyhow::ensure!(
+        maximum_partial_rope_absolute_error <= args.absolute_tolerance,
+        "partial RoPE exceeds absolute tolerance"
+    );
+    let partial_rope_tail_exact = [
+        (&query_input, &actual_query, query_rope_config),
+        (&key_input, &actual_key, key_rope_config),
+    ]
+    .iter()
+    .all(|(before, after, config)| {
+        before
+            .chunks_exact(config.head_dim)
+            .zip(after.chunks_exact(config.head_dim))
+            .all(|(left, right)| left[config.rotary_dim..] == right[config.rotary_dim..])
+    });
+    anyhow::ensure!(partial_rope_tail_exact, "partial RoPE modified the tail");
+
     let convolution_model_bytes = conv.model_bytes();
     let convolution_state_bytes = conv.resident_state_bytes();
     let convolution_transient_bytes = conv.transient_bytes();
@@ -218,9 +289,12 @@ fn main() -> anyhow::Result<()> {
     let gated_norm_transient_bytes = norm.transient_bytes();
     let qwen_norm_model_bytes = qwen_norm.model_bytes();
     let qwen_norm_transient_bytes = qwen_norm.transient_bytes();
+    let partial_rope_transient_bytes = query_rope.transient_bytes() + key_rope.transient_bytes();
     drop(conv);
     drop(norm);
     drop(qwen_norm);
+    drop(query_rope);
+    drop(key_rope);
     let (free_after_drop, _) = runtime.memory_info()?;
     let observed_reclaimed_bytes = free_after_drop.saturating_sub(free_after_prepare);
     let requested_bytes = convolution_model_bytes
@@ -229,7 +303,8 @@ fn main() -> anyhow::Result<()> {
         + gated_norm_model_bytes
         + gated_norm_transient_bytes
         + qwen_norm_model_bytes
-        + qwen_norm_transient_bytes;
+        + qwen_norm_transient_bytes
+        + partial_rope_transient_bytes;
     anyhow::ensure!(
         observed_reclaimed_bytes >= requested_bytes,
         "dropping CUDA linear-op objects did not reclaim requested buffers"
@@ -261,12 +336,15 @@ fn main() -> anyhow::Result<()> {
             qwen_norm_columns: qwen_norm_config.columns,
             qwen_norm_model_bytes,
             qwen_norm_transient_bytes,
+            partial_rope_transient_bytes,
             maximum_convolution_absolute_error,
             maximum_convolution_relative_error,
             maximum_gated_norm_absolute_error,
             maximum_gated_norm_relative_error,
             maximum_qwen_norm_absolute_error,
             maximum_qwen_norm_relative_error,
+            maximum_partial_rope_absolute_error,
+            partial_rope_tail_exact,
             state_matches_oracle_exactly,
             reset_zero_state_verified,
             driver_free_bytes_before_prepare: free_before_prepare,

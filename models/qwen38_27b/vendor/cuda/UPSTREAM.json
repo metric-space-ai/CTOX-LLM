@@ -80,6 +80,20 @@
       "purpose": "Unmodified public host declaration paired with norm.cu."
     },
     {
+      "path": "ggml/src/ggml-cuda/rope.cu",
+      "upstream_path": "ggml/src/ggml-cuda/rope.cu",
+      "sha256": "8286f7b57bb76ab490e05d42cb8262ad886b85a8fdaaef63d6538b7ff06940b2",
+      "lines": 672,
+      "purpose": "Rotary-position kernels and launch organization, including non-interleaved NeoX pairing. Reference for CTOX's Qwen partial-RoPE CUDA candidate."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/rope.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/rope.cuh",
+      "sha256": "3e69d8f2dc1ecab9a8e7ac9208529b8525901c0318505891916c325981aeb885",
+      "lines": 9,
+      "purpose": "Unmodified public host declaration paired with rope.cu."
+    },
+    {
       "path": "ggml/src/ggml-cuda/ssm-conv.cu",
       "upstream_path": "ggml/src/ggml-cuda/ssm-conv.cu",
       "sha256": "684ef5e8180ba88bb1f389310b28f8a694cb107a924492c43682a5c5c1754424",

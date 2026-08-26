@@ -20,7 +20,7 @@ use super::cuda::{
     A8_QUANTIZE_SYMBOL, CAUSAL_CONV_F16_SYMBOL, GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS,
     GATED_DELTA_KEY_DIM, GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
     GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
-    LINEAR_CONV_STATE_BYTES, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
+    LINEAR_CONV_STATE_BYTES, PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
     Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
     Q4_B64_RECOVERED_ROW_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
 };
@@ -172,6 +172,7 @@ struct CudaContextInner {
     causal_conv_f16_function: CuFunction,
     gated_rms_norm_f16_function: CuFunction,
     qwen_rms_norm_f16_function: CuFunction,
+    partial_rope_f32_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
 }
@@ -381,6 +382,23 @@ pub struct PreparedCudaRmsNorm {
     transient_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CudaPartialRopeConfig {
+    pub heads: usize,
+    pub head_dim: usize,
+    pub rotary_dim: usize,
+    pub theta: f32,
+}
+
+pub struct PreparedCudaPartialRope {
+    context: Rc<CudaContextInner>,
+    config: CudaPartialRopeConfig,
+    values: DeviceBuffer,
+    cosine: DeviceBuffer,
+    sine: DeviceBuffer,
+    transient_bytes: usize,
+}
+
 impl CudaCandidateRuntime {
     /// Creates a private driver context on one exact device and loads the
     /// caller-supplied cubin. Only compute capability 8.6 is accepted.
@@ -577,6 +595,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let partial_rope_f32_function =
+            match resolve_function(&driver, module, PARTIAL_ROPE_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         Ok(Self {
             inner: Rc::new(CudaContextInner {
                 driver,
@@ -593,6 +622,7 @@ impl CudaCandidateRuntime {
                 causal_conv_f16_function,
                 gated_rms_norm_f16_function,
                 qwen_rms_norm_f16_function,
+                partial_rope_f32_function,
                 device_name,
                 compute_capability,
             }),
@@ -1067,6 +1097,110 @@ impl CudaCandidateRuntime {
         if result.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
                 "CUDA Qwen RMSNorm produced a non-finite output".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn prepare_partial_rope_f32(
+        &self,
+        config: CudaPartialRopeConfig,
+    ) -> Result<PreparedCudaPartialRope> {
+        if config.heads == 0
+            || config.head_dim == 0
+            || config.rotary_dim == 0
+            || !config.rotary_dim.is_multiple_of(2)
+            || config.rotary_dim > config.head_dim
+            || !config.theta.is_finite()
+            || config.theta <= 0.0
+            || u32::try_from(config.heads).is_err()
+            || u32::try_from(config.head_dim).is_err()
+            || u32::try_from(config.rotary_dim).is_err()
+        {
+            return Err(EngineError::Shape(
+                "invalid CUDA partial-RoPE geometry or theta".into(),
+            ));
+        }
+        let value_count = config
+            .heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA RoPE shape overflows".into()))?;
+        let value_bytes = value_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA RoPE values overflow".into()))?;
+        let table_bytes = (config.rotary_dim / 2)
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA RoPE tables overflow".into()))?;
+        let values = DeviceBuffer::allocate(self, value_bytes)?;
+        let cosine = DeviceBuffer::allocate(self, table_bytes)?;
+        let sine = DeviceBuffer::allocate(self, table_bytes)?;
+        values.zero()?;
+        let prepared = PreparedCudaPartialRope {
+            context: Rc::clone(&self.inner),
+            config,
+            values,
+            cosine,
+            sine,
+            transient_bytes: value_bytes + table_bytes * 2,
+        };
+        prepared.write_position(0)?;
+        Ok(prepared)
+    }
+
+    pub fn dispatch_partial_rope_f32(
+        &self,
+        prepared: &PreparedCudaPartialRope,
+    ) -> Result<Vec<f32>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA partial RoPE belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        let mut values = prepared.values.ptr();
+        let mut cosine = prepared.cosine.ptr();
+        let mut sine = prepared.sine.ptr();
+        let mut heads = prepared.config.heads as u32;
+        let mut head_dim = prepared.config.head_dim as u32;
+        let mut rotary_dim = prepared.config.rotary_dim as u32;
+        let mut params = [
+            (&mut values as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut cosine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut sine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut heads as *mut u32).cast::<c_void>(),
+            (&mut head_dim as *mut u32).cast::<c_void>(),
+            (&mut rotary_dim as *mut u32).cast::<c_void>(),
+        ];
+        let pair_count = heads
+            .checked_mul(rotary_dim / 2)
+            .ok_or_else(|| EngineError::Shape("CUDA RoPE pair count overflows".into()))?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.partial_rope_f32_function,
+                    pair_count.div_ceil(LINEAR_THREADS_PER_BLOCK),
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "partial-RoPE kernel launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "partial-RoPE context synchronization",
+            )?;
+        }
+        let mut result = vec![0.0_f32; prepared.config.heads * prepared.config.head_dim];
+        prepared.values.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA partial RoPE produced a non-finite output".into(),
             ));
         }
         Ok(result)
@@ -2185,6 +2319,43 @@ impl PreparedCudaRmsNorm {
             ));
         }
         self.input.write(as_bytes(input))
+    }
+}
+
+impl PreparedCudaPartialRope {
+    pub fn config(&self) -> CudaPartialRopeConfig {
+        self.config
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_values(&self, values: &[f32]) -> Result<()> {
+        let expected = self.config.heads * self.config.head_dim;
+        if values.len() != expected || values.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::Shape(
+                "CUDA partial-RoPE values have invalid length or data".into(),
+            ));
+        }
+        self.values.write(as_bytes(values))
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        let half_dim = self.config.rotary_dim / 2;
+        let mut cosine = Vec::with_capacity(half_dim);
+        let mut sine = Vec::with_capacity(half_dim);
+        for index in 0..half_dim {
+            let inverse_frequency = self
+                .config
+                .theta
+                .powf(-((2 * index) as f32) / self.config.rotary_dim as f32);
+            let angle = position as f32 * inverse_frequency;
+            cosine.push(angle.cos());
+            sine.push(angle.sin());
+        }
+        self.cosine.write(as_bytes(&cosine))?;
+        self.sine.write(as_bytes(&sine))
     }
 }
 

@@ -577,3 +577,32 @@ void ctox_qwen_rms_norm_f16_sm86(
             * (1.0f + __half2float(weight[column]));
     }
 }
+
+// Qwen uses NeoX/non-interleaved pairing: the first rotary_dim/2 values are
+// paired with the following rotary_dim/2 values. Cosine/sine values are tiny
+// per-position control buffers prepared by the host; the tail remains exactly
+// untouched in this in-place kernel.
+// ref: ggml/src/ggml-cuda/rope.cu:116-183
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_partial_rope_f32_sm86(
+    float* __restrict__ values,
+    const float* __restrict__ cosine,
+    const float* __restrict__ sine,
+    unsigned heads,
+    unsigned head_dim,
+    unsigned rotary_dim) {
+    const unsigned pair_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned half_dim = rotary_dim / 2u;
+    const unsigned pair_count = heads * half_dim;
+    if (pair_index >= pair_count || rotary_dim == 0u
+        || (rotary_dim & 1u) != 0u || rotary_dim > head_dim) {
+        return;
+    }
+    const unsigned head = pair_index / half_dim;
+    const unsigned index = pair_index - head * half_dim;
+    const unsigned base = head * head_dim;
+    const float left = values[base + index];
+    const float right = values[base + index + half_dim];
+    values[base + index] = left * cosine[index] - right * sine[index];
+    values[base + index + half_dim] = right * cosine[index] + left * sine[index];
+}
