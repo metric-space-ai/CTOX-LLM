@@ -1563,6 +1563,96 @@ void ctox_paged_q2q4_gqa_decode_f32_sm86(
     }
 }
 
+// Causal multi-query form of the same packed-page traversal. One warp owns
+// one (prompt token, query head) pair and visits exactly the cache prefix
+// visible to that prompt position. This keeps output scratch linear in the
+// chunk size and preserves decode's logical-token accumulation order.
+// This remains verifier-only until the page packer and complete prefill graph
+// provide a fully batched producer path and controlled latency evidence.
+// ref: ggml/src/ggml-cuda/fattn-vec.cuh:1-611
+// ref: ggml/src/ggml-cuda/fattn-common.cuh:1-1274
+extern "C" __global__ __launch_bounds__(32, 16)
+void ctox_paged_q2q4_gqa_prefill_f32_sm86(
+    const float* __restrict__ query,
+    const unsigned char* __restrict__ q2_pages,
+    const unsigned char* __restrict__ q4_pages,
+    const CtoxPagedKvDescriptor* __restrict__ descriptors,
+    float* __restrict__ output,
+    const CtoxPagedGqaParams* __restrict__ params_ptr,
+    unsigned query_tokens) {
+    const CtoxPagedGqaParams params = *params_ptr;
+    const unsigned lane = threadIdx.x;
+    const unsigned query_head = blockIdx.x % params.query_heads;
+    const unsigned query_token = blockIdx.x / params.query_heads;
+    if (query_token >= query_tokens || query_tokens == 0u
+        || params.tokens < query_tokens || params.query_heads != 24u
+        || params.key_value_heads != 4u || params.head_dim != 256u
+        || params.page_tokens == 0u) {
+        return;
+    }
+    const unsigned query_heads_per_kv = params.query_heads / params.key_value_heads;
+    const unsigned key_value_head = query_head / query_heads_per_kv;
+    const unsigned query_base =
+        (query_token * params.query_heads + query_head) * params.head_dim;
+    const unsigned key_base = key_value_head * params.head_dim;
+    const unsigned value_base = params.combined_values / 2u + key_base;
+    const unsigned causal_tokens =
+        params.tokens - query_tokens + query_token + 1u;
+
+    float query_values[8];
+    float accumulated[8] = {0.0f, 0.0f, 0.0f, 0.0f,
+                            0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        query_values[slot] = query[query_base + lane + slot * kWarpSize];
+    }
+    float maximum = -3.402823466e+38f;
+    float denominator = 0.0f;
+    for (unsigned logical_token = 0u; logical_token < causal_tokens;
+         ++logical_token) {
+        const unsigned page_index = logical_token / params.page_tokens;
+        if (page_index >= params.page_count) {
+            continue;
+        }
+        const CtoxPagedKvDescriptor descriptor = descriptors[page_index];
+        if (logical_token < descriptor.first_token
+            || logical_token >= descriptor.first_token + descriptor.tokens) {
+            continue;
+        }
+        const unsigned token_in_page = logical_token - descriptor.first_token;
+        float partial = 0.0f;
+#pragma unroll
+        for (unsigned slot = 0u; slot < 8u; ++slot) {
+            const unsigned dim = lane + slot * kWarpSize;
+            partial = fmaf(query_values[slot],
+                           decode_paged_kv(q2_pages, q4_pages, descriptor,
+                                           token_in_page, key_base + dim, params),
+                           partial);
+        }
+        const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
+            * params.scale;
+        const float next_maximum = fmaxf(maximum, score);
+        const float previous_factor = expf(maximum - next_maximum);
+        const float score_factor = expf(score - next_maximum);
+        denominator = denominator * previous_factor + score_factor;
+#pragma unroll
+        for (unsigned slot = 0u; slot < 8u; ++slot) {
+            const unsigned dim = lane + slot * kWarpSize;
+            accumulated[slot] = fmaf(
+                score_factor,
+                decode_paged_kv(q2_pages, q4_pages, descriptor,
+                                token_in_page, value_base + dim, params),
+                accumulated[slot] * previous_factor);
+        }
+        maximum = next_maximum;
+    }
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        const unsigned dim = lane + slot * kWarpSize;
+        output[query_base + dim] = accumulated[slot] / denominator;
+    }
+}
+
 // Split-KV attention candidate for the target's five-token MTP verification
 // block. The existing decode kernel launches only 24 blocks; this kernel
 // exposes query-token x query-head x KV-segment parallelism and merges the

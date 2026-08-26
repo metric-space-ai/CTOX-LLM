@@ -291,8 +291,10 @@ matches sequential CUDA output and final FP16 state bit-for-bit across a
 matches 11 sequential CUDA launches bit-for-bit for every output and the final
 FP16 recurrent state, while keeping one persistent state owner. Its batched
 Qwen input preparation now expands compact Q/K, copies V, and transforms raw
-A/B in one launch while sharing the immutable A_log/dt_bias allocation. Paged
-GQA prefill and executor replacement of the current sequential loop remain
+A/B in one launch while sharing the immutable A_log/dt_bias allocation. The
+direct causal paged-GQA prefill scan is also exact against sequential all-Q4
+decode and stays within `5.97e-8` of the mixed Q2/Q4 scalar oracle. A batched
+KV page packer and executor replacement of the current sequential loop remain
 open.
 
 An isolated mixed-Q2/Q4 split-KV attention candidate now covers the five

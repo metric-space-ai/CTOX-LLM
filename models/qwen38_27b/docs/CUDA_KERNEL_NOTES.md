@@ -529,6 +529,21 @@ Evidence is recorded in
 lifecycle evidence only; complete-graph integration and controlled chunk-size
 latency remain open before promotion.
 
+The direct causal paged-GQA prefill candidate maps one warp to each
+`(query_token, query_head)` pair and scans exactly that position's logical
+prefix from the canonical mixed Q2/Q4 page descriptors. It requires only
+linear token-major output scratch rather than split-KV partial tensors. CUDA
+12.6 compiled the kernel with 128 registers and zero stack or spills. On the
+RTX A4500, a 40-token all-Q4 run matched 40 sequential decode launches
+bit-for-bit. A second final-cache run containing 24 Q2 and 16 Q4 tokens stayed
+within `5.97e-8` absolute error of the quantized scalar oracle. All 3,303,808
+verifier-owned bytes were reclaimed immediately. The module SHA-256 was
+`fa695c4d15d9632b04303b99c95b35b10ab59d683999c06430309cb2babc5d4a`;
+full evidence is in
+`benchmarks/cuda/sm86-paged-gqa-prefill-20260826.json`. A production batched KV
+page packer, complete-graph integration, and controlled chunk/context latency
+remain promotion gates.
+
 The loader-resolved embedding-row candidate decodes one canonical Q2 or Q4 row
 and fuses packed FP16 `s_in` plus scalar `s_out` on device. The production
 owner now keeps the entire pure/mixed table resident and launches directly at

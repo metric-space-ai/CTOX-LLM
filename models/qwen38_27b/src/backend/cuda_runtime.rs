@@ -27,9 +27,9 @@ use super::cuda::{
     GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
     LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES,
     PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, PAGED_GQA_SPLIT_SEGMENTS,
-    PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL,
-    PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL,
-    Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_BATCHED_MMQ_SYMBOL,
+    PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL,
+    PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL,
+    PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_BATCHED_MMQ_SYMBOL,
     Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
     Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_BATCHED_MATMUL_SYMBOL, Q4_B64_A8_BATCHED_MMQ_SYMBOL,
     Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
@@ -240,6 +240,7 @@ struct CudaContextInner {
     pack_paged_kv_q4_f32_function: CuFunction,
     demote_paged_kv_q4_to_q2_function: CuFunction,
     paged_q2q4_gqa_f32_function: CuFunction,
+    paged_q2q4_gqa_prefill_f32_function: CuFunction,
     paged_q2q4_gqa_split_partial_f32_function: CuFunction,
     paged_q2q4_gqa_split_combine_f32_function: CuFunction,
     argmax_f32_function: CuFunction,
@@ -903,6 +904,18 @@ pub struct PreparedCudaSplitPagedGqa {
     transient_bytes: usize,
 }
 
+/// Bounded token-major output for the direct causal paged-GQA prefill
+/// candidate. Persistent mixed Q2/Q4 pages remain owned by
+/// [`PreparedCudaPagedGqa`].
+pub struct PreparedCudaPagedGqaPrefillOutput {
+    context: Rc<CudaContextInner>,
+    token_capacity: u32,
+    query_heads: u32,
+    head_dim: u32,
+    output: DeviceBuffer,
+    transient_bytes: usize,
+}
+
 #[derive(Clone)]
 struct CudaPagedGqaCheckpoint {
     tokens: usize,
@@ -1323,6 +1336,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let paged_q2q4_gqa_prefill_f32_function =
+            match resolve_function(&driver, module, PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let paged_q2q4_gqa_split_partial_f32_function =
             match resolve_function(&driver, module, PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL) {
                 Ok(function) => function,
@@ -1401,6 +1425,7 @@ impl CudaCandidateRuntime {
                 pack_paged_kv_q4_f32_function,
                 demote_paged_kv_q4_to_q2_function,
                 paged_q2q4_gqa_f32_function,
+                paged_q2q4_gqa_prefill_f32_function,
                 paged_q2q4_gqa_split_partial_f32_function,
                 paged_q2q4_gqa_split_combine_f32_function,
                 argmax_f32_function,
@@ -4110,6 +4135,122 @@ impl CudaCandidateRuntime {
             ));
         }
         Ok(result)
+    }
+
+    pub fn prepare_paged_q2q4_gqa_prefill_output(
+        &self,
+        config: CudaPagedGqaConfig,
+        token_capacity: usize,
+    ) -> Result<PreparedCudaPagedGqaPrefillOutput> {
+        if config.query_heads != 24 || config.key_value_heads != 4 || config.head_dim != 256 {
+            return Err(EngineError::Shape(
+                "CUDA paged-GQA prefill requires Qwen's 24/4/256 profile".into(),
+            ));
+        }
+        let token_capacity = validate_a8_batch_capacity(token_capacity)?;
+        let output_bytes = (token_capacity as usize)
+            .checked_mul(config.query_heads)
+            .and_then(|values| values.checked_mul(config.head_dim))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA paged-GQA prefill output overflows".into())
+            })?;
+        self.make_current()?;
+        Ok(PreparedCudaPagedGqaPrefillOutput {
+            context: Rc::clone(&self.inner),
+            token_capacity,
+            query_heads: config.query_heads as u32,
+            head_dim: config.head_dim as u32,
+            output: DeviceBuffer::allocate(self, output_bytes)?,
+            transient_bytes: output_bytes,
+        })
+    }
+
+    /// Executes causal attention for the newest token-major prompt chunk over
+    /// an already populated canonical mixed Q2/Q4 cache. The cache is borrowed
+    /// in place; only bounded output scratch belongs to `output`.
+    pub fn dispatch_paged_q2q4_gqa_prefill_device<'a>(
+        &self,
+        prepared: &PreparedCudaPagedGqa,
+        output: &'a PreparedCudaPagedGqaPrefillOutput,
+        query: CudaDeviceF32View<'_>,
+        query_tokens: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let query_tokens = validate_a8_batch_capacity(query_tokens)?;
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &output.context)
+            || !Rc::ptr_eq(&self.inner, query.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA paged-GQA prefill crosses driver contexts".into(),
+            ));
+        }
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA paged GQA state is poisoned; reset is required".into(),
+            ));
+        }
+        if output.query_heads != prepared.config.query_heads as u32
+            || output.head_dim != prepared.config.head_dim as u32
+            || query_tokens > output.token_capacity
+            || query_tokens as usize > prepared.tokens
+        {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA paged-GQA prefill requests {query_tokens} tokens with capacity {} and {} cached tokens",
+                output.token_capacity, prepared.tokens
+            )));
+        }
+        let query_values = (query_tokens as usize)
+            .checked_mul(prepared.config.query_heads)
+            .and_then(|values| values.checked_mul(prepared.config.head_dim))
+            .ok_or_else(|| EngineError::Shape("CUDA paged-GQA query shape overflows".into()))?;
+        if query.values() != query_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA paged-GQA prefill query has {} values, expected {query_values}",
+                query.values()
+            )));
+        }
+
+        self.make_current()?;
+        let mut query_ptr = query.ptr()?;
+        let mut q2_pages_ptr = prepared.q2_pages.ptr();
+        let mut q4_pages_ptr = prepared.q4_pages.ptr();
+        let mut descriptors_ptr = prepared.descriptors.ptr();
+        let mut output_ptr = output.output.ptr();
+        let mut params_ptr = prepared.params.ptr();
+        let mut query_token_count = query_tokens;
+        let mut params = [
+            (&mut query_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q2_pages_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q4_pages_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut descriptors_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut params_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut query_token_count as *mut u32).cast::<c_void>(),
+        ];
+        let blocks = query_tokens
+            .checked_mul(prepared.config.query_heads as u32)
+            .ok_or_else(|| EngineError::Shape("CUDA paged-GQA prefill grid overflows".into()))?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.paged_q2q4_gqa_prefill_f32_function,
+                    blocks,
+                    1,
+                    1,
+                    WARP_SIZE,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "paged Q2/Q4 GQA prefill kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("paged Q2/Q4 GQA prefill context synchronization")?;
+        output.device_output(query_tokens as usize)
     }
 
     /// Seeds a verifier cache from finite f32 K/V rows without running the
@@ -7465,6 +7606,30 @@ impl PreparedCudaSplitPagedGqa {
     }
 }
 
+impl PreparedCudaPagedGqaPrefillOutput {
+    pub fn token_capacity(&self) -> usize {
+        self.token_capacity as usize
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn device_output(&self, query_tokens: usize) -> Result<CudaDeviceF32View<'_>> {
+        let query_tokens = validate_a8_batch_capacity(query_tokens)?;
+        if query_tokens > self.token_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA paged-GQA prefill requests {query_tokens} tokens, capacity is {}",
+                self.token_capacity
+            )));
+        }
+        self.output.f32_view(
+            0,
+            query_tokens as usize * self.query_heads as usize * self.head_dim as usize,
+        )
+    }
+}
+
 impl CudaVerifierF32Tensor {
     pub fn values(&self) -> usize {
         self.values
@@ -8521,10 +8686,13 @@ mod tests {
         assert_owned::<PreparedCudaBatchedA8Output>();
         assert_owned::<PreparedCudaBatchedRmsNormWorkspace>();
         assert_owned::<PreparedCudaCausalConvScanOutput>();
+        assert_owned::<PreparedCudaGatedDeltaScanInputs>();
+        assert_owned::<PreparedCudaGatedDeltaScanOutput>();
         assert_owned::<PreparedCudaGatheredA8Projection>();
         assert_owned::<PreparedCudaArgmax>();
         assert_owned::<PreparedCudaRecoveredRow>();
         assert_owned::<PreparedCudaPagedGqa>();
+        assert_owned::<PreparedCudaPagedGqaPrefillOutput>();
         assert_owned::<PreparedCudaQueryGate>();
         assert_owned::<CudaVerifierF32Tensor>();
     }

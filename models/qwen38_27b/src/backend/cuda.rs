@@ -537,6 +537,7 @@ pub const QUERY_GATE_NORM_ROPE_F32_SYMBOL: &str = "ctox_qwen_query_gate_norm_rop
 pub const PACK_PAGED_KV_Q4_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_f32_sm86";
 pub const DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL: &str = "ctox_demote_paged_kv_q4_to_q2_sm86";
 pub const PAGED_Q2Q4_GQA_F32_SYMBOL: &str = "ctox_paged_q2q4_gqa_decode_f32_sm86";
+pub const PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL: &str = "ctox_paged_q2q4_gqa_prefill_f32_sm86";
 pub const PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL: &str =
     "ctox_paged_q2q4_gqa_split_partial_f32_sm86";
 pub const PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL: &str =
@@ -930,6 +931,45 @@ pub const PAGED_Q2Q4_GQA_F32_PARAMS: &[KernelParam] = &[
     },
 ];
 pub const PAGED_Q2Q4_GQA_F32_PARAM_BYTES: u32 = 48;
+
+pub const PAGED_Q2Q4_GQA_PREFILL_F32_PARAMS: &[KernelParam] = &[
+    KernelParam {
+        name: "query",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 0,
+    },
+    KernelParam {
+        name: "q2_pages",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 8,
+    },
+    KernelParam {
+        name: "q4_pages",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 16,
+    },
+    KernelParam {
+        name: "descriptors",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 24,
+    },
+    KernelParam {
+        name: "output",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 32,
+    },
+    KernelParam {
+        name: "params",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 40,
+    },
+    KernelParam {
+        name: "query_tokens",
+        size_bytes: 4,
+        offset_bytes: 48,
+    },
+];
+pub const PAGED_Q2Q4_GQA_PREFILL_F32_PARAM_BYTES: u32 = 52;
 
 pub const PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_PARAMS: &[KernelParam] = &[
     KernelParam {
@@ -1594,6 +1634,9 @@ mod tests {
         assert_eq!(PAGED_Q2Q4_GQA_F32_PARAMS.len(), 6);
         assert_eq!(PAGED_Q2Q4_GQA_F32_PARAMS[5].offset_bytes, 40);
         assert_eq!(PAGED_Q2Q4_GQA_F32_PARAM_BYTES, 48);
+        assert_eq!(PAGED_Q2Q4_GQA_PREFILL_F32_PARAMS.len(), 7);
+        assert_eq!(PAGED_Q2Q4_GQA_PREFILL_F32_PARAMS[6].offset_bytes, 48);
+        assert_eq!(PAGED_Q2Q4_GQA_PREFILL_F32_PARAM_BYTES, 52);
         assert_eq!(PAGED_GQA_SPLIT_SEGMENTS, 16);
         assert_eq!(PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, 5);
         assert_eq!(PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_PARAMS.len(), 10);
@@ -1613,6 +1656,7 @@ mod tests {
             PACK_PAGED_KV_Q4_F32_SYMBOL,
             DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
             PAGED_Q2Q4_GQA_F32_SYMBOL,
+            PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL,
             PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL,
             PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL,
         ] {
