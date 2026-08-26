@@ -10,6 +10,9 @@ import math
 from collections import Counter
 from pathlib import Path
 
+from cache_teacher import validate_local_model_provenance
+from select_activation_calibration import write_bytes_atomic
+
 
 BLOCK = 64
 Q2_BLOCK_BYTES = 18
@@ -91,18 +94,48 @@ def packed_bytes(dtype: str, elements: int) -> int:
     raise ValueError(dtype)
 
 
+def validate_assignment_source(
+    assignment: dict | None,
+    source_plan: Path | None,
+) -> None:
+    if assignment is None:
+        if source_plan is not None:
+            raise ValueError("--assignment-source-plan requires --assignment")
+        return
+    if source_plan is None:
+        raise ValueError("--assignment requires --assignment-source-plan")
+    if hashlib.sha256(source_plan.read_bytes()).hexdigest() != assignment.get("plan_sha256"):
+        raise ValueError("Q2/Q4 assignment does not match its source quant plan")
+    budget = int(assignment.get("budget_bytes", -1))
+    used = int(assignment.get("bytes_used", budget + 1))
+    if not 0 < used <= budget <= FOLD_RESIDENT_LIMIT:
+        raise ValueError("Q2/Q4 assignment violates the Fold resident budget")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--local-model-provenance", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--assignment", type=Path)
+    parser.add_argument("--assignment-source-plan", type=Path)
     parser.add_argument("--q-proj-q4-start", type=int, default=35)
     parser.add_argument("--linear-out-q4-start", type=int, default=64)
     parser.add_argument("--late-ffn-q4-start", type=int, default=64)
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
+    try:
+        _provenance, provenance_sha256 = validate_local_model_provenance(
+            args.checkpoint,
+            args.revision,
+            args.local_model_provenance,
+        )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
+    if provenance_sha256 is None:
+        raise SystemExit("quant planning requires verified local BF16 provenance")
     index_path = args.checkpoint / "model.safetensors.index.json"
     weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
     try:
@@ -112,6 +145,7 @@ def main() -> None:
     assigned_q4: set[str] | None = None
     mixed_assignment: dict[str, dict] = {}
     assignment_format: str | None = None
+    assignment: dict | None = None
     if args.assignment:
         assignment = json.loads(args.assignment.read_text(encoding="utf-8"))
         assignment_format = assignment.get("format")
@@ -122,6 +156,10 @@ def main() -> None:
             raise SystemExit("unsupported Q2/Q4 assignment")
         assigned_q4 = set(assignment["q4_tensors"])
         mixed_assignment = assignment.get("mixed_tensors", {})
+    try:
+        validate_assignment_source(assignment, args.assignment_source_plan)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
 
     # Metadata lookup is shard-batched and never materializes tensor values.
     shard_tensors: dict[str, list[str]] = {}
@@ -246,6 +284,7 @@ def main() -> None:
         ),
         "model": "Qwen/Qwen3.8-27B",
         "revision": args.revision,
+        "local_model_provenance_sha256": provenance_sha256,
         "alignment": ALIGNMENT,
         "vision": "separate",
         "mtp": "resident",
@@ -269,8 +308,15 @@ def main() -> None:
             "q4_tensor_count": len(assigned_q4 or ()),
             "mixed_tensor_count": len(mixed_assignment),
         }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        if total_bytes != int(assignment["bytes_used"]):
+            raise SystemExit(
+                f"rebuilt plan uses {total_bytes} bytes, assignment promised "
+                f"{assignment['bytes_used']}"
+            )
+    write_bytes_atomic(
+        args.output,
+        (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
     print(json.dumps({key: plan[key] for key in ("total_bytes", "gib", "fits_fold_limit", "dtype_bytes")}, indent=2))
     if total_bytes > FOLD_RESIDENT_LIMIT:
         raise SystemExit(2)

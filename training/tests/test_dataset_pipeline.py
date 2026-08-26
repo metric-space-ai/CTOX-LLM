@@ -29,6 +29,7 @@ from build_quant_plan import (  # noqa: E402
     CONTAINER_MANIFEST_RESERVE,
     FOLD_PACKAGE_LIMIT,
     FOLD_RESIDENT_LIMIT,
+    validate_assignment_source,
 )
 from cache_teacher import (  # noqa: E402
     mtp_target_positions,
@@ -530,6 +531,28 @@ class DatasetPipelineTests(unittest.TestCase):
                     "model",
                     "revision",
                     "teacher",
+                )
+
+    def test_quant_plan_rebuild_requires_the_exact_assignment_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source-plan.json"
+            source.write_bytes(b"source")
+            assignment = {
+                "plan_sha256": hashlib.sha256(b"source").hexdigest(),
+                "budget_bytes": FOLD_RESIDENT_LIMIT,
+                "bytes_used": FOLD_RESIDENT_LIMIT - 1,
+            }
+            validate_assignment_source(assignment, source)
+            with self.assertRaisesRegex(ValueError, "source quant plan"):
+                validate_assignment_source(
+                    {**assignment, "plan_sha256": "wrong"}, source
+                )
+            with self.assertRaisesRegex(ValueError, "requires"):
+                validate_assignment_source(assignment, None)
+            with self.assertRaisesRegex(ValueError, "resident budget"):
+                validate_assignment_source(
+                    {**assignment, "budget_bytes": FOLD_RESIDENT_LIMIT + 1},
+                    source,
                 )
 
     def test_teacher_cache_batch_group_binds_plan_and_contiguous_verifications(
