@@ -1283,9 +1283,9 @@ impl PreparedCudaProjectionGraph {
                     .into(),
             ));
         }
-        if self.target_tokens == 0 || self.target_tokens != self.mtp_tokens {
+        if self.target_tokens == 0 || self.target_tokens != self.mtp_tokens.saturating_add(1) {
             return Err(EngineError::InvalidState(format!(
-                "CUDA speculative checkpoint requires aligned target/MTP state, observed {}/{}",
+                "CUDA speculative checkpoint requires target state one token ahead of MTP, observed {}/{}",
                 self.target_tokens, self.mtp_tokens
             )));
         }

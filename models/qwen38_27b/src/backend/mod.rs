@@ -1,6 +1,8 @@
 pub mod cpu;
 pub mod cuda;
 #[cfg(feature = "cuda")]
+pub mod cuda_executor;
+#[cfg(feature = "cuda")]
 pub mod cuda_graph;
 #[cfg(feature = "cuda")]
 pub mod cuda_runtime;

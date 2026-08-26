@@ -321,7 +321,7 @@ with two driver device-to-device copies; no host tensor or backend-specific
 requantization is introduced. Operator-local barriers retain their standalone
 verifier semantics, but the complete graph suppresses them inside a
 transactional default-stream submission and synchronizes exactly once before
-committing each target or MTP state transition. The v3 SM86 verifier records
+committing each target or MTP state transition. The v4 SM86 verifier records
 attempts, commits, deferred operator barriers, and context synchronizations;
 its hardware run is pending, so this is not yet a production or roofline
 claim. A second complete target transition verifies the greedy MTP proposal
@@ -329,10 +329,24 @@ and records acceptance or fallback explicitly. The graph additionally owns one
 device-side FP16 checkpoint for all 48 convolution/GatedDelta states and the
 last target hidden vector. While a branch is active, paged attention suppresses
 Q4 demotion and uses the admitted spare boundary slot, so restoring host-side
-page metadata never refers to overwritten state. The verifier restores that
-checkpoint and requires a repeated target transition to produce bit-identical
-logits. Chained MTP4 construction, accepted-prefix replay through the executor,
-and production sampling remain unbound.
+page metadata never refers to overwritten state. Its checkpoint starts only
+when target state is exactly one token ahead of MTP state. The verifier restores
+that checkpoint, replays both the MTP and target transition, and requires the
+repeated target logits to be bit-identical.
+
+`CudaModelExecutor` now assembles the same graph behind the stable Rust
+`ModelExecutor` ABI. It supports sequential prefill, up to four chained drafts,
+full-target verification, device-side checkpoint/restore, replay of exactly the
+accepted causal prefix, reset, and fail-closed unload without CPU model
+operations. Even a fully accepted block is restored and replayed: the final
+candidate has target state but no subsequent MTP transition, so retaining the
+speculative branch would violate the target-one-ahead invariant. Near the
+admitted context boundary, the returned draft block is shortened rather than
+overrunning KV capacity. `qwen38-cuda-executor-verify` exercises the complete
+lifecycle and hashes every token-boundary distribution, but its hardware run is
+pending. It currently reads full logits at verifier boundaries; restricted-row
+draft evaluation, device sampling, production quality, and roofline promotion
+remain open.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not

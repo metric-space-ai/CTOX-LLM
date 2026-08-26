@@ -108,8 +108,13 @@ The CPU correctness executor composes the complete target and native MTP
 graphs for sequential prefill/decode, including independent MTP KV state,
 target-final-hidden handoff, chained MTP4 target verification, and tested
 partial-prefix replay/commit transitions. It remains a scalar verifier rather
-than a production executor. CUDA, Metal, CPU SIMD token mixers, and Snapdragon
-still need optimized full graph implementations before production admission.
+than a production executor. The CUDA SM86 candidate now implements the same
+`ModelExecutor` lifecycle over its complete resident graph, including MTP4
+checkpoint/restore and accepted-prefix replay with target state exactly one
+token ahead of MTP state. The direct lifecycle verifier exists, but its
+complete-model hardware result and promotion gates remain pending. Metal, CPU
+SIMD token mixers, and Snapdragon still need optimized full graph
+implementations before production admission.
 
 `EngineServer<E>` now maps this exact lifecycle onto the v1 wire contract. It
 does not own alternate sampling or model state: the server mutex owns one
@@ -117,8 +122,9 @@ does not own alternate sampling or model state: the server mutex owns one
 allows cancellation from a separate connection, and reports unload residue
 through the engine health contract. The Responses text renderer/detokenizer and
 the pinned chat-template frontend are implemented. The server binary exposes a
-fully signed CPU-verifier assembly for ABI tests; constructing the final
-promoted CUDA/Metal executors remains open.
+fully signed CPU-verifier assembly for ABI tests. Wiring the CUDA candidate into
+signed server construction follows its hardware evidence; constructing a
+promoted CUDA or Metal executor remains open.
 `EngineServer::load_signed` is the single production assembly boundary: it
 verifies one manifest trust root and loads the selected backend pack, memory
 profile, MTP vocabulary, model container, tokenizer, and chat template from

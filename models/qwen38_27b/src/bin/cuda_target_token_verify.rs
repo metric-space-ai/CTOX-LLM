@@ -154,6 +154,15 @@ fn main() -> anyhow::Result<()> {
     );
 
     let checkpoint_started = Instant::now();
+    anyhow::ensure!(
+        graph.target_tokens() == 2 && graph.mtp_tokens() == 1,
+        "CUDA checkpoint base does not keep target exactly one token ahead of MTP"
+    );
+    graph.begin_speculative_branch(&runtime)?;
+    anyhow::ensure!(
+        graph.speculative_branch_active(),
+        "CUDA speculative checkpoint did not become active"
+    );
     let checkpoint_mtp_view = graph.dispatch_mtp_draft_device(
         &runtime,
         &Qwen38Config::default(),
@@ -163,15 +172,6 @@ fn main() -> anyhow::Result<()> {
     let checkpoint_mtp_logits = runtime.verifier_read_f32_device(checkpoint_mtp_view)?;
     let checkpoint_mtp_logits_f32le_sha256 = digest_logits(&checkpoint_mtp_logits);
     let checkpoint_draft_token = rank_valid_logits(&checkpoint_mtp_logits)?[0].token_id;
-    anyhow::ensure!(
-        graph.target_tokens() == 2 && graph.mtp_tokens() == 2,
-        "CUDA checkpoint base is not target/MTP aligned"
-    );
-    graph.begin_speculative_branch(&runtime)?;
-    anyhow::ensure!(
-        graph.speculative_branch_active(),
-        "CUDA speculative checkpoint did not become active"
-    );
     let speculative_view = graph.dispatch_target_token_device(
         &runtime,
         &Qwen38Config::default(),
@@ -182,9 +182,15 @@ fn main() -> anyhow::Result<()> {
     let speculative_target_logits_f32le_sha256 = digest_logits(&speculative_logits);
     graph.restore_speculative_branch(&runtime)?;
     anyhow::ensure!(
-        !graph.speculative_branch_active() && graph.target_tokens() == 2 && graph.mtp_tokens() == 2,
+        !graph.speculative_branch_active() && graph.target_tokens() == 2 && graph.mtp_tokens() == 1,
         "CUDA speculative restore did not return to the checkpoint counters"
     );
+    let _ = graph.dispatch_mtp_draft_device(
+        &runtime,
+        &Qwen38Config::default(),
+        target_verified_token,
+        2,
+    )?;
     let replayed_view = graph.dispatch_target_token_device(
         &runtime,
         &Qwen38Config::default(),
@@ -197,6 +203,10 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(
         speculative_restore_exact,
         "CUDA replay after speculative restore changed target logits"
+    );
+    anyhow::ensure!(
+        graph.target_tokens() == 3 && graph.mtp_tokens() == 2,
+        "CUDA accepted-prefix replay did not preserve target-one-ahead state"
     );
     let checkpoint_replay_milliseconds = checkpoint_started.elapsed().as_secs_f64() * 1.0e3;
     graph.reset_session()?;
@@ -214,15 +224,15 @@ fn main() -> anyhow::Result<()> {
     );
     let submission_stats = runtime.submission_stats();
     anyhow::ensure!(
-        submission_stats.token_submission_attempts == 6
-            && submission_stats.token_submission_commits == 6,
-        "CUDA target/MTP chain committed {}/{} token submissions, expected 6/6",
+        submission_stats.token_submission_attempts == 7
+            && submission_stats.token_submission_commits == 7,
+        "CUDA target/MTP chain committed {}/{} token submissions, expected 7/7",
         submission_stats.token_submission_commits,
         submission_stats.token_submission_attempts,
     );
     anyhow::ensure!(
-        submission_stats.context_synchronizations == 12,
-        "CUDA target/MTP chain used {} context barriers, expected six commits and six verifier readbacks",
+        submission_stats.context_synchronizations == 13,
+        "CUDA target/MTP chain used {} context barriers, expected seven commits and six verifier readbacks",
         submission_stats.context_synchronizations,
     );
     anyhow::ensure!(
@@ -234,7 +244,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.cuda-sm86-target-token.v3",
+            format: "ctox.cuda-sm86-target-token.v4",
             status: "finite_logits_verifier_only_not_promoted",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -277,7 +287,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_before_prepare: free_before_prepare,
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
-            note: "Executes embedding, all 64 target layers, final norm, LM head, target-selected-token MTP drafts, target verification, one device-side speculative checkpoint, restore, bit-exact target replay, reset, and unload. Each target/MTP step has one commit barrier; logits cross the host only at explicit verifier boundaries. Draft rejection is a valid result and is reported, not hidden. The checkpoint proves the bounded replay primitive, not the complete MTP4 executor: chained draft assembly, partial-prefix replay, production sampling, prefill, BF16/CPU comparison, and roofline promotion remain open.",
+            note: "Executes embedding, all 64 target layers, final norm, LM head, target-selected-token MTP drafts, target verification, one device-side speculative checkpoint, restore, bit-exact accepted-prefix replay through both MTP and target state, reset, and unload. The checkpoint starts with target exactly one token ahead of MTP, matching the executor contract. Each target/MTP step has one commit barrier; logits cross the host only at explicit verifier boundaries. Draft rejection is a valid result and is reported, not hidden. This proves one bounded replay transition, not the complete MTP4 executor: chained draft assembly, multi-token partial-prefix replay, production sampling, prefill, BF16/CPU comparison, and roofline promotion remain open.",
         })?
     );
     Ok(())

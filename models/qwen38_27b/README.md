@@ -236,7 +236,8 @@ device views directly with no tensor readback before the token boundary. The
 complete graph now defers operator-local driver barriers and commits each
 target or MTP transition with one context synchronization. The dedicated SM86
 verifier records attempted/committed submissions, deferred barriers, and the
-explicit verifier readbacks; its hardware result is still pending. The CUDA
+explicit verifier readbacks; its corrected target-one-ahead checkpoint hardware
+result is still pending. The CUDA
 graph now also owns exactly one FP16 checkpoint for every linear recurrent and
 convolution state, one target-hidden checkpoint, and retained Q4 KV boundary
 capacity. It can restore a speculative branch without copying state through
@@ -245,9 +246,14 @@ The one-layer MTP draft is now connected to the final normalized target hidden
 state through a device-only concatenation buffer and reuses the same embedding,
 attention, FFN, norm, and LM-head operators. Its hardware run and subsequent
 target verification use a second complete target transition and report either
-an accepted draft or the target fallback without hiding rejection. Chained
-MTP4 assembly, partial-prefix replay through `ModelExecutor`, and production
-sampling remain open.
+an accepted draft or the target fallback without hiding rejection. A
+verifier-only `CudaModelExecutor` now drives load, warmup, sequential prefill,
+chained MTP4 target verification, bounded device checkpointing, accepted-prefix
+restore/replay, reset, allocation accounting, and unload through the shared
+Rust ABI. `qwen38-cuda-executor-verify` binds that lifecycle to the exact
+artifact, CUDA module, and canonical release draft-vocabulary hashes. Its
+complete hardware run, gathered-row draft head, device sampling, quality gates,
+and roofline promotion remain open.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight
@@ -289,5 +295,6 @@ bring-up negotiates and reports health but remains fail-closed with
 `engine_not_ready`. An explicit signed-release CPU-verifier mode now exercises
 the real loader, tokenizer, token-ID and Responses generation, cancellation,
 MTP token ordering, reset, and unload through the same reusable server adapter.
-Its verifier promotion state cannot pass production admission; the optimized
-CUDA/Metal executor assembly remains unfinished.
+Its verifier promotion state cannot pass production admission. CUDA now has an
+assembled verifier executor awaiting complete-model hardware evidence; Metal
+executor assembly remains unfinished.
