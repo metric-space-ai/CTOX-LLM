@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use ctox_qwen38_27b::backend::cuda_runtime::{CudaCandidateRuntime, CudaPagedGqaConfig};
+use ctox_qwen38_27b::kv_cache::PagedKvCache;
 use ctox_qwen38_27b::reference::grouped_query_attention;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -80,6 +81,13 @@ fn main() -> anyhow::Result<()> {
     let reset_verified;
     {
         let mut prepared = runtime.prepare_paged_q2q4_gqa(config)?;
+        let mut oracle = PagedKvCache::new(
+            config.maximum_tokens,
+            config.key_value_heads * config.head_dim,
+            config.page_tokens,
+            config.sink_tokens,
+            config.recent_tokens,
+        )?;
         (free_after_prepare, _) = runtime.memory_info()?;
         packed_device_bytes = prepared.packed_device_bytes();
         transient_bytes = prepared.transient_bytes();
@@ -95,8 +103,9 @@ fn main() -> anyhow::Result<()> {
                 .collect();
             let actual =
                 runtime.append_and_dispatch_paged_q2q4_gqa(&mut prepared, &query, &key, &value)?;
-            let cached_key = prepared.verifier_flattened_key()?;
-            let cached_value = prepared.verifier_flattened_value()?;
+            oracle.push(&key, &value)?;
+            let cached_key = oracle.flattened_key(config.key_value_heads, config.head_dim)?;
+            let cached_value = oracle.flattened_value(config.key_value_heads, config.head_dim)?;
             let expected = grouped_query_attention(
                 &query,
                 &cached_key,
@@ -119,13 +128,18 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        verifier_cpu_packed_bytes = prepared.verifier_cpu_packed_bytes();
+        verifier_cpu_packed_bytes = oracle.packed_bytes();
         q4_tokens = prepared.q4_tokens();
-        anyhow::ensure!(q4_tokens < args.tokens, "no old Q4 page was demoted to Q2");
+        anyhow::ensure!(
+            prepared.q2_tokens() > 0 && q4_tokens == oracle.q4_tokens(),
+            "device page demotion differs from the canonical CPU policy"
+        );
         prepared.reset()?;
+        oracle.reset();
         reset_verified = prepared.tokens() == 0
             && prepared.q4_tokens() == 0
-            && prepared.verifier_cpu_packed_bytes() == 0;
+            && prepared.q2_tokens() == 0
+            && oracle.packed_bytes() == 0;
         anyhow::ensure!(reset_verified, "packed CUDA GQA reset failed");
     }
     let (free_after_drop, _) = runtime.memory_info()?;
@@ -162,7 +176,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
-            note: "Verifier-only CPU quantization mirror remains a promotion blocker; the CUDA cache itself stores only canonical packed Q2/Q4 pages.",
+            note: "The CPU cache exists only as an external verifier oracle; CUDA packs Q4 and demotes Q4-to-Q2 entirely on device with no host packed-cache mirror.",
         })?
     );
     Ok(())

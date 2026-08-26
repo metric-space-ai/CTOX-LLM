@@ -59,7 +59,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports eleven explicitly unpromoted
+- The same verifier cubin additionally exports thirteen explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
@@ -73,6 +73,8 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
   - `ctox_gated_rms_norm_f16_sm86`
   - `ctox_qwen_rms_norm_f16_sm86`
   - `ctox_partial_rope_f32_sm86`
+  - `ctox_pack_paged_kv_q4_f32_sm86`
+  - `ctox_demote_paged_kv_q4_to_q2_sm86`
   - `ctox_paged_q2q4_gqa_decode_f32_sm86`
   These symbols are intentionally excluded from the production module ABI
   until their quality and complete-graph gates pass.
@@ -148,20 +150,23 @@ The first packed paged-GQA correctness candidate fixes Qwen3.8-27B's exact
 24-query-head, 4-KV-head, 256-wide geometry. Persistent device storage consists
 only of canonical Q2_B64/Q4_B64 page arenas plus 16-byte page descriptors; it
 never allocates an expanded FP16/FP32 KV cache. Sink, recent, and current pages
-remain Q4 while completed middle pages are demoted to Q2. A verifier-only CPU
-`PagedKvCache` currently performs append quantization and is therefore an
-explicit production-promotion blocker. The kernel directly decodes packed K/V
-and performs numerically stable online-softmax plus value accumulation in one
-cache scan rather than separate max, denominator and output scans. CUDA 12.6
-reports 128 registers and zero stack/spill/shared-memory bytes for the SM86
-candidate. Its 16-warps-per-SM launch bound is explicit. The current unified
-cubin SHA-256 is
-`e7fcd2a7203467e467d1fbd7e45836759650eebcd60e9749d6911d11f0ac89c5`.
+remain Q4 while completed middle pages are demoted to Q2. Q4 append
+quantization now runs directly on the GPU, and completed pages are converted
+Q4-to-Q2 without an f32 intermediate or host packed-cache mirror. Explicit RN
+arithmetic pins Q4 codes to the Rust canonical formula. The attention kernel
+directly decodes packed K/V and performs numerically stable online-softmax plus
+value accumulation in one cache scan rather than separate max, denominator and
+output scans. CUDA 12.6 reports 15 registers/76 bytes shared memory for Q4
+packing, 16 registers/no shared memory for demotion, and 128 registers/no
+shared memory for GQA; all three have zero stack/spill bytes. GQA's
+16-warps-per-SM launch bound is explicit. The current unified cubin SHA-256 is
+`222a866b60571691860d3a31fd33860bc80a08d6ca0f8b739dfff970e6ff6f1b`.
 Its numerical/demotion/reset/unload verifier is queued on physical GPU 2 after
 the teacher, evaluation, activation and earlier verifier chain; GPU 0 is never
-eligible. Promotion requires a device-side page pack/demotion path and an
-upstream-anchored online-softmax/tiled rewrite with controlled roofline
-evidence.
+eligible. The CPU `PagedKvCache` exists only in the separate verifier as an
+oracle. Production graph wiring must bind device-resident Q/K/V projection
+outputs directly instead of using the verifier runtime's host f32 upload, and
+the online-softmax path still needs controlled roofline evidence.
 
 The first GPU3 run is recorded in
 `benchmarks/cuda/sm86-q2q4-fused-matvec-20260826.json`. It proved both formats

@@ -629,6 +629,108 @@ struct CtoxPagedGqaParams {
     float scale;
 };
 
+__device__ __forceinline__ float warp_max(float value) {
+#pragma unroll
+    for (unsigned offset = kWarpSize / 2; offset != 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+    }
+    return value;
+}
+
+// Append one f32 K/V token directly into a canonical Q4_B64 page. One block
+// owns one 64-value quantization block; the packed page is never materialized
+// in host memory.
+extern "C" __global__ __launch_bounds__(64, 8)
+void ctox_pack_paged_kv_q4_f32_sm86(
+    unsigned char* __restrict__ q4_pages,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    unsigned physical_slot,
+    unsigned token_in_page,
+    unsigned component_values,
+    unsigned q4_token_bytes,
+    unsigned q4_page_bytes) {
+    const unsigned combined_index = blockIdx.x * kBlockLen + threadIdx.x;
+    const float item = combined_index < component_values
+        ? key[combined_index]
+        : value[combined_index - component_values];
+    float maximum = warp_max(fabsf(item));
+    __shared__ float warp_maxima[2];
+    __shared__ float block_maximum;
+    __shared__ unsigned char codes[kBlockLen];
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned warp = threadIdx.x / kWarpSize;
+    if (lane == 0u) {
+        warp_maxima[warp] = maximum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        block_maximum = fmaxf(warp_maxima[0], warp_maxima[1]);
+    }
+    __syncthreads();
+    unsigned code = 0u;
+    if (block_maximum != 0.0f) {
+        // Explicit RN intrinsics keep canonical KV codes independent of the
+        // module's fast-math setting and match Rust's stepwise f32 formula.
+        const float normalized = fminf(
+            1.0f, fmaxf(-1.0f, __fdiv_rn(item, block_maximum)));
+        const float selector = __fadd_rn(__fmul_rn(normalized, 7.5f), 7.5f);
+        code = static_cast<unsigned>(
+            fminf(15.0f, fmaxf(0.0f, roundf(selector))));
+    }
+    codes[threadIdx.x] = static_cast<unsigned char>(code);
+    __syncthreads();
+    unsigned char* packed = q4_pages
+        + static_cast<unsigned long long>(physical_slot) * q4_page_bytes
+        + static_cast<unsigned long long>(token_in_page) * q4_token_bytes
+        + blockIdx.x * kQ4BlockBytes;
+    if (threadIdx.x == 0u) {
+        *reinterpret_cast<__half*>(packed) = __float2half_rn(block_maximum);
+    }
+    if (threadIdx.x < kBlockLen / 2u) {
+        packed[2u + threadIdx.x] = codes[threadIdx.x * 2u]
+            | static_cast<unsigned char>(codes[threadIdx.x * 2u + 1u] << 4u);
+    }
+}
+
+__device__ __forceinline__ unsigned q4_code_to_q2(unsigned code) {
+    return code <= 2u ? 0u : code <= 7u ? 1u : code <= 12u ? 2u : 3u;
+}
+
+// A Q4 page is demoted without an f32 intermediate. Q4 quantization always
+// contains an extreme code for each non-zero block, so canonical Q4->f32->Q2
+// preserves the same FP16 scale and reduces to this exact codebook mapping.
+extern "C" __global__ __launch_bounds__(16, 16)
+void ctox_demote_paged_kv_q4_to_q2_sm86(
+    const unsigned char* __restrict__ q4_page,
+    unsigned char* __restrict__ q2_page,
+    unsigned tokens,
+    unsigned blocks_per_token) {
+    const unsigned page_block = blockIdx.x;
+    if (page_block >= tokens * blocks_per_token) {
+        return;
+    }
+    const unsigned token = page_block / blocks_per_token;
+    const unsigned block = page_block - token * blocks_per_token;
+    const unsigned char* source = q4_page
+        + static_cast<unsigned long long>(token) * blocks_per_token * kQ4BlockBytes
+        + block * kQ4BlockBytes;
+    unsigned char* target = q2_page
+        + static_cast<unsigned long long>(token) * blocks_per_token * kQ2BlockBytes
+        + block * kQ2BlockBytes;
+    if (threadIdx.x == 0u) {
+        *reinterpret_cast<unsigned short*>(target) =
+            *reinterpret_cast<const unsigned short*>(source);
+    }
+    const unsigned first = source[2u + threadIdx.x * 2u];
+    const unsigned second = source[3u + threadIdx.x * 2u];
+    target[2u + threadIdx.x] = static_cast<unsigned char>(
+        q4_code_to_q2(first & 15u)
+        | (q4_code_to_q2(first >> 4u) << 2u)
+        | (q4_code_to_q2(second & 15u) << 4u)
+        | (q4_code_to_q2(second >> 4u) << 6u));
+}
+
 __device__ __forceinline__ float decode_paged_kv(
     const unsigned char* q2_pages,
     const unsigned char* q4_pages,

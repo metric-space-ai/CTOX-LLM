@@ -182,6 +182,14 @@ and key transforms share one command encoder and one synchronization.
 Complete-graph residency and unload measurements on the 7.8-GiB artifact are
 still required before this changes backend promotion state.
 
+CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
+the projection and token-mixer candidates. Q4 append quantization and
+Q4-to-Q2 page demotion execute on device, persistent storage contains no
+expanded FP16/FP32 KV cache, and attention uses one-pass online softmax over
+the packed pages. Its separate scalar-oracle verifier is queued on physical
+GPU 2 after the BF16 recovery pipeline; the production backend remains
+fail-closed until that evidence and full device-buffer graph wiring exist.
+
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight
 gated RMSNorm with fused `SiLU(z)`. Each operation matches its scalar state or
