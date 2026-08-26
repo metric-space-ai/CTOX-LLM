@@ -112,6 +112,11 @@ from packed_student_model import (  # noqa: E402
 )
 from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
 from select_manifest import select  # noqa: E402
+from select_activation_calibration import (  # noqa: E402
+    load_token_counts,
+    select_calibration,
+    sequence_bucket,
+)
 from select_teacher_smoke import select_ids as select_teacher_smoke_ids  # noqa: E402
 from select_uncached_teacher_records import select_missing  # noqa: E402
 from select_primary_domain_supplement import select_supplement  # noqa: E402
@@ -183,6 +188,102 @@ class DatasetPipelineTests(unittest.TestCase):
             canonical_text(record).encode("utf-8")
         ).hexdigest()
         return record
+
+    def test_activation_calibration_sequence_buckets_are_closed(self) -> None:
+        self.assertEqual(sequence_bucket(4_096), "up_to_4k")
+        self.assertEqual(sequence_bucket(4_097), "4k_16k")
+        self.assertEqual(sequence_bucket(16_384), "4k_16k")
+        self.assertEqual(sequence_bucket(16_385), "16k_32k")
+        self.assertEqual(sequence_bucket(32_769), "32k_64k")
+        self.assertEqual(sequence_bucket(65_537), "64k_96k")
+        self.assertEqual(sequence_bucket(98_305), "over_96k")
+
+    def test_activation_calibration_selection_is_deterministic_and_closes_quotas(
+        self,
+    ) -> None:
+        records = [
+            {"id": "a", "language": "de", "category": "code"},
+            {"id": "b", "language": "en", "category": "agentic"},
+            {"id": "c", "language": "de", "category": "chat"},
+            {"id": "d", "language": "en", "category": "math"},
+            {"id": "e", "language": "fr", "category": "long_context"},
+        ]
+        domains = {
+            sample_id: {"primary_label": domain}
+            for sample_id, domain in zip("abcde", ("software", "tools", "software", "math", "tools"))
+        }
+        services = {
+            sample_id: {"labels": labels}
+            for sample_id, labels in zip(
+                "abcde",
+                (("implementation",), ("tool_calling",), ("implementation",), ("reasoning",), ("reasoning",)),
+            )
+        }
+        tokens = {"a": 2_000, "b": 5_000, "c": 18_000, "d": 34_000, "e": 100_000}
+        requirements = {
+            ("domain", "software"): 1,
+            ("domain", "tools"): 1,
+            ("language", "de"): 1,
+            ("language", "en"): 1,
+            ("language", "fr"): 1,
+            ("service", "implementation"): 1,
+            ("service", "tool_calling"): 1,
+            ("service", "reasoning"): 1,
+            ("category", "long_context"): 1,
+            ("length", "over_96k"): 1,
+        }
+        first, counts = select_calibration(
+            records, domains, services, tokens, requirements, 5, 131_072
+        )
+        second, _ = select_calibration(
+            records, domains, services, tokens, requirements, 5, 131_072
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), set("abcde"))
+        for feature, minimum in requirements.items():
+            self.assertGreaterEqual(counts[feature], minimum)
+
+    def test_activation_calibration_rejects_mismatched_ids_and_impossible_quota(
+        self,
+    ) -> None:
+        records = [{"id": "a", "language": "en", "category": "chat"}]
+        domains = {"a": {"primary_label": "general"}}
+        services = {"a": {"labels": ["conversation"]}}
+        with self.assertRaisesRegex(ValueError, "token counts differ"):
+            select_calibration(
+                records, domains, services, {}, {("domain", "general"): 1}, 1, 4_096
+            )
+        with self.assertRaisesRegex(ValueError, "cannot satisfy"):
+            select_calibration(
+                records,
+                domains,
+                services,
+                {"a": 1_000},
+                {("language", "de"): 1},
+                1,
+                4_096,
+            )
+
+    def test_activation_calibration_token_plans_merge_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.json"
+            second = root / "second.json"
+            first.write_text(json.dumps({"samples": [{"id": "a", "sequence_tokens": 7}]}))
+            second.write_text(json.dumps({"samples": [{"id": "b", "sequence_tokens": 11}]}))
+            self.assertEqual(load_token_counts([first, second], {"a", "b"}), {"a": 7, "b": 11})
+            second.write_text(
+                json.dumps(
+                    {
+                        "samples": [
+                            {"id": "a", "sequence_tokens": 8},
+                            {"id": "b", "sequence_tokens": 11},
+                        ]
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "disagree"):
+                load_token_counts([first, second], {"a", "b"})
 
     def test_teacher_cache_batch_group_binds_plan_and_contiguous_verifications(
         self,
