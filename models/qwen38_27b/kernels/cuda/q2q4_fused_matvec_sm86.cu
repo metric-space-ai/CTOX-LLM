@@ -736,6 +736,83 @@ void ctox_q4_b64_recovered_row_sm86(const unsigned char* __restrict__ weights,
     output[column] = value * load_optional_f16(s_in, column) * s_out;
 }
 
+// Batched embedding gather follows the pinned upstream get_rows mapping:
+// grid.x selects requested rows and grid.y covers columns. Mixed Q2/Q4 tables
+// issue one launch per canonical segment; each launch ignores row IDs outside
+// its immutable interval and writes the shared token-major output directly.
+// No token-wise host launch or backend repacking is required.
+// ref: ggml/src/ggml-cuda/getrows.cu:5-38
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_q2_b64_recovered_rows_sm86(
+    const unsigned char* __restrict__ weights,
+    const __half* __restrict__ s_in,
+    const __half* __restrict__ s_out,
+    const unsigned* __restrict__ row_ids,
+    float* __restrict__ output,
+    unsigned requested_rows,
+    unsigned columns,
+    unsigned row_start,
+    unsigned row_end) {
+    const unsigned requested_row = blockIdx.x;
+    const unsigned column = blockIdx.y * blockDim.x + threadIdx.x;
+    if (requested_row >= requested_rows || column >= columns) {
+        return;
+    }
+    const unsigned source_row = row_ids[requested_row];
+    if (source_row < row_start || source_row >= row_end) {
+        return;
+    }
+    const unsigned local_row = source_row - row_start;
+    const unsigned blocks_per_row = columns / kBlockLen;
+    const unsigned char* row_weights = weights
+        + static_cast<unsigned long long>(local_row) * blocks_per_row * kQ2BlockBytes;
+    const unsigned block = column / kBlockLen;
+    const unsigned local = column % kBlockLen;
+    const unsigned char* packed = row_weights + block * kQ2BlockBytes;
+    const unsigned code = (packed[2u + local / 4u] >> ((local % 4u) * 2u)) & 0x3u;
+    const float value = static_cast<float>(static_cast<int>(code) * 2 - 3)
+        * (1.0f / 3.0f) * load_f16(packed);
+    output[static_cast<unsigned long long>(requested_row) * columns + column]
+        = value * load_optional_f16(s_in, column)
+        * load_f16(reinterpret_cast<const unsigned char*>(s_out + source_row));
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_q4_b64_recovered_rows_sm86(
+    const unsigned char* __restrict__ weights,
+    const __half* __restrict__ s_in,
+    const __half* __restrict__ s_out,
+    const unsigned* __restrict__ row_ids,
+    float* __restrict__ output,
+    unsigned requested_rows,
+    unsigned columns,
+    unsigned row_start,
+    unsigned row_end) {
+    const unsigned requested_row = blockIdx.x;
+    const unsigned column = blockIdx.y * blockDim.x + threadIdx.x;
+    if (requested_row >= requested_rows || column >= columns) {
+        return;
+    }
+    const unsigned source_row = row_ids[requested_row];
+    if (source_row < row_start || source_row >= row_end) {
+        return;
+    }
+    const unsigned local_row = source_row - row_start;
+    const unsigned blocks_per_row = columns / kBlockLen;
+    const unsigned char* row_weights = weights
+        + static_cast<unsigned long long>(local_row) * blocks_per_row * kQ4BlockBytes;
+    const unsigned block = column / kBlockLen;
+    const unsigned local = column % kBlockLen;
+    const unsigned char* packed = row_weights + block * kQ4BlockBytes;
+    const unsigned byte = packed[2u + local / 2u];
+    const unsigned code = (byte >> ((local % 2u) * 4u)) & 0xfu;
+    const float value = static_cast<float>(static_cast<int>(code) * 2 - 15)
+        * (1.0f / 15.0f) * load_f16(packed);
+    output[static_cast<unsigned long long>(requested_row) * columns + column]
+        = value * load_optional_f16(s_in, column)
+        * load_f16(reinterpret_cast<const unsigned char*>(s_out + source_row));
+}
+
 // Prepare the exact Qwen3.8-27B single-token GatedDeltaNet inputs without a
 // host-side repeat or elementwise pass. in_proj_qkv/conv emits compact
 // [Q:16x128, K:16x128, V:48x128]; Q and K repeat each source head three

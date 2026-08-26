@@ -170,6 +170,8 @@ pub const TOPK_TOPP_SAMPLE_F32_SYMBOL: &str = "ctox_topk_topp_sample_f32_sm86";
 pub const CUDA_SAMPLER_MAX_TOP_K: usize = 256;
 pub const Q2_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q2_b64_recovered_row_sm86";
 pub const Q4_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q4_b64_recovered_row_sm86";
+pub const Q2_B64_RECOVERED_ROWS_SYMBOL: &str = "ctox_q2_b64_recovered_rows_sm86";
+pub const Q4_B64_RECOVERED_ROWS_SYMBOL: &str = "ctox_q4_b64_recovered_rows_sm86";
 
 pub const SWIGLU_A8_QUANTIZE_PARAMS: &[KernelParam] = &[
     KernelParam {

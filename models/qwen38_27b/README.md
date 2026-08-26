@@ -317,7 +317,10 @@ bit-identical to the established MMQ graph path. A fail-closed execution cursor
 now admits a chunk only at the exact committed position and releases its new
 commit position only after all 645 bound operations and the final barrier have
 completed in order. Kernel dispatch wiring and complete-graph hardware
-verification remain open. The
+verification remain open. A pinned-`get_rows`-structured batched embedding
+candidate now keeps FP16 `s_in`/`s_out` resident and gathers a whole token-ID
+chunk in at most one launch per canonical Q2/Q4 segment; compilation and
+mixed-table hardware evidence are the next gate. The
 standalone MMQ verifier exercises this same graph-facing path and the shared
 two-buffer batched RMSNorm workspace. The first causal-convolution scan now
 matches sequential CUDA output and final FP16 state bit-for-bit across a

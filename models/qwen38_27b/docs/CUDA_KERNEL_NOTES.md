@@ -567,6 +567,22 @@ copies output back for comparison; the resident table API returns a borrowed
 device view instead. Full numerical evidence for the original row kernel is in
 `benchmarks/cuda/sm86-recovered-row-20260826.json`.
 
+The next verifier candidate adapts the pinned upstream `get_rows` grid
+organization (`grid.x = requested row`, `grid.y = column tile`) to canonical
+Q2_B64/Q4_B64 recovery. A bounded chunk uploads one compact u32 token-ID list;
+the complete FP16 `s_in` and `s_out` corrections remain resident. Pure tables
+need one launch, while mixed tables need at most one launch per canonical
+segment; each segment ignores IDs outside its row interval and writes the same
+token-major output without repacking or a host token loop. Rust now owns the
+row-ID/output workspace and fail-closed dispatcher. CUDA 12.6 compiles both
+Q2 and Q4 entries for SM86 with 16 registers and zero stack, shared, or local
+bytes. Source SHA-256 is
+`77dfc7923fa5f13e7fee8c82d809644d0592c8365cbe34460802eb96366ef4d1`;
+the complete cubin SHA-256 is
+`c2d7eb14fa3b68cf7510b89dddde544a0d1fa1e0f71724409c3baed031d83ff1`.
+Mixed-row numerical evidence, allocation accounting in the graph-wide prefill
+pool, and executor binding remain required before this candidate is promoted.
+
 ## Runtime ownership and unload
 
 Prepared CUDA graph objects now own a reference to a private, thread-affine

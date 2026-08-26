@@ -31,12 +31,13 @@ use super::cuda::{
     PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL,
     PARTIAL_ROPE_BATCH_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_BATCHED_MATMUL_SYMBOL,
     Q2_B64_A8_BATCHED_MMQ_SYMBOL, Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
-    Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_BATCHED_MATMUL_SYMBOL,
-    Q4_B64_A8_BATCHED_MMQ_SYMBOL, Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL,
-    Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_BATCH_F32_SYMBOL,
-    QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL,
-    ROPE_TABLE_BATCH_F32_SYMBOL, SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
-    TOPK_TOPP_SAMPLE_F32_SYMBOL,
+    Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROWS_SYMBOL, Q2_B64_RECOVERED_ROW_SYMBOL,
+    Q4_B64_A8_BATCHED_MATMUL_SYMBOL, Q4_B64_A8_BATCHED_MMQ_SYMBOL,
+    Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
+    Q4_B64_RECOVERED_ROWS_SYMBOL, Q4_B64_RECOVERED_ROW_SYMBOL,
+    QUERY_GATE_NORM_ROPE_BATCH_F32_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL,
+    QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL, ROPE_TABLE_BATCH_F32_SYMBOL,
+    SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL, TOPK_TOPP_SAMPLE_F32_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -227,6 +228,8 @@ struct CudaContextInner {
     q4_a8_gathered_function: CuFunction,
     q2_recovered_row_function: CuFunction,
     q4_recovered_row_function: CuFunction,
+    q2_recovered_rows_function: CuFunction,
+    q4_recovered_rows_function: CuFunction,
     gated_delta_prep_f32_function: CuFunction,
     gated_delta_prep_scan_f32_function: CuFunction,
     gated_delta_f16_function: CuFunction,
@@ -631,9 +634,22 @@ pub struct PreparedCudaEmbedding {
     layout: CudaA8ProjectionLayout,
     weights: DeviceBuffer,
     s_in: DeviceBuffer,
+    s_out: DeviceBuffer,
     output: DeviceBuffer,
     model_bytes: usize,
     graph_bytes: usize,
+}
+
+/// Token-major embedding output and device row-ID list shared by every
+/// bounded prefill chunk. Immutable table data stays in
+/// [`PreparedCudaEmbedding`].
+pub struct PreparedCudaBatchedEmbeddingWorkspace {
+    context: Rc<CudaContextInner>,
+    token_capacity: u32,
+    columns: u32,
+    row_ids: DeviceBuffer,
+    output: DeviceBuffer,
+    transient_bytes: usize,
 }
 
 /// Exact Qwen3.8-27B recurrence geometry accepted by the CUDA verifier.
@@ -1246,6 +1262,28 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let q2_recovered_rows_function =
+            match resolve_function(&driver, module, Q2_B64_RECOVERED_ROWS_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let q4_recovered_rows_function =
+            match resolve_function(&driver, module, Q4_B64_RECOVERED_ROWS_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let gated_delta_prep_f32_function =
             match resolve_function(&driver, module, GATED_DELTA_PREP_F32_SYMBOL) {
                 Ok(function) => function,
@@ -1519,6 +1557,8 @@ impl CudaCandidateRuntime {
                 q4_a8_gathered_function,
                 q2_recovered_row_function,
                 q4_recovered_row_function,
+                q2_recovered_rows_function,
+                q4_recovered_rows_function,
                 gated_delta_prep_f32_function,
                 gated_delta_prep_scan_f32_function,
                 gated_delta_f16_function,
@@ -5395,18 +5435,26 @@ impl CudaCandidateRuntime {
         let ScaleSlice::F16Le(s_in_bytes) = recovered.s_in.as_recovery_scales()? else {
             unreachable!("recovered embedding scales reject F32")
         };
+        let ScaleSlice::F16Le(s_out_bytes) = recovered.s_out.as_recovery_scales()? else {
+            unreachable!("recovered embedding scales reject F32")
+        };
         self.make_current()?;
         let weights = DeviceBuffer::from_bytes(self, recovered.matrix.weights)?;
         let s_in = DeviceBuffer::from_bytes(self, s_in_bytes)?;
+        let s_out = DeviceBuffer::from_bytes(self, s_out_bytes)?;
         let output_bytes = recovered
             .matrix
             .columns
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| EngineError::MemoryBudget("CUDA embedding output overflows".into()))?;
         let output = DeviceBuffer::allocate(self, output_bytes)?;
-        let model_bytes = weights.len().checked_add(s_in.len()).ok_or_else(|| {
-            EngineError::MemoryBudget("CUDA embedding model bytes overflow".into())
-        })?;
+        let model_bytes = weights
+            .len()
+            .checked_add(s_in.len())
+            .and_then(|bytes| bytes.checked_add(s_out.len()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA embedding model bytes overflow".into())
+            })?;
         let graph_bytes = output.len();
         Ok(PreparedCudaEmbedding {
             context: Rc::clone(&self.inner),
@@ -5415,10 +5463,139 @@ impl CudaCandidateRuntime {
             layout,
             weights,
             s_in,
+            s_out,
             output,
             model_bytes,
             graph_bytes,
         })
+    }
+
+    pub fn prepare_batched_embedding_workspace(
+        &self,
+        prepared: &PreparedCudaEmbedding,
+        token_capacity: usize,
+    ) -> Result<PreparedCudaBatchedEmbeddingWorkspace> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || token_capacity == 0
+            || token_capacity > 65_535
+        {
+            return Err(EngineError::Shape(
+                "CUDA batched embedding requires the same context and 1..=65535 tokens".into(),
+            ));
+        }
+        let token_capacity = u32::try_from(token_capacity)
+            .map_err(|_| EngineError::MemoryBudget("CUDA embedding capacity exceeds u32".into()))?;
+        let row_id_bytes = (token_capacity as usize)
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA embedding row IDs overflow".into()))?;
+        let output_bytes = (token_capacity as usize)
+            .checked_mul(prepared.columns as usize)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA batched embedding output overflows".into())
+            })?;
+        let row_ids = DeviceBuffer::allocate(self, row_id_bytes)?;
+        let output = DeviceBuffer::allocate(self, output_bytes)?;
+        Ok(PreparedCudaBatchedEmbeddingWorkspace {
+            context: Rc::clone(&self.inner),
+            token_capacity,
+            columns: prepared.columns,
+            transient_bytes: row_ids.len() + output.len(),
+            row_ids,
+            output,
+        })
+    }
+
+    pub fn dispatch_embedding_rows_device<'a>(
+        &self,
+        prepared: &PreparedCudaEmbedding,
+        workspace: &'a PreparedCudaBatchedEmbeddingWorkspace,
+        row_ids: &[u32],
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &workspace.context)
+            || workspace.columns != prepared.columns
+            || row_ids.is_empty()
+            || row_ids.len() > workspace.token_capacity as usize
+            || row_ids.iter().any(|row| *row >= prepared.rows)
+        {
+            return Err(EngineError::Shape(
+                "CUDA batched embedding context, shape, or row IDs are invalid".into(),
+            ));
+        }
+        let mut row_bytes = Vec::with_capacity(std::mem::size_of_val(row_ids));
+        for row in row_ids {
+            row_bytes.extend_from_slice(&row.to_le_bytes());
+        }
+        workspace.row_ids.write_range(0, &row_bytes)?;
+        self.make_current()?;
+        let launches: Vec<(TensorDType, u32, u32, usize)> = match &prepared.layout {
+            CudaA8ProjectionLayout::Pure(dtype) => vec![(*dtype, 0, prepared.rows, 0)],
+            CudaA8ProjectionLayout::Mixed(segments) => segments
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.descriptor.dtype,
+                        segment.row_start,
+                        segment.row_start + segment.row_count,
+                        segment.weight_offset,
+                    )
+                })
+                .collect(),
+        };
+        for (dtype, mut row_start, mut row_end, weight_offset) in launches {
+            let function = match dtype {
+                TensorDType::Q2B64 => self.inner.q2_recovered_rows_function,
+                TensorDType::Q4B64 => self.inner.q4_recovered_rows_function,
+                _ => unreachable!("validated CUDA embedding segment dtype"),
+            };
+            let mut weights = device_ptr_offset(prepared.weights.ptr(), weight_offset)?;
+            let mut s_in = prepared.s_in.ptr();
+            let mut s_out = prepared.s_out.ptr();
+            let mut ids = workspace.row_ids.ptr();
+            let mut output = workspace.output.ptr();
+            let mut requested_rows = u32::try_from(row_ids.len())
+                .map_err(|_| EngineError::Shape("CUDA embedding row count exceeds u32".into()))?;
+            let mut columns = prepared.columns;
+            let mut params = [
+                (&mut weights as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut s_in as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut s_out as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut ids as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut requested_rows as *mut u32).cast::<c_void>(),
+                (&mut columns as *mut u32).cast::<c_void>(),
+                (&mut row_start as *mut u32).cast::<c_void>(),
+                (&mut row_end as *mut u32).cast::<c_void>(),
+            ];
+            unsafe {
+                self.inner.driver.check(
+                    (self.inner.driver.launch_kernel)(
+                        function,
+                        requested_rows,
+                        prepared.columns.div_ceil(THREADS_PER_BLOCK),
+                        1,
+                        THREADS_PER_BLOCK,
+                        1,
+                        1,
+                        0,
+                        ptr::null_mut(),
+                        params.as_mut_ptr(),
+                        ptr::null_mut(),
+                    ),
+                    "batched recovered embedding launch",
+                )?;
+            }
+        }
+        workspace.output.f32_view(
+            0,
+            row_ids
+                .len()
+                .checked_mul(prepared.columns as usize)
+                .ok_or_else(|| {
+                    EngineError::Shape("CUDA batched embedding output view overflows".into())
+                })?,
+        )
     }
 
     /// Selects and decodes one row from the resident embedding table. `s_out`
@@ -8016,6 +8193,29 @@ impl PreparedCudaEmbedding {
     }
 }
 
+impl PreparedCudaBatchedEmbeddingWorkspace {
+    pub fn token_capacity(&self) -> usize {
+        self.token_capacity as usize
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn device_output(&self, tokens: usize) -> Result<CudaDeviceF32View<'_>> {
+        if tokens == 0 || tokens > self.token_capacity() {
+            return Err(EngineError::Shape(
+                "CUDA batched embedding output token count is invalid".into(),
+            ));
+        }
+        self.output.f32_view(0, tokens * self.columns())
+    }
+}
+
 impl PreparedCudaGatedDelta {
     pub fn config(&self) -> CudaGatedDeltaConfig {
         self.config
@@ -9703,6 +9903,8 @@ mod tests {
         assert_owned::<PreparedCudaGatheredA8Projection>();
         assert_owned::<PreparedCudaArgmax>();
         assert_owned::<PreparedCudaRecoveredRow>();
+        assert_owned::<PreparedCudaEmbedding>();
+        assert_owned::<PreparedCudaBatchedEmbeddingWorkspace>();
         assert_owned::<PreparedCudaPagedGqa>();
         assert_owned::<PreparedCudaPagedGqaPrefillOutput>();
         assert_owned::<PreparedCudaQueryGate>();
