@@ -154,10 +154,45 @@ pub const Q4_B64_FUSED_MATVEC: CudaKernelAbi = CudaKernelAbi {
 /// backend, not merely successful symbol resolution.
 // ref: ggml/src/ggml-cuda/vecdotq.cuh:115-137
 pub const A8_QUANTIZE_SYMBOL: &str = "ctox_quantize_a8_b64_sm86";
+pub const SWIGLU_A8_QUANTIZE_SYMBOL: &str = "ctox_quantize_swiglu_a8_b64_sm86";
 pub const Q2_B64_A8_MATVEC_SYMBOL: &str = "ctox_q2_b64_a8_matvec_sm86";
 pub const Q4_B64_A8_MATVEC_SYMBOL: &str = "ctox_q4_b64_a8_matvec_sm86";
 pub const Q2_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q2_b64_recovered_row_sm86";
 pub const Q4_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q4_b64_recovered_row_sm86";
+
+pub const SWIGLU_A8_QUANTIZE_PARAMS: &[KernelParam] = &[
+    KernelParam {
+        name: "gate",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 0,
+    },
+    KernelParam {
+        name: "up",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 8,
+    },
+    KernelParam {
+        name: "s_in",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 16,
+    },
+    KernelParam {
+        name: "q8_codes",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 24,
+    },
+    KernelParam {
+        name: "q8_scales",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 32,
+    },
+    KernelParam {
+        name: "columns",
+        size_bytes: 4,
+        offset_bytes: 40,
+    },
+];
+pub const SWIGLU_A8_QUANTIZE_PARAM_BYTES: u32 = 44;
 
 /// Verifier-only Qwen GatedDeltaNet recurrence. The production module ABI
 /// intentionally excludes this symbol until the FP16-state implementation
@@ -1064,6 +1099,7 @@ mod tests {
         let symbols: Vec<_> = abi.expected_symbols().collect();
         assert_eq!(symbols.len(), 2);
         assert!(!symbols.contains(&A8_QUANTIZE_SYMBOL));
+        assert!(!symbols.contains(&SWIGLU_A8_QUANTIZE_SYMBOL));
         assert!(!symbols.contains(&Q2_B64_A8_MATVEC_SYMBOL));
         assert!(!symbols.contains(&Q4_B64_A8_MATVEC_SYMBOL));
         assert!(!symbols.contains(&Q2_B64_RECOVERED_ROW_SYMBOL));
@@ -1112,6 +1148,17 @@ mod tests {
             .kernels
             .iter()
             .any(|kernel| kernel.symbol == GATED_DELTA_PREP_F32_SYMBOL));
+    }
+
+    #[test]
+    fn swiglu_a8_candidate_has_tightly_packed_driver_abi() {
+        assert_eq!(SWIGLU_A8_QUANTIZE_PARAMS.len(), 6);
+        assert_eq!(SWIGLU_A8_QUANTIZE_PARAMS[5].offset_bytes, 40);
+        assert_eq!(SWIGLU_A8_QUANTIZE_PARAM_BYTES, 44);
+        assert!(!SM86_MODULE_ABI
+            .kernels
+            .iter()
+            .any(|kernel| kernel.symbol == SWIGLU_A8_QUANTIZE_SYMBOL));
     }
 
     #[test]

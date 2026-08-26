@@ -204,6 +204,10 @@ into the recurrence. Its expanded scalar-oracle verifier is queued on physical
 GPU 2 after the BF16 recovery pipeline; the production backend remains
 fail-closed until that evidence and
 the complete projection/RoPE/attention/output graph wiring exist.
+For the FFN path, a fused CUDA candidate now combines `SiLU(gate) * up`, the
+down-projection recovery input scale, and A8 block quantization without a
+separate f32 SwiGLU allocation. Hardware numerical evidence remains required
+before it can be used by the production executor.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight

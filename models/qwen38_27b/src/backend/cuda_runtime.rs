@@ -26,6 +26,7 @@ use super::cuda::{
     PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
     Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
     Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
+    SWIGLU_A8_QUANTIZE_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -169,6 +170,7 @@ struct CudaContextInner {
     q2_function: CuFunction,
     q4_function: CuFunction,
     a8_quantize_function: CuFunction,
+    swiglu_a8_quantize_function: CuFunction,
     q2_a8_function: CuFunction,
     q4_a8_function: CuFunction,
     q2_recovered_row_function: CuFunction,
@@ -673,6 +675,17 @@ impl CudaCandidateRuntime {
                 return Err(error);
             }
         };
+        let swiglu_a8_quantize_function =
+            match resolve_function(&driver, module, SWIGLU_A8_QUANTIZE_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let q2_a8_function = match resolve_function(&driver, module, Q2_B64_A8_MATVEC_SYMBOL) {
             Ok(function) => function,
             Err(error) => {
@@ -833,6 +846,7 @@ impl CudaCandidateRuntime {
                 q2_function,
                 q4_function,
                 a8_quantize_function,
+                swiglu_a8_quantize_function,
                 q2_a8_function,
                 q4_a8_function,
                 q2_recovered_row_function,
@@ -2729,6 +2743,44 @@ impl CudaCandidateRuntime {
         )
     }
 
+    /// Fuse the Qwen FFN `SiLU(gate) * up` edge into the corrected A8 input
+    /// quantization for the down projection. Neither producer view is copied
+    /// and no intermediate f32 SwiGLU tensor is allocated.
+    pub fn quantize_shared_a8_swiglu_device(
+        &self,
+        prepared: &PreparedCudaA8Activation,
+        gate: CudaDeviceF32View<'_>,
+        up: CudaDeviceF32View<'_>,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared shared CUDA A8 activation belongs to another context".into(),
+            ));
+        }
+        for (name, view) in [("gate", gate), ("up", up)] {
+            if !Rc::ptr_eq(&self.inner, view.context) {
+                return Err(EngineError::InvalidState(format!(
+                    "shared CUDA A8 SwiGLU {name} belongs to another context"
+                )));
+            }
+            if view.values() != prepared.columns as usize {
+                return Err(EngineError::Shape(format!(
+                    "shared CUDA A8 SwiGLU {name} has {} values, expected {}",
+                    view.values(),
+                    prepared.columns
+                )));
+            }
+        }
+        self.launch_swiglu_a8_quantization(
+            gate.ptr()?,
+            up.ptr()?,
+            prepared.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            prepared.q8_codes.ptr(),
+            prepared.q8_scales.ptr(),
+            prepared.columns,
+        )
+    }
+
     /// Quantizes one corrected activation, launches every byte-identity-bound
     /// projection, synchronizes once, and returns outputs in caller order.
     pub fn dispatch_shared_a8_fanout(
@@ -2940,6 +2992,54 @@ impl CudaCandidateRuntime {
                     ptr::null_mut(),
                 ),
                 "A8 quantization launch",
+            )
+        }
+    }
+
+    fn launch_swiglu_a8_quantization(
+        &self,
+        gate_ptr: CuDevicePtr,
+        up_ptr: CuDevicePtr,
+        s_in_ptr: CuDevicePtr,
+        q8_codes_ptr: CuDevicePtr,
+        q8_scales_ptr: CuDevicePtr,
+        column_count: u32,
+    ) -> Result<()> {
+        self.make_current()?;
+        let mut gate = gate_ptr;
+        let mut up = up_ptr;
+        let mut s_in = s_in_ptr;
+        let mut q8_codes = q8_codes_ptr;
+        let mut q8_scales = q8_scales_ptr;
+        let mut columns = column_count;
+        let mut params = [
+            (&mut gate as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut up as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_in as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.swiglu_a8_quantize_function,
+                    column_count.div_ceil(64),
+                    1,
+                    1,
+                    64,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "SwiGLU A8 quantization launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "SwiGLU A8 quantization context synchronization",
             )
         }
     }
@@ -3353,6 +3453,19 @@ impl PreparedCudaA8Activation {
             ));
         }
         self.input.write(as_bytes(input))
+    }
+
+    pub fn verifier_read_quantized(&self) -> Result<(Vec<i8>, Vec<f32>)> {
+        let mut codes = vec![0_i8; self.columns()];
+        let mut scales = vec![0.0_f32; self.columns().div_ceil(BLOCK_LEN)];
+        self.q8_codes.copy_to(as_bytes_mut(&mut codes))?;
+        self.q8_scales.copy_to(as_bytes_mut(&mut scales))?;
+        if scales.iter().any(|scale| !scale.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA verifier read produced a non-finite A8 scale".into(),
+            ));
+        }
+        Ok((codes, scales))
     }
 }
 

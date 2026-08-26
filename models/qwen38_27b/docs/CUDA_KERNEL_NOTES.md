@@ -59,11 +59,12 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports fifteen explicitly unpromoted
+- The same verifier cubin additionally exports sixteen explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
   - `ctox_quantize_a8_b64_sm86`
+  - `ctox_quantize_swiglu_a8_b64_sm86`
   - `ctox_q2_b64_a8_matvec_sm86`
   - `ctox_q4_b64_a8_matvec_sm86`
   - `ctox_q2_b64_recovered_row_sm86`
@@ -143,6 +144,14 @@ before feeding them directly into the recurrence; graph execution itself does
 not use verifier staging owners. CUDA 12.6 compiles this preparation kernel
 with 18 registers and no stack or spill traffic. Physical-GPU numerical
 evidence is still required before either candidate can be promoted.
+
+The Qwen FFN down-projection path also has an unpromoted fused activation
+quantizer. It consumes the producer-owned 17,408-value gate and up projection
+views, computes `SiLU(gate) * up`, applies the down-projection's packed FP16
+`s_in`, and emits A8 codes/scales in one launch. This avoids materializing and
+rereading a 69,632-byte f32 SwiGLU tensor for every token and layer. Its
+verifier compares every A8 code and block scale with the Rust oracle before
+the candidate may feed the existing Q2/Q4 dp4a down projection.
 
 The general Qwen `(1 + weight)` RMSNorm candidate uses one 256-thread block
 per row and an eight-warp reduction, so hidden width 5,120 does not serialize
