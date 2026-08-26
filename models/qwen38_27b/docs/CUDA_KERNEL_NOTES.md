@@ -309,7 +309,10 @@ allocation and reuses the recovered-row kernel, while only the requested
 scalar `s_out` is read from the immutable mapping. The graph additionally owns
 all 134 target/MTP normalization operators: four standalone input norms and
 130 fused residual/RMSNorm edges, with each following-layer input norm loaded
-exactly once. Actual 645-step schedule execution is not yet included.
+exactly once. A fail-closed binding plan resolves all 645 frozen decode steps
+to these exact resources and rejects incomplete projection, activation, mixer,
+attention, or norm ownership before hardware dispatch. Actual 645-step
+schedule execution is not yet included.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not

@@ -17,6 +17,9 @@ use crate::backend::cuda_runtime::{
     PreparedCudaGatedRmsNorm, PreparedCudaPagedGqa, PreparedCudaPartialRope, PreparedCudaQueryGate,
     PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
 };
+use crate::backend::cuda_schedule::{
+    CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaNormBinding,
+};
 use crate::backend::{Activation, ScaleSlice};
 use crate::config::LayerKind;
 use crate::fanout::qwen38_fanout_groups;
@@ -37,6 +40,189 @@ pub struct CudaProjectionGroupPlan {
 pub struct CudaProjectionPlan {
     groups: Vec<CudaProjectionGroupPlan>,
     projection_groups: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CudaPreparedResource {
+    Embedding,
+    Activation(String),
+    Projection(String),
+    LinearMixer(usize),
+    FullAttention(String),
+    RegularNorm(String),
+    ResidualNorm(String),
+    TokenBarrier,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaBoundDecodeStep {
+    pub schedule_index: usize,
+    pub layer: Option<usize>,
+    pub operation: CudaDecodeOperation,
+    pub resources: Vec<CudaPreparedResource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaDecodeBindingPlan {
+    steps: Vec<CudaBoundDecodeStep>,
+}
+
+impl CudaDecodeBindingPlan {
+    pub fn qwen38(
+        schedule: &CudaDecodeSchedule,
+        projections: &CudaProjectionPlan,
+        config: &Qwen38Config,
+    ) -> Result<Self> {
+        schedule.validate()?;
+        let mut steps = Vec::with_capacity(schedule.steps.len());
+        for (schedule_index, step) in schedule.steps.iter().enumerate() {
+            steps.push(bind_decode_step(schedule_index, step, projections, config)?);
+        }
+        let plan = Self { steps };
+        plan.validate_complete_ownership(projections, config)?;
+        Ok(plan)
+    }
+
+    pub fn steps(&self) -> &[CudaBoundDecodeStep] {
+        &self.steps
+    }
+
+    pub fn resource_count(&self, expected: fn(&CudaPreparedResource) -> bool) -> usize {
+        self.steps
+            .iter()
+            .flat_map(|step| &step.resources)
+            .filter(|resource| expected(resource))
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    fn validate_complete_ownership(
+        &self,
+        projections: &CudaProjectionPlan,
+        config: &Qwen38Config,
+    ) -> Result<()> {
+        if self.steps.is_empty() {
+            return Err(EngineError::InvalidState(
+                "CUDA decode binding plan cannot be empty".into(),
+            ));
+        }
+        let resources: BTreeSet<_> = self
+            .steps
+            .iter()
+            .flat_map(|step| step.resources.iter().cloned())
+            .collect();
+        let bound_projections: BTreeSet<_> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                CudaPreparedResource::Projection(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected_projections: BTreeSet<_> =
+            projections.projection_groups.keys().cloned().collect();
+        compare_resource_set("projection", &bound_projections, &expected_projections)?;
+
+        let bound_activations: BTreeSet<_> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                CudaPreparedResource::Activation(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected_activations: BTreeSet<_> = projections
+            .groups
+            .iter()
+            .map(|group| group.key.clone())
+            .collect();
+        compare_resource_set("activation", &bound_activations, &expected_activations)?;
+
+        let bound_linear_mixers: BTreeSet<_> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                CudaPreparedResource::LinearMixer(layer) => Some(*layer),
+                _ => None,
+            })
+            .collect();
+        let expected_linear_mixers: BTreeSet<_> = (0..config.num_hidden_layers)
+            .filter(|layer| config.layer_kind(*layer) == Some(LayerKind::LinearAttention))
+            .collect();
+        compare_resource_set(
+            "linear mixer",
+            &bound_linear_mixers,
+            &expected_linear_mixers,
+        )?;
+
+        let bound_full_attention: BTreeSet<_> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                CudaPreparedResource::FullAttention(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut expected_full_attention: BTreeSet<_> = (0..config.num_hidden_layers)
+            .filter(|layer| config.layer_kind(*layer) == Some(LayerKind::FullAttention))
+            .map(|layer| format!("target:{layer}"))
+            .collect();
+        expected_full_attention.insert("mtp:0".into());
+        compare_resource_set(
+            "full attention",
+            &bound_full_attention,
+            &expected_full_attention,
+        )?;
+
+        let bound_regular_norms: BTreeSet<_> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                CudaPreparedResource::RegularNorm(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected_regular_norms = BTreeSet::from([
+            "target:initial".to_owned(),
+            "mtp:pre_embedding".to_owned(),
+            "mtp:pre_hidden".to_owned(),
+            "mtp:input".to_owned(),
+        ]);
+        compare_resource_set(
+            "regular norm",
+            &bound_regular_norms,
+            &expected_regular_norms,
+        )?;
+
+        let bound_residual_norms: BTreeSet<_> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                CudaPreparedResource::ResidualNorm(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut expected_residual_norms = BTreeSet::new();
+        for layer in 0..config.num_hidden_layers {
+            expected_residual_norms.insert(format!("target:{layer}:post_attention"));
+            if layer + 1 == config.num_hidden_layers {
+                expected_residual_norms.insert(format!("target:{layer}:post_ffn:final"));
+            } else {
+                expected_residual_norms
+                    .insert(format!("target:{layer}:post_ffn:layer_{}", layer + 1));
+            }
+        }
+        expected_residual_norms.insert("mtp:post_attention".to_owned());
+        expected_residual_norms.insert("mtp:final".to_owned());
+        compare_resource_set(
+            "residual norm",
+            &bound_residual_norms,
+            &expected_residual_norms,
+        )?;
+
+        if !resources.contains(&CudaPreparedResource::Embedding)
+            || !resources.contains(&CudaPreparedResource::TokenBarrier)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA decode binding omits embedding or token barrier".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl CudaProjectionPlan {
@@ -166,12 +352,269 @@ impl CudaProjectionPlan {
     }
 }
 
+fn bind_decode_step(
+    schedule_index: usize,
+    step: &CudaDecodeStep,
+    projections: &CudaProjectionPlan,
+    config: &Qwen38Config,
+) -> Result<CudaBoundDecodeStep> {
+    if step.operation != CudaDecodeOperation::RmsNorm
+        && step.operation != CudaDecodeOperation::ResidualRmsNorm
+        && step.norm.is_some()
+    {
+        return Err(EngineError::InvalidState(format!(
+            "CUDA decode step {schedule_index} attaches a norm to {:?}",
+            step.operation
+        )));
+    }
+    let mut resources = Vec::new();
+    match step.operation {
+        CudaDecodeOperation::Embedding => {
+            require_global_step(schedule_index, step)?;
+            resources.push(CudaPreparedResource::Embedding);
+        }
+        CudaDecodeOperation::RmsNorm => {
+            if step.layer != Some(0) || step.norm != Some(CudaNormBinding::LayerInput(0)) {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA decode step {schedule_index} is not the frozen initial norm"
+                )));
+            }
+            resources.push(CudaPreparedResource::RegularNorm("target:initial".into()));
+        }
+        CudaDecodeOperation::FullAttentionFanout => {
+            let layer = require_layer_kind(schedule_index, step, config, LayerKind::FullAttention)?;
+            let prefix = format!("model.language_model.layers.{layer}.self_attn");
+            add_projection_resources(
+                projections,
+                [
+                    format!("{prefix}.q_proj.weight"),
+                    format!("{prefix}.k_proj.weight"),
+                    format!("{prefix}.v_proj.weight"),
+                ],
+                &mut resources,
+            )?;
+        }
+        CudaDecodeOperation::QueryGateNormRope
+        | CudaDecodeOperation::KeyRope
+        | CudaDecodeOperation::PagedKvAppend
+        | CudaDecodeOperation::PagedGqa => {
+            let layer = require_layer_kind(schedule_index, step, config, LayerKind::FullAttention)?;
+            resources.push(CudaPreparedResource::FullAttention(format!(
+                "target:{layer}"
+            )));
+        }
+        CudaDecodeOperation::AttentionGateA8OutputProjection => {
+            let layer = require_layer_kind(schedule_index, step, config, LayerKind::FullAttention)?;
+            let name = format!("model.language_model.layers.{layer}.self_attn.o_proj.weight");
+            resources.push(CudaPreparedResource::FullAttention(format!(
+                "target:{layer}"
+            )));
+            add_projection_resources(projections, [name], &mut resources)?;
+        }
+        CudaDecodeOperation::LinearFanout => {
+            let layer =
+                require_layer_kind(schedule_index, step, config, LayerKind::LinearAttention)?;
+            let prefix = format!("model.language_model.layers.{layer}.linear_attn");
+            add_projection_resources(
+                projections,
+                [
+                    format!("{prefix}.in_proj_qkv.weight"),
+                    format!("{prefix}.in_proj_z.weight"),
+                    format!("{prefix}.in_proj_a.weight"),
+                    format!("{prefix}.in_proj_b.weight"),
+                ],
+                &mut resources,
+            )?;
+        }
+        CudaDecodeOperation::CausalConvolution
+        | CudaDecodeOperation::GatedDeltaPrepare
+        | CudaDecodeOperation::GatedDeltaRecurrent
+        | CudaDecodeOperation::GatedRmsNorm => {
+            let layer =
+                require_layer_kind(schedule_index, step, config, LayerKind::LinearAttention)?;
+            resources.push(CudaPreparedResource::LinearMixer(layer));
+        }
+        CudaDecodeOperation::LinearOutputProjection => {
+            let layer =
+                require_layer_kind(schedule_index, step, config, LayerKind::LinearAttention)?;
+            resources.push(CudaPreparedResource::LinearMixer(layer));
+            add_projection_resources(
+                projections,
+                [format!(
+                    "model.language_model.layers.{layer}.linear_attn.out_proj.weight"
+                )],
+                &mut resources,
+            )?;
+        }
+        CudaDecodeOperation::ResidualRmsNorm => {
+            let layer = require_layer(schedule_index, step, config)?;
+            let key = match step.norm {
+                Some(CudaNormBinding::LayerPostAttention(bound)) if bound == layer => {
+                    format!("target:{layer}:post_attention")
+                }
+                Some(CudaNormBinding::LayerInput(next)) if next == layer + 1 => {
+                    format!("target:{layer}:post_ffn:layer_{next}")
+                }
+                Some(CudaNormBinding::Final) if layer + 1 == config.num_hidden_layers => {
+                    format!("target:{layer}:post_ffn:final")
+                }
+                _ => {
+                    return Err(EngineError::InvalidState(format!(
+                        "CUDA residual norm at step {schedule_index} has incompatible binding {:?}",
+                        step.norm
+                    )))
+                }
+            };
+            resources.push(CudaPreparedResource::ResidualNorm(key));
+        }
+        CudaDecodeOperation::FfnGateUpFanout => {
+            let layer = require_layer(schedule_index, step, config)?;
+            let prefix = format!("model.language_model.layers.{layer}.mlp");
+            add_projection_resources(
+                projections,
+                [
+                    format!("{prefix}.gate_proj.weight"),
+                    format!("{prefix}.up_proj.weight"),
+                ],
+                &mut resources,
+            )?;
+        }
+        CudaDecodeOperation::SwiGluA8DownProjection => {
+            let layer = require_layer(schedule_index, step, config)?;
+            add_projection_resources(
+                projections,
+                [format!(
+                    "model.language_model.layers.{layer}.mlp.down_proj.weight"
+                )],
+                &mut resources,
+            )?;
+        }
+        CudaDecodeOperation::LmHead => {
+            require_global_step(schedule_index, step)?;
+            add_projection_resources(projections, ["lm_head.weight".to_owned()], &mut resources)?;
+        }
+        CudaDecodeOperation::MtpDraftAndTargetVerify => {
+            require_global_step(schedule_index, step)?;
+            resources.extend([
+                CudaPreparedResource::Embedding,
+                CudaPreparedResource::FullAttention("mtp:0".into()),
+                CudaPreparedResource::RegularNorm("mtp:pre_embedding".into()),
+                CudaPreparedResource::RegularNorm("mtp:pre_hidden".into()),
+                CudaPreparedResource::RegularNorm("mtp:input".into()),
+                CudaPreparedResource::ResidualNorm("mtp:post_attention".into()),
+                CudaPreparedResource::ResidualNorm("mtp:final".into()),
+            ]);
+            add_projection_resources(
+                projections,
+                [
+                    "mtp.fc.weight".to_owned(),
+                    "mtp.layers.0.self_attn.q_proj.weight".to_owned(),
+                    "mtp.layers.0.self_attn.k_proj.weight".to_owned(),
+                    "mtp.layers.0.self_attn.v_proj.weight".to_owned(),
+                    "mtp.layers.0.self_attn.o_proj.weight".to_owned(),
+                    "mtp.layers.0.mlp.gate_proj.weight".to_owned(),
+                    "mtp.layers.0.mlp.up_proj.weight".to_owned(),
+                    "mtp.layers.0.mlp.down_proj.weight".to_owned(),
+                    "lm_head.weight".to_owned(),
+                ],
+                &mut resources,
+            )?;
+        }
+        CudaDecodeOperation::TokenBarrier => {
+            require_global_step(schedule_index, step)?;
+            resources.push(CudaPreparedResource::TokenBarrier);
+        }
+    }
+    resources.sort();
+    resources.dedup();
+    if resources.is_empty() {
+        return Err(EngineError::InvalidState(format!(
+            "CUDA decode step {schedule_index} has no prepared resource"
+        )));
+    }
+    Ok(CudaBoundDecodeStep {
+        schedule_index,
+        layer: step.layer,
+        operation: step.operation,
+        resources,
+    })
+}
+
+fn add_projection_resources<const N: usize>(
+    projections: &CudaProjectionPlan,
+    names: [String; N],
+    resources: &mut Vec<CudaPreparedResource>,
+) -> Result<()> {
+    for name in names {
+        let group = projections.group_for_projection(&name)?;
+        resources.push(CudaPreparedResource::Activation(group.to_owned()));
+        resources.push(CudaPreparedResource::Projection(name));
+    }
+    Ok(())
+}
+
+fn require_global_step(schedule_index: usize, step: &CudaDecodeStep) -> Result<()> {
+    if step.layer.is_some() || step.norm.is_some() {
+        return Err(EngineError::InvalidState(format!(
+            "CUDA global decode step {schedule_index} carries a layer or norm"
+        )));
+    }
+    Ok(())
+}
+
+fn require_layer(
+    schedule_index: usize,
+    step: &CudaDecodeStep,
+    config: &Qwen38Config,
+) -> Result<usize> {
+    let layer = step.layer.ok_or_else(|| {
+        EngineError::InvalidState(format!("CUDA decode step {schedule_index} has no layer"))
+    })?;
+    if layer >= config.num_hidden_layers {
+        return Err(EngineError::InvalidState(format!(
+            "CUDA decode step {schedule_index} references layer {layer}"
+        )));
+    }
+    Ok(layer)
+}
+
+fn require_layer_kind(
+    schedule_index: usize,
+    step: &CudaDecodeStep,
+    config: &Qwen38Config,
+    expected: LayerKind,
+) -> Result<usize> {
+    let layer = require_layer(schedule_index, step, config)?;
+    if config.layer_kind(layer) != Some(expected) {
+        return Err(EngineError::InvalidState(format!(
+            "CUDA decode step {schedule_index} binds {expected:?} resources to layer {layer}"
+        )));
+    }
+    Ok(layer)
+}
+
+fn compare_resource_set<T: Ord>(
+    label: &str,
+    actual: &BTreeSet<T>,
+    expected: &BTreeSet<T>,
+) -> Result<()> {
+    if actual != expected {
+        return Err(EngineError::InvalidState(format!(
+            "CUDA decode binding owns {} {label} resources, expected {}",
+            actual.len(),
+            expected.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Resident CUDA projection state. `artifact` intentionally keeps the
 /// immutable mapping alive, while all accelerator allocations are owned by
 /// the prepared objects' private driver context.
 pub struct PreparedCudaProjectionGraph {
     artifact: ModelArtifact,
     plan: CudaProjectionPlan,
+    decode_bindings: CudaDecodeBindingPlan,
     embedding: PreparedCudaEmbedding,
     activations: BTreeMap<String, PreparedCudaA8Activation>,
     projections: BTreeMap<String, PreparedCudaA8Projection>,
@@ -328,6 +771,8 @@ impl PreparedCudaProjectionGraph {
         }
         validate_tensor_contract(artifact.manifest(), config)?;
         let plan = CudaProjectionPlan::qwen38(config)?;
+        let decode_schedule = CudaDecodeSchedule::qwen38(config)?;
+        let decode_bindings = CudaDecodeBindingPlan::qwen38(&decode_schedule, &plan, config)?;
         let mut activations = BTreeMap::new();
         let mut projections = BTreeMap::new();
         let mut linear_mixers = BTreeMap::new();
@@ -551,9 +996,10 @@ impl PreparedCudaProjectionGraph {
         let norms = prepare_norms(runtime, artifact, config)?;
         model_bytes = checked_add(model_bytes, norms.model_bytes, "CUDA model bytes")?;
         graph_bytes = checked_add(graph_bytes, norms.graph_bytes, "CUDA graph bytes")?;
-        Ok(Self {
+        let graph = Self {
             artifact: artifact.clone(),
             plan,
+            decode_bindings,
             embedding,
             activations,
             projections,
@@ -563,7 +1009,9 @@ impl PreparedCudaProjectionGraph {
             model_bytes,
             graph_bytes,
             session_bytes,
-        })
+        };
+        graph.validate_bound_resources()?;
+        Ok(graph)
     }
 
     pub fn artifact_manifest_sha256(&self) -> &str {
@@ -572,6 +1020,10 @@ impl PreparedCudaProjectionGraph {
 
     pub fn plan(&self) -> &CudaProjectionPlan {
         &self.plan
+    }
+
+    pub fn decode_bindings(&self) -> &CudaDecodeBindingPlan {
+        &self.decode_bindings
     }
 
     pub fn embedding(&self) -> &PreparedCudaEmbedding {
@@ -655,6 +1107,35 @@ impl PreparedCudaProjectionGraph {
             self.session_bytes,
             "CUDA resident bytes",
         )
+    }
+
+    fn validate_bound_resources(&self) -> Result<()> {
+        for step in self.decode_bindings.steps() {
+            for resource in &step.resources {
+                match resource {
+                    CudaPreparedResource::Embedding | CudaPreparedResource::TokenBarrier => {}
+                    CudaPreparedResource::Activation(key) => {
+                        self.activation(key)?;
+                    }
+                    CudaPreparedResource::Projection(name) => {
+                        self.projection(name)?;
+                    }
+                    CudaPreparedResource::LinearMixer(layer) => {
+                        self.linear_mixer(*layer)?;
+                    }
+                    CudaPreparedResource::FullAttention(key) => {
+                        self.full_attention(key)?;
+                    }
+                    CudaPreparedResource::RegularNorm(key) => {
+                        self.norms.regular(key)?;
+                    }
+                    CudaPreparedResource::ResidualNorm(key) => {
+                        self.norms.residual(key)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1005,5 +1486,64 @@ mod tests {
             .group_for_projection("lm_head.weight")
             .unwrap()
             .starts_with("independent:"));
+    }
+
+    #[test]
+    fn frozen_decode_bindings_cover_every_resident_operator() {
+        let config = Qwen38Config::default();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let schedule = CudaDecodeSchedule::qwen38(&config).unwrap();
+        let bindings = CudaDecodeBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
+        assert_eq!(bindings.steps().len(), 645);
+        assert_eq!(
+            bindings.resource_count(|resource| {
+                matches!(resource, CudaPreparedResource::Projection(_))
+            }),
+            505
+        );
+        assert_eq!(
+            bindings.resource_count(|resource| {
+                matches!(resource, CudaPreparedResource::Activation(_))
+            }),
+            262
+        );
+        assert_eq!(
+            bindings.resource_count(|resource| {
+                matches!(resource, CudaPreparedResource::LinearMixer(_))
+            }),
+            48
+        );
+        assert_eq!(
+            bindings.resource_count(|resource| {
+                matches!(resource, CudaPreparedResource::FullAttention(_))
+            }),
+            17
+        );
+        assert_eq!(
+            bindings.resource_count(|resource| {
+                matches!(resource, CudaPreparedResource::RegularNorm(_))
+            }),
+            4
+        );
+        assert_eq!(
+            bindings.resource_count(|resource| {
+                matches!(resource, CudaPreparedResource::ResidualNorm(_))
+            }),
+            130
+        );
+    }
+
+    #[test]
+    fn binding_rejects_schedule_that_hides_the_mtp_program() {
+        let config = Qwen38Config::default();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let mut schedule = CudaDecodeSchedule::qwen38(&config).unwrap();
+        let mtp = schedule
+            .steps
+            .iter_mut()
+            .find(|step| step.operation == CudaDecodeOperation::MtpDraftAndTargetVerify)
+            .unwrap();
+        mtp.operation = CudaDecodeOperation::LmHead;
+        assert!(CudaDecodeBindingPlan::qwen38(&schedule, &projections, &config).is_err());
     }
 }

@@ -212,8 +212,10 @@ before it can be used by the production executor.
 The CUDA assembly contract is now a frozen 645-step device schedule covering
 all 64 target layers, final logits, and MTP verification with exactly one host
 barrier at token completion. It validates device-slot dataflow and rejects any
-topology other than the exact Qwen3.8-27B configuration. Binding every planned
-step to prepared artifact-backed operators remains in progress. The CUDA
+topology other than the exact Qwen3.8-27B configuration. An exact binding plan
+now resolves all 645 steps to the resident artifact-backed resources and proves
+unique coverage of every 505 projection, 262 activation owner, 48 linear mixer,
+17 full-attention state, and 134 norm operator. The CUDA
 projection loader now validates and uploads pure or mixed Q2/Q4 matrices and
 packed FP16 recovery scales directly from mmap-backed `RecoveredMatrixView`
 objects, without widening/repacking model state or allocating a redundant f32
@@ -227,8 +229,8 @@ uses 128K and is a residency gate, not an end-to-end inference claim. All 134
 target/MTP normalization operators are also owned by the load graph: four
 standalone input norms and 130 fused residual/RMSNorm edges. The previously
 open full-attention gate edge has a fused sigmoid-gate/recovery/A8/output-
-projection CUDA candidate and dedicated hardware verifier. Binding the frozen
-645-step schedule to these resident operators remains open.
+projection CUDA candidate and dedicated hardware verifier. Dispatching the
+bound 645-step schedule without host intermediates remains open.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight
