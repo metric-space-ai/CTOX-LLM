@@ -735,6 +735,23 @@ impl<'a> CudaPrefillExecutionCursor<'a> {
         Ok(())
     }
 
+    /// Skip only the LM-head read of an intermediate prompt chunk. Target and
+    /// optional MTP state still have to execute and the final chunk must use
+    /// the logits-producing API.
+    pub fn skip_intermediate_lm_head(&mut self) -> Result<()> {
+        let expected = self.next_step().ok_or_else(|| {
+            EngineError::InvalidState("CUDA prefill chunk is already complete".into())
+        })?;
+        if expected.layer.is_some() || expected.operation != CudaPrefillOperation::LastTokenLmHead {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA prefill can skip only an intermediate LM head, next step is {:?} layer {:?}",
+                expected.operation, expected.layer
+            )));
+        }
+        self.next_step += 1;
+        Ok(())
+    }
+
     /// Records the one schedule step that is intentionally inactive when the
     /// caller requested target-only prefill. No other CUDA operation may be
     /// skipped through this boundary.
@@ -2988,7 +3005,37 @@ impl PreparedCudaProjectionGraph {
             token_ids,
             start_position,
             false,
-        )
+            true,
+        )?
+        .ok_or_else(|| {
+            EngineError::InvalidState("CUDA final prefill omitted LM-head logits".into())
+        })
+    }
+
+    /// Advances a non-final target-only prompt chunk without reading the
+    /// complete LM head. All target session state commits exactly as in the
+    /// logits-producing path.
+    pub fn dispatch_target_prefill_state_without_mtp_device(
+        &mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        token_ids: &[u32],
+        start_position: usize,
+    ) -> Result<()> {
+        let logits = self.dispatch_target_prefill_chunk_device_impl(
+            runtime,
+            config,
+            token_ids,
+            start_position,
+            false,
+            false,
+        )?;
+        if logits.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA state-only prefill unexpectedly produced logits".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Executes target and the causally shifted one-layer MTP prompt state in
@@ -3006,7 +3053,37 @@ impl PreparedCudaProjectionGraph {
             token_ids,
             start_position,
             true,
-        )
+            true,
+        )?
+        .ok_or_else(|| {
+            EngineError::InvalidState("CUDA final MTP prefill omitted LM-head logits".into())
+        })
+    }
+
+    /// Advances a non-final target+MTP prompt chunk while omitting the target
+    /// LM head. The retained hidden boundary and both causal caches still
+    /// commit atomically.
+    pub fn dispatch_target_prefill_state_with_mtp_device(
+        &mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        token_ids: &[u32],
+        start_position: usize,
+    ) -> Result<()> {
+        let logits = self.dispatch_target_prefill_chunk_device_impl(
+            runtime,
+            config,
+            token_ids,
+            start_position,
+            true,
+            false,
+        )?;
+        if logits.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA state-only MTP prefill unexpectedly produced logits".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn dispatch_target_prefill_chunk_device_impl<'a>(
@@ -3016,7 +3093,8 @@ impl PreparedCudaProjectionGraph {
         token_ids: &[u32],
         start_position: usize,
         mtp_enabled: bool,
-    ) -> Result<CudaDeviceF32View<'a>> {
+        emit_logits: bool,
+    ) -> Result<Option<CudaDeviceF32View<'a>>> {
         if config != &Qwen38Config::default() {
             return Err(EngineError::Shape(
                 "CUDA target prefill requires the frozen Qwen3.8-27B topology".into(),
@@ -3072,7 +3150,7 @@ impl PreparedCudaProjectionGraph {
         let tokens = token_ids.len();
         let dispatch = runtime.run_token_submission(
             "target prefill chunk commit synchronization",
-            || -> Result<CudaDeviceF32View<'a>> {
+            || -> Result<Option<CudaDeviceF32View<'a>>> {
                 let embedded = runtime.dispatch_embedding_rows_device(
                     embedding,
                     prefill_workspaces.embedding(),
@@ -3293,23 +3371,29 @@ impl PreparedCudaProjectionGraph {
                     )?;
                 }
 
-                let last_row = normalized.slice(
-                    (tokens - 1)
-                        .checked_mul(config.hidden_size)
-                        .ok_or_else(|| {
-                            EngineError::Shape("CUDA final prompt row offset overflows".into())
-                        })?,
-                    config.hidden_size,
-                )?;
-                let logits = dispatch_projection_device(
-                    runtime,
-                    plan,
-                    activations,
-                    projections,
-                    last_row,
-                    "lm_head.weight",
-                )?;
-                advance_prefill(&mut cursor, None, CudaPrefillOperation::LastTokenLmHead)?;
+                let logits = if emit_logits {
+                    let last_row = normalized.slice(
+                        (tokens - 1)
+                            .checked_mul(config.hidden_size)
+                            .ok_or_else(|| {
+                                EngineError::Shape("CUDA final prompt row offset overflows".into())
+                            })?,
+                        config.hidden_size,
+                    )?;
+                    let logits = dispatch_projection_device(
+                        runtime,
+                        plan,
+                        activations,
+                        projections,
+                        last_row,
+                        "lm_head.weight",
+                    )?;
+                    advance_prefill(&mut cursor, None, CudaPrefillOperation::LastTokenLmHead)?;
+                    Some(logits)
+                } else {
+                    cursor.skip_intermediate_lm_head()?;
+                    None
+                };
                 if let Some(alignment) = mtp_alignment {
                     dispatch_mtp_prefill_parts(
                         runtime,
@@ -4846,6 +4930,46 @@ mod tests {
             CudaPrefillOperation::ChunkBarrier
         );
         assert!(cursor.skip_disabled_mtp().is_err());
+    }
+
+    #[test]
+    fn intermediate_prefill_can_skip_only_its_lm_head_read() {
+        let config = Qwen38Config::default();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let schedule = CudaPrefillSchedule::qwen38(&config, 512).unwrap();
+        let bindings = CudaPrefillBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
+        let mut cursor = bindings
+            .execution_cursor(
+                CudaPrefillChunk {
+                    start_position: 512,
+                    token_count: 8,
+                },
+                512,
+                1_024,
+            )
+            .unwrap();
+        assert!(cursor.skip_intermediate_lm_head().is_err());
+        while cursor
+            .next_step()
+            .is_some_and(|step| step.operation != CudaPrefillOperation::LastTokenLmHead)
+        {
+            let step = cursor.next_step().unwrap().clone();
+            cursor
+                .advance(step.schedule_index, step.layer, step.operation)
+                .unwrap();
+        }
+        cursor.skip_intermediate_lm_head().unwrap();
+        assert_eq!(
+            cursor.next_step().unwrap().operation,
+            CudaPrefillOperation::MtpPrefillCausalScan
+        );
+        assert!(cursor.skip_intermediate_lm_head().is_err());
+        cursor.skip_disabled_mtp().unwrap();
+        let barrier = cursor.next_step().unwrap().clone();
+        cursor
+            .advance(barrier.schedule_index, barrier.layer, barrier.operation)
+            .unwrap();
+        assert_eq!(cursor.finish().unwrap(), 520);
     }
 
     #[test]

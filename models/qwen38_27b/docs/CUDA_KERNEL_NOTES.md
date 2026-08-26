@@ -598,8 +598,11 @@ Evidence is in `benchmarks/cuda/sm86-batched-fused-a8-512-20260826.json`.
 The CUDA executor now selects the layer-major chunk graph for target-only
 prefill, bounded to 512 tokens. It uses the graph-owned embedding, norm,
 projection, attention, and linear-mixer workspaces, executes the final LM head
-only for the last row, and exposes one commit barrier per chunk. Its fail-
-closed cursor permits only the explicitly disabled MTP step to be skipped.
+only for the last row of the final prompt chunk, and exposes one commit barrier
+per chunk. Intermediate chunks use a distinct state-only API whose cursor may
+skip exactly the LM-head step but must still commit every target/MTP state
+transition. Its fail-closed cursor permits only the explicitly disabled MTP
+step to be skipped.
 MTP-enabled prefill now dispatches the native one-layer MTP graph over the
 causally shifted chunk while preserving the target-one-ahead invariant. This
 is source and unit-test integration; complete-model SM86 numerical, memory,

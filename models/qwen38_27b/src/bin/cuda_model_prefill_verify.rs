@@ -199,24 +199,40 @@ fn main() -> anyhow::Result<()> {
     let batched_stats_before = runtime.submission_stats();
     let batched_started = Instant::now();
     let mut batched_logits = Vec::new();
-    for chunk in args.token_ids.chunks(maximum_chunk_tokens) {
+    for (chunk_index, chunk) in args.token_ids.chunks(maximum_chunk_tokens).enumerate() {
         let start_position = graph.target_tokens();
-        let batched_view = if args.mtp_enabled {
-            graph.dispatch_target_prefill_chunk_with_mtp_device(
+        if chunk_index + 1 == chunks {
+            let batched_view = if args.mtp_enabled {
+                graph.dispatch_target_prefill_chunk_with_mtp_device(
+                    &runtime,
+                    &config,
+                    chunk,
+                    start_position,
+                )?
+            } else {
+                graph.dispatch_target_prefill_chunk_without_mtp_device(
+                    &runtime,
+                    &config,
+                    chunk,
+                    start_position,
+                )?
+            };
+            batched_logits = runtime.verifier_read_f32_device(batched_view)?;
+        } else if args.mtp_enabled {
+            graph.dispatch_target_prefill_state_with_mtp_device(
                 &runtime,
                 &config,
                 chunk,
                 start_position,
-            )?
+            )?;
         } else {
-            graph.dispatch_target_prefill_chunk_without_mtp_device(
+            graph.dispatch_target_prefill_state_without_mtp_device(
                 &runtime,
                 &config,
                 chunk,
                 start_position,
-            )?
-        };
-        batched_logits = runtime.verifier_read_f32_device(batched_view)?;
+            )?;
+        }
     }
     let batched_milliseconds = batched_started.elapsed().as_secs_f64() * 1.0e3;
     ensure_logits(&batched_logits, "batched")?;

@@ -305,8 +305,10 @@ prefill pools therefore total 240,584,704 bytes before executor-specific
 scratch. The schedule batches every large
 Q2/Q4 projection, retains causal device scans for paged GQA, convolution,
 GatedDelta recurrence, and MTP state, computes the target LM head only for the
-last prompt token, and exposes one cancellation/commit barrier per bounded
-chunk. Batched activation/output workspaces are separate from resident matrix
+last token of the final prompt chunk, and exposes one cancellation/commit
+barrier per bounded chunk. Intermediate chunks commit all target/MTP state
+while skipping the otherwise unused 248,320-row head read. Batched
+activation/output workspaces are separate from resident matrix
 owners, so enabling a 512-token chunk does not duplicate model weights. The
 frozen projection arena now proves that all 504 chunk-wide target/MTP matrices
 fit four conflict-free output slots plus one maximum-width A8 encoding slot:

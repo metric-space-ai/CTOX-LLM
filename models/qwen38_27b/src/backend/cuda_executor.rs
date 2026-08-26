@@ -682,26 +682,41 @@ impl ModelExecutor for CudaModelExecutor {
                 return Err(EngineError::Cancelled);
             }
             let start_position = graph.target_tokens();
-            let view = if mtp_enabled {
-                graph.dispatch_target_prefill_chunk_with_mtp_device(
-                    runtime,
-                    &self.config,
-                    chunk,
-                    start_position,
-                )?
-            } else {
-                graph.dispatch_target_prefill_chunk_without_mtp_device(
-                    runtime,
-                    &self.config,
-                    chunk,
-                    start_position,
-                )?
-            };
-            if start_position + chunk.len() == tokens.len() {
+            let final_chunk = start_position + chunk.len() == tokens.len();
+            if final_chunk {
+                let view = if mtp_enabled {
+                    graph.dispatch_target_prefill_chunk_with_mtp_device(
+                        runtime,
+                        &self.config,
+                        chunk,
+                        start_position,
+                    )?
+                } else {
+                    graph.dispatch_target_prefill_chunk_without_mtp_device(
+                        runtime,
+                        &self.config,
+                        chunk,
+                        start_position,
+                    )?
+                };
                 target_logits = match self.mtp_output_mode {
                     CudaMtpOutputMode::CompactGreedy => Vec::new(),
                     CudaMtpOutputMode::FullVerifierLogits => read_valid_logits(runtime, view)?,
                 };
+            } else if mtp_enabled {
+                graph.dispatch_target_prefill_state_with_mtp_device(
+                    runtime,
+                    &self.config,
+                    chunk,
+                    start_position,
+                )?;
+            } else {
+                graph.dispatch_target_prefill_state_without_mtp_device(
+                    runtime,
+                    &self.config,
+                    chunk,
+                    start_position,
+                )?;
             }
         }
         Ok(ExecutorStep {
