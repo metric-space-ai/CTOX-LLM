@@ -534,10 +534,12 @@ workspace once rather than once per layer: 20,971,520 bytes for causal-
 convolution output, 37,945,344 bytes for prepared GatedDelta inputs,
 12,582,912 bytes for recurrent output, and 12,582,912 bytes for batched gated
 RMSNorm output. The exact total is 84,082,688 bytes and is shared across all 48
-linear-attention layers. Together with the 63,045,632-byte full-attention pool
-and 82,968,576-byte projection arena, fixed graph-owned chunk workspaces total
-230,096,896 bytes. Host planning and actual CUDA allocations must match
-exactly; this is an ownership/bounded-memory result, not yet complete-graph
+linear-attention layers. Together with the 73,533,440-byte embedding/frontend/
+full-attention pool and 82,968,576-byte projection arena, fixed graph-owned
+chunk workspaces total 240,584,704 bytes. The first pool includes the
+2,048-byte device token-ID list and 10,485,760-byte token-major embedding
+output needed by a 512-token chunk. Host planning and actual CUDA allocations
+must match exactly; this is an ownership/bounded-memory result, not yet complete-graph
 performance evidence. The batched gated-RMSNorm verifier is compiled into the
 linear-ops hardware harness, but its updated A4500 run remains required.
 

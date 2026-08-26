@@ -4,8 +4,8 @@
 //! MTP projection into the exact shared-correction group used by the recovery
 //! pipeline, then prepares immutable packed weights and recovery scales
 //! directly from the CTOXQ mapping. It does not implement a generic graph
-//! runtime and it does not admit embedding-row lookup until that dedicated
-//! production kernel is wired.
+//! runtime. The bounded prefill ownership also includes the dedicated batched
+//! embedding row-ID/output workspace; no token-wise host launch is admitted.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,14 +14,14 @@ use crate::backend::cuda_runtime::{
     CudaGatedRmsNormConfig, CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig,
     CudaRmsNormConfig, PreparedCudaA8Activation, PreparedCudaA8Projection,
     PreparedCudaBatchedA8OutputArena, PreparedCudaBatchedA8Workspace,
-    PreparedCudaBatchedGatedRmsNormOutput, PreparedCudaBatchedQueryGateOutput,
-    PreparedCudaBatchedRmsNormWorkspace, PreparedCudaBatchedRopeWorkspace, PreparedCudaCausalConv,
-    PreparedCudaCausalConvScanOutput, PreparedCudaEmbedding, PreparedCudaF32Checkpoint,
-    PreparedCudaF32Concat, PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs,
-    PreparedCudaGatedDeltaScanInputs, PreparedCudaGatedDeltaScanOutput, PreparedCudaGatedRmsNorm,
-    PreparedCudaGatheredA8Projection, PreparedCudaPagedGqa, PreparedCudaPagedGqaPrefillOutput,
-    PreparedCudaPartialRope, PreparedCudaQueryGate, PreparedCudaResidualRmsNorm,
-    PreparedCudaRmsNorm,
+    PreparedCudaBatchedEmbeddingWorkspace, PreparedCudaBatchedGatedRmsNormOutput,
+    PreparedCudaBatchedQueryGateOutput, PreparedCudaBatchedRmsNormWorkspace,
+    PreparedCudaBatchedRopeWorkspace, PreparedCudaCausalConv, PreparedCudaCausalConvScanOutput,
+    PreparedCudaEmbedding, PreparedCudaF32Checkpoint, PreparedCudaF32Concat,
+    PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs, PreparedCudaGatedDeltaScanInputs,
+    PreparedCudaGatedDeltaScanOutput, PreparedCudaGatedRmsNorm, PreparedCudaGatheredA8Projection,
+    PreparedCudaPagedGqa, PreparedCudaPagedGqaPrefillOutput, PreparedCudaPartialRope,
+    PreparedCudaQueryGate, PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
 };
 use crate::backend::cuda_schedule::{
     CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaNormBinding, CudaPrefillChunk,
@@ -115,6 +115,8 @@ pub struct CudaPrefillExecutionCursor<'a> {
 /// schedule overwrites the same slots after each consumer has completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaPrefillWorkspaceBudget {
+    pub embedding_row_id_bytes: u64,
+    pub embedding_output_bytes: u64,
     pub hidden_norm_bytes: u64,
     pub key_norm_bytes: u64,
     pub rope_table_bytes: u64,
@@ -359,6 +361,8 @@ impl CudaPrefillWorkspaceBudget {
         }
         let f32_bytes =
             u64::try_from(std::mem::size_of::<f32>()).expect("f32 byte count always fits u64");
+        let u32_bytes =
+            u64::try_from(std::mem::size_of::<u32>()).expect("u32 byte count always fits u64");
         let chunk = u64::try_from(max_chunk_tokens)
             .map_err(|_| EngineError::MemoryBudget("CUDA prefill chunk exceeds u64".into()))?;
         let hidden = u64::try_from(config.hidden_size)
@@ -372,6 +376,12 @@ impl CudaPrefillWorkspaceBudget {
         let rope_half = u64::try_from(config.rotary_dim / 2)
             .map_err(|_| EngineError::MemoryBudget("CUDA rotary dimension exceeds u64".into()))?;
 
+        let embedding_row_id_bytes =
+            checked_product(&[chunk, u32_bytes], "CUDA embedding row-ID workspace bytes")?;
+        let embedding_output_bytes = checked_product(
+            &[chunk, hidden, f32_bytes],
+            "CUDA embedding output workspace bytes",
+        )?;
         let hidden_norm_bytes = checked_product(
             &[chunk, hidden, f32_bytes, 2],
             "CUDA hidden-norm workspace bytes",
@@ -393,6 +403,8 @@ impl CudaPrefillWorkspaceBudget {
             "CUDA paged-GQA output bytes",
         )?;
         let total_bytes = [
+            embedding_row_id_bytes,
+            embedding_output_bytes,
             hidden_norm_bytes,
             key_norm_bytes,
             rope_table_bytes,
@@ -404,6 +416,8 @@ impl CudaPrefillWorkspaceBudget {
             checked_add(total, value, "CUDA prefill workspace bytes")
         })?;
         Ok(Self {
+            embedding_row_id_bytes,
+            embedding_output_bytes,
             hidden_norm_bytes,
             key_norm_bytes,
             rope_table_bytes,
@@ -1525,6 +1539,7 @@ pub struct PreparedCudaPrefillWorkspaces {
     budget: CudaPrefillWorkspaceBudget,
     projection_budget: CudaPrefillProjectionWorkspacePlan,
     linear_budget: CudaPrefillLinearWorkspaceBudget,
+    embedding: PreparedCudaBatchedEmbeddingWorkspace,
     hidden_norm: PreparedCudaBatchedRmsNormWorkspace,
     key_norm: PreparedCudaBatchedRmsNormWorkspace,
     rope: PreparedCudaBatchedRopeWorkspace,
@@ -1545,6 +1560,7 @@ impl PreparedCudaPrefillWorkspaces {
         max_chunk_tokens: usize,
         maximum_context_tokens: usize,
         projection_budget: CudaPrefillProjectionWorkspacePlan,
+        embedding_table: &PreparedCudaEmbedding,
     ) -> Result<Self> {
         let budget = CudaPrefillWorkspaceBudget::qwen38(config, max_chunk_tokens)?;
         let linear_budget = CudaPrefillLinearWorkspaceBudget::qwen38(config, max_chunk_tokens)?;
@@ -1553,6 +1569,8 @@ impl PreparedCudaPrefillWorkspaces {
                 "CUDA attention/projection workspace chunk capacities differ".into(),
             ));
         }
+        let embedding =
+            runtime.prepare_batched_embedding_workspace(embedding_table, max_chunk_tokens)?;
         let hidden_norm =
             runtime.prepare_batched_rms_norm_workspace(max_chunk_tokens, config.hidden_size)?;
         let key_rows = max_chunk_tokens
@@ -1596,6 +1614,7 @@ impl PreparedCudaPrefillWorkspaces {
             max_chunk_tokens,
         )?;
         let actual = [
+            embedding.transient_bytes(),
             hidden_norm.transient_bytes(),
             key_norm.transient_bytes(),
             rope.transient_bytes(),
@@ -1634,6 +1653,7 @@ impl PreparedCudaPrefillWorkspaces {
             budget,
             projection_budget,
             linear_budget,
+            embedding,
             hidden_norm,
             key_norm,
             rope,
@@ -1668,6 +1688,10 @@ impl PreparedCudaPrefillWorkspaces {
         self.budget.total_bytes
             + self.projection_budget.total_bytes
             + self.linear_budget.total_bytes
+    }
+
+    pub fn embedding(&self) -> &PreparedCudaBatchedEmbeddingWorkspace {
+        &self.embedding
     }
 
     pub fn hidden_norm(&self) -> &PreparedCudaBatchedRmsNormWorkspace {
@@ -2213,6 +2237,7 @@ impl PreparedCudaProjectionGraph {
             prefill_bindings.max_chunk_tokens(),
             maximum_context_tokens,
             prefill_bindings.projection_workspace(),
+            &embedding,
         )?;
         graph_bytes = checked_add(
             graph_bytes,
@@ -3417,14 +3442,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frozen_prefill_attention_workspace_is_one_fixed_sixty_mib_pool() {
+    fn frozen_prefill_frontend_and_attention_workspace_is_one_fixed_pool() {
         let budget = CudaPrefillWorkspaceBudget::qwen38(&Qwen38Config::default(), 512).unwrap();
+        assert_eq!(budget.embedding_row_id_bytes, 2_048);
+        assert_eq!(budget.embedding_output_bytes, 10_485_760);
         assert_eq!(budget.hidden_norm_bytes, 20_971_520);
         assert_eq!(budget.key_norm_bytes, 4_194_304);
         assert_eq!(budget.rope_table_bytes, 131_072);
         assert_eq!(budget.query_gate_bytes, 25_165_824);
         assert_eq!(budget.paged_gqa_output_bytes, 12_582_912);
-        assert_eq!(budget.total_bytes, 63_045_632);
+        assert_eq!(budget.total_bytes, 73_533_440);
     }
 
     #[test]
@@ -3433,7 +3460,7 @@ mod tests {
         let one = CudaPrefillWorkspaceBudget::qwen38(&config, 1).unwrap();
         let full = CudaPrefillWorkspaceBudget::qwen38(&config, 512).unwrap();
         assert_eq!(full.total_bytes, one.total_bytes * 512);
-        assert_eq!(full.total_bytes, 63_045_632);
+        assert_eq!(full.total_bytes, 73_533_440);
         assert!(CudaPrefillWorkspaceBudget::qwen38(&config, 0).is_err());
         assert!(CudaPrefillWorkspaceBudget::qwen38(&config, 65_536).is_err());
     }
@@ -3481,7 +3508,7 @@ mod tests {
             CudaPrefillProjectionWorkspacePlan::qwen38(&config, &projections, 512).unwrap();
         assert_eq!(
             budget.total_bytes + attention.total_bytes + projection.total_bytes,
-            230_096_896
+            240_584_704
         );
     }
 

@@ -290,17 +290,18 @@ plan resolves the complete prompt program to the same 505 projections, 262
 shared activation owners, 48 linear mixers, 17 full-attention states, and 134
 norm operators used by decode; reordered residual producers or missing MTP
 resources fail closed. The loaded graph now owns exactly one reusable
-63,045,632-byte full-attention workspace pool for a 512-token chunk: hidden
-and K normalization, shared RoPE tables, Query/Gate output, and causal GQA
-output. Its planned and allocated byte counts must agree exactly, and the pool
-does not scale with the 16 target attention layers plus MTP. Projection
-workspaces remain separate from that immutable ownership contract. The graph
-now also owns one reusable 84,082,688-byte linear-attention pool for the same
+73,533,440-byte frontend and full-attention workspace pool for a 512-token
+chunk: a 2,048-byte device token-ID list, 10,485,760-byte token-major
+embedding output, hidden and K normalization, shared RoPE tables, Query/Gate
+output, and causal GQA output. Its planned and allocated byte counts must agree
+exactly, and the pool does not scale with the 16 target attention layers plus
+MTP. Projection workspaces remain separate from that immutable ownership
+contract. The graph now also owns one reusable 84,082,688-byte linear-attention pool for the same
 512-token chunk: causal-convolution output, prepared GatedDelta Q/K/V/decay/
 beta inputs, recurrent output, and batched gated-RMSNorm output. Those buffers
 are shared by all 48 linear-attention layers rather than multiplied by layer
 count, and planned versus allocated bytes fail closed. The three graph-owned
-prefill pools therefore total 230,096,896 bytes before executor-specific
+prefill pools therefore total 240,584,704 bytes before executor-specific
 scratch. The schedule batches every large
 Q2/Q4 projection, retains causal device scans for paged GQA, convolution,
 GatedDelta recurrence, and MTP state, computes the target LM head only for the
