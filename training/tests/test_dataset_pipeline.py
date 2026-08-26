@@ -154,6 +154,7 @@ from run_teacher_batches import cache_environment, completed_batch_matches  # no
 from run_activation_batches import (  # noqa: E402
     completed_batch_matches as completed_activation_batch_matches,
 )
+from finalize_activation_assignment import verified_artifacts  # noqa: E402
 
 
 class DatasetPipelineTests(unittest.TestCase):
@@ -485,6 +486,51 @@ class DatasetPipelineTests(unittest.TestCase):
         sensitivity["candidates"][0]["observed"] = True
         with self.assertRaisesRegex(ValueError, "bound"):
             validate_sensitivity_contract(sensitivity, plan, "other")
+
+    def test_activation_finalizer_requires_every_verified_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "release-batch-000-v1.safetensors"
+            artifact.write_bytes(b"sealed")
+            batch = {"batch_index": 0, "samples": 2, "sequence_tokens": 3}
+            verification = {
+                "status": "passed",
+                "artifact_sha256": hashlib.sha256(b"sealed").hexdigest(),
+                "batch_plan_sha256": "batches",
+                "quant_plan_sha256": "plan",
+                "model": "model",
+                "revision": "revision",
+                "local_model_provenance_sha256": "teacher",
+                **batch,
+            }
+            (root / "release-batch-000-v1-verification-v1.json").write_text(
+                json.dumps(verification)
+            )
+            self.assertEqual(
+                verified_artifacts(
+                    root,
+                    "release",
+                    [batch],
+                    "batches",
+                    "plan",
+                    "model",
+                    "revision",
+                    "teacher",
+                ),
+                [artifact],
+            )
+            artifact.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                verified_artifacts(
+                    root,
+                    "release",
+                    [batch],
+                    "batches",
+                    "plan",
+                    "model",
+                    "revision",
+                    "teacher",
+                )
 
     def test_teacher_cache_batch_group_binds_plan_and_contiguous_verifications(
         self,
