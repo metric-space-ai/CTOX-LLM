@@ -464,8 +464,12 @@ training, trained packing, direct and recovered held-out evaluation, and the
 30% gap-closure comparison. It records exact output paths, expected optimizer
 steps, checkpoint/resume contract, current ledger usage, all remaining stage
 reserves, and refuses the whole sequence if its projected total exceeds 240
-GPU-hours. The plan is an admission artifact, not a scheduler: every stage
-still validates its inputs and appends measured usage to the ledger.
+GPU-hours. `run_recovery_execution_plan.py` executes that immutable plan
+serially. It rehashes the pinned scripts before every stage, rejects GPU 0,
+persists an atomic plan-bound state after each output hash, and resumes recovery
+training only from the highest numbered checkpoint accepted by the trainer's
+exact run-contract check. Existing unrecorded outputs fail closed for manual
+inspection; a stage is never inferred complete from filenames alone.
 
 Vision remains a separate phase-resident package. `build_vision_plan.py`
 zero-pads matrix columns to 64-value storage blocks so non-aligned vision MLPs
