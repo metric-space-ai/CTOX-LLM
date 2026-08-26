@@ -35,6 +35,7 @@ struct Report<'a> {
     artifact_file_bytes: u64,
     activation_groups: usize,
     projections: usize,
+    embedding_rows: usize,
     linear_mixer_layers: usize,
     full_attention_states: usize,
     maximum_context_tokens: usize,
@@ -72,6 +73,7 @@ fn main() -> anyhow::Result<()> {
     )?;
     let activation_groups = graph.plan().group_count();
     let projections = graph.plan().projection_count();
+    let embedding_rows = graph.embedding().rows();
     let linear_mixer_layers = graph.linear_mixer_count();
     let full_attention_states = graph.full_attention_count();
     let requested_model_bytes = graph.model_bytes();
@@ -107,6 +109,7 @@ fn main() -> anyhow::Result<()> {
             artifact_file_bytes,
             activation_groups,
             projections,
+            embedding_rows,
             linear_mixer_layers,
             full_attention_states,
             maximum_context_tokens: args.maximum_context_tokens,
@@ -121,7 +124,7 @@ fn main() -> anyhow::Result<()> {
             observed_allocation_bytes: free_before_prepare.saturating_sub(free_after_prepare),
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
             checksum_and_prepare_milliseconds: elapsed_milliseconds,
-            note: "Full checksum, all 505 non-embedding target/MTP projections, 48 linear-attention state groups, and 16 target plus one MTP packed Q2/Q4 KV state. This proves artifact binding/residency/unload only; embedding, decoder execution, logits, and roofline promotion remain separate gates.",
+            note: "Full checksum, resident 248320-row embedding, all 505 remaining target/MTP projections, 48 linear-attention state groups, and 16 target plus one MTP packed Q2/Q4 KV state. This proves artifact binding/residency/unload only; decoder execution, logits, and roofline promotion remain separate gates.",
         })?
     );
     Ok(())

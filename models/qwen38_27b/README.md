@@ -219,10 +219,11 @@ packed FP16 recovery scales directly from mmap-backed `RecoveredMatrixView`
 objects, without widening/repacking model state or allocating a redundant f32
 input buffer per matrix. A deterministic artifact graph covers all 505
 non-embedding target/MTP projections with exactly 262 activation owners and a
-full-load/unload verifier. It now also binds every linear-attention parameter
-and persistent FP16 state plus context-sized Q2/Q4 KV arenas for 16 target and
-one MTP full-attention layer; the queued GPU3 run uses 128K and is a residency
-gate, not an end-to-end inference claim. The previously
+full-load/unload verifier. The packed 248,320-row embedding is resident and
+selected in place without per-token weight upload. The graph also binds every
+linear-attention parameter and persistent FP16 state plus context-sized Q2/Q4
+KV arenas for 16 target and one MTP full-attention layer; the queued GPU3 run
+uses 128K and is a residency gate, not an end-to-end inference claim. The previously
 open full-attention gate edge now has a fused sigmoid-gate/recovery/A8/output-
 projection CUDA candidate and dedicated hardware verifier.
 

@@ -303,8 +303,11 @@ layers' mmap-loaded FP16 convolution/norm weights, direct packed F32
 All 16 target full-attention layers plus the resident MTP layer own query/key
 normalization, RoPE buffers and context-sized Q2/Q4 paged KV arenas. The
 verifier defaults to 128K and reports model, reusable graph and session bytes
-separately. Embedding, decoder residual/input norms, remaining MTP norms and
-actual schedule execution are not yet included.
+separately. The complete packed embedding table and shared FP16 `s_in` are now
+resident too. Token lookup selects the correct pure or mixed row inside that
+allocation and reuses the recovered-row kernel, while only the requested
+scalar `s_out` is read from the immutable mapping. Decoder residual/input
+norms, remaining MTP norms and actual schedule execution are not yet included.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not
@@ -325,13 +328,15 @@ The A8 path is therefore computationally validated but not promoted. Its
 quality must be measured after recovery on full-model logits and the held-out
 multilingual, general, coding, agentic, tool-calling, and long-context suite.
 
-The loader-resolved embedding-row candidate now decodes one canonical Q2 or
-Q4 row and fuses packed FP16 `s_in` plus scalar `s_out` on device. The
+The loader-resolved embedding-row candidate decodes one canonical Q2 or Q4 row
+and fuses packed FP16 `s_in` plus scalar `s_out` on device. The production
+owner now keeps the entire pure/mixed table resident and launches directly at
+the validated row offset without a per-token weight transfer. The
 5120-column verifier matched the scalar recovered-row oracle exactly for Q2
 and within `5.97e-8` for Q4. Five repeated-launch replicates had median kernel
 intervals of 2.96 microseconds (Q2) and 3.02 microseconds (Q4). The verifier
-copies output back for comparison; production graph wiring must instead keep
-the activation device-resident. Full evidence is in
+copies output back for comparison; the resident table API returns a borrowed
+device view instead. Full numerical evidence for the original row kernel is in
 `benchmarks/cuda/sm86-recovered-row-20260826.json`.
 
 ## Runtime ownership and unload

@@ -13,8 +13,9 @@ use crate::backend::cuda_runtime::{
     CudaCandidateRuntime, CudaCausalConvConfig, CudaGatedDeltaConfig, CudaGatedRmsNormConfig,
     CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig, CudaRmsNormConfig,
     PreparedCudaA8Activation, PreparedCudaA8Projection, PreparedCudaCausalConv,
-    PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs, PreparedCudaGatedRmsNorm,
-    PreparedCudaPagedGqa, PreparedCudaPartialRope, PreparedCudaQueryGate, PreparedCudaRmsNorm,
+    PreparedCudaEmbedding, PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs,
+    PreparedCudaGatedRmsNorm, PreparedCudaPagedGqa, PreparedCudaPartialRope, PreparedCudaQueryGate,
+    PreparedCudaRmsNorm,
 };
 use crate::backend::{Activation, ScaleSlice};
 use crate::config::LayerKind;
@@ -171,6 +172,7 @@ impl CudaProjectionPlan {
 pub struct PreparedCudaProjectionGraph {
     artifact: ModelArtifact,
     plan: CudaProjectionPlan,
+    embedding: PreparedCudaEmbedding,
     activations: BTreeMap<String, PreparedCudaA8Activation>,
     projections: BTreeMap<String, PreparedCudaA8Projection>,
     linear_mixers: BTreeMap<usize, PreparedCudaLinearMixerLayer>,
@@ -295,6 +297,23 @@ impl PreparedCudaProjectionGraph {
         let mut model_bytes = 0_u64;
         let mut graph_bytes = 0_u64;
         let mut session_bytes = 0_u64;
+
+        let embedding_view = artifact.recovered_matrix(EMBEDDING_MATRIX)?;
+        let embedding = runtime.prepare_embedding_recovered(embedding_view)?;
+        model_bytes = checked_add(
+            model_bytes,
+            u64::try_from(embedding.model_bytes()).map_err(|_| {
+                EngineError::MemoryBudget("CUDA embedding model bytes exceed u64".into())
+            })?,
+            "CUDA model bytes",
+        )?;
+        graph_bytes = checked_add(
+            graph_bytes,
+            u64::try_from(embedding.graph_bytes()).map_err(|_| {
+                EngineError::MemoryBudget("CUDA embedding graph bytes exceed u64".into())
+            })?,
+            "CUDA graph bytes",
+        )?;
 
         for group in plan.groups() {
             let first_name = group.projection_names.first().ok_or_else(|| {
@@ -494,6 +513,7 @@ impl PreparedCudaProjectionGraph {
         Ok(Self {
             artifact: artifact.clone(),
             plan,
+            embedding,
             activations,
             projections,
             linear_mixers,
@@ -510,6 +530,21 @@ impl PreparedCudaProjectionGraph {
 
     pub fn plan(&self) -> &CudaProjectionPlan {
         &self.plan
+    }
+
+    pub fn embedding(&self) -> &PreparedCudaEmbedding {
+        &self.embedding
+    }
+
+    pub fn embedding_s_out(&self, row: usize) -> Result<f32> {
+        let recovered = self.artifact.recovered_matrix(EMBEDDING_MATRIX)?;
+        if row >= recovered.matrix.rows {
+            return Err(EngineError::Shape(format!(
+                "CUDA embedding row {row} exceeds {}",
+                recovered.matrix.rows
+            )));
+        }
+        recovered.s_out.value(row)
     }
 
     pub fn activation(&self, key: &str) -> Result<&PreparedCudaA8Activation> {

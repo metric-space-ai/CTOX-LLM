@@ -348,6 +348,22 @@ pub struct PreparedCudaRecoveredRow {
     resident_bytes: usize,
 }
 
+/// Complete resident embedding table using the canonical packed Q2/Q4 codes.
+/// A token dispatch selects one row inside this allocation and reuses the
+/// recovered-row kernel; no per-token weight upload or backend repacking is
+/// performed.
+pub struct PreparedCudaEmbedding {
+    context: Rc<CudaContextInner>,
+    rows: u32,
+    columns: u32,
+    layout: CudaA8ProjectionLayout,
+    weights: DeviceBuffer,
+    s_in: DeviceBuffer,
+    output: DeviceBuffer,
+    model_bytes: usize,
+    graph_bytes: usize,
+}
+
 /// Exact Qwen3.8-27B recurrence geometry accepted by the CUDA verifier.
 /// Dynamic shapes remain rejected until their own kernel profile exists.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2546,6 +2562,100 @@ impl CudaCandidateRuntime {
         Ok(result)
     }
 
+    pub fn prepare_embedding_recovered(
+        &self,
+        recovered: RecoveredMatrixView<'_>,
+    ) -> Result<PreparedCudaEmbedding> {
+        let layout = validate_recovered_a8_projection_layout(recovered)?;
+        let ScaleSlice::F16Le(s_in_bytes) = recovered.s_in.as_recovery_scales()? else {
+            unreachable!("recovered embedding scales reject F32")
+        };
+        self.make_current()?;
+        let weights = DeviceBuffer::from_bytes(self, recovered.matrix.weights)?;
+        let s_in = DeviceBuffer::from_bytes(self, s_in_bytes)?;
+        let output_bytes = recovered
+            .matrix
+            .columns
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA embedding output overflows".into()))?;
+        let output = DeviceBuffer::allocate(self, output_bytes)?;
+        let model_bytes = weights.len().checked_add(s_in.len()).ok_or_else(|| {
+            EngineError::MemoryBudget("CUDA embedding model bytes overflow".into())
+        })?;
+        let graph_bytes = output.len();
+        Ok(PreparedCudaEmbedding {
+            context: Rc::clone(&self.inner),
+            rows: recovered.matrix.rows as u32,
+            columns: recovered.matrix.columns as u32,
+            layout,
+            weights,
+            s_in,
+            output,
+            model_bytes,
+            graph_bytes,
+        })
+    }
+
+    /// Selects and decodes one row from the resident embedding table. `s_out`
+    /// is the one finite scalar read from the immutable mapped artifact; all
+    /// large data and the resulting activation stay on the device.
+    pub fn dispatch_embedding_row_device<'a>(
+        &self,
+        prepared: &'a PreparedCudaEmbedding,
+        row: usize,
+        s_out: f32,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA embedding belongs to another context".into(),
+            ));
+        }
+        if row >= prepared.rows as usize || !s_out.is_finite() {
+            return Err(EngineError::Shape(format!(
+                "CUDA embedding row {row} or recovery scale is invalid"
+            )));
+        }
+        let (dtype, offset) =
+            embedding_row_location(&prepared.layout, prepared.rows, prepared.columns, row)?;
+        self.make_current()?;
+        let function = match dtype {
+            TensorDType::Q2B64 => self.inner.q2_recovered_row_function,
+            TensorDType::Q4B64 => self.inner.q4_recovered_row_function,
+            _ => unreachable!("validated CUDA embedding row dtype"),
+        };
+        let mut weights = device_ptr_offset(prepared.weights.ptr(), offset)?;
+        let mut s_in = prepared.s_in.ptr();
+        let mut s_out = s_out;
+        let mut output = prepared.output.ptr();
+        let mut columns = prepared.columns;
+        let mut params = [
+            (&mut weights as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_in as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_out as *mut f32).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    function,
+                    prepared.columns.div_ceil(THREADS_PER_BLOCK),
+                    1,
+                    1,
+                    THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "resident embedding-row launch",
+            )?;
+        }
+        prepared.output.f32_view(0, prepared.columns as usize)
+    }
+
     pub fn prepare_recovered_row(
         &self,
         operation: &RecoveredRow<'_>,
@@ -3896,6 +4006,28 @@ impl PreparedCudaRecoveredRow {
     }
 }
 
+impl PreparedCudaEmbedding {
+    pub fn rows(&self) -> usize {
+        self.rows as usize
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn model_bytes(&self) -> usize {
+        self.model_bytes
+    }
+
+    pub fn graph_bytes(&self) -> usize {
+        self.graph_bytes
+    }
+
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.output.f32_view(0, self.columns())
+    }
+}
+
 impl PreparedCudaGatedDelta {
     pub fn config(&self) -> CudaGatedDeltaConfig {
         self.config
@@ -4548,6 +4680,65 @@ fn validate_a8_projection_layout(operation: &FusedMatVec<'_>) -> Result<CudaA8Pr
     }
 }
 
+fn embedding_row_location(
+    layout: &CudaA8ProjectionLayout,
+    rows: u32,
+    columns: u32,
+    row: usize,
+) -> Result<(TensorDType, usize)> {
+    if row >= rows as usize || columns == 0 || !(columns as usize).is_multiple_of(BLOCK_LEN) {
+        return Err(EngineError::Shape(format!(
+            "CUDA embedding row {row} or geometry is invalid"
+        )));
+    }
+    let blocks_per_row = columns as usize / BLOCK_LEN;
+    match layout {
+        CudaA8ProjectionLayout::Pure(dtype) => {
+            let block_bytes = match dtype {
+                TensorDType::Q2B64 => Q2_BLOCK_BYTES,
+                TensorDType::Q4B64 => Q4_BLOCK_BYTES,
+                _ => unreachable!("validated pure embedding dtype"),
+            };
+            let row_bytes = blocks_per_row.checked_mul(block_bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA embedding row bytes overflow".into())
+            })?;
+            Ok((
+                *dtype,
+                row.checked_mul(row_bytes).ok_or_else(|| {
+                    EngineError::MemoryBudget("CUDA embedding row offset overflows".into())
+                })?,
+            ))
+        }
+        CudaA8ProjectionLayout::Mixed(segments) => {
+            let segment = segments
+                .iter()
+                .find(|segment| {
+                    let start = segment.row_start as usize;
+                    let end = start.saturating_add(segment.row_count as usize);
+                    row >= start && row < end
+                })
+                .ok_or_else(|| {
+                    EngineError::InvalidArtifact(format!(
+                        "CUDA embedding row {row} has no mixed segment"
+                    ))
+                })?;
+            let row_bytes = blocks_per_row
+                .checked_mul(segment.descriptor.block_bytes)
+                .ok_or_else(|| {
+                    EngineError::MemoryBudget("CUDA mixed embedding row bytes overflow".into())
+                })?;
+            let local = row - segment.row_start as usize;
+            let offset = local
+                .checked_mul(row_bytes)
+                .and_then(|bytes| bytes.checked_add(segment.weight_offset))
+                .ok_or_else(|| {
+                    EngineError::MemoryBudget("CUDA mixed embedding offset overflows".into())
+                })?;
+            Ok((segment.descriptor.dtype, offset))
+        }
+    }
+}
+
 fn validate_recovered_a8_projection_layout(
     recovered: RecoveredMatrixView<'_>,
 ) -> Result<CudaA8ProjectionLayout> {
@@ -4895,6 +5086,39 @@ mod tests {
             validate_f32_buffer(&nonfinite, nonfinite.len(), "test"),
             Err(EngineError::InvalidArtifact(_))
         ));
+    }
+
+    #[test]
+    fn resident_embedding_rows_resolve_pure_and_mixed_offsets() {
+        assert_eq!(
+            embedding_row_location(
+                &CudaA8ProjectionLayout::Pure(TensorDType::Q2B64),
+                3,
+                BLOCK_LEN as u32,
+                2,
+            )
+            .unwrap(),
+            (TensorDType::Q2B64, 2 * Q2_BLOCK_BYTES)
+        );
+        let mixed = CudaA8ProjectionLayout::Mixed(vec![
+            CudaMixedRowSegment {
+                descriptor: &Q2_B64_FUSED_MATVEC,
+                row_start: 0,
+                row_count: 2,
+                weight_offset: 0,
+            },
+            CudaMixedRowSegment {
+                descriptor: &Q4_B64_FUSED_MATVEC,
+                row_start: 2,
+                row_count: 1,
+                weight_offset: 2 * Q2_BLOCK_BYTES,
+            },
+        ]);
+        assert_eq!(
+            embedding_row_location(&mixed, 3, BLOCK_LEN as u32, 2).unwrap(),
+            (TensorDType::Q4B64, 2 * Q2_BLOCK_BYTES)
+        );
+        assert!(embedding_row_location(&mixed, 3, BLOCK_LEN as u32, 3).is_err());
     }
 
     #[test]
