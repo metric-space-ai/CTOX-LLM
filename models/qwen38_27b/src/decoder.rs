@@ -486,6 +486,41 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
             .fused_matvec(&matrix.operation(input, Activation::Identity)?)
     }
 
+    pub fn projection_fanout(&self, names: &[String], input: &[f32]) -> Result<Vec<Vec<f32>>> {
+        if names.is_empty() {
+            return Err(EngineError::Shape(
+                "projection fan-out requires at least one matrix".into(),
+            ));
+        }
+        let matrices = names
+            .iter()
+            .map(|name| {
+                let matrix = self.artifact.recovered_matrix(name)?;
+                if input.len() != matrix.matrix.columns {
+                    return Err(EngineError::Shape(format!(
+                        "projection {name} received {} values, expected {}",
+                        input.len(),
+                        matrix.matrix.columns
+                    )));
+                }
+                Ok(matrix)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let operations = matrices
+            .iter()
+            .map(|matrix| (*matrix).operation(input, Activation::Identity))
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.backend.fused_matvec_fanout(&operations)?;
+        if outputs.len() != names.len() {
+            return Err(EngineError::InvalidState(format!(
+                "projection fan-out returned {} outputs for {} matrices",
+                outputs.len(),
+                names.len()
+            )));
+        }
+        Ok(outputs)
+    }
+
     /// Evaluate only release-bound LM-head rows for an MTP proposal. The
     /// complete target LM head remains a separate mandatory operation.
     pub fn restricted_logits_from_final_hidden(
@@ -546,8 +581,15 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
             hidden,
         )?;
         let mlp_prefix = format!("{layer_prefix}.mlp");
-        let gate = self.projection(&format!("{mlp_prefix}.gate_proj.weight"), &normalized)?;
-        let up = self.projection(&format!("{mlp_prefix}.up_proj.weight"), &normalized)?;
+        let mut fanout = self.projection_fanout(
+            &[
+                format!("{mlp_prefix}.gate_proj.weight"),
+                format!("{mlp_prefix}.up_proj.weight"),
+            ],
+            &normalized,
+        )?;
+        let up = fanout.pop().expect("two fan-out outputs validated");
+        let gate = fanout.pop().expect("two fan-out outputs validated");
         let activated = swiglu(&gate, &up)?;
         let down = self.projection(&format!("{mlp_prefix}.down_proj.weight"), &activated)?;
         if down.len() != hidden.len() {
@@ -607,7 +649,17 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
             .num_key_value_heads
             .checked_mul(config.head_dim)
             .ok_or_else(|| EngineError::Shape("KV width overflows".into()))?;
-        let query_gate = self.projection(&format!("{prefix}.q_proj.weight"), &normalized)?;
+        let mut fanout = self.projection_fanout(
+            &[
+                format!("{prefix}.q_proj.weight"),
+                format!("{prefix}.k_proj.weight"),
+                format!("{prefix}.v_proj.weight"),
+            ],
+            &normalized,
+        )?;
+        let value = fanout.pop().expect("three fan-out outputs validated");
+        let mut key = fanout.pop().expect("three fan-out outputs validated");
+        let query_gate = fanout.pop().expect("three fan-out outputs validated");
         if query_gate.len() != query_width * 2 {
             return Err(EngineError::Shape(
                 "full-attention query/gate projection shape differs".into(),
@@ -619,8 +671,6 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
             query.extend_from_slice(&head[..config.head_dim]);
             gate.extend_from_slice(&head[config.head_dim..]);
         }
-        let mut key = self.projection(&format!("{prefix}.k_proj.weight"), &normalized)?;
-        let value = self.projection(&format!("{prefix}.v_proj.weight"), &normalized)?;
         if key.len() != key_value_width || value.len() != key_value_width {
             return Err(EngineError::Shape(
                 "full-attention key/value projection shape differs".into(),
@@ -716,10 +766,19 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
         let normalized =
             self.rms_norm(&format!("{layer_prefix}.input_layernorm.weight"), hidden)?;
         let prefix = format!("{layer_prefix}.linear_attn");
-        let mixed_qkv = self.projection(&format!("{prefix}.in_proj_qkv.weight"), &normalized)?;
-        let z = self.projection(&format!("{prefix}.in_proj_z.weight"), &normalized)?;
-        let a = self.projection(&format!("{prefix}.in_proj_a.weight"), &normalized)?;
-        let b = self.projection(&format!("{prefix}.in_proj_b.weight"), &normalized)?;
+        let mut fanout = self.projection_fanout(
+            &[
+                format!("{prefix}.in_proj_qkv.weight"),
+                format!("{prefix}.in_proj_z.weight"),
+                format!("{prefix}.in_proj_a.weight"),
+                format!("{prefix}.in_proj_b.weight"),
+            ],
+            &normalized,
+        )?;
+        let b = fanout.pop().expect("four fan-out outputs validated");
+        let a = fanout.pop().expect("four fan-out outputs validated");
+        let z = fanout.pop().expect("four fan-out outputs validated");
+        let mixed_qkv = fanout.pop().expect("four fan-out outputs validated");
         if mixed_qkv.len() != convolution_width
             || z.len() != value_width
             || a.len() != config.linear_num_value_heads

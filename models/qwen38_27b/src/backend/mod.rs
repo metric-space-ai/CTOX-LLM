@@ -146,6 +146,15 @@ pub trait Backend {
     fn promotion_state(&self) -> PromotionState;
     fn profile(&self) -> &'static str;
     fn fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<Vec<f32>>;
+    /// Execute projections that consume one logical activation. Backends may
+    /// share correction/quantization work when the inputs and `s_in` values
+    /// are identical; the default preserves exact independent semantics.
+    fn fused_matvec_fanout(&self, operations: &[FusedMatVec<'_>]) -> Result<Vec<Vec<f32>>> {
+        operations
+            .iter()
+            .map(|operation| self.fused_matvec(operation))
+            .collect()
+    }
     fn recovered_row(&self, operation: &RecoveredRow<'_>) -> Result<Vec<f32>>;
     fn recovered_row_matvec(&self, operation: &RecoveredRowMatVec<'_>) -> Result<f32>;
 }

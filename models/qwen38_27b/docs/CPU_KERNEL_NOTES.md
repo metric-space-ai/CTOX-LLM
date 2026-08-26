@@ -16,6 +16,12 @@ for every block of every row. The current implementation:
    old code, so the scalar oracle is numerically unchanged. Production scales
    are read directly from their little-endian FP16 mmap payload and widened
    per value; no persistent f32 scale copy is created.
+   The model graph now emits gate/up, full-attention Q/K/V, and all four
+   linear-attention input projections through an explicit fan-out operation.
+   When their input allocation and exact `s_in` representation match, the CPU
+   backend builds this corrected vector once for the complete fan-out. An
+   independent-recovery checkpoint with different scales keeps exact
+   per-projection semantics instead of incorrectly sharing the correction.
 2. Reads block scales and code bytes straight from the packed weight slice
    and decodes them in SIMD registers. No heap allocation and no
    dequantization temporary exists inside the block loop.
@@ -68,7 +74,9 @@ multiple rows, non-identity `s_in`/`s_out`, bias, Identity and SiLU
 activations, plus arbitrary-code packed decode checks against
 `Q2Block64`/`Q4Block64` dequantization. Mixed-row tests compare one combined
 payload against independent pure-Q2 and pure-Q4 dispatches and prove malformed
-segment coverage fails closed.
+segment coverage fails closed. The fan-out test compares shared Q2/Q4 output
+against independent dispatches, exercises the unequal-scale path, and rejects
+an empty fan-out.
 The mmap-to-kernel test also executes a recovered packed matrix and embedding
 row through the CPU backend and checks the composed numerical result.
 

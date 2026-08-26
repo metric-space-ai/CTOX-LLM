@@ -1,6 +1,6 @@
 use crate::backend::{
     Backend, BackendKind, ExecutionPolicy, FusedMatVec, PromotionState, RecoveredRow,
-    RecoveredRowMatVec,
+    RecoveredRowMatVec, ScaleSlice,
 };
 use crate::format::TensorDType;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q2_CODEBOOK, Q4_BLOCK_BYTES};
@@ -225,134 +225,26 @@ impl CpuBackend {
         Ok(sum)
     }
 
-    fn decode_recovered_row(operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
-        if operation.columns == 0 || !operation.columns.is_multiple_of(BLOCK_LEN) {
-            return Err(EngineError::Shape(
-                "recovered row columns must be non-zero and divisible by 64".into(),
-            ));
-        }
-        if operation.s_in.len() != operation.columns || !operation.s_out.is_finite() {
-            return Err(EngineError::Shape(
-                "recovered row scale contract differs".into(),
-            ));
-        }
-        let block_bytes = match operation.dtype {
-            TensorDType::Q2B64 => Q2_BLOCK_BYTES,
-            TensorDType::Q4B64 => Q4_BLOCK_BYTES,
-            other => return Err(EngineError::UnsupportedDType(format!("{other:?}"))),
-        };
-        let expected = operation
-            .columns
-            .checked_div(BLOCK_LEN)
-            .and_then(|blocks| blocks.checked_mul(block_bytes))
-            .ok_or_else(|| EngineError::Shape("recovered row size overflows usize".into()))?;
-        if operation.weights.len() != expected {
-            return Err(EngineError::Shape(format!(
-                "recovered row has {} packed bytes, expected {expected}",
-                operation.weights.len()
-            )));
-        }
-
-        let mut output = Vec::with_capacity(operation.columns);
-        for (block_index, block) in operation.weights.chunks_exact(block_bytes).enumerate() {
-            let scale = f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
-            if !scale.is_finite() {
-                return Err(EngineError::InvalidArtifact(
-                    "recovered row block scale is non-finite".into(),
-                ));
-            }
-            for local_column in 0..BLOCK_LEN {
-                let normalized = match operation.dtype {
-                    TensorDType::Q2B64 => {
-                        let packed = block[2 + local_column / 4];
-                        Q2_CODEBOOK[((packed >> ((local_column % 4) * 2)) & 0x3) as usize]
-                    }
-                    TensorDType::Q4B64 => {
-                        let packed = block[2 + local_column / 2];
-                        let code = if local_column.is_multiple_of(2) {
-                            packed & 0x0f
-                        } else {
-                            packed >> 4
-                        };
-                        (f32::from(code) - 7.5) / 7.5
-                    }
-                    _ => unreachable!("dtype validated"),
-                };
-                let column = block_index * BLOCK_LEN + local_column;
-                output.push(scale * normalized * operation.s_in.value(column)? * operation.s_out);
-            }
-        }
-        Ok(output)
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn detect_profile(policy: ExecutionPolicy) -> Result<CpuProfile> {
-    if std::arch::is_x86_feature_detected!("avx2") {
-        return Ok(CpuProfile::Avx2);
-    }
-    verifier_or_error(policy)
-}
-
-#[cfg(target_arch = "aarch64")]
-fn detect_profile(_policy: ExecutionPolicy) -> Result<CpuProfile> {
-    Ok(CpuProfile::Neon)
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn detect_profile(policy: ExecutionPolicy) -> Result<CpuProfile> {
-    verifier_or_error(policy)
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn verifier_or_error(policy: ExecutionPolicy) -> Result<CpuProfile> {
-    if policy == ExecutionPolicy::Verifier {
-        return Ok(CpuProfile::ScalarVerifier);
-    }
-    Err(EngineError::UnsupportedOperation {
-        backend: "cpu",
-        operation: "backend initialization",
-        reason: "no verified SIMD profile and scalar fallback is forbidden".into(),
-    })
-}
-
-impl Backend for CpuBackend {
-    fn kind(&self) -> BackendKind {
-        BackendKind::Cpu
-    }
-
-    fn promotion_state(&self) -> PromotionState {
-        match self.profile {
-            CpuProfile::ScalarVerifier => PromotionState::Verifier,
-            CpuProfile::Avx2 | CpuProfile::Neon => PromotionState::Experimental,
-        }
-    }
-
-    fn profile(&self) -> &'static str {
-        match self.profile {
-            CpuProfile::ScalarVerifier => "scalar-verifier",
-            CpuProfile::Avx2 => "x86_64-avx2",
-            CpuProfile::Neon => "aarch64-neon",
-        }
-    }
-
-    fn fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<Vec<f32>> {
-        let blocks_per_row = Self::validate(operation)?;
-        // Apply s_in exactly once per operation. The previous implementation
-        // rebuilt a scaled [f32; 64] input copy for every block of every row.
-        let corrected;
-        let input: &[f32] = match operation.s_in {
-            Some(scales) => {
-                corrected = operation
+    fn corrected_input(operation: &FusedMatVec<'_>) -> Result<Option<Vec<f32>>> {
+        operation
+            .s_in
+            .map(|scales| {
+                operation
                     .input
                     .iter()
                     .enumerate()
                     .map(|(index, value)| Ok(value * scales.value(index)?))
-                    .collect::<Result<Vec<f32>>>()?;
-                &corrected
-            }
-            None => operation.input,
-        };
+                    .collect()
+            })
+            .transpose()
+    }
+
+    fn execute_validated(
+        &self,
+        operation: &FusedMatVec<'_>,
+        blocks_per_row: usize,
+        input: &[f32],
+    ) -> Result<Vec<f32>> {
         let mut output = vec![0.0_f32; operation.rows];
         let finish_row = |row: usize, mut sum: f32| -> Result<f32> {
             sum += operation.bias.map(|bias| bias[row]).unwrap_or(0.0);
@@ -415,6 +307,168 @@ impl Backend for CpuBackend {
             _ => unreachable!("dtype validated"),
         }
         Ok(output)
+    }
+
+    fn decode_recovered_row(operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
+        if operation.columns == 0 || !operation.columns.is_multiple_of(BLOCK_LEN) {
+            return Err(EngineError::Shape(
+                "recovered row columns must be non-zero and divisible by 64".into(),
+            ));
+        }
+        if operation.s_in.len() != operation.columns || !operation.s_out.is_finite() {
+            return Err(EngineError::Shape(
+                "recovered row scale contract differs".into(),
+            ));
+        }
+        let block_bytes = match operation.dtype {
+            TensorDType::Q2B64 => Q2_BLOCK_BYTES,
+            TensorDType::Q4B64 => Q4_BLOCK_BYTES,
+            other => return Err(EngineError::UnsupportedDType(format!("{other:?}"))),
+        };
+        let expected = operation
+            .columns
+            .checked_div(BLOCK_LEN)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or_else(|| EngineError::Shape("recovered row size overflows usize".into()))?;
+        if operation.weights.len() != expected {
+            return Err(EngineError::Shape(format!(
+                "recovered row has {} packed bytes, expected {expected}",
+                operation.weights.len()
+            )));
+        }
+
+        let mut output = Vec::with_capacity(operation.columns);
+        for (block_index, block) in operation.weights.chunks_exact(block_bytes).enumerate() {
+            let scale = f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+            if !scale.is_finite() {
+                return Err(EngineError::InvalidArtifact(
+                    "recovered row block scale is non-finite".into(),
+                ));
+            }
+            for local_column in 0..BLOCK_LEN {
+                let normalized = match operation.dtype {
+                    TensorDType::Q2B64 => {
+                        let packed = block[2 + local_column / 4];
+                        Q2_CODEBOOK[((packed >> ((local_column % 4) * 2)) & 0x3) as usize]
+                    }
+                    TensorDType::Q4B64 => {
+                        let packed = block[2 + local_column / 2];
+                        let code = if local_column.is_multiple_of(2) {
+                            packed & 0x0f
+                        } else {
+                            packed >> 4
+                        };
+                        (f32::from(code) - 7.5) / 7.5
+                    }
+                    _ => unreachable!("dtype validated"),
+                };
+                let column = block_index * BLOCK_LEN + local_column;
+                output.push(scale * normalized * operation.s_in.value(column)? * operation.s_out);
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn same_scale_slice(left: Option<ScaleSlice<'_>>, right: Option<ScaleSlice<'_>>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(ScaleSlice::F16Le(left)), Some(ScaleSlice::F16Le(right))) => left == right,
+        (Some(ScaleSlice::F32(left)), Some(ScaleSlice::F32(right))) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn detect_profile(policy: ExecutionPolicy) -> Result<CpuProfile> {
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return Ok(CpuProfile::Avx2);
+    }
+    verifier_or_error(policy)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn detect_profile(_policy: ExecutionPolicy) -> Result<CpuProfile> {
+    Ok(CpuProfile::Neon)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn detect_profile(policy: ExecutionPolicy) -> Result<CpuProfile> {
+    verifier_or_error(policy)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn verifier_or_error(policy: ExecutionPolicy) -> Result<CpuProfile> {
+    if policy == ExecutionPolicy::Verifier {
+        return Ok(CpuProfile::ScalarVerifier);
+    }
+    Err(EngineError::UnsupportedOperation {
+        backend: "cpu",
+        operation: "backend initialization",
+        reason: "no verified SIMD profile and scalar fallback is forbidden".into(),
+    })
+}
+
+impl Backend for CpuBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Cpu
+    }
+
+    fn promotion_state(&self) -> PromotionState {
+        match self.profile {
+            CpuProfile::ScalarVerifier => PromotionState::Verifier,
+            CpuProfile::Avx2 | CpuProfile::Neon => PromotionState::Experimental,
+        }
+    }
+
+    fn profile(&self) -> &'static str {
+        match self.profile {
+            CpuProfile::ScalarVerifier => "scalar-verifier",
+            CpuProfile::Avx2 => "x86_64-avx2",
+            CpuProfile::Neon => "aarch64-neon",
+        }
+    }
+
+    fn fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<Vec<f32>> {
+        let blocks_per_row = Self::validate(operation)?;
+        // Apply s_in exactly once per operation. The previous implementation
+        // rebuilt a scaled [f32; 64] input copy for every block of every row.
+        let corrected = Self::corrected_input(operation)?;
+        self.execute_validated(
+            operation,
+            blocks_per_row,
+            corrected.as_deref().unwrap_or(operation.input),
+        )
+    }
+
+    fn fused_matvec_fanout(&self, operations: &[FusedMatVec<'_>]) -> Result<Vec<Vec<f32>>> {
+        let Some(first) = operations.first() else {
+            return Err(EngineError::Shape(
+                "CPU fan-out requires at least one projection".into(),
+            ));
+        };
+        let can_share = operations.iter().all(|operation| {
+            operation.input.len() == first.input.len()
+                && std::ptr::eq(operation.input.as_ptr(), first.input.as_ptr())
+                && same_scale_slice(operation.s_in, first.s_in)
+        });
+        if !can_share {
+            return operations
+                .iter()
+                .map(|operation| self.fused_matvec(operation))
+                .collect();
+        }
+        let blocks_per_row = operations
+            .iter()
+            .map(Self::validate)
+            .collect::<Result<Vec<_>>>()?;
+        let corrected = Self::corrected_input(first)?;
+        let input = corrected.as_deref().unwrap_or(first.input);
+        operations
+            .iter()
+            .zip(blocks_per_row)
+            .map(|(operation, blocks)| self.execute_validated(operation, blocks, input))
+            .collect()
     }
 
     fn recovered_row(&self, operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
@@ -901,6 +955,64 @@ mod tests {
             assert_eq!(&output[..2], q2_output.as_slice());
             assert_eq!(&output[2..], q4_output.as_slice());
         }
+    }
+
+    #[test]
+    fn fanout_matches_independent_projections_and_accepts_only_exact_shared_correction() {
+        let columns = BLOCK_LEN;
+        let input: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.0625).sin())
+            .collect();
+        let q2 = encode_fixture(TensorDType::Q2B64, 2, columns);
+        let q4 = encode_fixture(TensorDType::Q4B64, 3, columns);
+        let shared_s_in = vec![1.125_f32; columns];
+        let different_s_in = vec![0.875_f32; columns];
+        let q2_operation = FusedMatVec {
+            dtype: TensorDType::Q2B64,
+            weights: &q2,
+            segments: &[],
+            rows: 2,
+            columns,
+            input: &input,
+            s_in: Some(ScaleSlice::F32(&shared_s_in)),
+            s_out: None,
+            bias: None,
+            activation: Activation::Identity,
+        };
+        let q4_operation = FusedMatVec {
+            dtype: TensorDType::Q4B64,
+            weights: &q4,
+            rows: 3,
+            ..q2_operation
+        };
+        let backend = detected();
+        let independent = [
+            backend.fused_matvec(&q2_operation).unwrap(),
+            backend.fused_matvec(&q4_operation).unwrap(),
+        ];
+        assert_eq!(
+            backend
+                .fused_matvec_fanout(&[q2_operation, q4_operation])
+                .unwrap(),
+            independent
+        );
+
+        let different = FusedMatVec {
+            s_in: Some(ScaleSlice::F32(&different_s_in)),
+            ..q4_operation
+        };
+        assert_eq!(
+            backend
+                .fused_matvec_fanout(&[q2_operation, different])
+                .unwrap(),
+            [
+                backend.fused_matvec(&q2_operation).unwrap(),
+                backend.fused_matvec(&different).unwrap(),
+            ]
+        );
+        assert!(backend.fused_matvec_fanout(&[]).is_err());
+        assert!(same_scale_slice(q2_operation.s_in, q4_operation.s_in));
+        assert!(!same_scale_slice(q2_operation.s_in, different.s_in));
     }
 
     #[test]
