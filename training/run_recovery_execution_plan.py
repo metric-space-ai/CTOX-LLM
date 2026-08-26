@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from teacher_cache_dataset import VerifiedTeacherCache
+
 
 FORMAT = "ctox.recovery.execution-plan.v1"
 STATE_FORMAT = "ctox.recovery.execution-state.v1"
@@ -84,6 +86,44 @@ def canonical_requirement(requirement: str) -> str | None:
     return requirement
 
 
+def option_value(argv: list[str], option: str) -> str | None:
+    positions = [index for index, value in enumerate(argv) if value == option]
+    if len(positions) > 1:
+        raise ValueError(f"recovery stage repeats option {option}")
+    if not positions:
+        return None
+    index = positions[0]
+    if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
+        raise ValueError(f"recovery stage lacks a value for {option}")
+    return argv[index + 1]
+
+
+def validate_training_command(name: str, argv: list[str], outputs: list[str]) -> None:
+    if not any(Path(value).name == "train_recovery.py" for value in argv):
+        return
+    chunk_tokens = int(option_value(argv, "--prefill-chunk-tokens") or "0")
+    if chunk_tokens > 0 and "--gradient-checkpointing" in argv:
+        raise ValueError(
+            f"stage {name} combines stateful chunk prefill with gradient checkpointing"
+        )
+    sample_id = option_value(argv, "--sample-id")
+    if sample_id is not None:
+        cache_path = option_value(argv, "--teacher-cache-set")
+        cache_sha256 = option_value(argv, "--teacher-cache-set-sha256")
+        if cache_path is None or cache_sha256 is None:
+            raise ValueError(f"stage {name} sample selection lacks a bound teacher cache")
+        cache = VerifiedTeacherCache.from_manifest(Path(cache_path), cache_sha256)
+        if sample_id not in {str(artifact["id"]) for artifact in cache.artifacts}:
+            raise ValueError(f"stage {name} sample ID is absent from its verified cache")
+    declared = {
+        value
+        for option in ("--output-scales", "--output-report", "--output-evidence")
+        if (value := option_value(argv, option)) is not None
+    }
+    if declared != set(outputs):
+        raise ValueError(f"stage {name} outputs differ from its training argv")
+
+
 def validate_stages(document: dict[str, Any]) -> list[dict[str, Any]]:
     stages = document.get("stages")
     if not isinstance(stages, list) or not stages:
@@ -126,8 +166,27 @@ def validate_stages(document: dict[str, Any]) -> list[dict[str, Any]]:
         elif gpu_count == 0:
             if environment:
                 raise ValueError(f"CPU stage {name} unexpectedly binds CUDA")
+        elif gpu_count == 2:
+            physical_gpus = str(environment.get("CUDA_VISIBLE_DEVICES", "")).split(",")
+            if (
+                len(physical_gpus) != 2
+                or len(set(physical_gpus)) != 2
+                or any(not gpu.isdigit() or int(gpu) == 0 for gpu in physical_gpus)
+            ):
+                raise ValueError(
+                    f"stage {name} does not bind two distinct non-Greppy physical GPUs"
+                )
+            if option_value(argv, "--gpus") != "2":
+                raise ValueError(f"stage {name} does not declare two logical GPUs")
+            device = option_value(argv, "--device")
+            if device is not None and device != "cuda:0":
+                raise ValueError(f"stage {name} does not use logical cuda:0")
+            mtp_device = option_value(argv, "--mtp-device")
+            if mtp_device is not None and mtp_device != "cuda:1":
+                raise ValueError(f"stage {name} does not use logical cuda:1 for MTP")
         else:
             raise ValueError(f"stage {name} requests unsupported GPU count {gpu_count}")
+        validate_training_command(name, argv, outputs)
         seen.add(name)
     return stages
 

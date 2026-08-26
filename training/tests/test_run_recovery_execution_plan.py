@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TRAINING = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TRAINING))
@@ -42,6 +43,72 @@ class RecoveryExecutionPlanRunnerTests(unittest.TestCase):
         document["stages"][0]["environment"]["CUDA_VISIBLE_DEVICES"] = "0"
         with self.assertRaisesRegex(ValueError, "non-Greppy"):
             validate_stages(document)
+
+    def test_two_gpu_stage_requires_distinct_non_greppy_devices(self):
+        stage = self.stage("teacher_cache", ["admission"], gpu=2, physical="1,2")
+        stage["argv"].extend(["--gpus", "2", "--mtp-device", "cuda:1"])
+        self.assertEqual(len(validate_stages({"stages": [stage]})), 1)
+        stage["environment"]["CUDA_VISIBLE_DEVICES"] = "0,2"
+        with self.assertRaisesRegex(ValueError, "non-Greppy"):
+            validate_stages({"stages": [stage]})
+
+    def test_training_rejects_chunk_prefill_with_gradient_checkpointing(self):
+        stage = self.stage("smoke", ["admission"])
+        stage["argv"][1] = "/train_recovery.py"
+        stage["argv"].extend(
+            [
+                "--prefill-chunk-tokens",
+                "512",
+                "--gradient-checkpointing",
+                "--output-scales",
+                "/smoke-scales.json",
+                "--output-report",
+                "/smoke-report.json",
+                "--output-evidence",
+                "/smoke-evidence.json",
+            ]
+        )
+        stage["outputs"] = [
+            "/smoke-scales.json",
+            "/smoke-report.json",
+            "/smoke-evidence.json",
+        ]
+        with self.assertRaisesRegex(ValueError, "chunk prefill"):
+            validate_stages({"stages": [stage]})
+
+    def test_training_sample_must_belong_to_verified_cache(self):
+        stage = self.stage("smoke", ["admission"])
+        stage["argv"][1] = "/train_recovery.py"
+        stage["argv"].extend(
+            [
+                "--sample-id",
+                "sample-a",
+                "--teacher-cache-set",
+                "/cache.json",
+                "--teacher-cache-set-sha256",
+                "a" * 64,
+                "--output-scales",
+                "/smoke-scales.json",
+                "--output-report",
+                "/smoke-report.json",
+                "--output-evidence",
+                "/smoke-evidence.json",
+            ]
+        )
+        stage["outputs"] = [
+            "/smoke-scales.json",
+            "/smoke-report.json",
+            "/smoke-evidence.json",
+        ]
+        cache = mock.Mock(artifacts=[{"id": "sample-b"}])
+        with mock.patch(
+            "run_recovery_execution_plan.VerifiedTeacherCache.from_manifest",
+            return_value=cache,
+        ):
+            with self.assertRaisesRegex(ValueError, "absent"):
+                validate_stages({"stages": [stage]})
+            cache.artifacts = [{"id": "sample-a"}]
+            self.assertEqual(len(validate_stages({"stages": [stage]})), 1)
 
     def test_stages_reject_forward_dependency_and_extra_environment(self):
         with self.assertRaisesRegex(ValueError, "unsatisfied dependency"):
