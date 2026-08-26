@@ -320,8 +320,11 @@ commit position only after all 645 bound operations and the final barrier have
 completed in order. Kernel dispatch wiring and complete-graph hardware
 verification remain open. A pinned-`get_rows`-structured batched embedding
 candidate now keeps FP16 `s_in`/`s_out` resident and gathers a whole token-ID
-chunk in at most one launch per canonical Q2/Q4 segment; compilation and
-mixed-table hardware evidence are the next gate. The
+chunk in at most one launch per canonical Q2/Q4 segment. The final 857-Q2/
+113-Q4 embedding assignment is bit-identical to sequential CUDA row lookup on
+the A4500 and differs from the CPU oracle by at most `7.45e-9`; all
+398,458,880 verifier-owned bytes are reclaimed. Executor binding remains the
+next gate. The
 standalone MMQ verifier exercises this same graph-facing path and the shared
 two-buffer batched RMSNorm workspace. The first causal-convolution scan now
 matches sequential CUDA output and final FP16 state bit-for-bit across a

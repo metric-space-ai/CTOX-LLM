@@ -581,9 +581,15 @@ Q2 and Q4 entries for SM86 with 16 registers and zero stack, shared, or local
 bytes. Source SHA-256 is
 `77dfc7923fa5f13e7fee8c82d809644d0592c8365cbe34460802eb96366ef4d1`;
 the complete cubin SHA-256 is
-`c2d7eb14fa3b68cf7510b89dddde544a0d1fa1e0f71724409c3baed031d83ff1`.
-Mixed-row numerical evidence, allocation accounting in the graph-wide prefill
-pool, and executor binding remain required before this candidate is promoted.
+`0c6545a72ef3a76e6ac81e875977a29844d2307f9c97151536e767d8602c3b27`;
+two independent compilations produced identical bytes. The final
+248,320-by-5,120 embedding has 857 Q2 and 113 Q4 segments. An eight-row A4500
+fixture crossing both precisions in non-monotonic order, including one repeated
+row, is bit-identical to sequential CUDA lookup and differs from the CPU oracle
+by at most `7.45e-9`. All 398,458,880 verifier-observed allocation bytes were
+reclaimed. Evidence is recorded in
+`benchmarks/cuda/sm86-embedding-batch-20260826.json`. Executor binding remains
+required before this candidate is promoted.
 
 ## Runtime ownership and unload
 
