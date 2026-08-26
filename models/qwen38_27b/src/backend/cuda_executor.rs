@@ -2,10 +2,11 @@
 //!
 //! This remains a verifier candidate until full-model numerical, quality,
 //! unload, and roofline gates promote it. It never falls back to CPU model
-//! operators. Full target logits still cross the host for verifier evidence,
-//! but ordinary target selection reuses the resident LM-head output through
-//! device argmax or bounded top-k/top-p sampling. MTP proposals use the
-//! release-bound gathered LM head.
+//! operators. The server path returns compact device-selected MTP decisions;
+//! the dedicated evidence constructor retains complete logit readbacks for
+//! numerical hashes. Ordinary target selection reuses the resident LM-head
+//! output through device argmax or bounded top-k/top-p sampling. MTP proposals
+//! use the release-bound gathered LM head.
 
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -18,7 +19,7 @@ use crate::backend::cuda_runtime::{
 use crate::backend::{BackendKind, PromotionState};
 use crate::engine::{
     AllocationSnapshot, CancellationToken, DraftDistribution, ExecutorCapabilities, ExecutorStep,
-    ModelExecutor,
+    GreedyMtpVerification, ModelExecutor,
 };
 use crate::loader::ModelArtifact;
 use crate::memory::{LinearStateDType, SpeculativeStateStrategy};
@@ -42,6 +43,12 @@ struct PendingCudaSpeculativeBranch {
     candidate_tokens: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CudaMtpOutputMode {
+    CompactGreedy,
+    FullVerifierLogits,
+}
+
 pub struct CudaModelExecutor {
     config: Qwen38Config,
     runtime: Option<CudaCandidateRuntime>,
@@ -53,6 +60,7 @@ pub struct CudaModelExecutor {
     admitted_context: usize,
     admitted_draft_tokens: usize,
     free_bytes_before_graph: Option<usize>,
+    mtp_output_mode: CudaMtpOutputMode,
     warmed: bool,
     allocations: AllocationSnapshot,
 }
@@ -120,10 +128,23 @@ pub struct ThreadedCudaModelExecutor {
     sender: Option<mpsc::Sender<CudaWorkerCommand>>,
     worker: Option<JoinHandle<()>>,
     allocations: AllocationSnapshot,
+    compact_greedy_mtp_verification: bool,
 }
 
 impl CudaModelExecutor {
     pub fn new_sm86(cubin: &[u8], device: i32) -> Result<Self> {
+        Self::new_sm86_with_output_mode(cubin, device, CudaMtpOutputMode::CompactGreedy)
+    }
+
+    fn new_sm86_with_full_verifier_logits(cubin: &[u8], device: i32) -> Result<Self> {
+        Self::new_sm86_with_output_mode(cubin, device, CudaMtpOutputMode::FullVerifierLogits)
+    }
+
+    fn new_sm86_with_output_mode(
+        cubin: &[u8],
+        device: i32,
+        mtp_output_mode: CudaMtpOutputMode,
+    ) -> Result<Self> {
         Ok(Self {
             config: Qwen38Config::default(),
             runtime: Some(CudaCandidateRuntime::new(cubin, device)?),
@@ -135,6 +156,7 @@ impl CudaModelExecutor {
             admitted_context: 0,
             admitted_draft_tokens: 0,
             free_bytes_before_graph: None,
+            mtp_output_mode,
             warmed: false,
             allocations: AllocationSnapshot::default(),
         })
@@ -252,19 +274,44 @@ impl CudaModelExecutor {
 
 impl ThreadedCudaModelExecutor {
     pub fn new_sm86(cubin: &[u8], device: i32) -> Result<Self> {
+        Self::new_sm86_with_output_mode(cubin, device, CudaMtpOutputMode::CompactGreedy)
+    }
+
+    /// Hardware-verifier constructor retaining complete vocabulary readbacks
+    /// for numerical hashes. The server path uses [`Self::new_sm86`] and
+    /// receives only compact, target-verified MTP decisions.
+    pub fn new_sm86_with_full_verifier_logits(cubin: &[u8], device: i32) -> Result<Self> {
+        Self::new_sm86_with_output_mode(cubin, device, CudaMtpOutputMode::FullVerifierLogits)
+    }
+
+    fn new_sm86_with_output_mode(
+        cubin: &[u8],
+        device: i32,
+        mtp_output_mode: CudaMtpOutputMode,
+    ) -> Result<Self> {
         let module = cubin.to_vec();
         let (sender, receiver) = mpsc::channel();
         let (initialized_tx, initialized_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("qwen38-cuda-sm86-executor".into())
-            .spawn(move || match CudaModelExecutor::new_sm86(&module, device) {
-                Ok(executor) => {
-                    if initialized_tx.send(Ok(())).is_ok() {
-                        run_cuda_worker(executor, receiver);
+            .spawn(move || {
+                let initialized = match mtp_output_mode {
+                    CudaMtpOutputMode::CompactGreedy => {
+                        CudaModelExecutor::new_sm86(&module, device)
                     }
-                }
-                Err(error) => {
-                    let _ = initialized_tx.send(Err(error));
+                    CudaMtpOutputMode::FullVerifierLogits => {
+                        CudaModelExecutor::new_sm86_with_full_verifier_logits(&module, device)
+                    }
+                };
+                match initialized {
+                    Ok(executor) => {
+                        if initialized_tx.send(Ok(())).is_ok() {
+                            run_cuda_worker(executor, receiver);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = initialized_tx.send(Err(error));
+                    }
                 }
             })
             .map_err(|error| {
@@ -275,6 +322,8 @@ impl ThreadedCudaModelExecutor {
                 sender: Some(sender),
                 worker: Some(worker),
                 allocations: AllocationSnapshot::default(),
+                compact_greedy_mtp_verification: mtp_output_mode
+                    == CudaMtpOutputMode::CompactGreedy,
             }),
             Ok(Err(error)) => {
                 let _ = worker.join();
@@ -477,6 +526,9 @@ impl ModelExecutor for CudaModelExecutor {
             maximum_context_tokens: self.config.max_position_embeddings as u64,
             mtp: self.config.mtp_num_hidden_layers == 1,
             maximum_draft_tokens: MAXIMUM_CHAINED_MTP_DRAFTS as u32,
+            compact_greedy_mtp_verification: self.mtp_output_mode
+                == CudaMtpOutputMode::CompactGreedy,
+            resident_target_selection: self.mtp_output_mode == CudaMtpOutputMode::CompactGreedy,
             cancellation: true,
             session_reset: true,
             no_hidden_fallbacks: true,
@@ -645,7 +697,10 @@ impl ModelExecutor for CudaModelExecutor {
                 position,
             )?;
             if is_last {
-                target_logits = read_valid_logits(runtime, view)?;
+                target_logits = match self.mtp_output_mode {
+                    CudaMtpOutputMode::CompactGreedy => Vec::new(),
+                    CudaMtpOutputMode::FullVerifierLogits => read_valid_logits(runtime, view)?,
+                };
             }
         }
         Ok(ExecutorStep {
@@ -653,6 +708,7 @@ impl ModelExecutor for CudaModelExecutor {
             draft_logits: Vec::new(),
             target_verification_logits: Vec::new(),
             bonus_logits: None,
+            compact_greedy_mtp: None,
         })
     }
 
@@ -703,29 +759,106 @@ impl ModelExecutor for CudaModelExecutor {
                 token as usize,
                 absolute_position,
             )?;
-            Some(read_device_restricted_draft(
-                runtime,
-                argmax,
-                view,
-                &self.mtp_draft_token_ids,
-            )?)
+            Some(match self.mtp_output_mode {
+                CudaMtpOutputMode::CompactGreedy => (
+                    None,
+                    select_device_restricted_draft(
+                        runtime,
+                        argmax,
+                        view,
+                        &self.mtp_draft_token_ids,
+                    )?,
+                ),
+                CudaMtpOutputMode::FullVerifierLogits => {
+                    let (logits, token) = read_device_restricted_draft(
+                        runtime,
+                        argmax,
+                        view,
+                        &self.mtp_draft_token_ids,
+                    )?;
+                    (Some(logits), token)
+                }
+            })
         } else {
             None
         };
         let position = graph.target_tokens();
         let target_view =
             graph.dispatch_target_token_device(runtime, &self.config, token as usize, position)?;
-        let target_logits = read_valid_logits(runtime, target_view)?;
+        let compact_target_token = (self.mtp_output_mode == CudaMtpOutputMode::CompactGreedy)
+            .then(|| runtime.dispatch_argmax_f32_device(argmax, target_view))
+            .transpose()?;
+        let target_logits = match self.mtp_output_mode {
+            CudaMtpOutputMode::CompactGreedy => Vec::new(),
+            CudaMtpOutputMode::FullVerifierLogits => read_valid_logits(runtime, target_view)?,
+        };
         if !mtp_enabled {
             return Ok(ExecutorStep {
                 target_logits,
                 draft_logits: Vec::new(),
                 target_verification_logits: Vec::new(),
                 bonus_logits: None,
+                compact_greedy_mtp: None,
             });
         }
 
         graph.begin_speculative_branch(runtime)?;
+        if self.mtp_output_mode == CudaMtpOutputMode::CompactGreedy {
+            let (_, mut current_draft) = first_draft.ok_or_else(|| {
+                EngineError::InvalidState("CUDA MTP draft chain ended before verification".into())
+            })?;
+            let mut current_target = compact_target_token.ok_or_else(|| {
+                EngineError::InvalidState("CUDA compact MTP target selection is missing".into())
+            })?;
+            let mut candidate_tokens = Vec::with_capacity(speculative_draft_count);
+            let mut target_tokens = Vec::with_capacity(speculative_draft_count);
+            for depth in 0..speculative_draft_count {
+                if cancellation.is_cancelled() {
+                    return Err(EngineError::Cancelled);
+                }
+                let candidate = current_draft;
+                candidate_tokens.push(candidate);
+                target_tokens.push(current_target);
+                if depth + 1 < speculative_draft_count {
+                    let absolute_position = graph.target_tokens();
+                    let next_draft_view = graph.dispatch_mtp_restricted_draft_device(
+                        runtime,
+                        &self.config,
+                        candidate as usize,
+                        absolute_position,
+                    )?;
+                    current_draft = select_device_restricted_draft(
+                        runtime,
+                        argmax,
+                        next_draft_view,
+                        &self.mtp_draft_token_ids,
+                    )?;
+                }
+                let candidate_position = graph.target_tokens();
+                let next_target_view = graph.dispatch_target_token_device(
+                    runtime,
+                    &self.config,
+                    candidate as usize,
+                    candidate_position,
+                )?;
+                current_target = runtime.dispatch_argmax_f32_device(argmax, next_target_view)?;
+            }
+            self.pending_speculative = Some(PendingCudaSpeculativeBranch {
+                candidate_tokens: candidate_tokens.clone(),
+            });
+            return Ok(ExecutorStep {
+                target_logits,
+                draft_logits: Vec::new(),
+                target_verification_logits: Vec::new(),
+                bonus_logits: None,
+                compact_greedy_mtp: Some(GreedyMtpVerification {
+                    draft_tokens: candidate_tokens,
+                    target_tokens,
+                    bonus_token: current_target,
+                }),
+            });
+        }
+
         let mut draft_logits = Vec::with_capacity(speculative_draft_count);
         let mut target_verification_logits = Vec::with_capacity(speculative_draft_count);
         let mut candidate_tokens = Vec::with_capacity(speculative_draft_count);
@@ -740,7 +873,9 @@ impl ModelExecutor for CudaModelExecutor {
             })?;
             draft_logits.push(DraftDistribution::Restricted {
                 token_ids: self.mtp_draft_token_ids.clone(),
-                logits: draft,
+                logits: draft.ok_or_else(|| {
+                    EngineError::InvalidState("CUDA verifier MTP logits are missing".into())
+                })?,
             });
             target_verification_logits.push(current_target);
             candidate_tokens.push(candidate);
@@ -753,12 +888,13 @@ impl ModelExecutor for CudaModelExecutor {
                     candidate as usize,
                     absolute_position,
                 )?;
-                current_draft = Some(read_device_restricted_draft(
+                let (logits, token) = read_device_restricted_draft(
                     runtime,
                     argmax,
                     next_draft_view,
                     &self.mtp_draft_token_ids,
-                )?);
+                )?;
+                current_draft = Some((Some(logits), token));
             }
             let candidate_position = graph.target_tokens();
             let next_target_view = graph.dispatch_target_token_device(
@@ -775,6 +911,7 @@ impl ModelExecutor for CudaModelExecutor {
             draft_logits,
             target_verification_logits,
             bonus_logits: Some(current_target),
+            compact_greedy_mtp: None,
         })
     }
 
@@ -918,6 +1055,8 @@ impl ModelExecutor for ThreadedCudaModelExecutor {
             maximum_context_tokens: Qwen38Config::default().max_position_embeddings as u64,
             mtp: Qwen38Config::default().mtp_num_hidden_layers == 1,
             maximum_draft_tokens: MAXIMUM_CHAINED_MTP_DRAFTS as u32,
+            compact_greedy_mtp_verification: self.compact_greedy_mtp_verification,
+            resident_target_selection: self.compact_greedy_mtp_verification,
             cancellation: true,
             session_reset: true,
             no_hidden_fallbacks: true,
@@ -1061,6 +1200,19 @@ fn read_device_restricted_draft(
         )));
     }
     Ok((logits, token))
+}
+
+fn select_device_restricted_draft(
+    runtime: &CudaCandidateRuntime,
+    argmax: &PreparedCudaArgmax,
+    view: CudaDeviceF32View<'_>,
+    token_ids: &[u32],
+) -> Result<u32> {
+    let local_index = usize::try_from(runtime.dispatch_argmax_f32_device(argmax, view)?)
+        .map_err(|_| EngineError::Shape("CUDA argmax index exceeds usize".into()))?;
+    token_ids.get(local_index).copied().ok_or_else(|| {
+        EngineError::InvalidArtifact("CUDA argmax index exceeds restricted vocabulary".into())
+    })
 }
 
 fn read_valid_logits(

@@ -259,8 +259,11 @@ hardware verifier replays an identical checkpoint through both head variants
 and requires all 40,000 logits to match bit-for-bit. Its complete hardware run,
 quality gates, and roofline promotion remain open. Greedy MTP decisions now
 come from a finite-checking device argmax and are compared with the host oracle;
-the stable verifier ABI still returns compact logits. A pinned-TensorRT-derived
-top-k/top-p candidate now accepts canonical caller-supplied RNG draws without
+the server ABI returns only compact draft/target/bonus token decisions while an
+explicit hardware-evidence mode retains complete logit readbacks. Each compact
+decision is still causally checked by the engine before commit. A
+pinned-TensorRT-derived top-k/top-p candidate now accepts canonical
+caller-supplied RNG draws without
 host logit readback and is bound to ordinary target selection in the CUDA
 executor; its same-device primitive/lifecycle runs, unrestricted top-p,
 on-device RNG state, and stochastic MTP rejection sampling remain open. For IPC

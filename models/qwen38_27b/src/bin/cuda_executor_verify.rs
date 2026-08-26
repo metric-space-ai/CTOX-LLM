@@ -81,6 +81,18 @@ struct Report {
     replay_milliseconds: f64,
     unload_milliseconds: f64,
     allocations_zero_after_unload: bool,
+    compact_mode_capability: bool,
+    compact_prefill_host_logit_values: usize,
+    compact_decode_host_logit_values: usize,
+    compact_decisions_match_full_evidence: bool,
+    compact_token_submission_attempts: u64,
+    compact_token_submission_commits: u64,
+    compact_context_synchronizations: u64,
+    compact_device_argmax_launches: u64,
+    compact_load_milliseconds: f64,
+    compact_decode_milliseconds: f64,
+    compact_unload_milliseconds: f64,
+    compact_allocations_zero_after_unload: bool,
     note: &'static str,
 }
 
@@ -110,7 +122,8 @@ fn main() -> anyhow::Result<()> {
     let artifact_manifest_sha256 = artifact.manifest_sha256().to_owned();
     let profile = verifier_profile(&artifact, args.maximum_context_tokens)?;
 
-    let mut executor = ThreadedCudaModelExecutor::new_sm86(&module, args.device)?;
+    let mut executor =
+        ThreadedCudaModelExecutor::new_sm86_with_full_verifier_logits(&module, args.device)?;
     let load_started = Instant::now();
     executor.load(&artifact, &profile, &mtp_draft_token_ids)?;
     executor.warmup()?;
@@ -275,6 +288,113 @@ fn main() -> anyhow::Result<()> {
         "CUDA executor retained accounted allocations after unload"
     );
 
+    let mut compact_executor = ThreadedCudaModelExecutor::new_sm86(&module, args.device)?;
+    let compact_capabilities = compact_executor.capabilities();
+    let compact_mode_capability = compact_capabilities.compact_greedy_mtp_verification
+        && compact_capabilities.resident_target_selection;
+    anyhow::ensure!(
+        compact_mode_capability,
+        "CUDA server constructor does not advertise compact resident MTP verification"
+    );
+    let compact_load_started = Instant::now();
+    compact_executor.load(&artifact, &profile, &mtp_draft_token_ids)?;
+    compact_executor.warmup()?;
+    let compact_load_milliseconds = compact_load_started.elapsed().as_secs_f64() * 1.0e3;
+    let compact_prefill = compact_executor.prefill(&[args.token_id], true, &cancellation)?;
+    let compact_prefill_host_logit_values = compact_prefill.target_logits.len();
+    anyhow::ensure!(
+        compact_prefill_host_logit_values == 0
+            && compact_prefill.draft_logits.is_empty()
+            && compact_prefill.target_verification_logits.is_empty()
+            && compact_prefill.bonus_logits.is_none()
+            && compact_prefill.compact_greedy_mtp.is_none(),
+        "CUDA compact prefill returned host logits or speculative output"
+    );
+    let compact_decode_input = compact_executor
+        .select_target_token(
+            SamplerConfig {
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                seed: 0,
+            },
+            0.0,
+        )?
+        .context("CUDA compact prefill delegated target selection to the host")?;
+    anyhow::ensure!(
+        compact_decode_input == decode_input_token,
+        "CUDA compact prefill selected {compact_decode_input}, full evidence selected {decode_input_token}"
+    );
+    let compact_decode_started = Instant::now();
+    let compact_decoded = compact_executor.decode(compact_decode_input, true, &cancellation)?;
+    let compact_decode_milliseconds = compact_decode_started.elapsed().as_secs_f64() * 1.0e3;
+    let compact_decode_host_logit_values = compact_decoded
+        .target_logits
+        .len()
+        .saturating_add(
+            compact_decoded
+                .draft_logits
+                .iter()
+                .map(DraftDistribution::len)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            compact_decoded
+                .target_verification_logits
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+        )
+        .saturating_add(compact_decoded.bonus_logits.as_ref().map_or(0, Vec::len));
+    anyhow::ensure!(
+        compact_decode_host_logit_values == 0,
+        "CUDA compact MTP decode returned {compact_decode_host_logit_values} host logit values"
+    );
+    let compact_verification = compact_decoded
+        .compact_greedy_mtp
+        .as_ref()
+        .context("CUDA compact MTP decode omitted target-verified decisions")?;
+    let compact_decisions_match_full_evidence = compact_verification.draft_tokens == draft_tokens
+        && compact_verification.target_tokens == target_tokens
+        && compact_verification.bonus_token == bonus_token;
+    anyhow::ensure!(
+        compact_decisions_match_full_evidence,
+        "CUDA compact MTP decisions differ from full-logit evidence"
+    );
+    compact_executor.commit_speculative(accepted_drafts, &cancellation)?;
+    anyhow::ensure!(
+        compact_executor.session_token_counters()?
+            == (target_tokens_after_replay, mtp_tokens_after_replay),
+        "CUDA compact partial-prefix replay differs from full-logit evidence"
+    );
+    let compact_stats = compact_executor.submission_stats()?;
+    let compact_expected_submissions = 10 + u64::from(accepted_drafts) * 2;
+    anyhow::ensure!(
+        compact_stats.token_submission_attempts == compact_expected_submissions
+            && compact_stats.token_submission_commits == compact_expected_submissions,
+        "CUDA compact executor committed {}/{}, expected {compact_expected_submissions}/{compact_expected_submissions}",
+        compact_stats.token_submission_commits,
+        compact_stats.token_submission_attempts,
+    );
+    anyhow::ensure!(
+        compact_stats.device_argmax_launches == 10
+            && compact_stats.device_sampling_launches == 0
+            && compact_stats.context_synchronizations == compact_expected_submissions + 10,
+        "CUDA compact executor used unexpected selection or synchronization counts: argmax={}, sampling={}, barriers={}",
+        compact_stats.device_argmax_launches,
+        compact_stats.device_sampling_launches,
+        compact_stats.context_synchronizations,
+    );
+    compact_executor.reset_session()?;
+    let compact_unload_started = Instant::now();
+    compact_executor.unload()?;
+    let compact_unload_milliseconds = compact_unload_started.elapsed().as_secs_f64() * 1.0e3;
+    let compact_allocations_zero_after_unload = compact_executor.allocations().is_zero();
+    anyhow::ensure!(
+        compact_allocations_zero_after_unload,
+        "CUDA compact executor retained accounted allocations after unload"
+    );
+
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
@@ -321,7 +441,19 @@ fn main() -> anyhow::Result<()> {
             replay_milliseconds,
             unload_milliseconds,
             allocations_zero_after_unload,
-            note: "Exercises the sendable Rust ModelExecutor ABI through the dedicated thread that owns every CUDA object, without CPU model-operation fallback. Greedy and bounded top-k/top-p target decisions reuse the resident complete LM-head output and match the host oracle for canonical draws. MTP proposals execute exactly the release-bound gathered rows; complete distributions still cross the host only for verifier evidence. Production still requires on-device RNG state, unrestricted top-p, stochastic MTP accept/reject, BF16/logit quality, long-context, unload, and roofline evidence on the release checkpoint.",
+            compact_mode_capability,
+            compact_prefill_host_logit_values,
+            compact_decode_host_logit_values,
+            compact_decisions_match_full_evidence,
+            compact_token_submission_attempts: compact_stats.token_submission_attempts,
+            compact_token_submission_commits: compact_stats.token_submission_commits,
+            compact_context_synchronizations: compact_stats.context_synchronizations,
+            compact_device_argmax_launches: compact_stats.device_argmax_launches,
+            compact_load_milliseconds,
+            compact_decode_milliseconds,
+            compact_unload_milliseconds,
+            compact_allocations_zero_after_unload,
+            note: "Exercises both CUDA executor output modes through dedicated thread-affine workers without CPU model-operation fallback. The evidence mode proves complete gathered/target distributions and host-oracle decisions. The server mode returns zero host logit values, matches every evidence-mode draft/target/bonus decision, replays the same accepted prefix, and unloads fully. Production still requires on-device RNG state, unrestricted top-p, stochastic MTP accept/reject, BF16/logit quality, long-context, and roofline evidence on the release checkpoint.",
         })?
     );
     Ok(())

@@ -1138,6 +1138,8 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             } else {
                 0
             },
+            compact_greedy_mtp_verification: false,
+            resident_target_selection: false,
             cancellation: true,
             session_reset: true,
             no_hidden_fallbacks: false,
@@ -1268,6 +1270,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             draft_logits: Vec::new(),
             target_verification_logits: Vec::new(),
             bonus_logits: None,
+            compact_greedy_mtp: None,
         })
     }
 
@@ -1385,6 +1388,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             draft_logits,
             target_verification_logits,
             bonus_logits,
+            compact_greedy_mtp: None,
         })
     }
 

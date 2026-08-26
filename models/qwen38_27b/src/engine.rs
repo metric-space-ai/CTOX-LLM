@@ -30,6 +30,14 @@ pub struct ExecutorCapabilities {
     pub maximum_context_tokens: u64,
     pub mtp: bool,
     pub maximum_draft_tokens: u32,
+    /// The executor can return target-verified greedy MTP decisions without
+    /// materializing every draft/target vocabulary distribution on the host.
+    #[serde(default)]
+    pub compact_greedy_mtp_verification: bool,
+    /// Target sampling is guaranteed to complete in the executor, allowing
+    /// accelerator steps to omit the host target-logit vector.
+    #[serde(default)]
+    pub resident_target_selection: bool,
     pub cancellation: bool,
     pub session_reset: bool,
     pub no_hidden_fallbacks: bool,
@@ -78,6 +86,34 @@ pub struct ExecutorStep {
     /// Target distribution after all candidate tokens. The engine consumes it
     /// only when every draft is accepted.
     pub bonus_logits: Option<Vec<f32>>,
+    /// Compact accelerator result for deterministic MTP verification. This is
+    /// mutually exclusive with the three logit-based speculative fields.
+    pub compact_greedy_mtp: Option<GreedyMtpVerification>,
+}
+
+/// Causal MTP verification decisions selected from device-resident logits.
+/// `draft_tokens[i]` is accepted only when it equals `target_tokens[i]`;
+/// verification stops at the first mismatch. `bonus_token` is returned only
+/// when the complete draft block is accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GreedyMtpVerification {
+    pub draft_tokens: Vec<u32>,
+    pub target_tokens: Vec<u32>,
+    pub bonus_token: u32,
+}
+
+impl GreedyMtpVerification {
+    fn validate(&self, vocab_size: usize, maximum_draft_tokens: u32) -> bool {
+        !self.draft_tokens.is_empty()
+            && self.draft_tokens.len() == self.target_tokens.len()
+            && self.draft_tokens.len() <= maximum_draft_tokens as usize
+            && self
+                .draft_tokens
+                .iter()
+                .chain(&self.target_tokens)
+                .chain(std::iter::once(&self.bonus_token))
+                .all(|token| (*token as usize) < vocab_size)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,32 +193,60 @@ pub struct GeneratedStep {
 }
 
 impl ExecutorStep {
+    fn draft_count(&self) -> usize {
+        self.compact_greedy_mtp
+            .as_ref()
+            .map_or(self.draft_logits.len(), |verification| {
+                verification.draft_tokens.len()
+            })
+    }
+
     fn validate(&self, capabilities: &ExecutorCapabilities, mtp_enabled: bool) -> Result<()> {
-        if self.target_logits.len() != capabilities.vocab_size
-            || self.target_logits.iter().any(|value| !value.is_finite())
-        {
+        let has_valid_target_logits = self.target_logits.len() == capabilities.vocab_size
+            && self.target_logits.iter().all(|value| value.is_finite());
+        let valid_resident_target =
+            capabilities.resident_target_selection && self.target_logits.is_empty();
+        if !(has_valid_target_logits || valid_resident_target) {
             return Err(EngineError::InvalidArtifact(
                 "executor returned invalid target logits".into(),
             ));
         }
         if mtp_enabled {
-            if !capabilities.mtp
-                || self.draft_logits.is_empty()
-                || self.draft_logits.len() > capabilities.maximum_draft_tokens as usize
-                || self.target_verification_logits.len() != self.draft_logits.len()
-                || self.target_verification_logits.first() != Some(&self.target_logits)
-                || self
+            let has_logit_verification = !self.draft_logits.is_empty()
+                || !self.target_verification_logits.is_empty()
+                || self.bonus_logits.is_some();
+            let has_compact_verification = self.compact_greedy_mtp.is_some();
+            let valid_logit_verification = has_logit_verification
+                && has_valid_target_logits
+                && !self.draft_logits.is_empty()
+                && self.draft_logits.len() <= capabilities.maximum_draft_tokens as usize
+                && self.target_verification_logits.len() == self.draft_logits.len()
+                && self.target_verification_logits.first() == Some(&self.target_logits)
+                && self
                     .draft_logits
                     .iter()
-                    .any(|distribution| !distribution.validate(capabilities.vocab_size))
-                || self.target_verification_logits.iter().any(|logits| {
-                    logits.len() != capabilities.vocab_size
-                        || logits.iter().any(|value| !value.is_finite())
+                    .all(|distribution| distribution.validate(capabilities.vocab_size))
+                && self.target_verification_logits.iter().all(|logits| {
+                    logits.len() == capabilities.vocab_size
+                        && logits.iter().all(|value| value.is_finite())
                 })
-                || self.bonus_logits.as_ref().is_none_or(|logits| {
-                    logits.len() != capabilities.vocab_size
-                        || logits.iter().any(|value| !value.is_finite())
-                })
+                && self.bonus_logits.as_ref().is_some_and(|logits| {
+                    logits.len() == capabilities.vocab_size
+                        && logits.iter().all(|value| value.is_finite())
+                });
+            let valid_compact_verification = has_compact_verification
+                && capabilities.compact_greedy_mtp_verification
+                && self
+                    .compact_greedy_mtp
+                    .as_ref()
+                    .is_some_and(|verification| {
+                        verification
+                            .validate(capabilities.vocab_size, capabilities.maximum_draft_tokens)
+                    })
+                && !has_logit_verification;
+            if !capabilities.mtp
+                || has_logit_verification == has_compact_verification
+                || !(valid_logit_verification || valid_compact_verification)
             {
                 return Err(EngineError::InvalidArtifact(
                     "MTP output contains an invalid or unverifiable draft distribution".into(),
@@ -191,6 +255,7 @@ impl ExecutorStep {
         } else if !self.draft_logits.is_empty()
             || !self.target_verification_logits.is_empty()
             || self.bonus_logits.is_some()
+            || self.compact_greedy_mtp.is_some()
         {
             return Err(EngineError::InvalidArtifact(
                 "executor returned MTP drafts while MTP is disabled".into(),
@@ -568,13 +633,13 @@ impl<E: ModelExecutor> Engine<E> {
             self.invalidate_session()?;
             return Err(error);
         }
-        if output.draft_logits.len() > self.memory_profile.mtp_draft_tokens as usize {
+        if output.draft_count() > self.memory_profile.mtp_draft_tokens as usize {
             self.invalidate_session()?;
             return Err(EngineError::MemoryBudget(
                 "executor exceeded the admitted MTP draft depth".into(),
             ));
         }
-        let draft_tokens_proposed = output.draft_logits.len() as u32;
+        let draft_tokens_proposed = output.draft_count() as u32;
         let (token_id, draft_tokens_verified, accepted_draft_tokens) = if mtp_enabled {
             let (token, verified, accepted) = verify_greedy_mtp(&output)?;
             if let Err(error) = self
@@ -645,13 +710,18 @@ impl<E: ModelExecutor> Engine<E> {
         let selected = self.executor.select_target_token(sampling, draw)?;
         let token = match selected {
             Some(token) => token,
-            None => u32::try_from(
+            None if !target_logits.is_empty() => u32::try_from(
                 self.sampler
                     .as_ref()
                     .expect("sampler checked above")
                     .sample_with_draw(target_logits, draw)?,
             )
             .map_err(|_| EngineError::Shape("sampled token exceeds u32".into()))?,
+            None => {
+                return Err(EngineError::InvalidArtifact(
+                    "executor omitted target logits but delegated target selection".into(),
+                ))
+            }
         };
         if token as usize >= self.capabilities.vocab_size {
             return Err(EngineError::InvalidArtifact(format!(
@@ -789,6 +859,22 @@ fn greedy_token(logits: &[f32]) -> Result<u32> {
 }
 
 fn verify_greedy_mtp(output: &ExecutorStep) -> Result<(u32, u32, Vec<u32>)> {
+    if let Some(verification) = &output.compact_greedy_mtp {
+        let mut accepted = Vec::new();
+        let mut verified = 0_u32;
+        for (&draft, &target) in verification
+            .draft_tokens
+            .iter()
+            .zip(&verification.target_tokens)
+        {
+            verified += 1;
+            if draft != target {
+                return Ok((target, verified, accepted));
+            }
+            accepted.push(draft);
+        }
+        return Ok((verification.bonus_token, verified, accepted));
+    }
     let mut accepted = Vec::new();
     let mut verified = 0_u32;
     let mut fallback = None;
@@ -841,6 +927,7 @@ mod tests {
                     draft_logits: Vec::new(),
                     target_verification_logits: Vec::new(),
                     bonus_logits: None,
+                    compact_greedy_mtp: None,
                 };
             }
             let target_logits = vec![0.0, 1.0, 2.0];
@@ -857,6 +944,7 @@ mod tests {
                 },
                 target_verification_logits: if mtp { vec![target_logits] } else { Vec::new() },
                 bonus_logits: mtp.then_some(vec![0.0, 2.0, 1.0]),
+                compact_greedy_mtp: None,
             }
         }
     }
@@ -880,6 +968,8 @@ mod tests {
                 maximum_context_tokens: 16,
                 mtp: true,
                 maximum_draft_tokens: 1,
+                compact_greedy_mtp_verification: false,
+                resident_target_selection: false,
                 cancellation: true,
                 session_reset: true,
                 no_hidden_fallbacks: true,
@@ -1069,6 +1159,7 @@ mod tests {
             ],
             target_verification_logits: vec![target; 4],
             bonus_logits: Some(vec![0.0, 2.0, 1.0]),
+            compact_greedy_mtp: None,
         };
         let (token, verified, accepted) = verify_greedy_mtp(&output).unwrap();
         assert_eq!(token, 2);
@@ -1091,6 +1182,58 @@ mod tests {
     }
 
     #[test]
+    fn compact_greedy_mtp_preserves_causal_target_verification() {
+        let output = ExecutorStep {
+            target_logits: Vec::new(),
+            draft_logits: Vec::new(),
+            target_verification_logits: Vec::new(),
+            bonus_logits: None,
+            compact_greedy_mtp: Some(GreedyMtpVerification {
+                draft_tokens: vec![2, 2, 1, 2],
+                target_tokens: vec![2, 2, 0, 2],
+                bonus_token: 1,
+            }),
+        };
+        let mut capabilities = ExecutorCapabilities {
+            vocab_size: 3,
+            maximum_context_tokens: 16,
+            mtp: true,
+            maximum_draft_tokens: 4,
+            compact_greedy_mtp_verification: true,
+            resident_target_selection: true,
+            cancellation: true,
+            session_reset: true,
+            no_hidden_fallbacks: true,
+        };
+        output.validate(&capabilities, true).unwrap();
+        let (token, verified, accepted) = verify_greedy_mtp(&output).unwrap();
+        assert_eq!(token, 0);
+        assert_eq!(verified, 3);
+        assert_eq!(accepted, vec![2, 2]);
+
+        capabilities.compact_greedy_mtp_verification = false;
+        assert!(output.validate(&capabilities, true).is_err());
+        capabilities.compact_greedy_mtp_verification = true;
+        capabilities.resident_target_selection = false;
+        assert!(output.validate(&capabilities, true).is_err());
+
+        let all_accepted = ExecutorStep {
+            compact_greedy_mtp: Some(GreedyMtpVerification {
+                draft_tokens: vec![2, 1],
+                target_tokens: vec![2, 1],
+                bonus_token: 0,
+            }),
+            ..output
+        };
+        capabilities.resident_target_selection = true;
+        all_accepted.validate(&capabilities, true).unwrap();
+        assert_eq!(
+            verify_greedy_mtp(&all_accepted).unwrap(),
+            (0, 2, vec![2, 1])
+        );
+    }
+
+    #[test]
     fn restricted_mtp_vocab_maps_scores_to_global_tokens_and_stays_exact() {
         let target = vec![0.0, 0.1, 0.2, 0.3, 2.0, 0.4];
         let output = ExecutorStep {
@@ -1101,12 +1244,15 @@ mod tests {
             }],
             target_verification_logits: vec![target],
             bonus_logits: Some(vec![0.0, 0.1, 0.2, 3.0, 0.4, 0.5]),
+            compact_greedy_mtp: None,
         };
         let capabilities = ExecutorCapabilities {
             vocab_size: 6,
             maximum_context_tokens: 16,
             mtp: true,
             maximum_draft_tokens: 1,
+            compact_greedy_mtp_verification: false,
+            resident_target_selection: false,
             cancellation: true,
             session_reset: true,
             no_hidden_fallbacks: true,
@@ -1133,6 +1279,8 @@ mod tests {
             maximum_context_tokens: 16,
             mtp: true,
             maximum_draft_tokens: 1,
+            compact_greedy_mtp_verification: false,
+            resident_target_selection: false,
             cancellation: true,
             session_reset: true,
             no_hidden_fallbacks: true,
@@ -1146,6 +1294,7 @@ mod tests {
                 }],
                 target_verification_logits: vec![vec![0.0; 6]],
                 bonus_logits: Some(vec![0.0; 6]),
+                compact_greedy_mtp: None,
             };
             assert!(output.validate(&capabilities, true).is_err());
         }

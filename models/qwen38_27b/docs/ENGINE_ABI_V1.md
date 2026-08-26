@@ -40,15 +40,24 @@ operations are:
 - `health`, `capabilities`, and timing metrics;
 - explicit `unload`.
 
-An executor returns target logits and, when enabled, a candidate block, the
-target verification distribution at every candidate position, and the target
-bonus distribution after the complete block. It cannot claim acceptance
-itself: sampling and causal-prefix verification belong to the engine. The
-draft distribution may be complete or a release-bound restricted list of
-global token IDs and scores. Restricted IDs must be strictly increasing,
-unique, in-vocabulary, and paired one-to-one with finite scores. Target and
-bonus distributions always remain full-vocabulary; consequently an omitted
-draft token causes rejection/fallback rather than changing target semantics.
+An executor returns target logits unless it advertises and fulfills
+`resident_target_selection`; omission then forces successful executor-owned
+selection and may never fall back to the scalar sampler. When MTP is enabled,
+it also returns one of two mutually exclusive candidate-block representations.
+The correctness/evidence form
+contains the draft distribution, the complete target verification distribution
+at every candidate position, and the complete target bonus distribution. The
+compact accelerator form contains device-selected draft tokens, matching
+device-selected complete-target tokens, and the complete-target bonus token.
+It is accepted only when the executor advertises
+`compact_greedy_mtp_verification`; the engine still compares every causal pair
+and stops at the first mismatch, so the backend cannot claim acceptance
+itself. The logit draft distribution may be complete or a release-bound
+restricted list of global token IDs and scores. Restricted IDs must be strictly
+increasing, unique, in-vocabulary, and paired one-to-one with finite scores.
+Target and bonus distributions always remain full-vocabulary; consequently an
+omitted draft token causes rejection/fallback rather than changing target
+semantics.
 The signed release binds the exact ID file and multilingual/domain coverage.
 The executor retains the corresponding speculative state branch until the
 engine calls `commit_speculative(accepted_prefix_len)`. Rejection retains only
@@ -75,9 +84,14 @@ over its most recent resident complete distribution. The engine supplies the
 canonical PCG draw, validates the returned vocabulary ID, and uses the scalar
 sampler only when the executor explicitly delegates with `None`. Native-library
 and IPC callers therefore retain one seeded random stream without requiring a
-full CUDA/Metal logit readback. The current MTP verifier is deliberately restricted to
-temperature zero, where target/draft argmax equality is exact. Non-greedy MTP
-fails closed until a probability-correct rejection sampler is implemented.
+full CUDA/Metal logit readback. The current MTP verifier is deliberately
+restricted to temperature zero, where target/draft argmax equality is exact.
+CUDA server execution uses resident target selection plus the compact form and
+therefore avoids copying the target vocabulary, four target-verification
+vocabularies, and four 40,000-row gathered draft distributions to the host. The
+dedicated hardware verifier explicitly requests the evidence form so it can
+still hash and compare those distributions. Non-greedy MTP fails closed until
+a probability-correct rejection sampler is implemented.
 Production MTP will chain the native module for several drafts using the same
 two-phase ABI; the one-layer checkpoint does not impose a one-token scheduler
 limit.
