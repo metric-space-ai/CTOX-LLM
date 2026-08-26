@@ -1878,9 +1878,71 @@ pub struct PreparedCudaLinearMixerLayer {
     model_bytes: u64,
     graph_bytes: u64,
     session_bytes: u64,
+    speculative_checkpoint_bytes: u64,
 }
 
 impl PreparedCudaLinearMixerLayer {
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        runtime: &CudaCandidateRuntime,
+        layer: usize,
+        convolution_weight_f16_le: &[u8],
+        a_log_f32_le: &[u8],
+        dt_bias_f32_le: &[u8],
+        norm_weight_f16_le: &[u8],
+    ) -> Result<Self> {
+        let convolution = runtime
+            .prepare_causal_conv_f16(CudaCausalConvConfig::QWEN38_27B, convolution_weight_f16_le)?;
+        let inputs = runtime.prepare_gated_delta_inputs_f32_le(a_log_f32_le, dt_bias_f32_le)?;
+        let recurrence = runtime.prepare_gated_delta_f16(CudaGatedDeltaConfig::QWEN38_27B)?;
+        let norm = runtime
+            .prepare_gated_rms_norm_f16(CudaGatedRmsNormConfig::QWEN38_27B, norm_weight_f16_le)?;
+        let model_bytes = sum_usize(
+            [
+                convolution.model_bytes(),
+                inputs.model_bytes(),
+                norm.model_bytes(),
+            ],
+            "CUDA linear mixer model bytes",
+        )?;
+        let graph_bytes = sum_usize(
+            [
+                convolution.transient_bytes(),
+                inputs.transient_bytes(),
+                recurrence.transient_bytes(),
+                norm.transient_bytes(),
+            ],
+            "CUDA linear mixer graph bytes",
+        )?;
+        let speculative_checkpoint_bytes = sum_usize(
+            [
+                convolution.speculative_checkpoint_bytes(),
+                recurrence.speculative_checkpoint_bytes(),
+            ],
+            "CUDA linear checkpoint bytes",
+        )?;
+        let session_bytes = sum_usize(
+            [
+                convolution.resident_state_bytes(),
+                recurrence.resident_state_bytes(),
+                convolution.speculative_checkpoint_bytes(),
+                recurrence.speculative_checkpoint_bytes(),
+            ],
+            "CUDA linear mixer session bytes",
+        )?;
+        Ok(Self {
+            layer,
+            convolution,
+            inputs,
+            recurrence,
+            norm,
+            model_bytes,
+            graph_bytes,
+            session_bytes,
+            speculative_checkpoint_bytes,
+        })
+    }
+
     pub fn layer(&self) -> usize {
         self.layer
     }
@@ -1895,6 +1957,10 @@ impl PreparedCudaLinearMixerLayer {
 
     pub fn session_bytes(&self) -> u64 {
         self.session_bytes
+    }
+
+    pub fn speculative_checkpoint_bytes(&self) -> u64 {
+        self.speculative_checkpoint_bytes
     }
 
     fn begin_speculative(&mut self) -> Result<()> {
@@ -1968,6 +2034,63 @@ impl PreparedCudaLinearMixerLayer {
             prepared.beta,
         )?;
         runtime.dispatch_gated_rms_norm_f16_device(norm, mixed, gate)
+    }
+
+    /// Advances one complete token-major prompt chunk through the exact
+    /// Qwen3.8 linear-attention mixer. The caller supplies graph-owned,
+    /// reusable workspaces so this path performs no per-chunk allocation and
+    /// never stages the recurrent tensors through host memory.
+    ///
+    /// This is deliberately a launch-only layer primitive: the enclosing
+    /// graph submission owns the single chunk commit barrier and the one
+    /// graph-wide rollback checkpoint. Standalone callers must reset the
+    /// layer after an error because either recurrent state may have advanced.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_prefill_device<'a>(
+        &mut self,
+        runtime: &CudaCandidateRuntime,
+        convolution_output: &'a PreparedCudaCausalConvScanOutput,
+        input_workspace: &'a PreparedCudaGatedDeltaScanInputs,
+        recurrence_output: &'a PreparedCudaGatedDeltaScanOutput,
+        norm_output: &'a PreparedCudaBatchedGatedRmsNormOutput,
+        mixed_qkv: CudaDeviceF32View<'_>,
+        gate: CudaDeviceF32View<'_>,
+        raw_a: CudaDeviceF32View<'_>,
+        raw_b: CudaDeviceF32View<'_>,
+        tokens: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let Self {
+            convolution,
+            inputs,
+            recurrence,
+            norm,
+            ..
+        } = self;
+        let convolved = runtime.dispatch_causal_conv_f16_scan_device(
+            convolution,
+            convolution_output,
+            mixed_qkv,
+            tokens,
+        )?;
+        let prepared = runtime.dispatch_gated_delta_scan_inputs_device(
+            inputs,
+            input_workspace,
+            convolved,
+            raw_a,
+            raw_b,
+            tokens,
+        )?;
+        let mixed = runtime.dispatch_gated_delta_f16_scan_device(
+            recurrence,
+            recurrence_output,
+            prepared.query,
+            prepared.key,
+            prepared.value,
+            prepared.log_decay,
+            prepared.beta,
+            tokens,
+        )?;
+        runtime.dispatch_batched_gated_rms_norm_f16_device(norm, norm_output, mixed, gate, tokens)
     }
 }
 
@@ -2104,69 +2227,22 @@ impl PreparedCudaProjectionGraph {
                 continue;
             }
             let prefix = format!("model.language_model.layers.{layer}.linear_attn");
-            let convolution = runtime.prepare_causal_conv_f16(
-                CudaCausalConvConfig::QWEN38_27B,
+            let mixer = PreparedCudaLinearMixerLayer::prepare(
+                runtime,
+                layer,
                 artifact_f16(artifact, &format!("{prefix}.conv1d.weight"))?,
-            )?;
-            let inputs = runtime.prepare_gated_delta_inputs_f32_le(
                 artifact_f32(artifact, &format!("{prefix}.A_log"))?,
                 artifact_f32(artifact, &format!("{prefix}.dt_bias"))?,
-            )?;
-            let recurrence = runtime.prepare_gated_delta_f16(CudaGatedDeltaConfig::QWEN38_27B)?;
-            let norm = runtime.prepare_gated_rms_norm_f16(
-                CudaGatedRmsNormConfig::QWEN38_27B,
                 artifact_f16(artifact, &format!("{prefix}.norm.weight"))?,
-            )?;
-            let mixer_model_bytes = sum_usize(
-                [
-                    convolution.model_bytes(),
-                    inputs.model_bytes(),
-                    norm.model_bytes(),
-                ],
-                "CUDA linear mixer model bytes",
-            )?;
-            let mixer_graph_bytes = sum_usize(
-                [
-                    convolution.transient_bytes(),
-                    inputs.transient_bytes(),
-                    recurrence.transient_bytes(),
-                    norm.transient_bytes(),
-                ],
-                "CUDA linear mixer graph bytes",
-            )?;
-            let mixer_session_bytes = sum_usize(
-                [
-                    convolution.resident_state_bytes(),
-                    recurrence.resident_state_bytes(),
-                    convolution.speculative_checkpoint_bytes(),
-                    recurrence.speculative_checkpoint_bytes(),
-                ],
-                "CUDA linear mixer session bytes",
             )?;
             speculative_checkpoint_bytes = checked_add(
                 speculative_checkpoint_bytes,
-                sum_usize(
-                    [
-                        convolution.speculative_checkpoint_bytes(),
-                        recurrence.speculative_checkpoint_bytes(),
-                    ],
-                    "CUDA linear checkpoint bytes",
-                )?,
+                mixer.speculative_checkpoint_bytes,
                 "CUDA speculative checkpoint bytes",
             )?;
-            model_bytes = checked_add(model_bytes, mixer_model_bytes, "CUDA model bytes")?;
-            graph_bytes = checked_add(graph_bytes, mixer_graph_bytes, "CUDA graph bytes")?;
-            session_bytes = checked_add(session_bytes, mixer_session_bytes, "CUDA session bytes")?;
-            let mixer = PreparedCudaLinearMixerLayer {
-                layer,
-                convolution,
-                inputs,
-                recurrence,
-                norm,
-                model_bytes: mixer_model_bytes,
-                graph_bytes: mixer_graph_bytes,
-                session_bytes: mixer_session_bytes,
-            };
+            model_bytes = checked_add(model_bytes, mixer.model_bytes, "CUDA model bytes")?;
+            graph_bytes = checked_add(graph_bytes, mixer.graph_bytes, "CUDA graph bytes")?;
+            session_bytes = checked_add(session_bytes, mixer.session_bytes, "CUDA session bytes")?;
             if linear_mixers.insert(layer, mixer).is_some() {
                 return Err(EngineError::InvalidState(format!(
                     "duplicate CUDA linear mixer layer {layer}"

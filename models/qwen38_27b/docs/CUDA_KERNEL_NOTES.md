@@ -540,8 +540,25 @@ chunk workspaces total 240,584,704 bytes. The first pool includes the
 2,048-byte device token-ID list and 10,485,760-byte token-major embedding
 output needed by a 512-token chunk. Host planning and actual CUDA allocations
 must match exactly; this is an ownership/bounded-memory result, not yet complete-graph
-performance evidence. The batched gated-RMSNorm verifier is compiled into the
-linear-ops hardware harness, but its updated A4500 run remains required.
+performance evidence.
+
+`PreparedCudaLinearMixerLayer::dispatch_prefill_device` now composes that
+shared workspace into one allocation-free device chain: causal-convolution
+scan, fused GatedDelta input preparation, recurrent GatedDelta scan, and
+batched gated RMSNorm. The layer primitive deliberately does not install an
+intermediate commit barrier; the enclosing graph-wide chunk submission will
+own the sole barrier and rollback checkpoint. On an RTX A4500, the full
+512-token-capacity run produced 3,145,728 output values bit-identical to 512
+ordinary CUDA decode steps. Both the final FP16 convolution history and the
+final FP16 GatedDelta state were also bit-identical. Its four shared chunk
+outputs account for the planned 84,082,688 bytes; all 125,829,120 bytes
+observed across verifier owners, two mixer instances, and workspaces were
+reclaimed after drop. The unified cubin SHA-256 was
+`0c6545a72ef3a76e6ac81e875977a29844d2307f9c97151536e767d8602c3b27`.
+Evidence is recorded in
+`benchmarks/cuda/sm86-linear-prefill-512-20260826.json`. Projection fanout,
+the graph-wide transaction, all 645 scheduled steps, and controlled roofline
+evidence remain open before production promotion.
 
 The direct causal paged-GQA prefill candidate maps one warp to each
 `(query_token, query_head)` pair and scans exactly that position's logical
