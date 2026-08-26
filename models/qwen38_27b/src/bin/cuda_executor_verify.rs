@@ -17,7 +17,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Parser)]
-#[command(about = "Verify the embeddable Qwen CUDA executor lifecycle and MTP4 replay")]
+#[command(about = "Verify the embeddable Qwen CUDA executor lifecycle and MTP4 commit/replay")]
 struct Args {
     #[arg(long)]
     artifact: PathBuf,
@@ -59,13 +59,14 @@ struct Report {
     gathered_full_maximum_absolute_error: f32,
     verified_draft_prefix: u32,
     accepted_drafts: u32,
+    full_branch_committed_without_replay: bool,
     bonus_token: u32,
     target_logits_f32le_sha256: String,
     draft_logits_f32le_sha256: Vec<String>,
     target_verification_logits_f32le_sha256: Vec<String>,
     bonus_logits_f32le_sha256: String,
-    target_tokens_after_replay: usize,
-    mtp_tokens_after_replay: usize,
+    target_tokens_after_commit: usize,
+    mtp_tokens_after_commit: usize,
     token_submission_attempts: u64,
     token_submission_commits: u64,
     deferred_operator_synchronizations: u64,
@@ -78,7 +79,7 @@ struct Report {
     load_milliseconds: f64,
     prefill_milliseconds: f64,
     decode_milliseconds: f64,
-    replay_milliseconds: f64,
+    commit_milliseconds: f64,
     unload_milliseconds: f64,
     allocations_zero_after_unload: bool,
     compact_mode_capability: bool,
@@ -238,18 +239,24 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let bonus_logits_f32le_sha256 = digest_logits(bonus_logits);
 
-    let replay_started = Instant::now();
+    let full_branch_committed_without_replay = accepted_drafts as usize == draft_tokens.len();
+    let commit_started = Instant::now();
     executor.commit_speculative(accepted_drafts, &cancellation)?;
-    let replay_milliseconds = replay_started.elapsed().as_secs_f64() * 1.0e3;
-    let (target_tokens_after_replay, mtp_tokens_after_replay) =
+    let commit_milliseconds = commit_started.elapsed().as_secs_f64() * 1.0e3;
+    let (target_tokens_after_commit, mtp_tokens_after_commit) =
         executor.session_token_counters()?;
     anyhow::ensure!(
-        target_tokens_after_replay == 2 + accepted_drafts as usize
-            && mtp_tokens_after_replay + 1 == target_tokens_after_replay,
-        "CUDA partial-prefix replay produced target/MTP counters {target_tokens_after_replay}/{mtp_tokens_after_replay}"
+        target_tokens_after_commit == 2 + accepted_drafts as usize
+            && mtp_tokens_after_commit + 1 == target_tokens_after_commit,
+        "CUDA speculative commit produced target/MTP counters {target_tokens_after_commit}/{mtp_tokens_after_commit}"
     );
     let submission_stats = executor.submission_stats()?;
-    let expected_submissions = 12 + u64::from(accepted_drafts) * 2;
+    let replay_submissions = if full_branch_committed_without_replay {
+        0
+    } else {
+        u64::from(accepted_drafts) * 2
+    };
+    let expected_submissions = 13 + replay_submissions;
     anyhow::ensure!(
         submission_stats.token_submission_attempts == expected_submissions
             && submission_stats.token_submission_commits == expected_submissions,
@@ -364,11 +371,11 @@ fn main() -> anyhow::Result<()> {
     compact_executor.commit_speculative(accepted_drafts, &cancellation)?;
     anyhow::ensure!(
         compact_executor.session_token_counters()?
-            == (target_tokens_after_replay, mtp_tokens_after_replay),
-        "CUDA compact partial-prefix replay differs from full-logit evidence"
+            == (target_tokens_after_commit, mtp_tokens_after_commit),
+        "CUDA compact speculative commit differs from full-logit evidence"
     );
     let compact_stats = compact_executor.submission_stats()?;
-    let compact_expected_submissions = 10 + u64::from(accepted_drafts) * 2;
+    let compact_expected_submissions = 11 + replay_submissions;
     anyhow::ensure!(
         compact_stats.token_submission_attempts == compact_expected_submissions
             && compact_stats.token_submission_commits == compact_expected_submissions,
@@ -399,7 +406,7 @@ fn main() -> anyhow::Result<()> {
         "{}",
         serde_json::to_string_pretty(&Report {
             format: "ctox.cuda-sm86-executor.v1",
-            status: "lifecycle_mtp4_partial_replay_verifier_only_not_promoted",
+            status: "lifecycle_mtp4_commit_replay_verifier_only_not_promoted",
             thread_affine_worker: true,
             module_sha256,
             artifact_manifest_sha256,
@@ -418,13 +425,14 @@ fn main() -> anyhow::Result<()> {
             gathered_full_maximum_absolute_error: gathered_verification.maximum_absolute_error,
             verified_draft_prefix,
             accepted_drafts,
+            full_branch_committed_without_replay,
             bonus_token,
             target_logits_f32le_sha256,
             draft_logits_f32le_sha256,
             target_verification_logits_f32le_sha256,
             bonus_logits_f32le_sha256,
-            target_tokens_after_replay,
-            mtp_tokens_after_replay,
+            target_tokens_after_commit,
+            mtp_tokens_after_commit,
             token_submission_attempts: submission_stats.token_submission_attempts,
             token_submission_commits: submission_stats.token_submission_commits,
             deferred_operator_synchronizations: submission_stats
@@ -438,7 +446,7 @@ fn main() -> anyhow::Result<()> {
             load_milliseconds,
             prefill_milliseconds,
             decode_milliseconds,
-            replay_milliseconds,
+            commit_milliseconds,
             unload_milliseconds,
             allocations_zero_after_unload,
             compact_mode_capability,
@@ -453,7 +461,7 @@ fn main() -> anyhow::Result<()> {
             compact_decode_milliseconds,
             compact_unload_milliseconds,
             compact_allocations_zero_after_unload,
-            note: "Exercises both CUDA executor output modes through dedicated thread-affine workers without CPU model-operation fallback. The evidence mode proves complete gathered/target distributions and host-oracle decisions. The server mode returns zero host logit values, matches every evidence-mode draft/target/bonus decision, replays the same accepted prefix, and unloads fully. Production still requires on-device RNG state, unrestricted top-p, stochastic MTP accept/reject, BF16/logit quality, long-context, and roofline evidence on the release checkpoint.",
+            note: "Exercises both CUDA executor output modes through dedicated thread-affine workers without CPU model-operation fallback. The evidence mode proves complete gathered/target distributions and host-oracle decisions. The server mode returns zero host logit values and matches every evidence-mode draft/target/bonus decision. A fully accepted block commits its already computed state after one final headless MTP transition; partial acceptance restores and causally replays only the accepted prefix. Both paths unload fully. Production still requires on-device RNG state, unrestricted top-p, stochastic MTP accept/reject, BF16/logit quality, long-context, and roofline evidence on the release checkpoint.",
         })?
     );
     Ok(())

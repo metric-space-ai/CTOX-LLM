@@ -2953,6 +2953,12 @@ impl PreparedCudaProjectionGraph {
     /// Keep a completely accepted speculative branch and discard only its
     /// bounded replay checkpoint.
     pub fn commit_speculative_branch(&mut self) -> Result<()> {
+        if self.target_tokens != self.mtp_tokens.saturating_add(1) {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA speculative commit requires target exactly one token ahead, observed {}/{}",
+                self.target_tokens, self.mtp_tokens
+            )));
+        }
         self.speculative_base.take().ok_or_else(|| {
             EngineError::InvalidState("CUDA graph has no pending speculative branch".into())
         })?;
@@ -3640,8 +3646,9 @@ impl PreparedCudaProjectionGraph {
             config,
             next_token_id,
             absolute_position,
-            false,
-        )
+            CudaMtpHeadMode::Full,
+        )?
+        .ok_or_else(|| EngineError::InvalidState("CUDA full MTP draft omitted logits".into()))
     }
 
     pub fn dispatch_mtp_restricted_draft_device<'a>(
@@ -3651,7 +3658,39 @@ impl PreparedCudaProjectionGraph {
         next_token_id: usize,
         absolute_position: usize,
     ) -> Result<CudaDeviceF32View<'a>> {
-        self.dispatch_mtp_draft_device_impl(runtime, config, next_token_id, absolute_position, true)
+        self.dispatch_mtp_draft_device_impl(
+            runtime,
+            config,
+            next_token_id,
+            absolute_position,
+            CudaMtpHeadMode::Restricted,
+        )?
+        .ok_or_else(|| EngineError::InvalidState("CUDA restricted MTP draft omitted logits".into()))
+    }
+
+    /// Advance the native MTP state for an accepted token without reading
+    /// either the complete or gathered LM head. This closes the final causal
+    /// edge of a fully accepted speculative block.
+    pub fn dispatch_mtp_advance_device(
+        &mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        next_token_id: usize,
+        absolute_position: usize,
+    ) -> Result<()> {
+        let logits = self.dispatch_mtp_draft_device_impl(
+            runtime,
+            config,
+            next_token_id,
+            absolute_position,
+            CudaMtpHeadMode::StateOnly,
+        )?;
+        if logits.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA state-only MTP advance unexpectedly produced logits".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn dispatch_mtp_draft_device_impl<'a>(
@@ -3660,8 +3699,8 @@ impl PreparedCudaProjectionGraph {
         config: &Qwen38Config,
         next_token_id: usize,
         absolute_position: usize,
-        restricted: bool,
-    ) -> Result<CudaDeviceF32View<'a>> {
+        head_mode: CudaMtpHeadMode,
+    ) -> Result<Option<CudaDeviceF32View<'a>>> {
         if config != &Qwen38Config::default() {
             return Err(EngineError::Shape(
                 "CUDA MTP dispatch requires the frozen Qwen3.8-27B topology".into(),
@@ -3784,29 +3823,8 @@ impl PreparedCudaProjectionGraph {
                 residual,
                 down,
             )?;
-            if restricted {
-                let group = plan.group_for_projection("lm_head.weight")?;
-                let activation = activations.get(group).ok_or_else(|| {
-                    EngineError::InvalidState(
-                        "CUDA LM-head activation group is not resident".into(),
-                    )
-                })?;
-                let projection = projections.get("lm_head.weight").ok_or_else(|| {
-                    EngineError::InvalidState("CUDA LM head is not resident".into())
-                })?;
-                let gathered = mtp_draft_projection.as_ref().ok_or_else(|| {
-                    EngineError::InvalidState(
-                        "CUDA restricted MTP head was not prepared at load".into(),
-                    )
-                })?;
-                runtime.dispatch_shared_a8_gathered_device(
-                    activation,
-                    final_hidden,
-                    projection,
-                    gathered,
-                )
-            } else {
-                dispatch_projection_device(
+            match head_mode {
+                CudaMtpHeadMode::Full => dispatch_projection_device(
                     runtime,
                     plan,
                     activations,
@@ -3814,6 +3832,32 @@ impl PreparedCudaProjectionGraph {
                     final_hidden,
                     "lm_head.weight",
                 )
+                .map(Some),
+                CudaMtpHeadMode::Restricted => {
+                    let group = plan.group_for_projection("lm_head.weight")?;
+                    let activation = activations.get(group).ok_or_else(|| {
+                        EngineError::InvalidState(
+                            "CUDA LM-head activation group is not resident".into(),
+                        )
+                    })?;
+                    let projection = projections.get("lm_head.weight").ok_or_else(|| {
+                        EngineError::InvalidState("CUDA LM head is not resident".into())
+                    })?;
+                    let gathered = mtp_draft_projection.as_ref().ok_or_else(|| {
+                        EngineError::InvalidState(
+                            "CUDA restricted MTP head was not prepared at load".into(),
+                        )
+                    })?;
+                    runtime
+                        .dispatch_shared_a8_gathered_device(
+                            activation,
+                            final_hidden,
+                            projection,
+                            gathered,
+                        )
+                        .map(Some)
+                }
+                CudaMtpHeadMode::StateOnly => Ok(None),
             }
         })?;
         *mtp_tokens = mtp_tokens
@@ -4131,6 +4175,13 @@ fn dispatch_mtp_prefill_parts(
         alignment.rows,
     )?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CudaMtpHeadMode {
+    Full,
+    Restricted,
+    StateOnly,
 }
 
 #[derive(Clone, Copy)]

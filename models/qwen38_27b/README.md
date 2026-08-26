@@ -261,9 +261,11 @@ attention, FFN, norm, and LM-head operators. Its hardware run and subsequent
 target verification use a second complete target transition and report either
 an accepted draft or the target fallback without hiding rejection. A
 verifier-only `CudaModelExecutor` now drives load, warmup, layer-major prefill,
-chained MTP4 target verification, bounded device checkpointing, accepted-prefix
-restore/replay, reset, allocation accounting, and unload through the shared
-Rust ABI. `qwen38-cuda-executor-verify` binds that lifecycle to the exact
+chained MTP4 target verification, bounded device checkpointing, full-branch
+commit, accepted-prefix restore/replay, reset, allocation accounting, and unload
+through the shared Rust ABI. The final accepted draft advances MTP state without
+reading either LM head, so a fully accepted block retains the already computed
+target branch with no replay. `qwen38-cuda-executor-verify` binds that lifecycle to the exact
 artifact, CUDA module, and canonical release draft-vocabulary hashes. Its
 MTP proposals use a Q2/Q4-aware gathered projection over exactly the canonical
 40,000 draft rows while the full target head remains resident for verification;

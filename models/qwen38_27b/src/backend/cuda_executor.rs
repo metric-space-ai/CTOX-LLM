@@ -830,6 +830,7 @@ impl ModelExecutor for CudaModelExecutor {
             let mut target_tokens = Vec::with_capacity(speculative_draft_count);
             for depth in 0..speculative_draft_count {
                 if cancellation.is_cancelled() {
+                    graph.restore_speculative_branch(runtime)?;
                     return Err(EngineError::Cancelled);
                 }
                 let candidate = current_draft;
@@ -848,6 +849,14 @@ impl ModelExecutor for CudaModelExecutor {
                         argmax,
                         next_draft_view,
                         &self.mtp_draft_token_ids,
+                    )?;
+                } else {
+                    let absolute_position = graph.target_tokens();
+                    graph.dispatch_mtp_advance_device(
+                        runtime,
+                        &self.config,
+                        candidate as usize,
+                        absolute_position,
                     )?;
                 }
                 let candidate_position = graph.target_tokens();
@@ -882,6 +891,7 @@ impl ModelExecutor for CudaModelExecutor {
         let mut current_target = target_logits.clone();
         for depth in 0..speculative_draft_count {
             if cancellation.is_cancelled() {
+                graph.restore_speculative_branch(runtime)?;
                 return Err(EngineError::Cancelled);
             }
             let (draft, candidate) = current_draft.take().ok_or_else(|| {
@@ -911,6 +921,14 @@ impl ModelExecutor for CudaModelExecutor {
                     &self.mtp_draft_token_ids,
                 )?;
                 current_draft = Some((Some(logits), token));
+            } else {
+                let absolute_position = graph.target_tokens();
+                graph.dispatch_mtp_advance_device(
+                    runtime,
+                    &self.config,
+                    candidate as usize,
+                    absolute_position,
+                )?;
             }
             let candidate_position = graph.target_tokens();
             let next_target_view = graph.dispatch_target_token_device(
@@ -984,27 +1002,54 @@ impl ModelExecutor for CudaModelExecutor {
         let graph = self.graph.as_mut().ok_or_else(|| {
             EngineError::InvalidState("CUDA speculative commit has no graph".into())
         })?;
-        graph.restore_speculative_branch(runtime)?;
-        for candidate in branch.candidate_tokens.into_iter().take(accepted) {
-            if cancellation.is_cancelled() {
-                return Err(EngineError::Cancelled);
-            }
-            let absolute_position = graph.target_tokens();
-            let _ = graph.dispatch_mtp_draft_device(
-                runtime,
-                &self.config,
-                candidate as usize,
-                absolute_position,
-            )?;
-            let target_position = graph.target_tokens();
-            let _ = graph.dispatch_target_token_device(
-                runtime,
-                &self.config,
-                candidate as usize,
-                target_position,
-            )?;
+        if cancellation.is_cancelled() {
+            graph.restore_speculative_branch(runtime)?;
+            return Err(EngineError::Cancelled);
         }
-        Ok(())
+        if accepted == branch.candidate_tokens.len() {
+            graph.commit_speculative_branch()?;
+            return Ok(());
+        }
+        graph.restore_speculative_branch(runtime)?;
+        if accepted == 0 {
+            return Ok(());
+        }
+
+        // A partial prefix must be replayed causally. Snapshot the restored
+        // base again so cancellation or a failed replay can roll back rather
+        // than exposing a half-accepted session.
+        graph.begin_speculative_branch(runtime)?;
+        let replay = (|| {
+            for candidate in branch.candidate_tokens.into_iter().take(accepted) {
+                if cancellation.is_cancelled() {
+                    return Err(EngineError::Cancelled);
+                }
+                let absolute_position = graph.target_tokens();
+                graph.dispatch_mtp_advance_device(
+                    runtime,
+                    &self.config,
+                    candidate as usize,
+                    absolute_position,
+                )?;
+                let target_position = graph.target_tokens();
+                let _ = graph.dispatch_target_token_device(
+                    runtime,
+                    &self.config,
+                    candidate as usize,
+                    target_position,
+                )?;
+            }
+            Ok(())
+        })();
+        match replay {
+            Ok(()) => graph.commit_speculative_branch(),
+            Err(error) => match graph.restore_speculative_branch(runtime) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(EngineError::InvalidState(format!(
+                    "CUDA speculative replay and rollback failed: replay={error}; rollback={restore_error}"
+                ))),
+            },
+        }
     }
 
     fn reset_session(&mut self) -> Result<()> {

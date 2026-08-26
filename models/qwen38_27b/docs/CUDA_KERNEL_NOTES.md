@@ -378,9 +378,11 @@ repeated target logits to be bit-identical.
 `ModelExecutor` ABI. It supports layer-major prefill, up to four chained drafts,
 full-target verification, device-side checkpoint/restore, replay of exactly the
 accepted causal prefix, reset, and fail-closed unload without CPU model
-operations. Even a fully accepted block is restored and replayed: the final
-candidate has target state but no subsequent MTP transition, so retaining the
-speculative branch would violate the target-one-ahead invariant. Near the
+operations. The last candidate now executes one MTP state-only transition that
+omits both complete and gathered LM heads before its target step. A fully
+accepted branch therefore ends target-exactly-one-ahead and commits directly
+without replay; only a partial prefix restores and replays. Cancellation during
+branch construction or replay restores the last safe checkpoint. Near the
 admitted context boundary, the returned draft block is shortened rather than
 overrunning KV capacity. `qwen38-cuda-executor-verify` exercises the complete
 lifecycle and hashes every token-boundary distribution, but its hardware run is
