@@ -13,13 +13,14 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Parser)]
-#[command(about = "Compare complete sequential and batched Qwen target prefill on CUDA SM86")]
+#[command(about = "Compare complete sequential and chunked Qwen prefill on CUDA SM86")]
 struct Args {
     #[arg(long)]
     artifact: PathBuf,
     #[arg(long)]
     module: PathBuf,
-    /// Comma-delimited tokenizer IDs. One complete prompt chunk is verified.
+    /// Comma-delimited tokenizer IDs. Prompts longer than the prepared chunk
+    /// capacity exercise the cross-chunk target/MTP state boundary.
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     token_ids: Vec<u32>,
     #[arg(long, default_value_t = 0)]
@@ -68,6 +69,8 @@ struct Report<'a> {
     artifact_manifest_sha256: String,
     token_ids: Vec<u32>,
     tokens: usize,
+    chunks: usize,
+    maximum_chunk_tokens: usize,
     maximum_context_tokens: usize,
     mtp_enabled: bool,
     sequential_logits_f32le_sha256: String,
@@ -108,8 +111,8 @@ struct Report<'a> {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     anyhow::ensure!(
-        (2..=512).contains(&args.token_ids.len()),
-        "token_ids must contain one complete chunk in 2..=512"
+        (2..=args.maximum_context_tokens).contains(&args.token_ids.len()),
+        "token_ids must contain 2..=maximum_context_tokens tokens"
     );
     anyhow::ensure!(
         args.maximum_context_tokens >= args.token_ids.len(),
@@ -148,6 +151,8 @@ fn main() -> anyhow::Result<()> {
     )?;
     let graph_prepare_milliseconds = prepare_started.elapsed().as_secs_f64() * 1.0e3;
     let (free_after_prepare, _) = runtime.memory_info()?;
+    let maximum_chunk_tokens = graph.prefill_workspaces().max_chunk_tokens();
+    let chunks = args.token_ids.len().div_ceil(maximum_chunk_tokens);
 
     let sequential_stats_before = runtime.submission_stats();
     let sequential_started = Instant::now();
@@ -193,22 +198,26 @@ fn main() -> anyhow::Result<()> {
 
     let batched_stats_before = runtime.submission_stats();
     let batched_started = Instant::now();
-    let batched_view = if args.mtp_enabled {
-        graph.dispatch_target_prefill_chunk_with_mtp_device(
-            &runtime,
-            &config,
-            &args.token_ids,
-            0,
-        )?
-    } else {
-        graph.dispatch_target_prefill_chunk_without_mtp_device(
-            &runtime,
-            &config,
-            &args.token_ids,
-            0,
-        )?
-    };
-    let batched_logits = runtime.verifier_read_f32_device(batched_view)?;
+    let mut batched_logits = Vec::new();
+    for chunk in args.token_ids.chunks(maximum_chunk_tokens) {
+        let start_position = graph.target_tokens();
+        let batched_view = if args.mtp_enabled {
+            graph.dispatch_target_prefill_chunk_with_mtp_device(
+                &runtime,
+                &config,
+                chunk,
+                start_position,
+            )?
+        } else {
+            graph.dispatch_target_prefill_chunk_without_mtp_device(
+                &runtime,
+                &config,
+                chunk,
+                start_position,
+            )?
+        };
+        batched_logits = runtime.verifier_read_f32_device(batched_view)?;
+    }
     let batched_milliseconds = batched_started.elapsed().as_secs_f64() * 1.0e3;
     ensure_logits(&batched_logits, "batched")?;
     let batched_continuation = dispatch_continuation(
@@ -223,9 +232,11 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(
         graph.target_tokens() == expected_target_tokens
             && graph.mtp_tokens() == expected_mtp_tokens
-            && batched_stats.token_submission_attempts == 1 + 2 * u64::from(args.mtp_enabled)
-            && batched_stats.token_submission_commits == 1 + 2 * u64::from(args.mtp_enabled),
-        "batched path did not commit the chunk as one transaction"
+            && batched_stats.token_submission_attempts
+                == chunks as u64 + 2 * u64::from(args.mtp_enabled)
+            && batched_stats.token_submission_commits
+                == chunks as u64 + 2 * u64::from(args.mtp_enabled),
+        "batched path did not commit each chunk as one transaction"
     );
 
     let (maximum_absolute_logit_error, maximum_relative_logit_error) = compare_logits(
@@ -314,6 +325,8 @@ fn main() -> anyhow::Result<()> {
             artifact_manifest_sha256,
             token_ids: args.token_ids,
             tokens: prompt_tokens,
+            chunks,
+            maximum_chunk_tokens,
             maximum_context_tokens: args.maximum_context_tokens,
             mtp_enabled: args.mtp_enabled,
             sequential_logits_f32le_sha256,
@@ -348,7 +361,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_drop: free_after_drop,
             observed_allocation_bytes: free_before_prepare.saturating_sub(free_after_prepare),
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
-            note: "Runs the same complete 64-layer target and optional causally shifted MTP prompt state first through sequential token transactions and then through one 645-step layer-major chunk after an explicit reset. It compares final target logits, the greedy decision, the next MTP and target continuation logits, bit-exact target linear recurrence/convolution state, target and MTP cache precision metadata, synchronization counts, and allocator reclamation. BF16 quality, throughput promotion, and multi-chunk boundary equivalence remain separate gates.",
+            note: "Runs the same complete 64-layer target and optional causally shifted MTP prompt state first through sequential token transactions and then through one or more bounded 645-step layer-major chunks after an explicit reset. Prompts above the prepared chunk capacity exercise the retained target-hidden MTP boundary. The verifier compares final target logits, the greedy decision, the next MTP and target continuation logits, bit-exact target linear recurrence/convolution state, target and MTP cache precision metadata, synchronization counts, and allocator reclamation. BF16 quality and throughput promotion remain separate gates.",
         })?
     );
     Ok(())

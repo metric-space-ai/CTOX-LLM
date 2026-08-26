@@ -615,8 +615,10 @@ device-to-device copies rather than a host token loop or another custom CUDA
 kernel. Hardware verification remains open.
 `PreparedCudaProjectionGraph` binds the ordinary fan-out, attention-gate, and
 SwiGLU forms to its single admitted activation/output arena. The complete
-target-only 645-step executor transaction is now exposed through a dedicated
-full-model verifier:
+645-step target/MTP executor transaction is now exposed through a dedicated
+full-model verifier. Passing more than 512 token IDs makes it compare the
+sequential oracle with multiple bounded chunks, including the retained-hidden
+MTP boundary:
 
 ```text
 cargo run --release --features cuda --bin qwen38-cuda-model-prefill-verify -- \

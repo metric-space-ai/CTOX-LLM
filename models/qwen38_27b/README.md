@@ -318,8 +318,10 @@ bit-identical to the established MMQ graph path. A fail-closed execution cursor
 now admits a chunk only at the exact committed position and releases its new
 commit position only after all 645 bound operations and the final barrier have
 completed in order. The target-only executor now dispatches that complete
-program, and `qwen38-cuda-model-prefill-verify` compares it with the sequential
-64-layer device path after an explicit reset. Complete-graph SM86 hardware
+program, and `qwen38-cuda-model-prefill-verify` compares target-only or MTP-
+enabled execution with the sequential 64-layer device path after an explicit
+reset. Prompts above 512 tokens traverse multiple bounded chunks and therefore
+exercise the retained target-hidden MTP boundary. Complete-graph SM86 hardware
 evidence remains open. The fused FFN SwiGLU/A8 and full-attention sigmoid-
 gate/A8 candidates now use `grid.y` for all 512 prompt rows while retaining the
 single-row decode ABI. On the RTX A4500, selected rows were bit-exact to the
