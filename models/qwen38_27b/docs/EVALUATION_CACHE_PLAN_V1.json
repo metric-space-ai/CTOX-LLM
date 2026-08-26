@@ -1,0 +1,65 @@
+{
+  "format": "ctox.qwen38.evaluation-cache-plan-evidence.v1",
+  "date": "2026-08-26",
+  "status": "planned_and_scheduled_after_recovery_smoke",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "teacher_provenance_sha256": "d930966047fee2be4a3e1f70e55d0b507231bc5d9ead935bd166879d8bdc81d0",
+  "input": {
+    "materialized": "release-recovery-evaluation-642-v7.jsonl",
+    "records": 642,
+    "bytes": 14936462,
+    "sha256": "06f148135c7dfa1a7cf05fdfe8da78bf4cbd49b9d973fe9c3c8287634c16691f",
+    "domain_tags": "release-recovery-evaluation-642-v7.jsonl",
+    "domain_tags_records": 642,
+    "domain_tags_sha256": "37e43eb0fc724d2825a67ede21814d7725873c27152719d1a4f796410af67787",
+    "service_tags": "release-recovery-evaluation-642-v7.jsonl",
+    "service_tags_records": 642,
+    "service_tags_sha256": "ad76b30c6a3ff04ac0bf132b9518912b8192b829dcdc1d8dfc8c72535a6d15a6"
+  },
+  "cache_plan": {
+    "path": "release-teacher-cache-evaluation-642-v1.json",
+    "sha256": "21d5701ec4472b4e0a34e88f9b79f3078f010021cbb0ceb806c7cee9c9627b85",
+    "sequence_tokens": 4380409,
+    "sequence_tokens_p50": 2161,
+    "sequence_tokens_p95": 23375,
+    "sequence_tokens_max": 130873,
+    "tensor_payload_bytes": 6496456585,
+    "projected_cache_bytes": 6506975113,
+    "projected_cache_gib": 6.060092815198004
+  },
+  "batch_plan": {
+    "path": "release-teacher-cache-evaluation-642-batches-v1.json",
+    "sha256": "6ec26b98abdfd59587cb2880ce0dea4af7d81c96b3e0daba16de87cc8a4b98df",
+    "batches": 8,
+    "maximum_samples_per_batch": 96,
+    "maximum_sequence_tokens_per_batch": 1000000,
+    "maximum_projected_bytes_per_batch": 2147483648
+  },
+  "coverage": {
+    "categories": {
+      "agentic": 96,
+      "chat": 247,
+      "code": 142,
+      "long_context": 20,
+      "math": 137
+    },
+    "language_strata": 15,
+    "german": 62,
+    "german_english_mixed": 17,
+    "non_english_records": 192
+  },
+  "execution": {
+    "physical_gpu_indices": [1, 2],
+    "cuda_visible_devices": "1,2",
+    "mtp_logical_device": "cuda:1",
+    "prefill_chunk_tokens": 512,
+    "reserved_gpu_hours": 24,
+    "output_cache_set": "release-recovery-evaluation-642-v1-cache-set.json",
+    "full_artifact_rehash_required": true
+  },
+  "limitations": [
+    "This evidence proves cohort sizing and scheduling, not completed teacher artifacts.",
+    "Quality and retrieval gates remain open until the cache set and final recovered checkpoint both exist."
+  ]
+}

@@ -79,6 +79,12 @@ from prompt_format import normalize_content, normalize_messages, normalize_tool_
 from filter_recovery_cohort import filter_records  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
 from fit_recovery_scales import quant_dtype_ranges, validate_recovery_inputs  # noqa: E402
+from evaluate_recovery import (  # noqa: E402
+    MetricAggregate,
+    logical_qcode_root,
+    require_exact_ids,
+)
+from compare_recovery_evaluations import compare_reports  # noqa: E402
 from fanout_recovery import (  # noqa: E402
     INDEPENDENT_POLICY,
     QWEN38_FANOUT_POLICY,
@@ -855,6 +861,116 @@ class DatasetPipelineTests(unittest.TestCase):
             recovery_training_status(True, None, 0),
             "bounded_run_complete",
         )
+
+    def test_heldout_metric_aggregation_tracks_sample_and_target_means(self) -> None:
+        aggregate = MetricAggregate()
+        base = {
+            "sequence_tokens": 10,
+            "logit_targets": 2,
+            "hidden_targets": 1,
+            "mtp_targets": 2,
+            "mtp_hidden_targets": 1,
+            "losses": {
+                "kl": 1.0,
+                "ce": 2.0,
+                "hidden": 3.0,
+                "mtp_kl": 4.0,
+                "mtp_ce": 5.0,
+                "mtp_hidden": 6.0,
+            },
+        }
+        aggregate.add(base)
+        changed = json.loads(json.dumps(base))
+        changed["logit_targets"] = 6
+        changed["mtp_targets"] = 6
+        changed["losses"]["kl"] = 3.0
+        aggregate.add(changed)
+        report = aggregate.report()
+        self.assertEqual(report["sample_mean_losses"]["kl"], 2.0)
+        self.assertEqual(report["target_weighted_mean_losses"]["kl"], 2.5)
+        self.assertEqual(report["target_counts"]["kl"], 8)
+
+    def test_logical_qcode_root_ignores_recovery_scales_but_binds_codes(self) -> None:
+        manifest = {
+            "tensors": [
+                {
+                    "name": "matrix.weight",
+                    "dtype": "q2_b64",
+                    "shape": [2, 64],
+                    "sha256": "1" * 64,
+                },
+                {
+                    "name": "matrix.weight.s_in",
+                    "dtype": "f16",
+                    "shape": [64],
+                    "sha256": "2" * 64,
+                },
+            ]
+        }
+        expected = logical_qcode_root(manifest)
+        manifest["tensors"][1]["sha256"] = "3" * 64
+        self.assertEqual(logical_qcode_root(manifest), expected)
+        manifest["tensors"][0]["sha256"] = "4" * 64
+        self.assertNotEqual(logical_qcode_root(manifest), expected)
+
+    def test_heldout_comparison_requires_same_codes_and_thirty_percent_closure(
+        self,
+    ) -> None:
+        losses = {
+            "kl": 1.0,
+            "ce": 2.0,
+            "hidden": 1.0,
+            "mtp_kl": 1.0,
+            "mtp_ce": 2.0,
+            "mtp_hidden": 1.0,
+        }
+        aggregate = {
+            "records": 1,
+            "sequence_tokens": 10,
+            "sample_mean_losses": losses,
+            "target_weighted_mean_losses": losses,
+            "target_counts": {name: 1 for name in losses},
+        }
+        identity = {
+            "format": "ctox.recovery.heldout-evaluation.v1",
+            "status": "complete",
+            "model": "Qwen/Qwen3.8-27B",
+            "revision": "r",
+            "local_model_provenance_sha256": "p",
+            "logical_qcode_root_sha256": "q",
+            "teacher_cache_set_sha256": "c",
+            "teacher_artifact_root_sha256": "t",
+            "materialized_sha256": "m",
+            "domain_tags_sha256": "d",
+            "service_tags_sha256": "s",
+            "prefill_chunk_tokens": 512,
+            "compute_dtype": "bfloat16",
+            "artifact_sha256": "a",
+            "samples": [{"id": "sample"}],
+            "aggregates": {
+                "overall": aggregate,
+                "groups": {"category": {"chat": aggregate}},
+            },
+        }
+        direct = json.loads(json.dumps(identity))
+        recovered = json.loads(json.dumps(identity))
+        recovered["artifact_sha256"] = "b"
+        for target in (
+            recovered["aggregates"]["overall"],
+            recovered["aggregates"]["groups"]["category"]["chat"],
+        ):
+            for name in ("kl", "hidden", "mtp_kl", "mtp_hidden"):
+                target["target_weighted_mean_losses"][name] *= 0.6
+        comparison = compare_reports(direct, recovered, 0.30)
+        self.assertEqual(comparison["status"], "passed")
+        recovered["logical_qcode_root_sha256"] = "different"
+        with self.assertRaisesRegex(ValueError, "logical_qcode"):
+            compare_reports(direct, recovered, 0.30)
+
+    def test_evaluation_sidecars_require_exact_ids(self) -> None:
+        require_exact_ids({"a", "b"}, {"a": {}, "b": {}}, "tags")
+        with self.assertRaisesRegex(ValueError, "missing"):
+            require_exact_ids({"a", "b"}, {"a": {}, "c": {}}, "tags")
 
     def test_partial_accumulation_is_rescaled_to_the_exact_mean(self) -> None:
         if torch is None:

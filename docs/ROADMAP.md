@@ -328,8 +328,10 @@ The immediate execution batch is:
 5. replace `train_recovery.py`'s layer-only utility with a complete packed
    fixed-qcode student trainer consuming KL, CE, hidden, activation, and MTP
    losses, while retaining the bounded layer utility as an initializer tool;
-6. run held-out quality/long-context/MTP ablations until the release gates pass,
-   then freeze the logical checkpoint and release manifest;
+6. run the content-addressed held-out numerical evaluator and direct-vs-trained
+   fixed-qcode comparison, then generation/tool/long-context/MTP ablations until
+   every separate release gate passes and freeze the logical checkpoint and
+   release manifest;
 7. in parallel where it does not consume the recovery GPU, complete the
    embeddable Rust `Engine` lifecycle and scalar full-graph oracle. Accelerator
    tuning begins only after logical checkpoint identity is frozen.

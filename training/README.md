@@ -425,6 +425,23 @@ Omitting the option remains available only for explicitly marked identity
 baselines. The packer refuses to overwrite files and refuses plans above the
 Fold limit.
 
+`evaluate_recovery.py` runs a fully checksummed packed checkpoint against a
+separate, content-addressed teacher cache set. It binds the materialized
+cohort, domain tags, service-mode tags, BF16 provenance, and an independently
+derived root over quantized tensor descriptors and payload hashes. Recovery
+scales are excluded from that root, so a direct and trained pack compare only
+when their logical Q2/Q4 codes are byte-identical. Stateful 512-token prefill
+uses the same bounded cache path as training. Reports retain every sample and
+produce both sample-mean and exact target-count-weighted KL, CE, hidden, MTP-KL,
+MTP-CE, and MTP-hidden metrics for categories, languages, primary and
+multi-label domains, service modes, and sources.
+`compare_recovery_evaluations.py` then requires the same ordered cohort,
+sidecar hashes, compute contract, and logical-code root. Its 30% gate measures
+the recoverable BF16 distillation gap using KL/hidden families whose ideal is
+zero; ordinary CE is still reported but is not incorrectly treated as having
+zero BF16 baseline. This numerical gate does not replace task-level generation,
+tool-execution, weighted benchmark, or 128K retrieval gates.
+
 Vision remains a separate phase-resident package. `build_vision_plan.py`
 zero-pads matrix columns to 64-value storage blocks so non-aligned vision MLPs
 can still use Q2/Q4 kernels. `plan_vision_residency.py` then selects whole
