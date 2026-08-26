@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from collect_activation_stats import save_file_atomic
+
 
 SEMANTIC_METADATA_FIELDS = (
     "model",
@@ -149,11 +151,11 @@ def merge(paths: list[Path], output: Path, torch: Any, safe_open: Any, save_file
     for base, values in row_counts.items():
         tensors[f"{base}.row_count"] = values
     assert reference_metadata is not None
-    output.parent.mkdir(parents=True, exist_ok=True)
-    save_file(
+    save_file_atomic(
+        save_file,
         tensors,
         output,
-        metadata=merged_metadata(
+        merged_metadata(
             reference_metadata,
             sample_ids,
             total_tokens,
