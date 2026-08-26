@@ -327,7 +327,14 @@ def main() -> None:
             skipped: list[dict[str, Any]] = []
             accumulated = 0
             bounded_stop = False
-            with GpuRun(args.ledger, "end-to-end-recovery", args.gpus, sys.argv):
+            budget_stop = False
+            with GpuRun(
+                args.ledger,
+                "end-to-end-recovery",
+                args.gpus,
+                sys.argv,
+                maximum_gpu_hours=args.reserved_gpu_hours,
+            ) as gpu_run:
 
                 def complete_optimizer_step(
                     epoch: int,
@@ -335,7 +342,7 @@ def main() -> None:
                     sample_id: str,
                     sequence_tokens: int,
                 ) -> None:
-                    nonlocal accumulated, bounded_stop
+                    nonlocal accumulated, bounded_stop, budget_stop
                     accumulation_correction = normalize_accumulated_gradients(
                         trainable,
                         accumulated,
@@ -383,6 +390,8 @@ def main() -> None:
                         and cursor["optimizer_steps"] >= args.max_optimizer_steps
                     ):
                         bounded_stop = True
+                    if gpu_run.budget_exhausted():
+                        budget_stop = True
 
                 for epoch in range(cursor["epoch"], args.epochs):
                     order = training_order(
@@ -486,10 +495,10 @@ def main() -> None:
                                 str(descriptor["id"]),
                                 sequence_tokens,
                             )
-                            if bounded_stop:
+                            if bounded_stop or budget_stop:
                                 break
                         del teacher, regularization, loss_steps, sample_metrics
-                    if bounded_stop:
+                    if bounded_stop or budget_stop:
                         break
                     if accumulated:
                         if last_trained is None:
@@ -497,9 +506,26 @@ def main() -> None:
                                 "partial gradient group lacks a trained sample"
                             )
                         complete_optimizer_step(epoch, *last_trained)
-                        if bounded_stop:
+                        if bounded_stop or budget_stop:
                             break
                     cursor.update({"epoch": epoch + 1, "next_position": 0})
+            if budget_stop:
+                budget_checkpoint = args.checkpoint_dir / (
+                    f"recovery-step-{cursor['optimizer_steps']:06d}.safetensors"
+                )
+                if not budget_checkpoint.exists():
+                    save_training_checkpoint(
+                        budget_checkpoint,
+                        parameters,
+                        optimizer,
+                        cursor,
+                        run_contract_sha256,
+                        torch,
+                    )
+                raise RuntimeError(
+                    "recovery exhausted its admitted GPU-hour reservation at an "
+                    f"optimizer boundary; resume from {budget_checkpoint}"
+                )
             final_checkpoint = args.checkpoint_dir / (
                 f"recovery-final-step-{cursor['optimizer_steps']:06d}.safetensors"
             )

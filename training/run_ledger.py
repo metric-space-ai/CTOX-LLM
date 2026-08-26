@@ -10,17 +10,36 @@ from pathlib import Path
 
 
 class GpuRun(AbstractContextManager["GpuRun"]):
-    def __init__(self, ledger: Path, stage: str, gpu_count: int, command: list[str]) -> None:
+    def __init__(
+        self,
+        ledger: Path,
+        stage: str,
+        gpu_count: int,
+        command: list[str],
+        maximum_gpu_hours: float | None = None,
+    ) -> None:
         if gpu_count < 1:
             raise ValueError("gpu_count must be positive")
+        if maximum_gpu_hours is not None and maximum_gpu_hours <= 0:
+            raise ValueError("maximum_gpu_hours must be positive")
         self.ledger = ledger
         self.stage = stage
         self.gpu_count = gpu_count
         self.command = command
+        self.maximum_gpu_hours = maximum_gpu_hours
         self.started = time.time()
 
     def __enter__(self) -> "GpuRun":
         return self
+
+    def consumed_gpu_hours(self) -> float:
+        return (time.time() - self.started) * self.gpu_count / 3600.0
+
+    def budget_exhausted(self) -> bool:
+        return (
+            self.maximum_gpu_hours is not None
+            and self.consumed_gpu_hours() >= self.maximum_gpu_hours
+        )
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         ended = time.time()
@@ -33,6 +52,7 @@ class GpuRun(AbstractContextManager["GpuRun"]):
             "gpu_count": self.gpu_count,
             "gpu_hours": (ended - self.started) * self.gpu_count / 3600.0,
             "command": self.command,
+            "maximum_gpu_hours": self.maximum_gpu_hours,
             "success": exc_type is None,
         }
         self.ledger.parent.mkdir(parents=True, exist_ok=True)

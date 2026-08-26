@@ -470,6 +470,10 @@ persists an atomic plan-bound state after each output hash, and resumes recovery
 training only from the highest numbered checkpoint accepted by the trainer's
 exact run-contract check. Existing unrecorded outputs fail closed for manual
 inspection; a stage is never inferred complete from filenames alone.
+The recovery trainer additionally measures its admitted stage reservation at
+optimizer boundaries. If that reservation is exhausted, it writes an exact
+run-contract checkpoint and exits unsuccessfully before emitting final scales
+or reports; an over-budget partial run therefore cannot advance to packing.
 
 Vision remains a separate phase-resident package. `build_vision_plan.py`
 zero-pads matrix columns to 64-value storage blocks so non-aligned vision MLPs
