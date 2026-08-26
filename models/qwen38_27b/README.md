@@ -294,6 +294,11 @@ GatedDelta recurrence, and MTP state, computes the target LM head only for the
 last prompt token, and exposes one cancellation/commit barrier per bounded
 chunk. Batched activation/output workspaces are separate from resident matrix
 owners, so enabling a 512-token chunk does not duplicate model weights. The
+frozen projection arena now proves that all 504 chunk-wide target/MTP matrices
+fit four conflict-free output slots plus one maximum-width A8 encoding slot:
+82,968,576 planned bytes at 512 tokens. The 248,320-row LM head remains outside
+that arena because prefill consumes only its final prompt row. Allocating this
+arena and binding its offset views to the MMQ dispatcher remain open. The
 standalone MMQ verifier exercises this same graph-facing path and the shared
 two-buffer batched RMSNorm workspace. The first causal-convolution scan now
 matches sequential CUDA output and final FP16 state bit-for-bit across a

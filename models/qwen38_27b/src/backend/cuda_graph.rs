@@ -29,6 +29,7 @@ use crate::config::LayerKind;
 use crate::fanout::qwen38_fanout_groups;
 use crate::kv_cache::{DEFAULT_KV_PAGE_TOKENS, DEFAULT_KV_RECENT_TOKENS, DEFAULT_KV_SINK_TOKENS};
 use crate::loader::{FloatTensorView, ModelArtifact};
+use crate::quant::BLOCK_LEN;
 use crate::tensor_contract::{expected_tensor_contract, validate_tensor_contract, TensorClass};
 use crate::{EngineError, Qwen38Config, Result};
 
@@ -90,6 +91,7 @@ pub struct CudaBoundPrefillStep {
 pub struct CudaPrefillBindingPlan {
     steps: Vec<CudaBoundPrefillStep>,
     max_chunk_tokens: usize,
+    projection_workspace: CudaPrefillProjectionWorkspacePlan,
 }
 
 /// Exact bytes for the shared full-attention prefill scratch admitted with a
@@ -103,6 +105,147 @@ pub struct CudaPrefillWorkspaceBudget {
     pub query_gate_bytes: u64,
     pub paged_gqa_output_bytes: u64,
     pub total_bytes: u64,
+}
+
+/// Fixed arena geometry for every chunk-wide Q2/Q4 projection. `lm_head` is
+/// intentionally excluded: the schedule evaluates only the final prompt row
+/// through its already-resident one-token output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaPrefillProjectionWorkspacePlan {
+    pub max_chunk_tokens: usize,
+    pub activation_columns: usize,
+    pub output_slot_rows: [usize; 4],
+    pub chunk_projection_count: usize,
+    pub last_token_lm_head_rows: usize,
+    pub activation_code_bytes: u64,
+    pub activation_scale_bytes: u64,
+    pub output_arena_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl CudaPrefillProjectionWorkspacePlan {
+    fn qwen38(
+        config: &Qwen38Config,
+        projections: &CudaProjectionPlan,
+        max_chunk_tokens: usize,
+    ) -> Result<Self> {
+        if max_chunk_tokens == 0 || max_chunk_tokens > 65_535 {
+            return Err(EngineError::MemoryBudget(
+                "CUDA projection workspace chunk capacity must be in 1..=65535".into(),
+            ));
+        }
+        let output_slot_rows = [
+            config.intermediate_size,
+            config.intermediate_size,
+            (config.num_key_value_heads * config.head_dim).max(config.linear_num_value_heads),
+            config.linear_num_value_heads,
+        ];
+        let contract = expected_tensor_contract(config);
+        let mut activation_columns = 0_usize;
+        let mut chunk_projection_count = 0_usize;
+        let mut last_token_lm_head_rows = None;
+        for name in projections.projection_groups.keys() {
+            let spec = contract.get(name).ok_or_else(|| {
+                EngineError::InvalidState(format!(
+                    "CUDA projection workspace cannot resolve tensor {name}"
+                ))
+            })?;
+            let [rows, columns] = spec.shape.as_slice() else {
+                return Err(EngineError::Shape(format!(
+                    "CUDA projection {name} is not a rank-two matrix"
+                )));
+            };
+            let rows = usize::try_from(*rows).map_err(|_| {
+                EngineError::MemoryBudget(format!("CUDA projection {name} rows exceed usize"))
+            })?;
+            let columns = usize::try_from(*columns).map_err(|_| {
+                EngineError::MemoryBudget(format!("CUDA projection {name} columns exceed usize"))
+            })?;
+            if name == "lm_head.weight" {
+                last_token_lm_head_rows = Some(rows);
+                continue;
+            }
+            let slot = prefill_projection_output_slot(name)?;
+            if rows > output_slot_rows[slot] {
+                return Err(EngineError::MemoryBudget(format!(
+                    "CUDA projection {name} needs {rows} output rows, slot {slot} admits {}",
+                    output_slot_rows[slot]
+                )));
+            }
+            activation_columns = activation_columns.max(columns);
+            chunk_projection_count += 1;
+        }
+        for group in projections.groups() {
+            let mut slots = BTreeSet::new();
+            for name in &group.projection_names {
+                if name == "lm_head.weight" {
+                    continue;
+                }
+                let slot = prefill_projection_output_slot(name)?;
+                if !slots.insert(slot) {
+                    return Err(EngineError::InvalidState(format!(
+                        "CUDA projection group {} aliases live output slot {slot}",
+                        group.key
+                    )));
+                }
+            }
+        }
+        let last_token_lm_head_rows = last_token_lm_head_rows.ok_or_else(|| {
+            EngineError::InvalidState("CUDA projection workspace omits LM head".into())
+        })?;
+        if chunk_projection_count + 1 != projections.projection_count() {
+            return Err(EngineError::InvalidState(
+                "CUDA projection workspace does not cover the complete graph".into(),
+            ));
+        }
+        let chunk = u64::try_from(max_chunk_tokens)
+            .map_err(|_| EngineError::MemoryBudget("CUDA prefill chunk exceeds u64".into()))?;
+        let columns = u64::try_from(activation_columns)
+            .map_err(|_| EngineError::MemoryBudget("CUDA projection columns exceed u64".into()))?;
+        let f32_bytes =
+            u64::try_from(std::mem::size_of::<f32>()).expect("f32 byte count always fits u64");
+        let activation_code_bytes =
+            checked_product(&[chunk, columns], "CUDA projection activation-code bytes")?;
+        let scale_blocks = u64::try_from(activation_columns.div_ceil(BLOCK_LEN)).map_err(|_| {
+            EngineError::MemoryBudget("CUDA projection scale blocks exceed u64".into())
+        })?;
+        let activation_scale_bytes = checked_product(
+            &[chunk, scale_blocks, f32_bytes],
+            "CUDA projection activation-scale bytes",
+        )?;
+        let output_rows = output_slot_rows
+            .into_iter()
+            .try_fold(0_u64, |total, rows| {
+                let rows = u64::try_from(rows).map_err(|_| {
+                    EngineError::MemoryBudget("CUDA projection output rows exceed u64".into())
+                })?;
+                checked_add(total, rows, "CUDA projection output rows")
+            })?;
+        let output_arena_bytes = checked_product(
+            &[chunk, output_rows, f32_bytes],
+            "CUDA projection output arena bytes",
+        )?;
+        let total_bytes = [
+            activation_code_bytes,
+            activation_scale_bytes,
+            output_arena_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, value| {
+            checked_add(total, value, "CUDA projection workspace bytes")
+        })?;
+        Ok(Self {
+            max_chunk_tokens,
+            activation_columns,
+            output_slot_rows,
+            chunk_projection_count,
+            last_token_lm_head_rows,
+            activation_code_bytes,
+            activation_scale_bytes,
+            output_arena_bytes,
+            total_bytes,
+        })
+    }
 }
 
 impl CudaPrefillWorkspaceBudget {
@@ -350,6 +493,11 @@ impl CudaPrefillBindingPlan {
         let plan = Self {
             steps,
             max_chunk_tokens: schedule.max_chunk_tokens,
+            projection_workspace: CudaPrefillProjectionWorkspacePlan::qwen38(
+                config,
+                projections,
+                schedule.max_chunk_tokens,
+            )?,
         };
         plan.validate_complete_ownership(projections, config)?;
         Ok(plan)
@@ -361,6 +509,10 @@ impl CudaPrefillBindingPlan {
 
     pub fn max_chunk_tokens(&self) -> usize {
         self.max_chunk_tokens
+    }
+
+    pub fn projection_workspace(&self) -> CudaPrefillProjectionWorkspacePlan {
+        self.projection_workspace
     }
 
     pub fn resource_count(&self, expected: fn(&CudaPreparedResource) -> bool) -> usize {
@@ -2943,6 +3095,33 @@ fn checked_product(values: &[u64], label: &str) -> Result<u64> {
     })
 }
 
+fn prefill_projection_output_slot(name: &str) -> Result<usize> {
+    let slot = if name.ends_with(".gate_proj.weight")
+        || name.ends_with(".q_proj.weight")
+        || name.ends_with(".in_proj_qkv.weight")
+        || name.ends_with(".o_proj.weight")
+        || name.ends_with(".out_proj.weight")
+        || name.ends_with(".down_proj.weight")
+        || name == "mtp.fc.weight"
+    {
+        0
+    } else if name.ends_with(".up_proj.weight")
+        || name.ends_with(".k_proj.weight")
+        || name.ends_with(".in_proj_z.weight")
+    {
+        1
+    } else if name.ends_with(".v_proj.weight") || name.ends_with(".in_proj_a.weight") {
+        2
+    } else if name.ends_with(".in_proj_b.weight") {
+        3
+    } else {
+        return Err(EngineError::InvalidState(format!(
+            "CUDA prefill projection {name} has no frozen output slot"
+        )));
+    };
+    Ok(slot)
+}
+
 fn sum_usize<const N: usize>(values: [usize; N], label: &str) -> Result<u64> {
     values.into_iter().try_fold(0_u64, |total, value| {
         let value = u64::try_from(value)
@@ -2975,6 +3154,34 @@ mod tests {
         assert_eq!(full.total_bytes, 63_045_632);
         assert!(CudaPrefillWorkspaceBudget::qwen38(&config, 0).is_err());
         assert!(CudaPrefillWorkspaceBudget::qwen38(&config, 65_536).is_err());
+    }
+
+    #[test]
+    fn frozen_prefill_projection_arena_covers_all_chunk_matrices_once() {
+        let config = Qwen38Config::default();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let plan = CudaPrefillProjectionWorkspacePlan::qwen38(&config, &projections, 512).unwrap();
+        assert_eq!(plan.activation_columns, 17_408);
+        assert_eq!(plan.output_slot_rows, [17_408, 17_408, 1_024, 48]);
+        assert_eq!(plan.chunk_projection_count, 504);
+        assert_eq!(plan.last_token_lm_head_rows, 248_320);
+        assert_eq!(plan.activation_code_bytes, 8_912_896);
+        assert_eq!(plan.activation_scale_bytes, 557_056);
+        assert_eq!(plan.output_arena_bytes, 73_498_624);
+        assert_eq!(plan.total_bytes, 82_968_576);
+    }
+
+    #[test]
+    fn projection_arena_scales_with_chunk_not_projection_count() {
+        let config = Qwen38Config::default();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let one = CudaPrefillProjectionWorkspacePlan::qwen38(&config, &projections, 1).unwrap();
+        let full = CudaPrefillProjectionWorkspacePlan::qwen38(&config, &projections, 512).unwrap();
+        assert_eq!(full.total_bytes, one.total_bytes * 512);
+        assert_eq!(
+            full.chunk_projection_count,
+            projections.projection_count() - 1
+        );
     }
 
     #[test]
