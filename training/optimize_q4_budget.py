@@ -103,6 +103,120 @@ def initial_selections(
     return selected, selected_row_groups
 
 
+def optimized_selections(
+    plan: dict,
+    candidates: list[dict],
+    mixed_groups: dict[str, list[dict]],
+    selected: set[str],
+    selected_row_groups: dict[str, set[int]],
+    budget_bytes: int,
+) -> tuple[set[str], dict[str, set[int]], list[dict]]:
+    alignment = int(plan["alignment"])
+    candidate_by_name = {item["name"]: item for item in candidates}
+    optional: list[tuple[str, str, int, float, int]] = []
+    for item in candidates:
+        if item["name"] in mixed_groups:
+            for group in item["row_groups"]:
+                extra = int(group["q4_bytes"]) - int(group["q2_bytes"])
+                if (
+                    group.get("fixed_q4")
+                    or group["quality_gain"] <= 0
+                    or extra <= 0
+                ):
+                    continue
+                optional.append(
+                    (
+                        "row_group",
+                        item["name"],
+                        int(group["group_index"]),
+                        float(group["quality_gain"]),
+                        extra,
+                    )
+                )
+            continue
+        extra = int(item["q4_bytes"]) - int(item["q2_bytes"])
+        if item.get("fixed_q4") or item["quality_gain"] <= 0 or extra <= 0:
+            continue
+        optional.append(
+            ("tensor", item["name"], -1, float(item["quality_gain"]), extra)
+        )
+
+    remaining = optional
+    decisions: list[dict] = []
+    current_bytes = layout_bytes(
+        plan,
+        selected,
+        mixed_groups,
+        selected_row_groups,
+    )
+    mixed_payload_bytes = {
+        name: mixed_tensor_bytes(groups, selected_row_groups.get(name, set()))
+        for name, groups in mixed_groups.items()
+    }
+    while remaining:
+        best: tuple[tuple[float, float, str, str, int], tuple, int] | None = None
+        for candidate in remaining:
+            kind, name, group_index, quality_gain, extra = candidate
+            if kind == "tensor":
+                item = candidate_by_name[name]
+                marginal_bytes = align(int(item["q4_bytes"]), alignment) - align(
+                    int(item["q2_bytes"]), alignment
+                )
+            else:
+                current_payload = mixed_payload_bytes[name]
+                marginal_bytes = align(current_payload + extra, alignment) - align(
+                    current_payload, alignment
+                )
+            if marginal_bytes < 0:
+                raise ValueError("Q4 selection unexpectedly reduces packed layout bytes")
+            trial_bytes = current_bytes + marginal_bytes
+            if trial_bytes > budget_bytes:
+                continue
+            gain_per_byte = (
+                math.inf if marginal_bytes == 0 else quality_gain / marginal_bytes
+            )
+            # `min` over the negative score is deterministic and keeps the
+            # stable semantic identity as the final tie-breaker.
+            key = (-gain_per_byte, -quality_gain, kind, name, group_index)
+            if best is None or key < best[0]:
+                best = (key, candidate, trial_bytes)
+        if best is None:
+            break
+        _, candidate, trial_bytes = best
+        kind, name, group_index, quality_gain, extra = candidate
+        marginal_bytes = trial_bytes - current_bytes
+        if kind == "tensor":
+            selected = selected | {name}
+        else:
+            selected_row_groups = {
+                key: set(value) for key, value in selected_row_groups.items()
+            }
+            selected_row_groups.setdefault(name, set()).add(group_index)
+            mixed_payload_bytes[name] += extra
+        decisions.append(
+            {
+                "rank": len(decisions) + 1,
+                "kind": kind,
+                "name": name,
+                "group_index": None if group_index < 0 else group_index,
+                "quality_gain": quality_gain,
+                "marginal_layout_bytes": marginal_bytes,
+                "quality_gain_per_marginal_byte": (
+                    None if marginal_bytes == 0 else quality_gain / marginal_bytes
+                ),
+                "layout_bytes_after": trial_bytes,
+            }
+        )
+        current_bytes = trial_bytes
+        remaining.remove(candidate)
+    exact_bytes = layout_bytes(plan, selected, mixed_groups, selected_row_groups)
+    if exact_bytes != current_bytes:
+        raise ValueError(
+            f"incremental layout accounting produced {current_bytes}, exact layout is {exact_bytes}"
+        )
+    return selected, selected_row_groups, decisions
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sensitivity", type=Path, required=True)
@@ -133,44 +247,14 @@ def main() -> None:
     base_bytes = layout_bytes(plan, selected, mixed_groups, selected_row_groups)
     if base_bytes > args.budget_bytes:
         raise SystemExit(f"fixed Q4 policy requires {base_bytes} bytes, above budget")
-    optional = []
-    for item in candidates:
-        if item["name"] in mixed_groups:
-            for group in item["row_groups"]:
-                if group.get("fixed_q4"):
-                    continue
-                extra = group["q4_bytes"] - group["q2_bytes"]
-                if extra <= 0 or group["quality_gain"] <= 0:
-                    continue
-                optional.append(
-                    (
-                        group["quality_gain"] / extra,
-                        "row_group",
-                        item["name"],
-                        group["group_index"],
-                    )
-                )
-            continue
-        if item.get("fixed_q4"):
-            continue
-        extra = item["q4_bytes"] - item["q2_bytes"]
-        if extra <= 0 or item["quality_gain"] <= 0:
-            continue
-        optional.append((item["quality_gain"] / extra, "tensor", item["name"], -1))
-    for _, kind, name, group_index in sorted(
-        optional,
-        key=lambda item: (-item[0], item[1], item[2], item[3]),
-    ):
-        trial_tensors = selected
-        trial_rows = selected_row_groups
-        if kind == "tensor":
-            trial_tensors = selected | {name}
-        else:
-            trial_rows = {key: set(value) for key, value in selected_row_groups.items()}
-            trial_rows.setdefault(name, set()).add(group_index)
-        if layout_bytes(plan, trial_tensors, mixed_groups, trial_rows) <= args.budget_bytes:
-            selected = trial_tensors
-            selected_row_groups = trial_rows
+    selected, selected_row_groups, decisions = optimized_selections(
+        plan,
+        candidates,
+        mixed_groups,
+        selected,
+        selected_row_groups,
+        args.budget_bytes,
+    )
     bytes_used = layout_bytes(plan, selected, mixed_groups, selected_row_groups)
     write_bytes_atomic(
         args.output,
@@ -179,6 +263,7 @@ def main() -> None:
                 {
                     "format": "ctox.q2q4.assignment.v2",
                     "selection_policy": "activation-weighted Q2-to-Q4 quality gain per added packed byte",
+                    "selection_decisions": decisions,
                     "budget_bytes": args.budget_bytes,
                     "base_bytes": base_bytes,
                     "bytes_used": bytes_used,

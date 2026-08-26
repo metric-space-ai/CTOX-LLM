@@ -392,7 +392,9 @@ The release sensitivity pass has no architecture-name-based Q4 exceptions:
 LM head, embedding row groups, attention K/V, MTP, and FFN matrices all begin
 as Q2 candidates. Q4 is assigned only in descending order of measured,
 activation-weighted Q2-to-Q4 error reduction per additional packed byte, with
-exact aligned-layout admission after each choice. If a supposedly sensitive
+the tensor's exact current aligned-layout delta recomputed after each choice.
+The assignment records every selected tensor/row group, rank, measured gain,
+marginal bytes, and cumulative layout size. If a supposedly sensitive
 area does not measure a material Q4 gain, it does not consume the Fold budget;
 held-out BF16 gates can still force a subsequent measured reassignment.
 The resident tensor plan reserves 2 MiB below that package ceiling for the

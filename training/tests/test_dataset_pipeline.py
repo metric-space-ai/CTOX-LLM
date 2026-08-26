@@ -69,6 +69,7 @@ from optimize_q4_budget import (  # noqa: E402
     initial_selections,
     layout_bytes,
     mixed_tensor_bytes,
+    optimized_selections,
     validate_sensitivity_contract,
 )
 from plan_teacher_cache import sample_tensor_bytes  # noqa: E402
@@ -2759,6 +2760,57 @@ class DatasetPipelineTests(unittest.TestCase):
         }
         self.assertEqual(layout_bytes(plan, set()), 2560)
         self.assertEqual(layout_bytes(plan, {"matrix.weight"}), 2816)
+
+    def test_q4_optimizer_recomputes_exact_marginal_layout_cost(self) -> None:
+        plan = {
+            "alignment": 256,
+            "tensors": [
+                {
+                    "name": "a.weight",
+                    "source_shard": "model.safetensors",
+                    "dtype": "q2_b64",
+                    "shape": [1, 1024],
+                    "length": 288,
+                },
+                {
+                    "name": "b.weight",
+                    "source_shard": "model.safetensors",
+                    "dtype": "q2_b64",
+                    "shape": [1, 1024],
+                    "length": 288,
+                },
+            ],
+        }
+        candidates = [
+            {
+                "name": "a.weight",
+                "fixed_q4": False,
+                "quality_gain": 2.0,
+                "q2_bytes": 288,
+                "q4_bytes": 544,
+            },
+            {
+                "name": "b.weight",
+                "fixed_q4": False,
+                "quality_gain": 5.0,
+                "q2_bytes": 288,
+                "q4_bytes": 544,
+            },
+        ]
+        base = layout_bytes(plan, set())
+        selected, groups, decisions = optimized_selections(
+            plan,
+            candidates,
+            {},
+            set(),
+            {},
+            base + 256,
+        )
+        self.assertEqual(selected, {"b.weight"})
+        self.assertEqual(groups, {})
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["marginal_layout_bytes"], 256)
+        self.assertEqual(decisions[0]["layout_bytes_after"], base + 256)
 
     def test_mixed_row_groups_change_exact_layout(self) -> None:
         groups = [
