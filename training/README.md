@@ -256,6 +256,11 @@ content-addressed cache-set manifest accepted by the end-to-end trainer. With
 `--expected-input`, its cached identity union must equal the final cohort
 exactly. Missing, extra, duplicate, or settings-incompatible batches fail
 closed.
+Release assembly supplies every previously audited reuse through repeatable
+`--bound-verification PATH SHA256` pairs. The builder rehashes those verification
+documents before parsing them and records their paths, byte counts, and hashes
+in the cache-set manifest; a valid but different replacement verification is
+not accepted merely because it covers the same sample identity.
 The trainer reopens that set only with its expected manifest SHA-256, then
 reconstructs and compares the sample count, artifact bytes, content root, and
 every underlying batch-verification hash before the first optimization step.

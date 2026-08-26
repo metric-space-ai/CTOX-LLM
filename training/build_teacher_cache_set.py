@@ -6,10 +6,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from select_activation_calibration import write_bytes_atomic
 from teacher_cache_dataset import VerifiedTeacherCache
+
+
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def batch_group(
@@ -63,6 +67,14 @@ def main() -> None:
         help="repeatable batch-plan/root/prefix group for a combined final cache set",
     )
     parser.add_argument("--verification", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--bound-verification",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("PATH", "SHA256"),
+        help="repeatable explicit verification whose exact bytes are frozen by SHA-256",
+    )
     parser.add_argument("--expected-input", type=Path)
     parser.add_argument("--teacher-revision", required=True)
     parser.add_argument("--teacher-provenance-sha256", required=True)
@@ -76,17 +88,27 @@ def main() -> None:
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
     try:
+        if args.expected_input is not None and args.verification:
+            raise ValueError(
+                "an expected-input final cache set requires bound explicit verifications"
+            )
         plan_arguments = (args.batch_plan, args.verification_root, args.prefix)
         has_legacy_group = any(value is not None for value in plan_arguments)
         if has_legacy_group and (
             any(value is None for value in plan_arguments)
             or args.verification
+            or args.bound_verification
             or args.batch_group
         ):
             raise ValueError(
                 "legacy batch-plan arguments must be complete and cannot be combined"
             )
-        if not has_legacy_group and not args.verification and not args.batch_group:
+        if (
+            not has_legacy_group
+            and not args.verification
+            and not args.bound_verification
+            and not args.batch_group
+        ):
             raise ValueError(
                 "provide verifications, batch groups, or batch plan, root, and prefix"
             )
@@ -94,7 +116,29 @@ def main() -> None:
             raw_groups = [(str(args.batch_plan), str(args.verification_root), args.prefix)]
         else:
             raw_groups = args.batch_group
-        verification_paths = list(args.verification)
+        verification_paths = [path.expanduser().resolve() for path in args.verification]
+        bound_verifications = []
+        for raw_path, expected_sha256 in args.bound_verification:
+            path = Path(raw_path).expanduser().resolve()
+            if not SHA256.fullmatch(expected_sha256):
+                raise ValueError(f"bound verification SHA-256 is invalid: {expected_sha256}")
+            encoded = path.read_bytes()
+            actual_sha256 = hashlib.sha256(encoded).hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    f"bound verification changed: {path} is {actual_sha256}, "
+                    f"expected {expected_sha256}"
+                )
+            verification_paths.append(path)
+            bound_verifications.append(
+                {
+                    "path": str(path),
+                    "bytes": len(encoded),
+                    "sha256": actual_sha256,
+                }
+            )
+        if len(verification_paths) != len(set(verification_paths)):
+            raise ValueError("explicit teacher-cache verification path occurs more than once")
         explicit_batch_count = len(verification_paths)
         if raw_groups:
             batch_groups = []
@@ -164,6 +208,7 @@ def main() -> None:
                     else None
                 ),
                 "prefix": args.prefix,
+                "bound_verifications": bound_verifications,
                 "batch_groups": batch_groups,
                 "expected_input": expected_input,
                 "all_artifacts_rehashed": not args.skip_artifact_rehash,

@@ -672,6 +672,7 @@ class DatasetPipelineTests(unittest.TestCase):
 
             reused = root / "reused.json"
             verification(reused, "1" * 64, root / "old-cache")
+            reused_sha256 = hashlib.sha256(reused.read_bytes()).hexdigest()
             plan = root / "plan.json"
             plan.write_text(
                 json.dumps(
@@ -692,10 +693,33 @@ class DatasetPipelineTests(unittest.TestCase):
                 + "\n"
             )
             output = root / "set.json"
-            arguments = [
+            unbound_arguments = [
                 "build_teacher_cache_set.py",
                 "--verification",
                 str(reused),
+                "--batch-group",
+                str(plan),
+                str(root),
+                "new",
+                "--expected-input",
+                str(expected),
+                "--teacher-revision",
+                revision,
+                "--teacher-provenance-sha256",
+                provenance,
+                "--output",
+                str(output),
+                "--skip-artifact-rehash",
+            ]
+            with patch.object(sys, "argv", unbound_arguments):
+                with self.assertRaisesRegex(SystemExit, "requires bound"):
+                    build_teacher_cache_set_main()
+
+            arguments = [
+                "build_teacher_cache_set.py",
+                "--bound-verification",
+                str(reused),
+                reused_sha256,
                 "--batch-group",
                 str(plan),
                 str(root),
@@ -716,6 +740,41 @@ class DatasetPipelineTests(unittest.TestCase):
             self.assertEqual(document["samples"], 2)
             self.assertEqual(document["expected_input"]["records"], 2)
             self.assertEqual(document["batch_groups"][0]["samples"], 1)
+            self.assertEqual(
+                document["bound_verifications"],
+                [
+                    {
+                        "path": str(reused.resolve()),
+                        "bytes": reused.stat().st_size,
+                        "sha256": reused_sha256,
+                    }
+                ],
+            )
+
+            reused.write_text(reused.read_text() + "\n")
+            changed_output = root / "changed-set.json"
+            changed_arguments = [
+                "build_teacher_cache_set.py",
+                "--bound-verification",
+                str(reused),
+                reused_sha256,
+                "--batch-group",
+                str(plan),
+                str(root),
+                "new",
+                "--expected-input",
+                str(expected),
+                "--teacher-revision",
+                revision,
+                "--teacher-provenance-sha256",
+                provenance,
+                "--output",
+                str(changed_output),
+                "--skip-artifact-rehash",
+            ]
+            with patch.object(sys, "argv", changed_arguments):
+                with self.assertRaisesRegex(SystemExit, "bound verification changed"):
+                    build_teacher_cache_set_main()
 
     def test_committed_general_purpose_evidence_covers_every_declared_domain(
         self,
