@@ -26,6 +26,7 @@ pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
 pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
 pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
 pub const PAGED_GQA_DECODE_KERNEL_NAME: &str = "qwen_paged_q2q4_gqa_decode_f32";
+pub const GATED_DELTA_F16_KERNEL_NAME: &str = "qwen_gated_delta_recurrent_f16";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -87,6 +88,20 @@ impl MetalPagedGqaBufferAbi {
     pub const DESCRIPTORS: u32 = 3;
     pub const OUTPUT: u32 = 4;
     pub const PARAMS: u32 = 5;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGatedDeltaBufferAbi;
+
+impl MetalGatedDeltaBufferAbi {
+    pub const QUERY: u32 = 0;
+    pub const KEY: u32 = 1;
+    pub const VALUE: u32 = 2;
+    pub const LOG_DECAY: u32 = 3;
+    pub const BETA: u32 = 4;
+    pub const STATE: u32 = 5;
+    pub const OUTPUT: u32 = 6;
+    pub const PARAMS: u32 = 7;
 }
 
 /// Activation codes consumed by `apply_activation` in the MSL source.
@@ -212,6 +227,34 @@ impl MetalPagedGqaParams {
             self.q2_page_bytes,
             self.q4_page_bytes,
             self.scale.to_bits(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalGatedDeltaParams {
+    pub heads: u32,
+    pub key_dim: u32,
+    pub value_dim: u32,
+    pub epsilon: f32,
+}
+
+impl MetalGatedDeltaParams {
+    pub const BYTE_LEN: usize = 16;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.heads,
+            self.key_dim,
+            self.value_dim,
+            self.epsilon.to_bits(),
         ]
         .iter()
         .enumerate()
@@ -702,6 +745,19 @@ mod tests {
             ],
             [0, 1, 2, 3, 4, 5]
         );
+        assert_eq!(
+            [
+                MetalGatedDeltaBufferAbi::QUERY,
+                MetalGatedDeltaBufferAbi::KEY,
+                MetalGatedDeltaBufferAbi::VALUE,
+                MetalGatedDeltaBufferAbi::LOG_DECAY,
+                MetalGatedDeltaBufferAbi::BETA,
+                MetalGatedDeltaBufferAbi::STATE,
+                MetalGatedDeltaBufferAbi::OUTPUT,
+                MetalGatedDeltaBufferAbi::PARAMS,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
     }
 
     #[test]
@@ -724,6 +780,7 @@ mod tests {
         assert!(RMS_NORM_1P_KERNEL_NAME.starts_with("qwen_rms_norm"));
         assert!(PARTIAL_ROPE_KERNEL_NAME.starts_with("qwen_partial_rope"));
         assert!(PAGED_GQA_DECODE_KERNEL_NAME.contains("paged_q2q4_gqa"));
+        assert!(GATED_DELTA_F16_KERNEL_NAME.contains("gated_delta_recurrent_f16"));
     }
 
     #[test]
@@ -804,6 +861,20 @@ mod tests {
                 0.0625_f32.to_bits(),
             ]
         );
+
+        let gated_delta = MetalGatedDeltaParams {
+            heads: 48,
+            key_dim: 128,
+            value_dim: 128,
+            epsilon: 1.0e-6,
+        };
+        let encoded = gated_delta.encode();
+        assert_eq!(encoded.len(), MetalGatedDeltaParams::BYTE_LEN);
+        let words: Vec<u32> = encoded
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![48, 128, 128, 1.0e-6_f32.to_bits()]);
     }
 
     #[test]
@@ -1027,6 +1098,7 @@ mod tests {
             RMS_NORM_1P_KERNEL_NAME,
             PARTIAL_ROPE_KERNEL_NAME,
             PAGED_GQA_DECODE_KERNEL_NAME,
+            GATED_DELTA_F16_KERNEL_NAME,
         ] {
             assert!(
                 text.contains(&format!("kernel void {name}")),

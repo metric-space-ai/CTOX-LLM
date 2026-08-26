@@ -84,6 +84,13 @@ struct PagedGqaParams {
     float scale;
 };
 
+struct GatedDeltaParams {
+    uint heads;
+    uint key_dim;
+    uint value_dim;
+    float epsilon;
+};
+
 inline float apply_activation(float value, uint activation) {
     if (activation == 1u) {
         // SiLU: x / (1 + exp(-x)), matching the Rust oracle.
@@ -619,4 +626,66 @@ kernel void qwen_paged_q2q4_gqa_decode_f32(
         uint dim = lane + slot * 32u;
         output[query_base + dim] = accumulated[slot];
     }
+}
+
+// Single-token Qwen GatedDeltaNet recurrence with persistent FP16 state.
+// One threadgroup owns one value head; one thread owns one value column and
+// walks the key dimension. All arithmetic is f32, while decay and update
+// writes round immediately to half exactly as the pinned Rust oracle does.
+kernel void qwen_gated_delta_recurrent_f16(
+    device const float* query [[buffer(0)]],
+    device const float* key [[buffer(1)]],
+    device const float* value [[buffer(2)]],
+    device const float* log_decay [[buffer(3)]],
+    device const float* beta [[buffer(4)]],
+    device half* state [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant GatedDeltaParams& params [[buffer(7)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint value_index [[thread_index_in_threadgroup]]) {
+    if (head >= params.heads || value_index >= params.value_dim) {
+        return;
+    }
+
+    threadgroup float q_inverse;
+    threadgroup float k_inverse;
+    if (value_index == 0u) {
+        float q_norm = 0.0f;
+        float k_norm = 0.0f;
+        uint qk_base = head * params.key_dim;
+        for (uint key_index = 0u; key_index < params.key_dim; ++key_index) {
+            float q = query[qk_base + key_index];
+            float k = key[qk_base + key_index];
+            q_norm += q * q;
+            k_norm += k * k;
+        }
+        q_inverse = rsqrt(q_norm + params.epsilon);
+        k_inverse = rsqrt(k_norm + params.epsilon);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint state_head_base = head * params.key_dim * params.value_dim;
+    uint qk_base = head * params.key_dim;
+    uint value_offset = head * params.value_dim + value_index;
+    float decay = exp(log_decay[head]);
+    float memory = 0.0f;
+    for (uint key_index = 0u; key_index < params.key_dim; ++key_index) {
+        uint state_index = state_head_base + key_index * params.value_dim + value_index;
+        half decayed = half(float(state[state_index]) * decay);
+        state[state_index] = decayed;
+        memory += float(decayed) * key[qk_base + key_index] * k_inverse;
+    }
+
+    float delta = (value[value_offset] - memory) * beta[head];
+    float result = 0.0f;
+    float query_scale = rsqrt(float(params.key_dim));
+    for (uint key_index = 0u; key_index < params.key_dim; ++key_index) {
+        uint state_index = state_head_base + key_index * params.value_dim + value_index;
+        half updated = half(float(state[state_index])
+            + key[qk_base + key_index] * k_inverse * delta);
+        state[state_index] = updated;
+        result += float(updated) * query[qk_base + key_index]
+            * q_inverse * query_scale;
+    }
+    output[value_offset] = result;
 }

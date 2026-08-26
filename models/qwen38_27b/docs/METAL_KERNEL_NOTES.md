@@ -25,6 +25,7 @@ usage, no scalar fallback.
 | `qwen_rms_norm_1p_f32` | FP16 weight, f32 activation | one 32-wide simdgroup per row |
 | `qwen_partial_rope_f32` | f32 Q/K heads in place | one thread per non-interleaved rotary pair |
 | `qwen_paged_q2q4_gqa_decode_f32` | f32 query/output, packed Q2/Q4 K/V | one 32-wide simdgroup per query head |
+| `qwen_gated_delta_recurrent_f16` | f32 step inputs/output, FP16 recurrent state | one threadgroup per value head |
 
 64 values per block, row-major block order, codebook matching
 `src/quant.rs` (Q2: {-1, -1/3, 1/3, 1}; Q4: (code - 7.5) / 7.5). Q3 does not
@@ -147,6 +148,18 @@ a CPU packed mirror for deterministic page transitions; that duplicate is not
 included in these device figures and must be eliminated by GPU-side packing
 and demotion before promotion.
 
+The recurrent GatedDeltaNet candidate keeps its matrix state exclusively in
+FP16. One threadgroup owns one value head and one thread owns one value column;
+each thread walks the key dimension, applies decay with an immediate FP16
+rounding, computes the delta, writes the updated value with the second FP16
+rounding, and accumulates the output in f32. Q/K normalization is calculated
+once per head in threadgroup memory. The frozen 48-head, 128x128 state occupies
+1,572,864 bytes (1.5 MiB) per linear-attention layer and 75,497,472 bytes
+(72 MiB) across all 48 layers. Reusable f32 inputs/output and the parameter
+block add 98,704 transient bytes per independently prepared layer; complete
+graph scheduling must share those transient buffers instead of multiplying
+them by 48.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -204,6 +217,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   Q4-to-Q2 page transition, compares every decode step with the scalar GQA
   oracle using the identical quantized cache, verifies bounded arena byte
   counts, and proves reset/reuse without an f32 device cache.
+- `gated_delta_f16_matches_recurrent_oracle_and_reuses_state` executes six
+  dependent recurrent steps, compares outputs and persistent state with the
+  FP16 scalar oracle after every token, rejects invalid geometry, and proves
+  reset/reuse without an f32 state shadow.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
@@ -246,10 +263,11 @@ dequantization array before this source was accepted.
   evidence.
 - No controlled size/residue/thermal sweep or hardware-counter roofline
   evidence exists yet.
-- Recovered embedding rows, Qwen RMSNorm, partial RoPE, and packed decode GQA
-  exist as verifier candidates. GQA still duplicates its packed pages in a
-  CPU correctness mirror and has no controlled performance evidence.
-  GatedDeltaNet, the MTP block, sampling, and complete model-graph Metal
-  execution do not exist yet.
+- Recovered embedding rows, Qwen RMSNorm, partial RoPE, packed decode GQA, and
+  FP16 recurrent GatedDeltaNet exist as verifier candidates. GQA still
+  duplicates its packed pages in a CPU correctness mirror; neither attention
+  path has controlled performance evidence. The linear-attention causal
+  convolution, MTP block, sampling, and complete model-graph Metal execution
+  do not exist yet.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

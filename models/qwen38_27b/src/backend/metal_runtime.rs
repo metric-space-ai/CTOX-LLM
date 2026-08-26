@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256};
 
 use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row, MetalBufferAbi,
-    MetalFusedMatVecParams, MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi,
-    MetalPartialRopeParams, MetalRmsNormBufferAbi, MetalRmsNormParams,
+    MetalFusedMatVecParams, MetalGatedDeltaBufferAbi, MetalGatedDeltaParams,
+    MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
+    MetalRmsNormBufferAbi, MetalRmsNormParams, GATED_DELTA_F16_KERNEL_NAME,
     MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
     Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
     Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
@@ -54,6 +55,7 @@ pub struct MetalCandidateRuntime {
     rms_norm_1p_pipeline: ComputePipelineState,
     partial_rope_pipeline: ComputePipelineState,
     paged_gqa_decode_pipeline: ComputePipelineState,
+    gated_delta_f16_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -228,6 +230,31 @@ pub struct MetalPagedGqaConfig {
     pub page_tokens: usize,
     pub sink_tokens: usize,
     pub recent_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalGatedDeltaConfig {
+    pub heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub epsilon: f32,
+}
+
+/// Persistent FP16 GatedDeltaNet recurrence state plus reusable f32 inputs and
+/// output. State never has an f32 device duplicate.
+pub struct PreparedMetalGatedDelta {
+    config: MetalGatedDeltaConfig,
+    query_buffer: Buffer,
+    key_buffer: Buffer,
+    value_buffer: Buffer,
+    log_decay_buffer: Buffer,
+    beta_buffer: Buffer,
+    state_buffer: Buffer,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    resident_state_bytes: usize,
+    transient_bytes: usize,
+    poisoned: bool,
 }
 
 /// Decode-only grouped-query attention retaining K/V pages in their packed
@@ -611,6 +638,77 @@ impl PreparedMetalPagedGqa {
     }
 }
 
+impl PreparedMetalGatedDelta {
+    pub fn config(&self) -> MetalGatedDeltaConfig {
+        self.config
+    }
+
+    pub fn resident_state_bytes(&self) -> usize {
+        self.resident_state_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_step(
+        &self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        log_decay: &[f32],
+        beta: &[f32],
+    ) -> Result<()> {
+        let qk_values = self
+            .config
+            .heads
+            .checked_mul(self.config.key_dim)
+            .ok_or_else(|| EngineError::Shape("Metal delta Q/K shape overflows".into()))?;
+        let value_values = self
+            .config
+            .heads
+            .checked_mul(self.config.value_dim)
+            .ok_or_else(|| EngineError::Shape("Metal delta value shape overflows".into()))?;
+        validate_metal_input(query, qk_values)?;
+        validate_metal_input(key, qk_values)?;
+        validate_metal_input(value, value_values)?;
+        validate_metal_input(log_decay, self.config.heads)?;
+        validate_metal_input(beta, self.config.heads)?;
+        for (source, target) in [
+            (query, &self.query_buffer),
+            (key, &self.key_buffer),
+            (value, &self.value_buffer),
+            (log_decay, &self.log_decay_buffer),
+            (beta, &self.beta_buffer),
+        ] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    target.contents().cast::<f32>(),
+                    source.len(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        zero_buffer(&self.state_buffer, self.resident_state_bytes);
+        let output_bytes = self.config.heads * self.config.value_dim * size_of_val(&[0.0_f32]);
+        zero_buffer(&self.output_buffer, output_bytes);
+        self.poisoned = false;
+    }
+
+    /// Readback exists only for same-device verifier evidence. Production
+    /// graph execution never materializes a second host state.
+    pub fn verifier_read_state(&self) -> Vec<half::f16> {
+        let values = self.resident_state_bytes / std::mem::size_of::<half::f16>();
+        unsafe {
+            slice::from_raw_parts(self.state_buffer.contents().cast::<half::f16>(), values).to_vec()
+        }
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -686,6 +784,13 @@ impl MetalCandidateRuntime {
                     "Metal paged GQA function lookup failed: {message}"
                 ))
             })?;
+        let gated_delta_f16_function = library
+            .get_function(GATED_DELTA_F16_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal gated-delta function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -757,6 +862,13 @@ impl MetalCandidateRuntime {
                 paged_gqa_decode_pipeline.thread_execution_width()
             )));
         }
+        let gated_delta_f16_pipeline = device
+            .new_compute_pipeline_state_with_function(&gated_delta_f16_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal gated-delta pipeline creation failed: {message}"
+                ))
+            })?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -770,6 +882,7 @@ impl MetalCandidateRuntime {
             rms_norm_1p_pipeline,
             partial_rope_pipeline,
             paged_gqa_decode_pipeline,
+            gated_delta_f16_pipeline,
         })
     }
 
@@ -1437,6 +1550,87 @@ impl MetalCandidateRuntime {
             output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
             params_buffer: new_zeroed_buffer(&self.device, MetalPagedGqaParams::BYTE_LEN)?,
             packed_device_bytes,
+            transient_bytes,
+            poisoned: false,
+        })
+    }
+
+    /// Allocate one persistent FP16 GatedDelta recurrence state. Inputs and
+    /// output are reusable f32 buffers; no f32 state shadow is retained.
+    pub fn prepare_gated_delta_f16(
+        &self,
+        config: MetalGatedDeltaConfig,
+    ) -> Result<PreparedMetalGatedDelta> {
+        if config.heads == 0
+            || config.key_dim == 0
+            || config.value_dim == 0
+            || config.value_dim > MAX_THREADS_PER_GROUP
+            || !config.value_dim.is_multiple_of(32)
+            || !config.epsilon.is_finite()
+            || config.epsilon <= 0.0
+        {
+            return Err(EngineError::Shape(
+                "invalid Metal gated-delta geometry or epsilon".into(),
+            ));
+        }
+        if config.value_dim as u64
+            > self
+                .gated_delta_f16_pipeline
+                .max_total_threads_per_threadgroup()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal gated-delta value dimension exceeds pipeline threadgroup capacity".into(),
+            ));
+        }
+        let qk_values = config
+            .heads
+            .checked_mul(config.key_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal delta Q/K values overflow".into()))?;
+        let value_values = config
+            .heads
+            .checked_mul(config.value_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal delta values overflow".into()))?;
+        let state_values = qk_values
+            .checked_mul(config.value_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal delta state values overflow".into()))?;
+        let qk_bytes = qk_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal delta Q/K bytes overflow".into()))?;
+        let value_bytes = value_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal delta value bytes overflow".into()))?;
+        let head_bytes = config
+            .heads
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal delta head bytes overflow".into()))?;
+        let resident_state_bytes = state_values
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal delta state bytes overflow".into()))?;
+        let transient_bytes = qk_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(value_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(head_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(MetalGatedDeltaParams::BYTE_LEN))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal delta transient bytes overflow".into())
+            })?;
+        let params = MetalGatedDeltaParams {
+            heads: usize_to_u32(config.heads, "Metal delta heads")?,
+            key_dim: usize_to_u32(config.key_dim, "Metal delta key dimension")?,
+            value_dim: usize_to_u32(config.value_dim, "Metal delta value dimension")?,
+            epsilon: config.epsilon,
+        };
+        Ok(PreparedMetalGatedDelta {
+            config,
+            query_buffer: new_zeroed_buffer(&self.device, qk_bytes)?,
+            key_buffer: new_zeroed_buffer(&self.device, qk_bytes)?,
+            value_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
+            log_decay_buffer: new_zeroed_buffer(&self.device, head_bytes)?,
+            beta_buffer: new_zeroed_buffer(&self.device, head_bytes)?,
+            state_buffer: new_zeroed_buffer(&self.device, resident_state_bytes)?,
+            output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
+            params_buffer: buffer_with_data(&self.device, &params.encode()),
+            resident_state_bytes,
             transient_bytes,
             poisoned: false,
         })
@@ -2419,6 +2613,79 @@ impl MetalCandidateRuntime {
                 "Metal paged GQA produced a non-finite output".into(),
             ));
         }
+        Ok(output)
+    }
+
+    /// Execute one recurrent GatedDeltaNet step against the persistent FP16
+    /// state. No CPU recurrence or f32 state fallback exists.
+    pub fn dispatch_gated_delta_f16(
+        &self,
+        prepared: &mut PreparedMetalGatedDelta,
+    ) -> Result<Vec<f32>> {
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "Metal gated-delta state is poisoned; reset is required".into(),
+            ));
+        }
+        prepared.poisoned = true;
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-gated-delta-f16-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.gated_delta_f16_pipeline);
+        for (binding, buffer) in [
+            (MetalGatedDeltaBufferAbi::QUERY, &prepared.query_buffer),
+            (MetalGatedDeltaBufferAbi::KEY, &prepared.key_buffer),
+            (MetalGatedDeltaBufferAbi::VALUE, &prepared.value_buffer),
+            (
+                MetalGatedDeltaBufferAbi::LOG_DECAY,
+                &prepared.log_decay_buffer,
+            ),
+            (MetalGatedDeltaBufferAbi::BETA, &prepared.beta_buffer),
+            (MetalGatedDeltaBufferAbi::STATE, &prepared.state_buffer),
+            (MetalGatedDeltaBufferAbi::OUTPUT, &prepared.output_buffer),
+            (MetalGatedDeltaBufferAbi::PARAMS, &prepared.params_buffer),
+        ] {
+            encoder.set_buffer(binding as u64, Some(buffer), 0);
+        }
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: prepared.config.heads as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: prepared.config.value_dim as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal gated-delta command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output_values = prepared
+            .config
+            .heads
+            .checked_mul(prepared.config.value_dim)
+            .ok_or_else(|| EngineError::Shape("Metal delta output shape overflows".into()))?;
+        let output = unsafe {
+            slice::from_raw_parts(
+                prepared.output_buffer.contents().cast::<f32>(),
+                output_values,
+            )
+            .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal gated-delta produced a non-finite output".into(),
+            ));
+        }
+        prepared.poisoned = false;
         Ok(output)
     }
 
@@ -3968,5 +4235,106 @@ mod tests {
             .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
             .is_err());
         assert!(!prepared.poisoned);
+    }
+
+    #[test]
+    fn gated_delta_f16_matches_recurrent_oracle_and_reuses_state() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let config = MetalGatedDeltaConfig {
+            heads: 2,
+            key_dim: 64,
+            value_dim: 64,
+            epsilon: 1.0e-6,
+        };
+        let mut prepared = runtime
+            .prepare_gated_delta_f16(config)
+            .expect("prepare FP16 gated-delta state");
+        assert_eq!(prepared.config(), config);
+        assert_eq!(prepared.resident_state_bytes(), 2 * 64 * 64 * 2);
+        assert_eq!(prepared.transient_bytes(), 2_080);
+        let mut expected_state = vec![f16::ZERO; config.heads * config.key_dim * config.value_dim];
+
+        for token in 0..6 {
+            let query: Vec<f32> = (0..config.heads * config.key_dim)
+                .map(|index| ((index + token * 5) as f32 * 0.023).sin() * 0.4)
+                .collect();
+            let key: Vec<f32> = (0..config.heads * config.key_dim)
+                .map(|index| ((index + token * 7) as f32 * 0.019).cos() * 0.35)
+                .collect();
+            let value: Vec<f32> = (0..config.heads * config.value_dim)
+                .map(|index| ((index + token * 11) as f32 * 0.017).sin() * 0.5)
+                .collect();
+            let log_decay = vec![-0.015 - token as f32 * 0.002, -0.025];
+            let beta = vec![0.45, 0.62];
+            let expected = crate::reference::recurrent_gated_delta_step_f16_state(
+                &query,
+                &key,
+                &value,
+                &log_decay,
+                &beta,
+                &mut expected_state,
+                config.heads,
+                config.key_dim,
+                config.value_dim,
+            )
+            .expect("FP16 recurrent scalar oracle");
+            prepared
+                .write_step(&query, &key, &value, &log_decay, &beta)
+                .expect("update gated-delta inputs");
+            let actual = runtime
+                .dispatch_gated_delta_f16(&mut prepared)
+                .expect("dispatch persistent gated-delta state");
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 3.0e-4_f32.max(expected.abs() * 2.0e-4);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "gated-delta token {token} output {index}: expected {expected}, got {actual}"
+                );
+            }
+            let actual_state = prepared.verifier_read_state();
+            for (index, (expected, actual)) in expected_state.iter().zip(actual_state).enumerate() {
+                assert!(
+                    (expected.to_f32() - actual.to_f32()).abs() <= 5.0e-4,
+                    "gated-delta token {token} state {index}: expected {expected}, got {actual}"
+                );
+            }
+        }
+
+        assert!(prepared
+            .write_step(&[0.0; 64], &[0.0; 128], &[0.0; 128], &[0.0; 2], &[0.0; 2])
+            .is_err());
+        prepared.reset();
+        assert!(prepared
+            .verifier_read_state()
+            .iter()
+            .all(|value| *value == f16::ZERO));
+        assert!(!prepared.poisoned);
+    }
+
+    #[test]
+    fn gated_delta_f16_rejects_invalid_geometry() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        for config in [
+            MetalGatedDeltaConfig {
+                heads: 0,
+                key_dim: 128,
+                value_dim: 128,
+                epsilon: 1.0e-6,
+            },
+            MetalGatedDeltaConfig {
+                heads: 48,
+                key_dim: 128,
+                value_dim: 80,
+                epsilon: 1.0e-6,
+            },
+            MetalGatedDeltaConfig {
+                heads: 48,
+                key_dim: 128,
+                value_dim: 128,
+                epsilon: 0.0,
+            },
+        ] {
+            assert!(runtime.prepare_gated_delta_f16(config).is_err());
+        }
     }
 }
