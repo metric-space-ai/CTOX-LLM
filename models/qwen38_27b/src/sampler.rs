@@ -43,11 +43,20 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> Result<usize> {
-        if self.config.temperature == 0.0 {
-            return self.sample_with_draw(logits, 0.0);
-        }
-        let draw = self.rng.next_f32();
+        let draw = self.next_draw();
         self.sample_with_draw(logits, draw)
+    }
+
+    pub(crate) fn config(&self) -> SamplerConfig {
+        self.config
+    }
+
+    pub(crate) fn next_draw(&mut self) -> f32 {
+        if self.config.temperature == 0.0 {
+            0.0
+        } else {
+            self.rng.next_f32()
+        }
     }
 
     /// Deterministic sampling entry point used by accelerator parity

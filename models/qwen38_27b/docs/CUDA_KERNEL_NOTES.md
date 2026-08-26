@@ -379,9 +379,12 @@ framework allocator is linked. The candidate deliberately rejects `top_k=0`
 and values above 256 until the full-vocabulary AirTopP path exists.
 `qwen38-cuda-sampling-verify` compares exact token decisions with the shared
 Rust sampler over full-tokenizer, tie, and wide-nucleus fixtures and proves
-workspace reclamation. Its GPU3 evidence is still pending, and even a passing
-primitive does not yet provide stochastic MTP accept/reject or production ABI
-integration.
+workspace reclamation. `CudaModelExecutor::select_target_token` now binds both
+this candidate and the greedy argmax to the resident complete LM-head output;
+the engine supplies the canonical draw and validates the returned token. Full
+logits still cross the host in verifier mode for evidence, not for the actual
+decision. GPU3 primitive and lifecycle evidence remain pending, and this does
+not yet provide on-device RNG state or stochastic MTP accept/reject.
 
 The Unix-socket service cannot move the private driver context among its
 connection threads. `ThreadedCudaModelExecutor` therefore creates the

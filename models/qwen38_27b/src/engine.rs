@@ -224,6 +224,12 @@ pub trait ModelExecutor {
         mtp_enabled: bool,
         cancellation: &CancellationToken,
     ) -> Result<ExecutorStep>;
+    /// Select from the most recent complete target distribution while it is
+    /// still resident in the backend. `None` delegates to the shared scalar
+    /// sampler; accelerator executors return `Some` or fail closed.
+    fn select_target_token(&mut self, _sampling: SamplerConfig, _draw: f32) -> Result<Option<u32>> {
+        Ok(None)
+    }
     /// Resolve the state branch prepared by an MTP decode. `accepted_drafts`
     /// is the causally verified prefix length selected by the engine.
     fn commit_speculative(
@@ -463,7 +469,7 @@ impl<E: ModelExecutor> Engine<E> {
                     .into(),
             });
         }
-        let mut sampler = Sampler::new(options.sampling)?;
+        let sampler = Sampler::new(options.sampling)?;
         cancelled(cancellation)?;
         let started = Instant::now();
         let output = match self
@@ -484,13 +490,19 @@ impl<E: ModelExecutor> Engine<E> {
             self.invalidate_session()?;
             return Err(error);
         }
-        let token_id = sampler.sample(&output.target_logits)? as u32;
+        self.sampler = Some(sampler);
+        let token_id = match self.select_target_token(&output.target_logits) {
+            Ok(token) => token,
+            Err(error) => {
+                self.invalidate_session()?;
+                return Err(error);
+            }
+        };
         self.session = Some(SessionStatus {
             id: options.id,
             context_tokens: tokens.len() as u64,
             mtp_enabled: options.mtp_enabled,
         });
-        self.sampler = Some(sampler);
         self.lifecycle = EngineLifecycle::Active;
         self.metrics.prefill_calls += 1;
         self.metrics.last_prefill_micros = elapsed_micros(started);
@@ -574,11 +586,13 @@ impl<E: ModelExecutor> Engine<E> {
             }
             (token, verified, accepted)
         } else {
-            let token = self
-                .sampler
-                .as_mut()
-                .ok_or_else(|| EngineError::InvalidState("active session has no sampler".into()))?
-                .sample(&output.target_logits)? as u32;
+            let token = match self.select_target_token(&output.target_logits) {
+                Ok(token) => token,
+                Err(error) => {
+                    self.invalidate_session()?;
+                    return Err(error);
+                }
+            };
             (token, 0, Vec::new())
         };
         let added = 1_u64
@@ -618,6 +632,34 @@ impl<E: ModelExecutor> Engine<E> {
             return self.invalidate_session();
         }
         Ok(())
+    }
+
+    fn select_target_token(&mut self, target_logits: &[f32]) -> Result<u32> {
+        let (sampling, draw) = {
+            let sampler = self
+                .sampler
+                .as_mut()
+                .ok_or_else(|| EngineError::InvalidState("active session has no sampler".into()))?;
+            (sampler.config(), sampler.next_draw())
+        };
+        let selected = self.executor.select_target_token(sampling, draw)?;
+        let token = match selected {
+            Some(token) => token,
+            None => u32::try_from(
+                self.sampler
+                    .as_ref()
+                    .expect("sampler checked above")
+                    .sample_with_draw(target_logits, draw)?,
+            )
+            .map_err(|_| EngineError::Shape("sampled token exceeds u32".into()))?,
+        };
+        if token as usize >= self.capabilities.vocab_size {
+            return Err(EngineError::InvalidArtifact(format!(
+                "executor selected token {token}, vocabulary has {} entries",
+                self.capabilities.vocab_size
+            )));
+        }
+        Ok(token)
     }
 
     fn invalidate_session(&mut self) -> Result<()> {
@@ -788,6 +830,7 @@ mod tests {
         invalid_output: bool,
         reject_draft: bool,
         committed_drafts: Option<u32>,
+        forced_target_token: Option<u32>,
     }
 
     impl MockExecutor {
@@ -877,6 +920,14 @@ mod tests {
                 cancellation.cancel();
             }
             Ok(self.output(mtp_enabled))
+        }
+
+        fn select_target_token(
+            &mut self,
+            _sampling: SamplerConfig,
+            _draw: f32,
+        ) -> Result<Option<u32>> {
+            Ok(self.forced_target_token)
         }
 
         fn commit_speculative(
@@ -976,6 +1027,7 @@ mod tests {
             invalid_output: false,
             reject_draft: false,
             committed_drafts: None,
+            forced_target_token: None,
         });
         engine.warmup().unwrap();
         engine
@@ -1108,6 +1160,7 @@ mod tests {
             invalid_output: false,
             reject_draft: true,
             committed_drafts: None,
+            forced_target_token: None,
         });
         engine.warmup().unwrap();
         engine
@@ -1142,6 +1195,7 @@ mod tests {
             invalid_output: false,
             reject_draft: false,
             committed_drafts: None,
+            forced_target_token: None,
         });
         engine.warmup().unwrap();
         engine
@@ -1176,6 +1230,7 @@ mod tests {
             invalid_output: false,
             reject_draft: false,
             committed_drafts: None,
+            forced_target_token: None,
         });
         engine.warmup().unwrap();
         engine
@@ -1206,6 +1261,7 @@ mod tests {
             invalid_output: false,
             reject_draft: false,
             committed_drafts: None,
+            forced_target_token: None,
         });
         engine.warmup().unwrap();
         assert!(matches!(
@@ -1235,6 +1291,7 @@ mod tests {
             invalid_output: false,
             reject_draft: false,
             committed_drafts: None,
+            forced_target_token: None,
         });
         assert!(engine.unload().is_err());
         assert_eq!(engine.health().lifecycle, EngineLifecycle::UnloadFailed);
@@ -1250,6 +1307,7 @@ mod tests {
             invalid_output: false,
             reject_draft: false,
             committed_drafts: None,
+            forced_target_token: None,
         };
         validate_executor(
             BackendKind::Cuda,
@@ -1278,6 +1336,7 @@ mod tests {
             invalid_output: true,
             reject_draft: false,
             committed_drafts: None,
+            forced_target_token: None,
         });
         engine.warmup().unwrap();
         assert!(engine
@@ -1306,6 +1365,7 @@ mod tests {
                 invalid_output: false,
                 reject_draft: false,
                 committed_drafts: None,
+                forced_target_token: None,
             })
         };
         let mut left = make();
@@ -1338,5 +1398,35 @@ mod tests {
                     .token_id
             );
         }
+    }
+
+    #[test]
+    fn accelerator_target_selection_wins_over_the_host_logit_oracle() {
+        let mut engine = engine(MockExecutor {
+            allocations: AllocationSnapshot::default(),
+            leak_on_unload: false,
+            cancel_during_decode: false,
+            invalid_output: false,
+            reject_draft: false,
+            committed_drafts: None,
+            forced_target_token: Some(0),
+        });
+        engine.warmup().unwrap();
+        let step = engine
+            .prefill(
+                SessionOptions {
+                    id: 12,
+                    mtp_enabled: false,
+                    sampling: SamplerConfig {
+                        temperature: 0.0,
+                        ..SamplerConfig::default()
+                    },
+                },
+                &[1],
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(step.token_id, 0);
+        assert_eq!(greedy_token(&[0.0, 1.0, 2.0]).unwrap(), 2);
     }
 }

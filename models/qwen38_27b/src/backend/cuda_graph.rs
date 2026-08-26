@@ -1622,6 +1622,21 @@ impl PreparedCudaProjectionGraph {
         self.mtp_tokens
     }
 
+    /// Borrow the most recent complete target distribution without a host
+    /// readback. The LM-head prepared output is overwritten only by the next
+    /// target projection; gathered MTP proposals own a separate buffer.
+    pub fn target_logits_device(&self) -> Result<CudaDeviceF32View<'_>> {
+        if self.poisoned || self.target_tokens == 0 {
+            return Err(EngineError::InvalidState(
+                "CUDA target logits require one healthy committed target token".into(),
+            ));
+        }
+        self.projections
+            .get("lm_head.weight")
+            .ok_or_else(|| EngineError::InvalidState("CUDA LM head is not resident".into()))?
+            .device_output()
+    }
+
     /// Executes the native one-layer MTP graph after the target model has
     /// selected `next_token_id`. The returned logits draft the following
     /// token; acceptance still requires a subsequent target-model step.

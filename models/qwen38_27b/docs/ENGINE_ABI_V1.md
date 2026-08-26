@@ -67,11 +67,15 @@ execution span is admitted before dispatch, including target work for every
 reserved draft. MTP output is rejected when the session disabled MTP or
 exceeds the signed memory profile's draft depth.
 
-Sampling is owned by this shared engine rather than by a particular embedding
-or wire server. `prefill` constructs one sampler from the explicit
-temperature, top-k, top-p, and seed values; every subsequent `decode` advances
-that same state. Native-library and IPC callers therefore use the same seeded
-random stream. The current MTP verifier is deliberately restricted to
+Sampling policy and RNG state are owned by this shared engine rather than by a
+particular embedding or wire server. `prefill` constructs one sampler from the
+explicit temperature, top-k, top-p, and seed values; every subsequent `decode`
+advances that same state. An accelerator may implement `select_target_token`
+over its most recent resident complete distribution. The engine supplies the
+canonical PCG draw, validates the returned vocabulary ID, and uses the scalar
+sampler only when the executor explicitly delegates with `None`. Native-library
+and IPC callers therefore retain one seeded random stream without requiring a
+full CUDA/Metal logit readback. The current MTP verifier is deliberately restricted to
 temperature zero, where target/draft argmax equality is exact. Non-greedy MTP
 fails closed until a probability-correct rejection sampler is implemented.
 Production MTP will chain the native module for several drafts using the same

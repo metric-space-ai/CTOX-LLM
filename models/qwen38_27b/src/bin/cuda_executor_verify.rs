@@ -10,6 +10,7 @@ use ctox_qwen38_27b::engine::{CancellationToken, DraftDistribution, ModelExecuto
 use ctox_qwen38_27b::loader::{ChecksumPolicy, ModelArtifact};
 use ctox_qwen38_27b::memory::{LinearStateDType, SpeculativeStateStrategy};
 use ctox_qwen38_27b::release::{KvMemoryFormula, MemoryProfile};
+use ctox_qwen38_27b::sampler::{Sampler, SamplerConfig};
 use ctox_qwen38_27b::tokenizer::TOKENIZER_VOCAB_SIZE;
 use ctox_qwen38_27b::Qwen38Config;
 use serde::Serialize;
@@ -48,6 +49,9 @@ struct Report {
     maximum_context_tokens: u64,
     prefill_input_token: u32,
     decode_input_token: u32,
+    prefill_device_greedy_token: u32,
+    prefill_device_sampled_token: u32,
+    prefill_sampling_draw: f32,
     draft_tokens: Vec<u32>,
     draft_rows_per_step: usize,
     all_drafts_restricted: bool,
@@ -67,6 +71,7 @@ struct Report {
     deferred_operator_synchronizations: u64,
     context_synchronizations: u64,
     device_argmax_launches: u64,
+    device_sampling_launches: u64,
     requested_model_bytes: u64,
     requested_graph_bytes: u64,
     requested_session_bytes: u64,
@@ -131,6 +136,34 @@ fn main() -> anyhow::Result<()> {
         "CUDA prefill unexpectedly returned speculative outputs"
     );
     let decode_input_token = greedy_token(&prefill.target_logits)?;
+    let prefill_device_greedy_token = executor
+        .select_target_token(
+            SamplerConfig {
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                seed: 0,
+            },
+            0.0,
+        )?
+        .context("CUDA executor delegated greedy target selection to the host")?;
+    anyhow::ensure!(
+        prefill_device_greedy_token == decode_input_token,
+        "CUDA resident greedy selection chose {prefill_device_greedy_token}, host oracle chose {decode_input_token}"
+    );
+    let stochastic_config = SamplerConfig::default();
+    let prefill_sampling_draw = 0.625_f32;
+    let expected_sampled_token = u32::try_from(
+        Sampler::new(stochastic_config)?
+            .sample_with_draw(&prefill.target_logits, prefill_sampling_draw)?,
+    )?;
+    let prefill_device_sampled_token = executor
+        .select_target_token(stochastic_config, prefill_sampling_draw)?
+        .context("CUDA executor delegated stochastic target selection to the host")?;
+    anyhow::ensure!(
+        prefill_device_sampled_token == expected_sampled_token,
+        "CUDA resident stochastic selection chose {prefill_device_sampled_token}, host oracle chose {expected_sampled_token}"
+    );
     let gathered_verification = executor.verify_gathered_mtp(decode_input_token)?;
     anyhow::ensure!(
         gathered_verification.rows == mtp_draft_token_ids.len()
@@ -212,15 +245,20 @@ fn main() -> anyhow::Result<()> {
         submission_stats.token_submission_attempts,
     );
     anyhow::ensure!(
-        submission_stats.context_synchronizations == expected_submissions + 16,
-        "CUDA executor used {} context barriers, expected {} commits plus twelve verifier readbacks and four device argmax decisions",
+        submission_stats.context_synchronizations == expected_submissions + 18,
+        "CUDA executor used {} context barriers, expected {} commits plus twelve verifier readbacks, five device argmax decisions, and one stochastic sampling decision",
         submission_stats.context_synchronizations,
         expected_submissions,
     );
     anyhow::ensure!(
-        submission_stats.device_argmax_launches == 4,
-        "CUDA executor used {} device argmax launches, expected four MTP decisions",
+        submission_stats.device_argmax_launches == 5,
+        "CUDA executor used {} device argmax launches, expected four MTP decisions plus one target decision",
         submission_stats.device_argmax_launches,
+    );
+    anyhow::ensure!(
+        submission_stats.device_sampling_launches == 1,
+        "CUDA executor used {} stochastic sampling launches, expected one target decision",
+        submission_stats.device_sampling_launches,
     );
 
     executor.reset_session()?;
@@ -250,6 +288,9 @@ fn main() -> anyhow::Result<()> {
             maximum_context_tokens: args.maximum_context_tokens,
             prefill_input_token: args.token_id,
             decode_input_token,
+            prefill_device_greedy_token,
+            prefill_device_sampled_token,
+            prefill_sampling_draw,
             draft_tokens,
             draft_rows_per_step: mtp_draft_token_ids.len(),
             all_drafts_restricted: true,
@@ -270,6 +311,7 @@ fn main() -> anyhow::Result<()> {
                 .deferred_operator_synchronizations,
             context_synchronizations: submission_stats.context_synchronizations,
             device_argmax_launches: submission_stats.device_argmax_launches,
+            device_sampling_launches: submission_stats.device_sampling_launches,
             requested_model_bytes: allocations.model_bytes,
             requested_graph_bytes: allocations.graph_bytes,
             requested_session_bytes: allocations.session_bytes,
@@ -279,7 +321,7 @@ fn main() -> anyhow::Result<()> {
             replay_milliseconds,
             unload_milliseconds,
             allocations_zero_after_unload,
-            note: "Exercises the sendable Rust ModelExecutor ABI through the dedicated thread that owns every CUDA object, without CPU model-operation fallback. MTP proposals execute exactly the release-bound gathered LM-head rows; complete target logits still cross the host at verifier boundaries and verify every draft. Device sampling remains performance work. Promotion still requires BF16/logit, quality, long-context, unload, and roofline evidence on the release checkpoint.",
+            note: "Exercises the sendable Rust ModelExecutor ABI through the dedicated thread that owns every CUDA object, without CPU model-operation fallback. Greedy and bounded top-k/top-p target decisions reuse the resident complete LM-head output and match the host oracle for canonical draws. MTP proposals execute exactly the release-bound gathered rows; complete distributions still cross the host only for verifier evidence. Production still requires on-device RNG state, unrestricted top-p, stochastic MTP accept/reject, BF16/logit quality, long-context, unload, and roofline evidence on the release checkpoint.",
         })?
     );
     Ok(())

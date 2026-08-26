@@ -2,9 +2,10 @@
 //!
 //! This remains a verifier candidate until full-model numerical, quality,
 //! unload, and roofline gates promote it. It never falls back to CPU model
-//! operators. Full target logits cross the host only at verifier boundaries;
-//! MTP proposals use the release-bound gathered LM head. Device sampling
-//! remains later performance work.
+//! operators. Full target logits still cross the host for verifier evidence,
+//! but ordinary target selection reuses the resident LM-head output through
+//! device argmax or bounded top-k/top-p sampling. MTP proposals use the
+//! release-bound gathered LM head.
 
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -12,6 +13,7 @@ use std::thread::{self, JoinHandle};
 use crate::backend::cuda_graph::PreparedCudaProjectionGraph;
 use crate::backend::cuda_runtime::{
     CudaCandidateRuntime, CudaDeviceF32View, CudaSubmissionStats, PreparedCudaArgmax,
+    PreparedCudaTopKTopPSampler,
 };
 use crate::backend::{BackendKind, PromotionState};
 use crate::engine::{
@@ -21,6 +23,7 @@ use crate::engine::{
 use crate::loader::ModelArtifact;
 use crate::memory::{LinearStateDType, SpeculativeStateStrategy};
 use crate::release::MemoryProfile;
+use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::TOKENIZER_VOCAB_SIZE;
 use crate::{EngineError, Qwen38Config, Result};
 
@@ -44,6 +47,7 @@ pub struct CudaModelExecutor {
     runtime: Option<CudaCandidateRuntime>,
     graph: Option<PreparedCudaProjectionGraph>,
     argmax: Option<PreparedCudaArgmax>,
+    target_sampler: Option<PreparedCudaTopKTopPSampler>,
     pending_speculative: Option<PendingCudaSpeculativeBranch>,
     mtp_draft_token_ids: Vec<u32>,
     admitted_context: usize,
@@ -74,6 +78,11 @@ enum CudaWorkerCommand {
         mtp_enabled: bool,
         cancellation: CancellationToken,
         reply: SyncSender<Result<ExecutorStep>>,
+    },
+    SelectTarget {
+        sampling: SamplerConfig,
+        draw: f32,
+        reply: SyncSender<Result<Option<u32>>>,
     },
     CommitSpeculative {
         accepted_drafts: u32,
@@ -120,6 +129,7 @@ impl CudaModelExecutor {
             runtime: Some(CudaCandidateRuntime::new(cubin, device)?),
             graph: None,
             argmax: None,
+            target_sampler: None,
             pending_speculative: None,
             mtp_draft_token_ids: Vec::new(),
             admitted_context: 0,
@@ -140,7 +150,12 @@ impl CudaModelExecutor {
         if cancellation.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
-        if !self.warmed || self.graph.is_none() || self.argmax.is_none() || self.runtime.is_none() {
+        if !self.warmed
+            || self.graph.is_none()
+            || self.argmax.is_none()
+            || self.target_sampler.is_none()
+            || self.runtime.is_none()
+        {
             return Err(EngineError::InvalidState(
                 "CUDA decode requires a warm loaded executor".into(),
             ));
@@ -395,6 +410,13 @@ fn run_cuda_worker(mut executor: CudaModelExecutor, receiver: mpsc::Receiver<Cud
             } => {
                 let _ = reply.send(executor.decode(token, mtp_enabled, &cancellation));
             }
+            CudaWorkerCommand::SelectTarget {
+                sampling,
+                draw,
+                reply,
+            } => {
+                let _ = reply.send(executor.select_target_token(sampling, draw));
+            }
             CudaWorkerCommand::CommitSpeculative {
                 accepted_drafts,
                 cancellation,
@@ -469,6 +491,7 @@ impl ModelExecutor for CudaModelExecutor {
     ) -> Result<()> {
         if self.graph.is_some()
             || self.argmax.is_some()
+            || self.target_sampler.is_some()
             || self.free_bytes_before_graph.is_some()
             || self.pending_speculative.is_some()
             || self.warmed
@@ -514,6 +537,7 @@ impl ModelExecutor for CudaModelExecutor {
             Some(mtp_draft_token_ids),
         )?;
         let argmax = runtime.prepare_argmax_f32()?;
+        let target_sampler = runtime.prepare_topk_topp_sampler(TOKENIZER_VOCAB_SIZE)?;
         let expected_checkpoint = profile
             .speculative_linear_state_bytes_per_session
             .checked_add(
@@ -528,13 +552,19 @@ impl ModelExecutor for CudaModelExecutor {
                 graph.speculative_checkpoint_bytes()
             )));
         }
-        let graph_bytes =
-            graph
-                .graph_bytes()
-                .checked_add(u64::try_from(argmax.resident_bytes()).map_err(|_| {
-                    EngineError::MemoryBudget("CUDA argmax bytes exceed u64".into())
-                })?)
-                .ok_or_else(|| EngineError::MemoryBudget("CUDA graph bytes overflow".into()))?;
+        let selection_bytes = u64::try_from(
+            argmax
+                .resident_bytes()
+                .checked_add(target_sampler.resident_bytes())
+                .ok_or_else(|| {
+                    EngineError::MemoryBudget("CUDA target selection bytes overflow".into())
+                })?,
+        )
+        .map_err(|_| EngineError::MemoryBudget("CUDA target selection bytes exceed u64".into()))?;
+        let graph_bytes = graph
+            .graph_bytes()
+            .checked_add(selection_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA graph bytes overflow".into()))?;
         self.allocations = AllocationSnapshot {
             model_bytes: graph.model_bytes(),
             graph_bytes,
@@ -543,6 +573,7 @@ impl ModelExecutor for CudaModelExecutor {
         };
         self.graph = Some(graph);
         self.argmax = Some(argmax);
+        self.target_sampler = Some(target_sampler);
         self.mtp_draft_token_ids = mtp_draft_token_ids.to_vec();
         self.admitted_context = admitted_context;
         self.admitted_draft_tokens = profile.mtp_draft_tokens as usize;
@@ -747,6 +778,38 @@ impl ModelExecutor for CudaModelExecutor {
         })
     }
 
+    fn select_target_token(&mut self, sampling: SamplerConfig, draw: f32) -> Result<Option<u32>> {
+        let _ = Sampler::new(sampling)?;
+        if !self.warmed || self.pending_speculative.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA target selection requires a warm committed target distribution".into(),
+            ));
+        }
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("CUDA target selection has no runtime".into())
+        })?;
+        let graph = self.graph.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("CUDA target selection has no graph".into())
+        })?;
+        let target_logits = graph
+            .target_logits_device()?
+            .slice(0, TOKENIZER_VOCAB_SIZE)?;
+        let token = if sampling.temperature == 0.0 {
+            let argmax = self.argmax.as_ref().ok_or_else(|| {
+                EngineError::InvalidState("CUDA target selection has no argmax".into())
+            })?;
+            runtime.dispatch_argmax_f32_device(argmax, target_logits)?
+        } else {
+            let sampler = self.target_sampler.as_ref().ok_or_else(|| {
+                EngineError::InvalidState("CUDA target selection has no sampler".into())
+            })?;
+            runtime
+                .dispatch_topk_topp_sample_f32_device(sampler, target_logits, sampling, draw)?
+                .token
+        };
+        Ok(Some(token))
+    }
+
     fn commit_speculative(
         &mut self,
         accepted_drafts: u32,
@@ -809,6 +872,8 @@ impl ModelExecutor for CudaModelExecutor {
         drop(graph);
         let argmax = self.argmax.take();
         drop(argmax);
+        let target_sampler = self.target_sampler.take();
+        drop(target_sampler);
         let expected_free = self.free_bytes_before_graph.take();
         let observed_free = self
             .runtime
@@ -903,6 +968,16 @@ impl ModelExecutor for ThreadedCudaModelExecutor {
             mtp_enabled,
             cancellation: cancellation.clone(),
             reply,
+        })
+    }
+
+    fn select_target_token(&mut self, sampling: SamplerConfig, draw: f32) -> Result<Option<u32>> {
+        self.request("target selection", |reply| {
+            CudaWorkerCommand::SelectTarget {
+                sampling,
+                draw,
+                reply,
+            }
         })
     }
 
