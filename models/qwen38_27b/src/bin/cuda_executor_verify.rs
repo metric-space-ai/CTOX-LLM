@@ -66,6 +66,7 @@ struct Report {
     token_submission_commits: u64,
     deferred_operator_synchronizations: u64,
     context_synchronizations: u64,
+    device_argmax_launches: u64,
     requested_model_bytes: u64,
     requested_graph_bytes: u64,
     requested_session_bytes: u64,
@@ -211,10 +212,15 @@ fn main() -> anyhow::Result<()> {
         submission_stats.token_submission_attempts,
     );
     anyhow::ensure!(
-        submission_stats.context_synchronizations == expected_submissions + 12,
-        "CUDA executor used {} context barriers, expected {} commits plus twelve verifier readbacks",
+        submission_stats.context_synchronizations == expected_submissions + 16,
+        "CUDA executor used {} context barriers, expected {} commits plus twelve verifier readbacks and four device argmax decisions",
         submission_stats.context_synchronizations,
         expected_submissions,
+    );
+    anyhow::ensure!(
+        submission_stats.device_argmax_launches == 4,
+        "CUDA executor used {} device argmax launches, expected four MTP decisions",
+        submission_stats.device_argmax_launches,
     );
 
     executor.reset_session()?;
@@ -263,6 +269,7 @@ fn main() -> anyhow::Result<()> {
             deferred_operator_synchronizations: submission_stats
                 .deferred_operator_synchronizations,
             context_synchronizations: submission_stats.context_synchronizations,
+            device_argmax_launches: submission_stats.device_argmax_launches,
             requested_model_bytes: allocations.model_bytes,
             requested_graph_bytes: allocations.graph_bytes,
             requested_session_bytes: allocations.session_bytes,

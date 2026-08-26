@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::cuda::{
     validate_mixed_operation, validate_operation, validate_recovered_row, CudaMixedRowSegment,
-    A8_QUANTIZE_SYMBOL, CAUSAL_CONV_F16_SYMBOL, DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
+    A8_QUANTIZE_SYMBOL, ARGMAX_F32_SYMBOL, CAUSAL_CONV_F16_SYMBOL, DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
     GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS, GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS,
     GATED_DELTA_PREP_F32_SYMBOL, GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM,
     GATED_RMS_NORM_COLUMNS, GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS,
@@ -175,6 +175,7 @@ pub struct CudaSubmissionStats {
     pub token_submission_commits: u64,
     pub deferred_operator_synchronizations: u64,
     pub context_synchronizations: u64,
+    pub device_argmax_launches: u64,
 }
 
 struct CudaContextInner {
@@ -203,6 +204,7 @@ struct CudaContextInner {
     pack_paged_kv_q4_f32_function: CuFunction,
     demote_paged_kv_q4_to_q2_function: CuFunction,
     paged_q2q4_gqa_f32_function: CuFunction,
+    argmax_f32_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
     token_submission_active: Cell<bool>,
@@ -210,6 +212,7 @@ struct CudaContextInner {
     token_submission_commits: Cell<u64>,
     deferred_operator_synchronizations: Cell<u64>,
     context_synchronizations: Cell<u64>,
+    device_argmax_launches: Cell<u64>,
 }
 
 /// Borrowed, context-bound f32 device tensor. The private buffer reference
@@ -468,6 +471,12 @@ pub struct PreparedCudaGatheredA8Projection {
     row_ids: DeviceBuffer,
     output: DeviceBuffer,
     resident_bytes: usize,
+}
+
+/// Eight-byte result buffer for deterministic device-side greedy selection.
+pub struct PreparedCudaArgmax {
+    context: Rc<CudaContextInner>,
+    result: DeviceBuffer,
 }
 
 /// One loader-resolved embedding row with both recovery corrections and its
@@ -1058,6 +1067,16 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let argmax_f32_function = match resolve_function(&driver, module, ARGMAX_F32_SYMBOL) {
+            Ok(function) => function,
+            Err(error) => {
+                unsafe {
+                    let _ = (driver.module_unload)(module);
+                    let _ = (driver.ctx_destroy)(context);
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             inner: Rc::new(CudaContextInner {
                 driver,
@@ -1085,6 +1104,7 @@ impl CudaCandidateRuntime {
                 pack_paged_kv_q4_f32_function,
                 demote_paged_kv_q4_to_q2_function,
                 paged_q2q4_gqa_f32_function,
+                argmax_f32_function,
                 device_name,
                 compute_capability,
                 token_submission_active: Cell::new(false),
@@ -1092,6 +1112,7 @@ impl CudaCandidateRuntime {
                 token_submission_commits: Cell::new(0),
                 deferred_operator_synchronizations: Cell::new(0),
                 context_synchronizations: Cell::new(0),
+                device_argmax_launches: Cell::new(0),
             }),
         })
     }
@@ -1102,6 +1123,7 @@ impl CudaCandidateRuntime {
             token_submission_commits: self.inner.token_submission_commits.get(),
             deferred_operator_synchronizations: self.inner.deferred_operator_synchronizations.get(),
             context_synchronizations: self.inner.context_synchronizations.get(),
+            device_argmax_launches: self.inner.device_argmax_launches.get(),
         }
     }
 
@@ -1213,6 +1235,66 @@ impl CudaCandidateRuntime {
             right_values,
             output: DeviceBuffer::allocate(self, bytes)?,
         })
+    }
+
+    pub fn prepare_argmax_f32(&self) -> Result<PreparedCudaArgmax> {
+        Ok(PreparedCudaArgmax {
+            context: Rc::clone(&self.inner),
+            result: DeviceBuffer::allocate(self, 2 * std::mem::size_of::<u32>())?,
+        })
+    }
+
+    /// Sampling-adjacent greedy selection over an already resident finite f32
+    /// distribution. Only the selected local index crosses the device boundary.
+    pub fn dispatch_argmax_f32_device(
+        &self,
+        prepared: &PreparedCudaArgmax,
+        values: CudaDeviceF32View<'_>,
+    ) -> Result<u32> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) || !Rc::ptr_eq(&self.inner, values.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA argmax crosses driver contexts".into(),
+            ));
+        }
+        let mut input = values.ptr()?;
+        let mut result = prepared.result.ptr();
+        let mut count = cuda_u32(values.values(), "CUDA argmax value count")?;
+        let mut params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut result as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut count as *mut u32).cast::<c_void>(),
+        ];
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.argmax_f32_function,
+                    1,
+                    1,
+                    1,
+                    THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "f32 argmax launch",
+            )?;
+        }
+        self.synchronize_after_launch("f32 argmax context synchronization")?;
+        let mut host = [0_u32; 2];
+        prepared.result.copy_to(as_bytes_mut(&mut host))?;
+        if host[1] != 0 || host[0] >= count {
+            return Err(EngineError::InvalidState(
+                "CUDA argmax observed non-finite logits or an invalid index".into(),
+            ));
+        }
+        self.inner
+            .device_argmax_launches
+            .set(self.inner.device_argmax_launches.get().saturating_add(1));
+        Ok(host[0])
     }
 
     pub fn prepare_f32_checkpoint(&self, values: usize) -> Result<PreparedCudaF32Checkpoint> {
@@ -4522,6 +4604,12 @@ impl PreparedCudaGatheredA8Projection {
     }
 }
 
+impl PreparedCudaArgmax {
+    pub fn resident_bytes(&self) -> usize {
+        self.result.len()
+    }
+}
+
 impl PreparedCudaRecoveredRow {
     pub fn dtype(&self) -> TensorDType {
         self.dtype
@@ -5932,6 +6020,7 @@ mod tests {
         assert_owned::<PreparedCudaA8Activation>();
         assert_owned::<PreparedCudaA8Projection>();
         assert_owned::<PreparedCudaGatheredA8Projection>();
+        assert_owned::<PreparedCudaArgmax>();
         assert_owned::<PreparedCudaRecoveredRow>();
         assert_owned::<PreparedCudaPagedGqa>();
         assert_owned::<PreparedCudaQueryGate>();

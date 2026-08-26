@@ -1201,3 +1201,63 @@ void ctox_paged_q2q4_gqa_decode_f32_sm86(
         output[query_base + dim] = accumulated[slot] / denominator;
     }
 }
+
+// Deterministic greedy token boundary. The ordered-key transform matches
+// Rust f32::total_cmp for finite values, including signed zero; equal bit
+// patterns select the later index, matching Iterator::max_by. One block scans
+// either the complete target logits or the compact release-bound MTP logits.
+// Non-finite input sets result[1] and must fail closed in the host dispatcher.
+// This remains an unpromoted sampling-adjacent candidate.
+// ref: ggml/src/ggml-cuda/fattn-common.cuh:675-711
+extern "C" __global__ __launch_bounds__(256, 1)
+void ctox_argmax_f32_sm86(const float* __restrict__ values,
+                          unsigned* __restrict__ result,
+                          unsigned count) {
+    __shared__ unsigned ordered_keys[256];
+    __shared__ unsigned indices[256];
+    if (threadIdx.x == 0u) {
+        result[1] = 0u;
+    }
+    __syncthreads();
+
+    unsigned best_key = 0u;
+    unsigned best_index = 0u;
+    bool has_value = false;
+    for (unsigned index = threadIdx.x; index < count; index += blockDim.x) {
+        const float value = values[index];
+        if (!isfinite(value)) {
+            atomicExch(result + 1, 1u);
+            continue;
+        }
+        const unsigned bits = __float_as_uint(value);
+        const unsigned sign_mask = (bits & 0x80000000u) == 0u
+            ? 0u : 0xffffffffu;
+        const unsigned key = bits ^ (sign_mask | 0x80000000u);
+        if (!has_value || key > best_key
+            || (key == best_key && index > best_index)) {
+            best_key = key;
+            best_index = index;
+            has_value = true;
+        }
+    }
+    ordered_keys[threadIdx.x] = has_value ? best_key : 0u;
+    indices[threadIdx.x] = has_value ? best_index : 0u;
+    __syncthreads();
+
+    for (unsigned width = blockDim.x / 2u; width != 0u; width >>= 1u) {
+        if (threadIdx.x < width) {
+            const unsigned candidate_key = ordered_keys[threadIdx.x + width];
+            const unsigned candidate_index = indices[threadIdx.x + width];
+            if (candidate_key > ordered_keys[threadIdx.x]
+                || (candidate_key == ordered_keys[threadIdx.x]
+                    && candidate_index > indices[threadIdx.x])) {
+                ordered_keys[threadIdx.x] = candidate_key;
+                indices[threadIdx.x] = candidate_index;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        result[0] = indices[0];
+    }
+}

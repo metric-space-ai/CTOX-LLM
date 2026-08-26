@@ -10,7 +10,9 @@ use std::sync::mpsc::{self, SyncSender};
 use std::thread::{self, JoinHandle};
 
 use crate::backend::cuda_graph::PreparedCudaProjectionGraph;
-use crate::backend::cuda_runtime::{CudaCandidateRuntime, CudaSubmissionStats};
+use crate::backend::cuda_runtime::{
+    CudaCandidateRuntime, CudaDeviceF32View, CudaSubmissionStats, PreparedCudaArgmax,
+};
 use crate::backend::{BackendKind, PromotionState};
 use crate::engine::{
     AllocationSnapshot, CancellationToken, DraftDistribution, ExecutorCapabilities, ExecutorStep,
@@ -41,6 +43,7 @@ pub struct CudaModelExecutor {
     config: Qwen38Config,
     runtime: Option<CudaCandidateRuntime>,
     graph: Option<PreparedCudaProjectionGraph>,
+    argmax: Option<PreparedCudaArgmax>,
     pending_speculative: Option<PendingCudaSpeculativeBranch>,
     mtp_draft_token_ids: Vec<u32>,
     admitted_context: usize,
@@ -116,6 +119,7 @@ impl CudaModelExecutor {
             config: Qwen38Config::default(),
             runtime: Some(CudaCandidateRuntime::new(cubin, device)?),
             graph: None,
+            argmax: None,
             pending_speculative: None,
             mtp_draft_token_ids: Vec::new(),
             admitted_context: 0,
@@ -136,7 +140,7 @@ impl CudaModelExecutor {
         if cancellation.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
-        if !self.warmed || self.graph.is_none() || self.runtime.is_none() {
+        if !self.warmed || self.graph.is_none() || self.argmax.is_none() || self.runtime.is_none() {
             return Err(EngineError::InvalidState(
                 "CUDA decode requires a warm loaded executor".into(),
             ));
@@ -464,6 +468,7 @@ impl ModelExecutor for CudaModelExecutor {
         mtp_draft_token_ids: &[u32],
     ) -> Result<()> {
         if self.graph.is_some()
+            || self.argmax.is_some()
             || self.free_bytes_before_graph.is_some()
             || self.pending_speculative.is_some()
             || self.warmed
@@ -508,6 +513,7 @@ impl ModelExecutor for CudaModelExecutor {
             admitted_context,
             Some(mtp_draft_token_ids),
         )?;
+        let argmax = runtime.prepare_argmax_f32()?;
         let expected_checkpoint = profile
             .speculative_linear_state_bytes_per_session
             .checked_add(
@@ -522,13 +528,21 @@ impl ModelExecutor for CudaModelExecutor {
                 graph.speculative_checkpoint_bytes()
             )));
         }
+        let graph_bytes =
+            graph
+                .graph_bytes()
+                .checked_add(u64::try_from(argmax.resident_bytes()).map_err(|_| {
+                    EngineError::MemoryBudget("CUDA argmax bytes exceed u64".into())
+                })?)
+                .ok_or_else(|| EngineError::MemoryBudget("CUDA graph bytes overflow".into()))?;
         self.allocations = AllocationSnapshot {
             model_bytes: graph.model_bytes(),
-            graph_bytes: graph.graph_bytes(),
+            graph_bytes,
             session_bytes: graph.session_bytes(),
             ..AllocationSnapshot::default()
         };
         self.graph = Some(graph);
+        self.argmax = Some(argmax);
         self.mtp_draft_token_ids = mtp_draft_token_ids.to_vec();
         self.admitted_context = admitted_context;
         self.admitted_draft_tokens = profile.mtp_draft_tokens as usize;
@@ -624,6 +638,7 @@ impl ModelExecutor for CudaModelExecutor {
             ));
         }
         let runtime = self.runtime.as_ref().expect("validated CUDA runtime");
+        let argmax = self.argmax.as_ref().expect("validated CUDA argmax");
         let graph = self.graph.as_mut().expect("validated CUDA graph");
         if graph.target_tokens() >= self.admitted_context {
             return Err(EngineError::MemoryBudget(
@@ -657,10 +672,11 @@ impl ModelExecutor for CudaModelExecutor {
                 token as usize,
                 absolute_position,
             )?;
-            Some(read_restricted_logits(
+            Some(read_device_restricted_draft(
                 runtime,
+                argmax,
                 view,
-                self.mtp_draft_token_ids.len(),
+                &self.mtp_draft_token_ids,
             )?)
         } else {
             None
@@ -688,10 +704,9 @@ impl ModelExecutor for CudaModelExecutor {
             if cancellation.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
-            let draft = current_draft.take().ok_or_else(|| {
+            let (draft, candidate) = current_draft.take().ok_or_else(|| {
                 EngineError::InvalidState("CUDA MTP draft chain ended early".into())
             })?;
-            let candidate = greedy_restricted_token(&self.mtp_draft_token_ids, &draft)?;
             draft_logits.push(DraftDistribution::Restricted {
                 token_ids: self.mtp_draft_token_ids.clone(),
                 logits: draft,
@@ -707,10 +722,11 @@ impl ModelExecutor for CudaModelExecutor {
                     candidate as usize,
                     absolute_position,
                 )?;
-                current_draft = Some(read_restricted_logits(
+                current_draft = Some(read_device_restricted_draft(
                     runtime,
+                    argmax,
                     next_draft_view,
-                    self.mtp_draft_token_ids.len(),
+                    &self.mtp_draft_token_ids,
                 )?);
             }
             let candidate_position = graph.target_tokens();
@@ -791,6 +807,8 @@ impl ModelExecutor for CudaModelExecutor {
         self.admitted_draft_tokens = 0;
         let graph = self.graph.take();
         drop(graph);
+        let argmax = self.argmax.take();
+        drop(argmax);
         let expected_free = self.free_bytes_before_graph.take();
         let observed_free = self
             .runtime
@@ -947,6 +965,27 @@ fn read_restricted_logits(
         )));
     }
     Ok(logits)
+}
+
+fn read_device_restricted_draft(
+    runtime: &CudaCandidateRuntime,
+    argmax: &PreparedCudaArgmax,
+    view: CudaDeviceF32View<'_>,
+    token_ids: &[u32],
+) -> Result<(Vec<f32>, u32)> {
+    let local_index = usize::try_from(runtime.dispatch_argmax_f32_device(argmax, view)?)
+        .map_err(|_| EngineError::Shape("CUDA argmax index exceeds usize".into()))?;
+    let logits = read_restricted_logits(runtime, view, token_ids.len())?;
+    let token = token_ids.get(local_index).copied().ok_or_else(|| {
+        EngineError::InvalidArtifact("CUDA argmax index exceeds restricted vocabulary".into())
+    })?;
+    let host_token = greedy_restricted_token(token_ids, &logits)?;
+    if token != host_token {
+        return Err(EngineError::InvalidState(format!(
+            "CUDA device argmax selected {token}, host oracle selected {host_token}"
+        )));
+    }
+    Ok((logits, token))
 }
 
 fn read_valid_logits(

@@ -59,7 +59,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports twenty explicitly unpromoted
+- The same verifier cubin additionally exports twenty-one explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
@@ -83,6 +83,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
   - `ctox_pack_paged_kv_q4_f32_sm86`
   - `ctox_demote_paged_kv_q4_to_q2_sm86`
   - `ctox_paged_q2q4_gqa_decode_f32_sm86`
+  - `ctox_argmax_f32_sm86`
   These symbols are intentionally excluded from the production module ABI
   until their quality and complete-graph gates pass.
 - One launch fuses dequant, dot product, `s_in`, `s_out`, bias, and
@@ -357,6 +358,15 @@ quality, and roofline promotion remain open. The hardware lifecycle verifier
 checkpoints the identical MTP state, executes the complete head, restores it,
 executes the gathered head, and requires every compact logit to be bit-exact
 with its global full-head row before continuing to MTP4 verification.
+
+The MTP chain now selects each compact draft with a deterministic one-block
+device argmax. Its finite-f32 ordered-key transform matches Rust
+`f32::total_cmp`, including signed zero and later-index tie breaking; a device
+non-finite flag fails closed. The verifier still reads compact distributions to
+prove the device decision against the host oracle and to satisfy the current
+stable engine ABI, but the token used for the next speculative transition is
+the device result. Removing those verifier distributions and implementing
+probability-correct stochastic device sampling remain separate ABI work.
 
 The Unix-socket service cannot move the private driver context among its
 connection threads. `ThreadedCudaModelExecutor` therefore creates the
