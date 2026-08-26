@@ -196,7 +196,10 @@ object retains that activation only for one projection. A separate
 shared-activation dispatcher now owns one corrected input, one transient A8
 code/scale pair, and matrix-local Q2/Q4 projections. It refuses a projection
 unless the column count, CUDA context, and SHA-256 identity of the exact packed
-FP16 `s_in` bytes match. The loader independently checks all 130 frozen Qwen
+FP16 `s_in` bytes match. Its device-view entry point consumes a producer-owned
+activation directly and returns borrowed projection-output views; the Q output
+can be split into the exact query and gate row ranges without copying, while K
+and V feed RoPE/GQA directly. The loader independently checks all 130 frozen Qwen
 fan-out groups (373 logical `s_in` tensors) when the checkpoint carries the
 `qwen38_fanout_s_in_v1` contract. The host contract, Rust/Python group digest,
 compile path, and negative identity test are validated; the exact Q/K/V-shaped

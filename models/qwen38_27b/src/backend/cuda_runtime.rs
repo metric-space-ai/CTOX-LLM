@@ -2242,6 +2242,50 @@ impl CudaCandidateRuntime {
         self.dispatch_prepared_shared_a8_fanout_repeated(activation, projections, 1)
     }
 
+    /// Quantizes a producer-owned corrected activation and dispatches the
+    /// complete identity-bound fan-out without an intermediate host or device
+    /// copy. Projection outputs remain in their prepared allocations.
+    pub fn dispatch_shared_a8_fanout_device<'a>(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        input: CudaDeviceF32View<'_>,
+        projections: &[&'a PreparedCudaA8Projection],
+    ) -> Result<Vec<CudaDeviceF32View<'a>>> {
+        self.validate_shared_a8_fanout(activation, projections, 1)?;
+        if !Rc::ptr_eq(&self.inner, input.context) {
+            return Err(EngineError::InvalidState(
+                "shared CUDA A8 device input belongs to another context".into(),
+            ));
+        }
+        if input.values() != activation.columns as usize {
+            return Err(EngineError::Shape(format!(
+                "shared CUDA A8 device input has {} values, expected {}",
+                input.values(),
+                activation.columns
+            )));
+        }
+        self.launch_a8_quantization(
+            input.ptr()?,
+            activation.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            activation.q8_codes.ptr(),
+            activation.q8_scales.ptr(),
+            activation.columns,
+        )?;
+        for projection in projections {
+            self.launch_shared_a8_projection(activation, projection)?;
+        }
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "shared A8 device fan-out context synchronization",
+            )?;
+        }
+        projections
+            .iter()
+            .map(|projection| (*projection).device_output())
+            .collect()
+    }
+
     /// Verifier/roofline variant that replays the complete fan-out without
     /// requantizing. Production decode uses one dispatch per projection.
     pub fn dispatch_prepared_shared_a8_fanout_repeated(
@@ -2846,6 +2890,10 @@ impl PreparedCudaRecoveredRow {
 
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.output.f32_view(0, self.columns())
     }
 }
 

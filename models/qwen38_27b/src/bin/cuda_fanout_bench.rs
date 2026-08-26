@@ -91,6 +91,8 @@ struct Report<'a> {
     isolated_requested_resident_bytes: usize,
     shared_requested_resident_bytes: usize,
     requested_resident_bytes_saved: usize,
+    verifier_device_input_bytes: usize,
+    device_view_path_verified: bool,
     mismatched_s_in_rejected: bool,
     elapsed_milliseconds: f64,
     mean_fanout_pass_milliseconds: f64,
@@ -161,7 +163,16 @@ fn main() -> anyhow::Result<()> {
             .iter()
             .map(|projection| projection.resident_bytes())
             .sum::<usize>();
-    let cuda_outputs = runtime.dispatch_shared_a8_fanout(&shared_activation, &projection_refs)?;
+    let verifier_device_input = runtime.prepare_verifier_f32_tensor(&input)?;
+    let cuda_output_views = runtime.dispatch_shared_a8_fanout_device(
+        &shared_activation,
+        verifier_device_input.device_view()?,
+        &projection_refs,
+    )?;
+    let cuda_outputs = cuda_output_views
+        .into_iter()
+        .map(|output| runtime.verifier_read_f32(output))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let projections = fixtures
         .iter()
@@ -194,7 +205,11 @@ fn main() -> anyhow::Result<()> {
     let mismatched_operation = fixtures[0].operation(&input, &mismatched_s_in);
     let mismatched_projection = runtime.prepare_shared_a8_projection(&mismatched_operation)?;
     let mismatched_s_in_rejected = runtime
-        .dispatch_shared_a8_fanout(&shared_activation, &[&mismatched_projection])
+        .dispatch_shared_a8_fanout_device(
+            &shared_activation,
+            verifier_device_input.device_view()?,
+            &[&mismatched_projection],
+        )
         .is_err();
     anyhow::ensure!(
         mismatched_s_in_rejected,
@@ -230,7 +245,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.cuda-sm86-shared-a8-fanout-benchmark.v1",
+            format: "ctox.cuda-sm86-shared-a8-fanout-benchmark.v2",
             status: "verifier_only_not_promotion_evidence",
             device: runtime.device_name(),
             compute_capability: format!("{major}.{minor}"),
@@ -248,6 +263,8 @@ fn main() -> anyhow::Result<()> {
             shared_requested_resident_bytes,
             requested_resident_bytes_saved: isolated_requested_resident_bytes
                 .saturating_sub(shared_requested_resident_bytes),
+            verifier_device_input_bytes: verifier_device_input.resident_bytes(),
+            device_view_path_verified: true,
             mismatched_s_in_rejected,
             elapsed_milliseconds: elapsed * 1_000.0,
             mean_fanout_pass_milliseconds: elapsed * 1_000.0 / total_fanout_passes as f64,
@@ -258,7 +275,7 @@ fn main() -> anyhow::Result<()> {
             projections,
             absolute_tolerance: args.absolute_tolerance,
             relative_tolerance: args.relative_tolerance,
-            note: "One packed-FP16 s_in identity and one transient A8 buffer feed Q4 Q plus Q2 K/V. Synchronous verifier intervals include one A8 quantization, three projection families, output copies, and host dispatch; packed-byte GB/s is not hardware-counter roofline evidence.",
+            note: "One packed-FP16 s_in identity and one transient A8 buffer feed Q4 Q plus Q2 K/V. Numerical verification feeds that fan-out through a producer-owned CUDA device view and reads outputs only through the explicit verifier API. Timed intervals retain the resident verifier input and include output copies plus host dispatch; packed-byte GB/s is not hardware-counter roofline evidence.",
         })?
     );
     Ok(())
