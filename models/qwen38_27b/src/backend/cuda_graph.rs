@@ -12,10 +12,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::backend::cuda_runtime::{
     CudaCandidateRuntime, CudaCausalConvConfig, CudaDeviceF32View, CudaGatedDeltaConfig,
     CudaGatedRmsNormConfig, CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig,
-    CudaRmsNormConfig, PreparedCudaA8Activation, PreparedCudaA8Projection, PreparedCudaCausalConv,
-    PreparedCudaEmbedding, PreparedCudaF32Checkpoint, PreparedCudaF32Concat,
-    PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs, PreparedCudaGatedRmsNorm,
-    PreparedCudaGatheredA8Projection, PreparedCudaPagedGqa, PreparedCudaPartialRope,
+    CudaRmsNormConfig, PreparedCudaA8Activation, PreparedCudaA8Projection,
+    PreparedCudaBatchedQueryGateOutput, PreparedCudaBatchedRmsNormWorkspace,
+    PreparedCudaBatchedRopeWorkspace, PreparedCudaCausalConv, PreparedCudaEmbedding,
+    PreparedCudaF32Checkpoint, PreparedCudaF32Concat, PreparedCudaGatedDelta,
+    PreparedCudaGatedDeltaInputs, PreparedCudaGatedRmsNorm, PreparedCudaGatheredA8Projection,
+    PreparedCudaPagedGqa, PreparedCudaPagedGqaPrefillOutput, PreparedCudaPartialRope,
     PreparedCudaQueryGate, PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
 };
 use crate::backend::cuda_schedule::{
@@ -88,6 +90,83 @@ pub struct CudaBoundPrefillStep {
 pub struct CudaPrefillBindingPlan {
     steps: Vec<CudaBoundPrefillStep>,
     max_chunk_tokens: usize,
+}
+
+/// Exact bytes for the shared full-attention prefill scratch admitted with a
+/// loaded graph. These buffers are independent of layer count: the layer-major
+/// schedule overwrites the same slots after each consumer has completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaPrefillWorkspaceBudget {
+    pub hidden_norm_bytes: u64,
+    pub key_norm_bytes: u64,
+    pub rope_table_bytes: u64,
+    pub query_gate_bytes: u64,
+    pub paged_gqa_output_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl CudaPrefillWorkspaceBudget {
+    pub fn qwen38(config: &Qwen38Config, max_chunk_tokens: usize) -> Result<Self> {
+        if max_chunk_tokens == 0 || max_chunk_tokens > 65_535 {
+            return Err(EngineError::MemoryBudget(
+                "CUDA prefill workspace chunk capacity must be in 1..=65535".into(),
+            ));
+        }
+        let f32_bytes =
+            u64::try_from(std::mem::size_of::<f32>()).expect("f32 byte count always fits u64");
+        let chunk = u64::try_from(max_chunk_tokens)
+            .map_err(|_| EngineError::MemoryBudget("CUDA prefill chunk exceeds u64".into()))?;
+        let hidden = u64::try_from(config.hidden_size)
+            .map_err(|_| EngineError::MemoryBudget("CUDA hidden size exceeds u64".into()))?;
+        let kv_heads = u64::try_from(config.num_key_value_heads)
+            .map_err(|_| EngineError::MemoryBudget("CUDA KV-head count exceeds u64".into()))?;
+        let query_heads = u64::try_from(config.num_attention_heads)
+            .map_err(|_| EngineError::MemoryBudget("CUDA query-head count exceeds u64".into()))?;
+        let head_dim = u64::try_from(config.head_dim)
+            .map_err(|_| EngineError::MemoryBudget("CUDA head dimension exceeds u64".into()))?;
+        let rope_half = u64::try_from(config.rotary_dim / 2)
+            .map_err(|_| EngineError::MemoryBudget("CUDA rotary dimension exceeds u64".into()))?;
+
+        let hidden_norm_bytes = checked_product(
+            &[chunk, hidden, f32_bytes, 2],
+            "CUDA hidden-norm workspace bytes",
+        )?;
+        let key_norm_bytes = checked_product(
+            &[chunk, kv_heads, head_dim, f32_bytes, 2],
+            "CUDA key-norm workspace bytes",
+        )?;
+        let rope_table_bytes = checked_product(
+            &[chunk, rope_half, f32_bytes, 2],
+            "CUDA RoPE-table workspace bytes",
+        )?;
+        let query_gate_bytes = checked_product(
+            &[chunk, query_heads, head_dim, f32_bytes, 2],
+            "CUDA query/gate workspace bytes",
+        )?;
+        let paged_gqa_output_bytes = checked_product(
+            &[chunk, query_heads, head_dim, f32_bytes],
+            "CUDA paged-GQA output bytes",
+        )?;
+        let total_bytes = [
+            hidden_norm_bytes,
+            key_norm_bytes,
+            rope_table_bytes,
+            query_gate_bytes,
+            paged_gqa_output_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, value| {
+            checked_add(total, value, "CUDA prefill workspace bytes")
+        })?;
+        Ok(Self {
+            hidden_norm_bytes,
+            key_norm_bytes,
+            rope_table_bytes,
+            query_gate_bytes,
+            paged_gqa_output_bytes,
+            total_bytes,
+        })
+    }
 }
 
 impl CudaDecodeBindingPlan {
@@ -1077,6 +1156,7 @@ pub struct PreparedCudaProjectionGraph {
     linear_mixers: BTreeMap<usize, PreparedCudaLinearMixerLayer>,
     full_attention: BTreeMap<String, PreparedCudaFullAttentionLayer>,
     norms: PreparedCudaNormGraph,
+    prefill_workspaces: PreparedCudaPrefillWorkspaces,
     mtp_concat: PreparedCudaF32Concat,
     target_hidden_checkpoint: PreparedCudaF32Checkpoint,
     model_bytes: u64,
@@ -1088,6 +1168,118 @@ pub struct PreparedCudaProjectionGraph {
     mtp_tokens: usize,
     mtp_poisoned: bool,
     speculative_base: Option<CudaSpeculativeBase>,
+}
+
+/// One fixed set of full-attention prompt buffers shared by all sixteen target
+/// layers and the MTP layer. It intentionally owns no weights, KV pages, or
+/// per-layer state.
+pub struct PreparedCudaPrefillWorkspaces {
+    max_chunk_tokens: usize,
+    budget: CudaPrefillWorkspaceBudget,
+    hidden_norm: PreparedCudaBatchedRmsNormWorkspace,
+    key_norm: PreparedCudaBatchedRmsNormWorkspace,
+    rope: PreparedCudaBatchedRopeWorkspace,
+    query_gate: PreparedCudaBatchedQueryGateOutput,
+    paged_gqa_output: PreparedCudaPagedGqaPrefillOutput,
+}
+
+impl PreparedCudaPrefillWorkspaces {
+    fn prepare(
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        max_chunk_tokens: usize,
+        maximum_context_tokens: usize,
+    ) -> Result<Self> {
+        let budget = CudaPrefillWorkspaceBudget::qwen38(config, max_chunk_tokens)?;
+        let hidden_norm =
+            runtime.prepare_batched_rms_norm_workspace(max_chunk_tokens, config.hidden_size)?;
+        let key_rows = max_chunk_tokens
+            .checked_mul(config.num_key_value_heads)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA key-norm rows overflow".into()))?;
+        let key_norm = runtime.prepare_batched_rms_norm_workspace(key_rows, config.head_dim)?;
+        let rope_config = CudaPartialRopeConfig {
+            heads: config.num_attention_heads,
+            head_dim: config.head_dim,
+            rotary_dim: config.rotary_dim,
+            theta: config.rope_theta,
+        };
+        let rope = runtime.prepare_batched_rope_workspace(rope_config, max_chunk_tokens)?;
+        let query_gate = runtime
+            .prepare_batched_query_gate_output(CudaQueryGateConfig::QWEN38_27B, max_chunk_tokens)?;
+        let paged_gqa_output = runtime.prepare_paged_q2q4_gqa_prefill_output(
+            CudaPagedGqaConfig {
+                query_heads: config.num_attention_heads,
+                key_value_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                maximum_tokens: maximum_context_tokens,
+                page_tokens: DEFAULT_KV_PAGE_TOKENS,
+                sink_tokens: DEFAULT_KV_SINK_TOKENS,
+                recent_tokens: DEFAULT_KV_RECENT_TOKENS,
+            },
+            max_chunk_tokens,
+        )?;
+        let actual = [
+            hidden_norm.transient_bytes(),
+            key_norm.transient_bytes(),
+            rope.transient_bytes(),
+            query_gate.transient_bytes(),
+            paged_gqa_output.transient_bytes(),
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, bytes| {
+            let bytes = u64::try_from(bytes).map_err(|_| {
+                EngineError::MemoryBudget("CUDA prefill workspace allocation exceeds u64".into())
+            })?;
+            checked_add(total, bytes, "CUDA prefill workspace allocation")
+        })?;
+        if actual != budget.total_bytes {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA prefill workspace allocated {actual} bytes, planned {}",
+                budget.total_bytes
+            )));
+        }
+        Ok(Self {
+            max_chunk_tokens,
+            budget,
+            hidden_norm,
+            key_norm,
+            rope,
+            query_gate,
+            paged_gqa_output,
+        })
+    }
+
+    pub fn max_chunk_tokens(&self) -> usize {
+        self.max_chunk_tokens
+    }
+
+    pub fn budget(&self) -> CudaPrefillWorkspaceBudget {
+        self.budget
+    }
+
+    pub fn transient_bytes(&self) -> u64 {
+        self.budget.total_bytes
+    }
+
+    pub fn hidden_norm(&self) -> &PreparedCudaBatchedRmsNormWorkspace {
+        &self.hidden_norm
+    }
+
+    pub fn key_norm(&self) -> &PreparedCudaBatchedRmsNormWorkspace {
+        &self.key_norm
+    }
+
+    pub fn rope(&self) -> &PreparedCudaBatchedRopeWorkspace {
+        &self.rope
+    }
+
+    pub fn query_gate(&self) -> &PreparedCudaBatchedQueryGateOutput {
+        &self.query_gate
+    }
+
+    pub fn paged_gqa_output(&self) -> &PreparedCudaPagedGqaPrefillOutput {
+        &self.paged_gqa_output
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1582,6 +1774,17 @@ impl PreparedCudaProjectionGraph {
         let norms = prepare_norms(runtime, artifact, config)?;
         model_bytes = checked_add(model_bytes, norms.model_bytes, "CUDA model bytes")?;
         graph_bytes = checked_add(graph_bytes, norms.graph_bytes, "CUDA graph bytes")?;
+        let prefill_workspaces = PreparedCudaPrefillWorkspaces::prepare(
+            runtime,
+            config,
+            prefill_bindings.max_chunk_tokens(),
+            maximum_context_tokens,
+        )?;
+        graph_bytes = checked_add(
+            graph_bytes,
+            prefill_workspaces.transient_bytes(),
+            "CUDA graph bytes",
+        )?;
         let mtp_concat = runtime.prepare_f32_concat(config.hidden_size, config.hidden_size)?;
         graph_bytes = checked_add(
             graph_bytes,
@@ -1633,6 +1836,7 @@ impl PreparedCudaProjectionGraph {
             linear_mixers,
             full_attention,
             norms,
+            prefill_workspaces,
             mtp_concat,
             target_hidden_checkpoint,
             model_bytes,
@@ -1663,6 +1867,10 @@ impl PreparedCudaProjectionGraph {
 
     pub fn prefill_bindings(&self) -> &CudaPrefillBindingPlan {
         &self.prefill_bindings
+    }
+
+    pub fn prefill_workspaces(&self) -> &PreparedCudaPrefillWorkspaces {
+        &self.prefill_workspaces
     }
 
     pub fn embedding(&self) -> &PreparedCudaEmbedding {
@@ -2727,6 +2935,14 @@ fn checked_add(left: u64, right: u64, label: &str) -> Result<u64> {
         .ok_or_else(|| EngineError::MemoryBudget(format!("{label} overflow")))
 }
 
+fn checked_product(values: &[u64], label: &str) -> Result<u64> {
+    values.iter().try_fold(1_u64, |product, value| {
+        product
+            .checked_mul(*value)
+            .ok_or_else(|| EngineError::MemoryBudget(format!("{label} overflow")))
+    })
+}
+
 fn sum_usize<const N: usize>(values: [usize; N], label: &str) -> Result<u64> {
     values.into_iter().try_fold(0_u64, |total, value| {
         let value = u64::try_from(value)
@@ -2738,6 +2954,28 @@ fn sum_usize<const N: usize>(values: [usize; N], label: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_prefill_attention_workspace_is_one_fixed_sixty_mib_pool() {
+        let budget = CudaPrefillWorkspaceBudget::qwen38(&Qwen38Config::default(), 512).unwrap();
+        assert_eq!(budget.hidden_norm_bytes, 20_971_520);
+        assert_eq!(budget.key_norm_bytes, 4_194_304);
+        assert_eq!(budget.rope_table_bytes, 131_072);
+        assert_eq!(budget.query_gate_bytes, 25_165_824);
+        assert_eq!(budget.paged_gqa_output_bytes, 12_582_912);
+        assert_eq!(budget.total_bytes, 63_045_632);
+    }
+
+    #[test]
+    fn prefill_attention_workspace_scales_with_chunk_not_layer_count() {
+        let config = Qwen38Config::default();
+        let one = CudaPrefillWorkspaceBudget::qwen38(&config, 1).unwrap();
+        let full = CudaPrefillWorkspaceBudget::qwen38(&config, 512).unwrap();
+        assert_eq!(full.total_bytes, one.total_bytes * 512);
+        assert_eq!(full.total_bytes, 63_045_632);
+        assert!(CudaPrefillWorkspaceBudget::qwen38(&config, 0).is_err());
+        assert!(CudaPrefillWorkspaceBudget::qwen38(&config, 65_536).is_err());
+    }
 
     #[test]
     fn frozen_plan_covers_every_non_embedding_projection_once() {

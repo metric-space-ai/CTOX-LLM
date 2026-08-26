@@ -282,8 +282,13 @@ an exact resident-resource binding plan. Before execution is enabled, that
 plan resolves the complete prompt program to the same 505 projections, 262
 shared activation owners, 48 linear mixers, 17 full-attention states, and 134
 norm operators used by decode; reordered residual producers or missing MTP
-resources fail closed. Single-copy graph workspace primitives remain separate
-from that immutable ownership contract. The schedule batches every large
+resources fail closed. The loaded graph now owns exactly one reusable
+63,045,632-byte full-attention workspace pool for a 512-token chunk: hidden
+and K normalization, shared RoPE tables, Query/Gate output, and causal GQA
+output. Its planned and allocated byte counts must agree exactly, and the pool
+does not scale with the 16 target attention layers plus MTP. Projection and
+linear-attention chunk arenas remain separate from that immutable ownership
+contract. The schedule batches every large
 Q2/Q4 projection, retains causal device scans for paged GQA, convolution,
 GatedDelta recurrence, and MTP state, computes the target LM head only for the
 last prompt token, and exposes one cancellation/commit barrier per bounded
