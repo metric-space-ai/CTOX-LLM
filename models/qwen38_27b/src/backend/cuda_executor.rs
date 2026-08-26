@@ -6,6 +6,9 @@
 //! for the engine-owned greedy sampler; restricted draft rows and a device
 //! sampler remain later performance work.
 
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::{self, JoinHandle};
+
 use crate::backend::cuda_graph::PreparedCudaProjectionGraph;
 use crate::backend::cuda_runtime::{CudaCandidateRuntime, CudaSubmissionStats};
 use crate::backend::{BackendKind, PromotionState};
@@ -37,6 +40,62 @@ pub struct CudaModelExecutor {
     admitted_draft_tokens: usize,
     free_bytes_before_graph: Option<usize>,
     warmed: bool,
+    allocations: AllocationSnapshot,
+}
+
+enum CudaWorkerCommand {
+    Load {
+        artifact: Box<ModelArtifact>,
+        profile: Box<MemoryProfile>,
+        mtp_draft_token_ids: Vec<u32>,
+        reply: SyncSender<Result<()>>,
+    },
+    Warmup {
+        reply: SyncSender<Result<()>>,
+    },
+    Prefill {
+        tokens: Vec<u32>,
+        mtp_enabled: bool,
+        cancellation: CancellationToken,
+        reply: SyncSender<Result<ExecutorStep>>,
+    },
+    Decode {
+        token: u32,
+        mtp_enabled: bool,
+        cancellation: CancellationToken,
+        reply: SyncSender<Result<ExecutorStep>>,
+    },
+    CommitSpeculative {
+        accepted_drafts: u32,
+        cancellation: CancellationToken,
+        reply: SyncSender<Result<()>>,
+    },
+    ResetSession {
+        reply: SyncSender<Result<()>>,
+    },
+    Unload {
+        reply: SyncSender<Result<()>>,
+    },
+    Allocations {
+        reply: SyncSender<Result<AllocationSnapshot>>,
+    },
+    SubmissionStats {
+        reply: SyncSender<Result<CudaSubmissionStats>>,
+    },
+    SessionTokenCounters {
+        reply: SyncSender<Result<(usize, usize)>>,
+    },
+    Shutdown {
+        reply: SyncSender<Result<()>>,
+    },
+}
+
+/// Sendable server adapter whose worker thread exclusively owns the CUDA
+/// context, graph, and allocator lifecycle. CUDA objects themselves remain
+/// deliberately `!Send`; no unsafe marker trait is used to cross that boundary.
+pub struct ThreadedCudaModelExecutor {
+    sender: Option<mpsc::Sender<CudaWorkerCommand>>,
+    worker: Option<JoinHandle<()>>,
     allocations: AllocationSnapshot,
 }
 
@@ -100,6 +159,198 @@ impl CudaModelExecutor {
         self.graph
             .as_ref()
             .map(|graph| (graph.target_tokens(), graph.mtp_tokens()))
+    }
+}
+
+impl ThreadedCudaModelExecutor {
+    pub fn new_sm86(cubin: &[u8], device: i32) -> Result<Self> {
+        let module = cubin.to_vec();
+        let (sender, receiver) = mpsc::channel();
+        let (initialized_tx, initialized_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("qwen38-cuda-sm86-executor".into())
+            .spawn(move || match CudaModelExecutor::new_sm86(&module, device) {
+                Ok(executor) => {
+                    if initialized_tx.send(Ok(())).is_ok() {
+                        run_cuda_worker(executor, receiver);
+                    }
+                }
+                Err(error) => {
+                    let _ = initialized_tx.send(Err(error));
+                }
+            })
+            .map_err(|error| {
+                EngineError::InvalidState(format!("failed to start CUDA executor worker: {error}"))
+            })?;
+        match initialized_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                sender: Some(sender),
+                worker: Some(worker),
+                allocations: AllocationSnapshot::default(),
+            }),
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(error) => {
+                let _ = worker.join();
+                Err(EngineError::InvalidState(format!(
+                    "CUDA executor worker exited during initialization: {error}"
+                )))
+            }
+        }
+    }
+
+    fn request<T>(
+        &self,
+        operation: &'static str,
+        command: impl FnOnce(SyncSender<Result<T>>) -> CudaWorkerCommand,
+    ) -> Result<T> {
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(format!(
+                "CUDA executor {operation} requested after shutdown"
+            ))
+        })?;
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        sender.send(command(reply_tx)).map_err(|_| {
+            EngineError::InvalidState(format!(
+                "CUDA executor worker is unavailable during {operation}"
+            ))
+        })?;
+        reply_rx.recv().map_err(|_| {
+            EngineError::InvalidState(format!(
+                "CUDA executor worker returned no result for {operation}"
+            ))
+        })?
+    }
+
+    fn refresh_allocations(&mut self) -> Result<()> {
+        self.allocations = self.request("allocation query", |reply| {
+            CudaWorkerCommand::Allocations { reply }
+        })?;
+        Ok(())
+    }
+
+    pub fn submission_stats(&self) -> Result<CudaSubmissionStats> {
+        self.request("submission statistics", |reply| {
+            CudaWorkerCommand::SubmissionStats { reply }
+        })
+    }
+
+    pub fn session_token_counters(&self) -> Result<(usize, usize)> {
+        self.request("session token counters", |reply| {
+            CudaWorkerCommand::SessionTokenCounters { reply }
+        })
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        let Some(sender) = self.sender.take() else {
+            return Ok(());
+        };
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let requested = sender
+            .send(CudaWorkerCommand::Shutdown { reply: reply_tx })
+            .is_ok();
+        drop(sender);
+        let result = if requested {
+            reply_rx.recv().map_err(|_| {
+                EngineError::InvalidState("CUDA executor worker returned no shutdown result".into())
+            })?
+        } else {
+            Err(EngineError::InvalidState(
+                "CUDA executor worker exited before shutdown".into(),
+            ))
+        };
+        let joined = self
+            .worker
+            .take()
+            .expect("live CUDA sender has a worker")
+            .join();
+        self.allocations = AllocationSnapshot::default();
+        if joined.is_err() {
+            return Err(EngineError::InvalidState(
+                "CUDA executor worker panicked during shutdown".into(),
+            ));
+        }
+        result
+    }
+}
+
+impl Drop for ThreadedCudaModelExecutor {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn run_cuda_worker(mut executor: CudaModelExecutor, receiver: mpsc::Receiver<CudaWorkerCommand>) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            CudaWorkerCommand::Load {
+                artifact,
+                profile,
+                mtp_draft_token_ids,
+                reply,
+            } => {
+                let _ = reply.send(executor.load(
+                    artifact.as_ref(),
+                    profile.as_ref(),
+                    &mtp_draft_token_ids,
+                ));
+            }
+            CudaWorkerCommand::Warmup { reply } => {
+                let _ = reply.send(executor.warmup());
+            }
+            CudaWorkerCommand::Prefill {
+                tokens,
+                mtp_enabled,
+                cancellation,
+                reply,
+            } => {
+                let _ = reply.send(executor.prefill(&tokens, mtp_enabled, &cancellation));
+            }
+            CudaWorkerCommand::Decode {
+                token,
+                mtp_enabled,
+                cancellation,
+                reply,
+            } => {
+                let _ = reply.send(executor.decode(token, mtp_enabled, &cancellation));
+            }
+            CudaWorkerCommand::CommitSpeculative {
+                accepted_drafts,
+                cancellation,
+                reply,
+            } => {
+                let _ = reply.send(executor.commit_speculative(accepted_drafts, &cancellation));
+            }
+            CudaWorkerCommand::ResetSession { reply } => {
+                let _ = reply.send(executor.reset_session());
+            }
+            CudaWorkerCommand::Unload { reply } => {
+                let _ = reply.send(executor.unload());
+            }
+            CudaWorkerCommand::Allocations { reply } => {
+                let _ = reply.send(Ok(executor.allocations()));
+            }
+            CudaWorkerCommand::SubmissionStats { reply } => {
+                let result = executor.submission_stats().ok_or_else(|| {
+                    EngineError::InvalidState("CUDA runtime is not available".into())
+                });
+                let _ = reply.send(result);
+            }
+            CudaWorkerCommand::SessionTokenCounters { reply } => {
+                let result = executor
+                    .session_token_counters()
+                    .ok_or_else(|| EngineError::InvalidState("CUDA graph is not loaded".into()));
+                let _ = reply.send(result);
+            }
+            CudaWorkerCommand::Shutdown { reply } => {
+                let reset = executor.reset_session();
+                let unload = executor.unload();
+                let _ = reply.send(reset.and(unload));
+                break;
+            }
+        }
     }
 }
 
@@ -475,6 +726,109 @@ impl ModelExecutor for CudaModelExecutor {
     }
 }
 
+impl ModelExecutor for ThreadedCudaModelExecutor {
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Cuda
+    }
+
+    fn hardware_profile(&self) -> &str {
+        CUDA_SM86_EXECUTOR_PROFILE
+    }
+
+    fn promotion_state(&self) -> PromotionState {
+        PromotionState::Verifier
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        ExecutorCapabilities {
+            vocab_size: TOKENIZER_VOCAB_SIZE,
+            maximum_context_tokens: Qwen38Config::default().max_position_embeddings as u64,
+            mtp: Qwen38Config::default().mtp_num_hidden_layers == 1,
+            maximum_draft_tokens: MAXIMUM_CHAINED_MTP_DRAFTS as u32,
+            cancellation: true,
+            session_reset: true,
+            no_hidden_fallbacks: true,
+        }
+    }
+
+    fn load(
+        &mut self,
+        artifact: &ModelArtifact,
+        profile: &MemoryProfile,
+        mtp_draft_token_ids: &[u32],
+    ) -> Result<()> {
+        self.request("load", |reply| CudaWorkerCommand::Load {
+            artifact: Box::new(artifact.clone()),
+            profile: Box::new(profile.clone()),
+            mtp_draft_token_ids: mtp_draft_token_ids.to_vec(),
+            reply,
+        })?;
+        self.refresh_allocations()
+    }
+
+    fn warmup(&mut self) -> Result<()> {
+        self.request("warmup", |reply| CudaWorkerCommand::Warmup { reply })
+    }
+
+    fn prefill(
+        &mut self,
+        tokens: &[u32],
+        mtp_enabled: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutorStep> {
+        self.request("prefill", |reply| CudaWorkerCommand::Prefill {
+            tokens: tokens.to_vec(),
+            mtp_enabled,
+            cancellation: cancellation.clone(),
+            reply,
+        })
+    }
+
+    fn decode(
+        &mut self,
+        token: u32,
+        mtp_enabled: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutorStep> {
+        self.request("decode", |reply| CudaWorkerCommand::Decode {
+            token,
+            mtp_enabled,
+            cancellation: cancellation.clone(),
+            reply,
+        })
+    }
+
+    fn commit_speculative(
+        &mut self,
+        accepted_drafts: u32,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.request("speculative commit", |reply| {
+            CudaWorkerCommand::CommitSpeculative {
+                accepted_drafts,
+                cancellation: cancellation.clone(),
+                reply,
+            }
+        })
+    }
+
+    fn reset_session(&mut self) -> Result<()> {
+        self.request("session reset", |reply| CudaWorkerCommand::ResetSession {
+            reply,
+        })
+    }
+
+    fn unload(&mut self) -> Result<()> {
+        let result = self.request("unload", |reply| CudaWorkerCommand::Unload { reply });
+        let allocation_result = self.refresh_allocations();
+        result.and(allocation_result)
+    }
+
+    fn allocations(&self) -> AllocationSnapshot {
+        self.allocations
+    }
+}
+
 fn greedy_token(logits: &[f32]) -> Result<u32> {
     logits
         .iter()
@@ -497,4 +851,16 @@ fn read_valid_logits(
     }
     logits.truncate(TOKENIZER_VOCAB_SIZE);
     Ok(logits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn threaded_cuda_adapter_is_send_without_moving_the_driver_context() {
+        assert_send::<ThreadedCudaModelExecutor>();
+    }
 }

@@ -348,6 +348,17 @@ pending. It currently reads full logits at verifier boundaries; restricted-row
 draft evaluation, device sampling, production quality, and roofline promotion
 remain open.
 
+The Unix-socket service cannot move the private driver context among its
+connection threads. `ThreadedCudaModelExecutor` therefore creates the
+`CudaModelExecutor` inside one named worker and sends typed lifecycle commands
+over Rust channels. Artifacts, profiles, token IDs, cancellation handles, and
+results cross that boundary; CUDA contexts, modules, graph owners, and buffers
+do not. Shutdown resets and unloads on the owner thread before joining it. This
+provides the `Send` adapter required by `EngineServer` without an unsafe `Send`
+implementation for CUDA objects. `qwen38-server --verification-cuda` exposes
+that path only under verifier policy and only when built with the `cuda`
+feature.
+
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not
 be conflated. The CUDA implementation differs from a CPU A8 oracle by at most

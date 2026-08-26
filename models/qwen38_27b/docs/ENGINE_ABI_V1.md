@@ -116,15 +116,23 @@ complete-model hardware result and promotion gates remain pending. Metal, CPU
 SIMD token mixers, and Snapdragon still need optimized full graph
 implementations before production admission.
 
+CUDA driver ownership remains thread-affine. The sendable server adapter owns
+the actual CUDA executor on one dedicated worker and serializes the same typed
+ABI calls over in-process channels; it does not mark the context or its `Rc`
+graph owners as `Send`. Cancellation tokens retain their shared atomic flag, so
+a socket control request can cancel a running worker operation without moving
+CUDA state. Worker shutdown performs reset and unload before joining.
+
 `EngineServer<E>` now maps this exact lifecycle onto the v1 wire contract. It
 does not own alternate sampling or model state: the server mutex owns one
 `Engine<E>`, streams accepted MTP tokens before the target bonus/fallback,
 allows cancellation from a separate connection, and reports unload residue
 through the engine health contract. The Responses text renderer/detokenizer and
 the pinned chat-template frontend are implemented. The server binary exposes a
-fully signed CPU-verifier assembly for ABI tests. Wiring the CUDA candidate into
-signed server construction follows its hardware evidence; constructing a
-promoted CUDA or Metal executor remains open.
+fully signed CPU-verifier assembly for ABI tests. A `cuda`-feature build also
+exposes an explicitly named `--verification-cuda` signed assembly using the
+dedicated worker; verifier promotion state still prevents production admission.
+Constructing a promoted CUDA or Metal executor remains open.
 `EngineServer::load_signed` is the single production assembly boundary: it
 verifies one manifest trust root and loads the selected backend pack, memory
 profile, MTP vocabulary, model container, tokenizer, and chat template from

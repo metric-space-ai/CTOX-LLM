@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::Context;
 use clap::Parser;
 use ctox_qwen38_27b::backend::cuda::{GATED_DELTA_STATE_BYTES, LINEAR_CONV_STATE_BYTES};
-use ctox_qwen38_27b::backend::cuda_executor::CudaModelExecutor;
+use ctox_qwen38_27b::backend::cuda_executor::ThreadedCudaModelExecutor;
 use ctox_qwen38_27b::engine::{CancellationToken, DraftDistribution, ModelExecutor};
 use ctox_qwen38_27b::loader::{ChecksumPolicy, ModelArtifact};
 use ctox_qwen38_27b::memory::{LinearStateDType, SpeculativeStateStrategy};
@@ -40,6 +40,7 @@ struct Args {
 struct Report {
     format: &'static str,
     status: &'static str,
+    thread_affine_worker: bool,
     module_sha256: String,
     artifact_manifest_sha256: String,
     mtp_draft_vocabulary_sha256: String,
@@ -99,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     let artifact_manifest_sha256 = artifact.manifest_sha256().to_owned();
     let profile = verifier_profile(&artifact, args.maximum_context_tokens)?;
 
-    let mut executor = CudaModelExecutor::new_sm86(&module, args.device)?;
+    let mut executor = ThreadedCudaModelExecutor::new_sm86(&module, args.device)?;
     let load_started = Instant::now();
     executor.load(&artifact, &profile, &mtp_draft_token_ids)?;
     executor.warmup()?;
@@ -175,17 +176,13 @@ fn main() -> anyhow::Result<()> {
     executor.commit_speculative(accepted_drafts, &cancellation)?;
     let replay_milliseconds = replay_started.elapsed().as_secs_f64() * 1.0e3;
     let (target_tokens_after_replay, mtp_tokens_after_replay) =
-        executor
-            .session_token_counters()
-            .context("CUDA executor lost its loaded graph after replay")?;
+        executor.session_token_counters()?;
     anyhow::ensure!(
         target_tokens_after_replay == 2 + accepted_drafts as usize
             && mtp_tokens_after_replay + 1 == target_tokens_after_replay,
         "CUDA partial-prefix replay produced target/MTP counters {target_tokens_after_replay}/{mtp_tokens_after_replay}"
     );
-    let submission_stats = executor
-        .submission_stats()
-        .context("CUDA executor lost its runtime before unload")?;
+    let submission_stats = executor.submission_stats()?;
     let expected_submissions = 10 + u64::from(accepted_drafts) * 2;
     anyhow::ensure!(
         submission_stats.token_submission_attempts == expected_submissions
@@ -203,7 +200,7 @@ fn main() -> anyhow::Result<()> {
 
     executor.reset_session()?;
     anyhow::ensure!(
-        executor.session_token_counters() == Some((0, 0)),
+        executor.session_token_counters()? == (0, 0),
         "CUDA executor reset retained token state"
     );
     let unload_started = Instant::now();
@@ -220,6 +217,7 @@ fn main() -> anyhow::Result<()> {
         serde_json::to_string_pretty(&Report {
             format: "ctox.cuda-sm86-executor.v1",
             status: "lifecycle_mtp4_partial_replay_verifier_only_not_promoted",
+            thread_affine_worker: true,
             module_sha256,
             artifact_manifest_sha256,
             mtp_draft_vocabulary_sha256,
@@ -251,7 +249,7 @@ fn main() -> anyhow::Result<()> {
             replay_milliseconds,
             unload_milliseconds,
             allocations_zero_after_unload,
-            note: "Exercises the embeddable Rust ModelExecutor ABI without CPU model-operation fallback. Full logits cross the host at verifier token boundaries. The supplied release-bound draft vocabulary is identity-checked but gathered-row MTP and device sampling remain performance work. Promotion still requires BF16/logit, quality, long-context, unload, and roofline evidence on the release checkpoint.",
+            note: "Exercises the sendable Rust ModelExecutor ABI through the dedicated thread that owns every CUDA object, without CPU model-operation fallback. Full logits cross the host at verifier token boundaries. The supplied release-bound draft vocabulary is identity-checked but gathered-row MTP and device sampling remain performance work. Promotion still requires BF16/logit, quality, long-context, unload, and roofline evidence on the release checkpoint.",
         })?
     );
     Ok(())

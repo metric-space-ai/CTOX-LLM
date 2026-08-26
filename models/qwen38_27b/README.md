@@ -253,7 +253,9 @@ restore/replay, reset, allocation accounting, and unload through the shared
 Rust ABI. `qwen38-cuda-executor-verify` binds that lifecycle to the exact
 artifact, CUDA module, and canonical release draft-vocabulary hashes. Its
 complete hardware run, gathered-row draft head, device sampling, quality gates,
-and roofline promotion remain open.
+and roofline promotion remain open. For IPC verification, a sendable adapter
+owns this deliberately thread-affine CUDA executor on one dedicated worker;
+the socket threads exchange typed commands and never move driver objects.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight
@@ -295,6 +297,9 @@ bring-up negotiates and reports health but remains fail-closed with
 `engine_not_ready`. An explicit signed-release CPU-verifier mode now exercises
 the real loader, tokenizer, token-ID and Responses generation, cancellation,
 MTP token ordering, reset, and unload through the same reusable server adapter.
-Its verifier promotion state cannot pass production admission. CUDA now has an
-assembled verifier executor awaiting complete-model hardware evidence; Metal
-executor assembly remains unfinished.
+Its verifier promotion state cannot pass production admission. With the
+`cuda` feature, the same server binary accepts `--verification-cuda` plus the
+signed release inputs and exact CUDA module; it still selects verifier policy
+and cannot be mistaken for a promoted service. CUDA now has an assembled
+verifier executor and IPC path awaiting complete-model hardware evidence;
+Metal executor assembly remains unfinished.
