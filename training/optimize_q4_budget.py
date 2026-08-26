@@ -9,6 +9,8 @@ import json
 import math
 from pathlib import Path
 
+from select_activation_calibration import write_bytes_atomic
+
 
 QUANTIZED_DTYPES = frozenset({"q2_b64", "q4_b64", "mixed_q2_q4_b64"})
 
@@ -62,6 +64,20 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def validate_sensitivity_contract(sensitivity: dict, plan: dict, plan_sha256: str) -> None:
+    if sensitivity.get("format") != "ctox.q2q4.sensitivity.v1":
+        raise ValueError("unsupported Q2/Q4 sensitivity format")
+    if sensitivity.get("model") != plan.get("model"):
+        raise ValueError("sensitivity model does not match the quant plan")
+    if sensitivity.get("revision") != plan.get("revision"):
+        raise ValueError("sensitivity revision does not match the quant plan")
+    if sensitivity.get("quant_plan_sha256") != plan_sha256:
+        raise ValueError("sensitivity is not bound to the quant plan")
+    unobserved = [item["name"] for item in sensitivity["candidates"] if not item.get("observed")]
+    if unobserved:
+        raise ValueError(f"sensitivity contains {len(unobserved)} unobserved candidates")
+
+
 def initial_selections(
     candidates: list[dict],
     mixed_groups: dict[str, list[dict]],
@@ -97,8 +113,17 @@ def main() -> None:
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
     sensitivity = json.loads(args.sensitivity.read_text(encoding="utf-8"))
-    candidates = sensitivity.get("candidates", sensitivity) if isinstance(sensitivity, dict) else sensitivity
-    plan = json.loads(args.plan.read_text(encoding="utf-8"))
+    plan_bytes = args.plan.read_bytes()
+    plan = json.loads(plan_bytes)
+    try:
+        validate_sensitivity_contract(
+            sensitivity,
+            plan,
+            hashlib.sha256(plan_bytes).hexdigest(),
+        )
+    except (ValueError, KeyError) as error:
+        raise SystemExit(str(error)) from error
+    candidates = sensitivity["candidates"]
     mixed_groups = {
         item["name"]: item["row_groups"]
         for item in candidates
@@ -147,33 +172,36 @@ def main() -> None:
             selected = trial_tensors
             selected_row_groups = trial_rows
     bytes_used = layout_bytes(plan, selected, mixed_groups, selected_row_groups)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(
-            {
-                "format": "ctox.q2q4.assignment.v2",
-                "budget_bytes": args.budget_bytes,
-                "base_bytes": base_bytes,
-                "bytes_used": bytes_used,
-                "plan_sha256": sha256(args.plan),
-                "sensitivity_sha256": sha256(args.sensitivity),
-                "q4_tensors": sorted(selected),
-                "mixed_tensors": {
-                    name: {
-                        "row_group_size": next(
-                            item["row_group_size"] for item in candidates if item["name"] == name
-                        ),
-                        "group_count": len(groups),
-                        "q4_groups": sorted(selected_row_groups.get(name, set())),
-                    }
-                    for name, groups in sorted(mixed_groups.items())
+    write_bytes_atomic(
+        args.output,
+        (
+            json.dumps(
+                {
+                    "format": "ctox.q2q4.assignment.v2",
+                    "budget_bytes": args.budget_bytes,
+                    "base_bytes": base_bytes,
+                    "bytes_used": bytes_used,
+                    "plan_sha256": sha256(args.plan),
+                    "sensitivity_sha256": sha256(args.sensitivity),
+                    "q4_tensors": sorted(selected),
+                    "mixed_tensors": {
+                        name: {
+                            "row_group_size": next(
+                                item["row_group_size"]
+                                for item in candidates
+                                if item["name"] == name
+                            ),
+                            "group_count": len(groups),
+                            "q4_groups": sorted(selected_row_groups.get(name, set())),
+                        }
+                        for name, groups in sorted(mixed_groups.items())
+                    },
                 },
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8"),
     )
 
 

@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from quantization import quantize_dequantize
+from cache_teacher import validate_local_model_provenance
 from run_ledger import GpuRun, require_budget
+from select_activation_calibration import write_bytes_atomic
 
 
 QUANTIZED_DTYPES = frozenset({"q2_b64", "q4_b64", "mixed_q2_q4_b64"})
@@ -47,6 +49,19 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(16 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_stats_bindings(
+    metadata: dict[str, str],
+    plan_sha256: str,
+    provenance_sha256: str,
+) -> None:
+    if metadata.get("format") != "ctox.activation-diagonal.v1":
+        raise ValueError("unsupported activation-statistics format")
+    if metadata.get("quant_plan_sha256") != plan_sha256:
+        raise ValueError("activation statistics do not match the quant plan")
+    if metadata.get("local_model_provenance_sha256") != provenance_sha256:
+        raise ValueError("activation statistics do not match the local BF16 provenance")
 
 
 def row_group_document(
@@ -183,12 +198,27 @@ def score_tensor(
 def run(args: argparse.Namespace, torch: Any, safe_open: Any) -> None:
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
-    plan = json.loads(args.plan.read_text(encoding="utf-8"))
+    try:
+        _provenance, provenance_sha256 = validate_local_model_provenance(
+            args.checkpoint,
+            args.revision,
+            args.local_model_provenance,
+        )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
+    if provenance_sha256 is None:
+        raise SystemExit("sensitivity scoring requires verified local BF16 provenance")
+    plan_bytes = args.plan.read_bytes()
+    plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
+    plan = json.loads(plan_bytes)
+    if plan.get("revision") != args.revision:
+        raise SystemExit("quant plan revision does not match --revision")
     quantized = quantized_entries(plan)
     shards = sorted({entry["source_shard"] for entry in quantized})
     candidates = []
     with ExitStack() as stack:
         stats = stack.enter_context(safe_open(args.stats, framework="pt", device="cpu"))
+        validate_stats_bindings(stats.metadata(), plan_sha256, provenance_sha256)
         sources = {
             shard: stack.enter_context(
                 safe_open(args.checkpoint / shard, framework="pt", device="cpu")
@@ -242,17 +272,23 @@ def run(args: argparse.Namespace, torch: Any, safe_open: Any) -> None:
         "format": "ctox.q2q4.sensitivity.v1",
         "model": plan["model"],
         "revision": plan["revision"],
+        "quant_plan_sha256": plan_sha256,
+        "local_model_provenance_sha256": provenance_sha256,
         "activation_stats_sha256": file_sha256(args.stats),
         "estimator": "diagonal-input-covariance",
         "candidates": candidates,
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_bytes_atomic(
+        args.output,
+        (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--local-model-provenance", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--stats", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

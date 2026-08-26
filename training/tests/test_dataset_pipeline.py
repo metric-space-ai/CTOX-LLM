@@ -63,7 +63,12 @@ from merge_manifests import merge  # noqa: E402
 from merge_domain_tags import merge_ordered_tags  # noqa: E402
 from merge_activation_stats import merged_metadata, source_runtime_profiles  # noqa: E402
 from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noqa: E402
-from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_bytes  # noqa: E402
+from optimize_q4_budget import (  # noqa: E402
+    initial_selections,
+    layout_bytes,
+    mixed_tensor_bytes,
+    validate_sensitivity_contract,
+)
 from plan_teacher_cache import sample_tensor_bytes  # noqa: E402
 from plan_teacher_batches import batches as plan_teacher_batches  # noqa: E402
 from plan_activation_batches import activation_batches  # noqa: E402
@@ -112,7 +117,11 @@ from packed_student_model import (  # noqa: E402
     set_parameter,
     set_submodule,
 )
-from score_quant_sensitivity import quantized_entries, row_group_document  # noqa: E402
+from score_quant_sensitivity import (  # noqa: E402
+    quantized_entries,
+    row_group_document,
+    validate_stats_bindings,
+)
 from select_manifest import select  # noqa: E402
 from select_activation_calibration import (  # noqa: E402
     load_token_counts,
@@ -447,6 +456,35 @@ class DatasetPipelineTests(unittest.TestCase):
                     "provenance",
                 )
             )
+
+    def test_sensitivity_rejects_cross_identity_activation_statistics(self) -> None:
+        metadata = {
+            "format": "ctox.activation-diagonal.v1",
+            "quant_plan_sha256": "plan",
+            "local_model_provenance_sha256": "teacher",
+        }
+        validate_stats_bindings(metadata, "plan", "teacher")
+        with self.assertRaisesRegex(ValueError, "quant plan"):
+            validate_stats_bindings(metadata, "other", "teacher")
+        with self.assertRaisesRegex(ValueError, "BF16 provenance"):
+            validate_stats_bindings(metadata, "plan", "other")
+
+    def test_q4_optimizer_requires_complete_identity_bound_sensitivity(self) -> None:
+        plan = {"model": "qwen", "revision": "revision"}
+        sensitivity = {
+            "format": "ctox.q2q4.sensitivity.v1",
+            "model": "qwen",
+            "revision": "revision",
+            "quant_plan_sha256": "plan",
+            "candidates": [{"name": "weight", "observed": True}],
+        }
+        validate_sensitivity_contract(sensitivity, plan, "plan")
+        sensitivity["candidates"][0]["observed"] = False
+        with self.assertRaisesRegex(ValueError, "unobserved"):
+            validate_sensitivity_contract(sensitivity, plan, "plan")
+        sensitivity["candidates"][0]["observed"] = True
+        with self.assertRaisesRegex(ValueError, "bound"):
+            validate_sensitivity_contract(sensitivity, plan, "other")
 
     def test_teacher_cache_batch_group_binds_plan_and_contiguous_verifications(
         self,
