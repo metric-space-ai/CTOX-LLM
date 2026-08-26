@@ -20,11 +20,14 @@
       "implementation_notes": "CPU_KERNEL_NOTES.md"
     },
     "cuda": {
-      "state": "contract",
+      "state": "candidate",
       "production_allowed": false,
       "required_first_profile": "sm86",
       "reference_pin": "../vendor/cuda/UPSTREAM.json",
-      "promotion_blocker": "compiled Q2_B64/Q4_B64 module, same-device verifier, and benchmark"
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "resident_projection_reuse"],
+      "evidence": "../benchmarks/cuda/sm86-q2q4-fused-matvec-20260826.json",
+      "implementation_notes": "CUDA_KERNEL_NOTES.md",
+      "promotion_blocker": "upstream-derived dp4a/MMQ path, controlled roofline sweep, complete graph kernels, allocator ownership, and full-model golden run"
     },
     "metal": {
       "state": "candidate",

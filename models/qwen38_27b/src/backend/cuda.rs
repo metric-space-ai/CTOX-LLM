@@ -13,7 +13,7 @@
 //! verifier run and benchmark evidence exist per `docs/PROMOTION_GATES.md`.
 
 use crate::backend::{
-    Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow, RecoveredRowMatVec,
+    Backend, BackendKind, FusedMatVec, PromotionState, RecoveredRow, RecoveredRowMatVec, ScaleSlice,
 };
 use crate::format::TensorDType;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
@@ -162,6 +162,73 @@ pub const SM86_MODULE_ABI: CudaModuleAbi = CudaModuleAbi {
     compute_capability: SM86_COMPUTE_CAPABILITY,
     kernels: &[Q2_B64_FUSED_MATVEC, Q4_B64_FUSED_MATVEC],
 };
+
+/// Validates a pure Q2_B64/Q4_B64 operation before the verifier-only CUDA
+/// runtime allocates device memory. Mixed matrices are dispatched as their
+/// manifest-defined homogeneous row segments by the graph layer; they are
+/// never re-packed or silently widened here.
+pub fn validate_operation(operation: &FusedMatVec<'_>) -> Result<&'static CudaKernelAbi> {
+    let descriptor = SM86_MODULE_ABI.descriptor_for(operation.dtype)?;
+    if operation.rows == 0 || operation.columns == 0 || !operation.columns.is_multiple_of(BLOCK_LEN)
+    {
+        return Err(EngineError::Shape(
+            "CUDA fused matvec dimensions must be non-zero and columns divisible by 64".into(),
+        ));
+    }
+    if !operation.segments.is_empty() {
+        return Err(EngineError::InvalidArtifact(
+            "pure CUDA Q2/Q4 operation declares mixed row segments".into(),
+        ));
+    }
+    if operation.input.len() != operation.columns {
+        return Err(EngineError::Shape(format!(
+            "input has {} values, expected {}",
+            operation.input.len(),
+            operation.columns
+        )));
+    }
+    let blocks_per_row = operation.columns / BLOCK_LEN;
+    let expected_weights = operation
+        .rows
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(descriptor.block_bytes))
+        .ok_or_else(|| EngineError::Shape("CUDA weight buffer size overflows usize".into()))?;
+    if operation.weights.len() != expected_weights {
+        return Err(EngineError::Shape(format!(
+            "weight buffer has {} bytes, expected {expected_weights}",
+            operation.weights.len()
+        )));
+    }
+    for (name, scales, expected) in [
+        ("s_in", operation.s_in, operation.columns),
+        ("s_out", operation.s_out, operation.rows),
+    ] {
+        if let Some(scales) = scales {
+            if !matches!(scales, ScaleSlice::F16Le(_)) {
+                return Err(EngineError::UnsupportedDType(format!(
+                    "CUDA {name} recovery scales must remain packed FP16"
+                )));
+            }
+            if scales.len() != expected {
+                return Err(EngineError::Shape(format!(
+                    "{name} has {} values, expected {expected}",
+                    scales.len()
+                )));
+            }
+        }
+    }
+    if operation
+        .bias
+        .is_some_and(|values| values.len() != operation.rows)
+    {
+        return Err(EngineError::Shape("bias length differs from rows".into()));
+    }
+    u32::try_from(operation.rows)
+        .map_err(|_| EngineError::Shape("rows exceed CUDA u32 launch limit".into()))?;
+    u32::try_from(operation.columns)
+        .map_err(|_| EngineError::Shape("columns exceed CUDA u32 launch limit".into()))?;
+    Ok(descriptor)
+}
 
 impl CudaModuleAbi {
     /// Every `CUfunction` symbol a conforming module must export.
@@ -316,7 +383,41 @@ impl Backend for CudaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{Activation, Backend};
+    use crate::backend::{Activation, Backend, ScaleSlice};
+    use crate::quant::{Q2Block64, Q4Block64};
+    use half::f16;
+
+    fn packed_weights(dtype: TensorDType, rows: usize, columns: usize) -> Vec<u8> {
+        let mut packed = Vec::new();
+        for block in 0..rows * columns / BLOCK_LEN {
+            let values: [f32; BLOCK_LEN] =
+                std::array::from_fn(|index| ((block * BLOCK_LEN + index) as f32 * 0.017).sin());
+            match dtype {
+                TensorDType::Q2B64 => packed.extend_from_slice(
+                    &Q2Block64::quantize(&values)
+                        .expect("finite Q2 fixture")
+                        .encode(),
+                ),
+                TensorDType::Q4B64 => packed.extend_from_slice(
+                    &Q4Block64::quantize(&values)
+                        .expect("finite Q4 fixture")
+                        .encode(),
+                ),
+                _ => unreachable!(),
+            }
+        }
+        packed
+    }
+
+    fn f16_bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .flat_map(|index| {
+                f16::from_f32(0.9 + (index % 7) as f32 * 0.01)
+                    .to_bits()
+                    .to_le_bytes()
+            })
+            .collect()
+    }
 
     #[test]
     fn profile_selection_maps_q2_and_q4() {
@@ -387,6 +488,72 @@ mod tests {
         assert!(SM86_MODULE_ABI.validate_module((8, 0), &symbols).is_err());
         assert!(SM86_MODULE_ABI.validate_module((9, 0), &symbols).is_err());
         assert!(SM86_MODULE_ABI.validate_module((7, 5), &symbols).is_err());
+    }
+
+    #[test]
+    fn operation_validation_accepts_exact_packed_q2_and_q4() {
+        for dtype in [TensorDType::Q2B64, TensorDType::Q4B64] {
+            let rows = 5;
+            let columns = 128;
+            let weights = packed_weights(dtype, rows, columns);
+            let input = vec![0.25_f32; columns];
+            let s_in = f16_bytes(columns);
+            let s_out = f16_bytes(rows);
+            let bias = vec![0.0_f32; rows];
+            let operation = FusedMatVec {
+                dtype,
+                weights: &weights,
+                segments: &[],
+                rows,
+                columns,
+                input: &input,
+                s_in: Some(ScaleSlice::F16Le(&s_in)),
+                s_out: Some(ScaleSlice::F16Le(&s_out)),
+                bias: Some(&bias),
+                activation: Activation::Silu,
+            };
+            let descriptor = validate_operation(&operation).unwrap();
+            assert_eq!(descriptor.dtype, dtype);
+        }
+    }
+
+    #[test]
+    fn operation_validation_rejects_repacking_and_host_scales() {
+        let rows = 2;
+        let columns = BLOCK_LEN;
+        let weights = packed_weights(TensorDType::Q2B64, rows, columns);
+        let input = vec![0.25_f32; columns];
+        let host_scales = vec![1.0_f32; columns];
+        let mut operation = FusedMatVec {
+            dtype: TensorDType::Q2B64,
+            weights: &weights,
+            segments: &[],
+            rows,
+            columns,
+            input: &input,
+            s_in: Some(ScaleSlice::F32(&host_scales)),
+            s_out: None,
+            bias: None,
+            activation: Activation::Identity,
+        };
+        assert!(matches!(
+            validate_operation(&operation),
+            Err(EngineError::UnsupportedDType(_))
+        ));
+        operation.s_in = None;
+        let segments = [crate::format::QuantSegment {
+            group_index: 0,
+            row_start: 0,
+            row_end: rows as u64,
+            dtype: TensorDType::Q2B64,
+            offset: 0,
+            length: weights.len() as u64,
+        }];
+        operation.segments = &segments;
+        assert!(matches!(
+            validate_operation(&operation),
+            Err(EngineError::InvalidArtifact(_))
+        ));
     }
 
     #[test]

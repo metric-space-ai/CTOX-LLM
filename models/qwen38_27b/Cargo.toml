@@ -11,7 +11,7 @@ description = "Self-contained Qwen3.8-27B Q2/Q4 inference engine for CTOX"
 [features]
 default = ["cpu"]
 cpu = []
-cuda = []
+cuda = ["dep:libloading"]
 metal = ["dep:metal-driver"]
 snapdragon = []
 android-jni = ["dep:jni"]
@@ -22,6 +22,7 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
 half = { version = "2", features = ["serde"] }
 jni = { version = "0.21", optional = true }
+libloading = { version = "0.8", optional = true }
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -63,3 +64,8 @@ path = "src/bin/roofline_gate.rs"
 name = "qwen38-metal-bench"
 path = "src/bin/metal_bench.rs"
 required-features = ["metal"]
+
+[[bin]]
+name = "qwen38-cuda-bench"
+path = "src/bin/cuda_bench.rs"
+required-features = ["cuda"]

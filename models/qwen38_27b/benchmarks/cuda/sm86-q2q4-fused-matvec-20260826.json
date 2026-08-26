@@ -1,0 +1,79 @@
+{
+  "format": "ctox.cuda-sm86-candidate-evidence.v1",
+  "status": "verifier_only_not_promotion_evidence",
+  "captured_at": "2026-08-26",
+  "host": "gpu3",
+  "device": {
+    "physical_index": 1,
+    "name": "NVIDIA RTX A4500",
+    "compute_capability": "8.6",
+    "cuda_toolkit": "12.6.85",
+    "rust_toolchain": "1.93.0"
+  },
+  "module": {
+    "source": "kernels/cuda/q2q4_fused_matvec_sm86.cu",
+    "sha256": "89a7adc21111448abd46a2039a438dba3aac7917e54ee7746c1e86e5e9a5fbe6",
+    "target": "sm_86",
+    "q2_registers": 56,
+    "q4_registers": 44,
+    "spill_load_bytes": 0,
+    "spill_store_bytes": 0
+  },
+  "correctness_contract": {
+    "oracle": "CpuBackend::scalar_verifier",
+    "activation": "silu",
+    "recovery_scales": "packed_fp16_s_in_and_s_out",
+    "bias": true,
+    "absolute_tolerance": 0.02,
+    "relative_tolerance": 0.001,
+    "partial_row_shape": {
+      "rows": 257,
+      "columns": 512,
+      "q2_maximum_absolute_error": 0.0000076293945,
+      "q2_maximum_relative_error": 0.00006391395
+    }
+  },
+  "measurements": [
+    {
+      "dtype": "q2_b64",
+      "rows": 5120,
+      "columns": 5120,
+      "warmup_syncs": 3,
+      "measured_syncs": 10,
+      "dispatches_per_sync": 20,
+      "total_dispatches": 200,
+      "packed_weight_bytes": 7372800,
+      "requested_resident_buffer_bytes": 7454720,
+      "elapsed_milliseconds": 13.30621,
+      "mean_dispatch_milliseconds": 0.06653105,
+      "packed_weight_gb_per_second": 110.81743035770515,
+      "maximum_absolute_error": 0.00003886223,
+      "maximum_relative_error": 0.019044442
+    },
+    {
+      "dtype": "q4_b64",
+      "rows": 5120,
+      "columns": 5120,
+      "warmup_syncs": 3,
+      "measured_syncs": 10,
+      "dispatches_per_sync": 20,
+      "total_dispatches": 200,
+      "packed_weight_bytes": 13926400,
+      "requested_resident_buffer_bytes": 14008320,
+      "elapsed_milliseconds": 13.203372,
+      "mean_dispatch_milliseconds": 0.06601686,
+      "packed_weight_gb_per_second": 210.95217191487146,
+      "maximum_absolute_error": 0.000031471252,
+      "maximum_relative_error": 0.0015040343
+    }
+  ],
+  "limitations": [
+    "A BF16 teacher process remained resident on all three GPUs and active on physical GPU 0.",
+    "The candidate ran on physical GPU 1, which was compute-idle but already held teacher weights.",
+    "Clocks, thermals, power state, ECC effects, and hardware counters were not controlled or captured.",
+    "Requested resident bytes exclude CUDA context and allocator overhead.",
+    "Packed-weight GB/s is an application-level ratio, not a sustainable-bandwidth roofline measurement.",
+    "The scalar unpack/FMA baseline is intentionally unpromoted and does not implement the complete model graph."
+  ],
+  "conclusion": "Both packed formats execute correctly through the direct Rust CUDA Driver API. Q2 and Q4 have nearly identical latency despite different packed byte counts, proving the Q2 candidate is instruction-bound. Promotion requires an upstream-derived Q8-activation dp4a/MMQ candidate and the complete controlled gate suite."
+}
