@@ -120,6 +120,7 @@ from packed_student_model import (  # noqa: E402
     set_submodule,
 )
 from score_quant_sensitivity import (  # noqa: E402
+    fixed_q4,
     quantized_entries,
     row_group_document,
     validate_stats_bindings,
@@ -2821,6 +2822,17 @@ class DatasetPipelineTests(unittest.TestCase):
         )
         self.assertEqual(selected, set())
         self.assertEqual(selected_groups, {"lm_head.weight": {0, 1}})
+
+    def test_release_q4_policy_has_no_architecture_name_exceptions(self) -> None:
+        for name in [
+            "lm_head.weight",
+            "model.language_model.embed_tokens.weight",
+            "model.language_model.layers.63.self_attn.k_proj.weight",
+            "model.language_model.layers.63.self_attn.v_proj.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.63.mlp.down_proj.weight",
+        ]:
+            self.assertFalse(fixed_q4(name), name)
 
     def test_recovery_mixed_ranges_preserve_planned_qcodes(self) -> None:
         entry = {

@@ -19,6 +19,7 @@ from select_activation_calibration import write_bytes_atomic
 
 
 QUANTIZED_DTYPES = frozenset({"q2_b64", "q4_b64", "mixed_q2_q4_b64"})
+FIXED_Q4_TENSORS = frozenset()
 
 
 def packed_bytes(dtype: str, elements: int) -> int:
@@ -27,12 +28,14 @@ def packed_bytes(dtype: str, elements: int) -> int:
 
 
 def fixed_q4(name: str) -> bool:
-    return (
-        name == "lm_head.weight"
-        or (name.startswith("mtp.") and ".self_attn." in name)
-        or name.endswith(".self_attn.k_proj.weight")
-        or name.endswith(".self_attn.v_proj.weight")
-    )
+    """Return only release-policy exceptions, never architecture guesses.
+
+    The final assignment is deliberately measurement-driven. Even LM-head,
+    embedding, K/V, and MTP matrices begin as Q2 candidates and earn Q4 only
+    through their activation-weighted reduction in expected error.
+    """
+
+    return name in FIXED_Q4_TENSORS
 
 
 def quantized_entries(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -276,6 +279,7 @@ def run(args: argparse.Namespace, torch: Any, safe_open: Any) -> None:
         "local_model_provenance_sha256": provenance_sha256,
         "activation_stats_sha256": file_sha256(args.stats),
         "estimator": "diagonal-input-covariance",
+        "fixed_q4_policy": "none; every large matrix is selected by measured quality gain",
         "candidates": candidates,
     }
     write_bytes_atomic(

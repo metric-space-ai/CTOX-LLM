@@ -178,6 +178,7 @@ def main() -> None:
             json.dumps(
                 {
                     "format": "ctox.q2q4.assignment.v2",
+                    "selection_policy": "activation-weighted Q2-to-Q4 quality gain per added packed byte",
                     "budget_bytes": args.budget_bytes,
                     "base_bytes": base_bytes,
                     "bytes_used": bytes_used,

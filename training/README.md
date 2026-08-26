@@ -388,6 +388,13 @@ count and elapsed time to `run-ledger.jsonl`.
 bytes, including alignment and recovery scales. It excludes vision, includes
 resident MTP, rejects a plan above 7.8 GiB, and emits the immutable assignment
 consumed by target packers.
+The release sensitivity pass has no architecture-name-based Q4 exceptions:
+LM head, embedding row groups, attention K/V, MTP, and FFN matrices all begin
+as Q2 candidates. Q4 is assigned only in descending order of measured,
+activation-weighted Q2-to-Q4 error reduction per additional packed byte, with
+exact aligned-layout admission after each choice. If a supposedly sensitive
+area does not measure a material Q4 gain, it does not consume the Fold budget;
+held-out BF16 gates can still force a subsequent measured reassignment.
 The resident tensor plan reserves 2 MiB below that package ceiling for the
 container manifest and release metadata. `pack_checkpoint.py` independently
 rejects a final file above the full 7.8-GiB package limit; fitting tensor bytes
