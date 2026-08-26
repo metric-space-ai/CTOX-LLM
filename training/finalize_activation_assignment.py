@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from run_activation_batches import completed_batch_matches
+from run_activation_batches import completed_batch_matches, validate_batch_plan
 
 
 def sha256(path: Path) -> str:
@@ -133,17 +133,14 @@ def main() -> None:
     args = parser.parse_args()
     batch_plan_bytes = args.batch_plan.read_bytes()
     batch_plan = json.loads(batch_plan_bytes)
-    if batch_plan.get("format") != "ctox.activation-batch-plan.v1":
-        raise SystemExit("unsupported activation batch-plan format")
-    if sha256(args.input) != batch_plan.get("input_sha256"):
-        raise SystemExit("activation input does not match the batch plan")
     plan_sha256 = sha256(args.plan)
     provenance_sha256 = sha256(args.local_model_provenance)
     try:
+        batches = validate_batch_plan(batch_plan, args.input)
         artifacts = verified_artifacts(
             args.artifact_root,
             args.artifact_prefix,
-            batch_plan["batches"],
+            batches,
             hashlib.sha256(batch_plan_bytes).hexdigest(),
             plan_sha256,
             str(args.checkpoint),
@@ -161,7 +158,7 @@ def main() -> None:
         if not merged_artifact_matches(
             args.merged_stats,
             artifacts,
-            batch_plan["batches"],
+            batches,
             plan_sha256,
             provenance_sha256,
             safe_open,

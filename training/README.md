@@ -215,6 +215,10 @@ every token-count cache plan named by the immutable batch plan, reloads the
 complete materialized cohort, and deterministically rebuilds every batch and
 summary count. A stale source hash or a schedule that claims samples not
 derivable from its named token plans fails before model load.
+`finalize_activation_assignment.py` repeats the same reconstruction before it
+accepts batch verifications, merges statistics, scores Q2/Q4 sensitivity, or
+optimizes the byte budget. Passing the collector once therefore cannot make a
+later stale or replaced token-count source admissible.
 `--hf-home` binds the already provisioned Hugging Face cache root explicitly
 for the model and pinned-kernel subprocesses; this prevents a stale host login
 cache or symlink from changing where an admitted run reads and writes.
