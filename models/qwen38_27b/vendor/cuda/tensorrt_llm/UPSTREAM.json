@@ -1,0 +1,32 @@
+{
+  "upstream": {
+    "repository": "https://github.com/NVIDIA/TensorRT-LLM",
+    "revision": "8bde0105047a8fbf7599f22494f95b5a88dae907",
+    "license": "Apache-2.0",
+    "license_file": "LICENSE",
+    "fetched": "2026-08-26",
+    "archive": "https://codeload.github.com/NVIDIA/TensorRT-LLM/tar.gz/8bde0105047a8fbf7599f22494f95b5a88dae907"
+  },
+  "scope": "Byte-identical CUDA top-k selection and block-reduction references used to derive CTOX's single-request SM86 top-k/top-p sampling candidate. The TensorRT-LLM framework is not linked or compiled into the model crate.",
+  "files": [
+    {
+      "path": "cpp/tensorrt_llm/kernels/samplingTopKKernels.cu",
+      "upstream_path": "cpp/tensorrt_llm/kernels/samplingTopKKernels.cu",
+      "sha256": "161b0d3e6676d64cbb480ee3918bde6f7bbb6b1a397db2239145be159057e376",
+      "lines": 480,
+      "purpose": "Two-stage repeated top-k reduction, exponential weighting, nucleus boundary, and random-threshold selection reference."
+    },
+    {
+      "path": "cpp/tensorrt_llm/common/reduceKernelUtils.cuh",
+      "upstream_path": "cpp/tensorrt_llm/common/reduceKernelUtils.cuh",
+      "sha256": "23248846d98fc9007014a25816cec7e785f3f6b47c79f1a0466f09e6f4f637db",
+      "lines": 428,
+      "purpose": "TopK_2 insertion and block-reduction comparison contract used by the upstream sampling stages."
+    }
+  ],
+  "notes": [
+    "Vendored files are reference material only and retain their upstream copyright and Apache-2.0 headers.",
+    "The CTOX adaptation accepts one already resident finite f32 distribution, one caller-supplied unit-interval draw, and a bounded top-k. It remains verifier-only until same-device parity, distribution, performance, and lifecycle evidence pass.",
+    "No TensorRT-LLM runtime, CUDA Runtime API, CURAND state, or framework allocator is introduced."
+  ]
+}

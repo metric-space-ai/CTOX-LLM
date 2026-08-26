@@ -18,23 +18,25 @@ use sha2::{Digest, Sha256};
 
 use super::cuda::{
     validate_mixed_operation, validate_operation, validate_recovered_row, CudaMixedRowSegment,
-    A8_QUANTIZE_SYMBOL, ARGMAX_F32_SYMBOL, CAUSAL_CONV_F16_SYMBOL, DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
-    GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS, GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS,
-    GATED_DELTA_PREP_F32_SYMBOL, GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM,
-    GATED_RMS_NORM_COLUMNS, GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS,
-    LINEAR_CONV_KERNEL_WIDTH, LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL,
-    PAGED_GQA_DESCRIPTOR_BYTES, PAGED_GQA_PARAMS_BYTES, PAGED_Q2Q4_GQA_F32_SYMBOL,
-    PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
-    Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_GATHERED_MATVEC_SYMBOL,
-    Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL,
-    QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL,
-    SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
+    A8_QUANTIZE_SYMBOL, ARGMAX_F32_SYMBOL, CAUSAL_CONV_F16_SYMBOL, CUDA_SAMPLER_MAX_TOP_K,
+    DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL, GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS,
+    GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS, GATED_DELTA_PREP_F32_SYMBOL,
+    GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
+    GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
+    LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES,
+    PAGED_GQA_PARAMS_BYTES, PAGED_Q2Q4_GQA_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL,
+    Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
+    Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL,
+    Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL,
+    QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL, SIGMOID_GATE_A8_QUANTIZE_SYMBOL,
+    SWIGLU_A8_QUANTIZE_SYMBOL, TOPK_TOPP_SAMPLE_F32_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
 use crate::kv_cache::KvPrecision;
 use crate::loader::RecoveredMatrixView;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
+use crate::sampler::SamplerConfig;
 use crate::{EngineError, Result};
 
 type CuResult = i32;
@@ -176,6 +178,14 @@ pub struct CudaSubmissionStats {
     pub deferred_operator_synchronizations: u64,
     pub context_synchronizations: u64,
     pub device_argmax_launches: u64,
+    pub device_sampling_launches: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CudaSampledToken {
+    pub token: u32,
+    pub nucleus_len: u32,
+    pub nucleus_total: f32,
 }
 
 struct CudaContextInner {
@@ -205,6 +215,7 @@ struct CudaContextInner {
     demote_paged_kv_q4_to_q2_function: CuFunction,
     paged_q2q4_gqa_f32_function: CuFunction,
     argmax_f32_function: CuFunction,
+    topk_topp_sample_f32_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
     token_submission_active: Cell<bool>,
@@ -213,6 +224,7 @@ struct CudaContextInner {
     deferred_operator_synchronizations: Cell<u64>,
     context_synchronizations: Cell<u64>,
     device_argmax_launches: Cell<u64>,
+    device_sampling_launches: Cell<u64>,
 }
 
 /// Borrowed, context-bound f32 device tensor. The private buffer reference
@@ -476,6 +488,15 @@ pub struct PreparedCudaGatheredA8Projection {
 /// Eight-byte result buffer for deterministic device-side greedy selection.
 pub struct PreparedCudaArgmax {
     context: Rc<CudaContextInner>,
+    result: DeviceBuffer,
+}
+
+/// Bounded top-k/top-p workspace and result. It never owns logits or RNG
+/// state; both remain part of the caller's graph/session contract.
+pub struct PreparedCudaTopKTopPSampler {
+    context: Rc<CudaContextInner>,
+    max_values: usize,
+    scratch: DeviceBuffer,
     result: DeviceBuffer,
 }
 
@@ -1077,6 +1098,17 @@ impl CudaCandidateRuntime {
                 return Err(error);
             }
         };
+        let topk_topp_sample_f32_function =
+            match resolve_function(&driver, module, TOPK_TOPP_SAMPLE_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         Ok(Self {
             inner: Rc::new(CudaContextInner {
                 driver,
@@ -1105,6 +1137,7 @@ impl CudaCandidateRuntime {
                 demote_paged_kv_q4_to_q2_function,
                 paged_q2q4_gqa_f32_function,
                 argmax_f32_function,
+                topk_topp_sample_f32_function,
                 device_name,
                 compute_capability,
                 token_submission_active: Cell::new(false),
@@ -1113,6 +1146,7 @@ impl CudaCandidateRuntime {
                 deferred_operator_synchronizations: Cell::new(0),
                 context_synchronizations: Cell::new(0),
                 device_argmax_launches: Cell::new(0),
+                device_sampling_launches: Cell::new(0),
             }),
         })
     }
@@ -1124,6 +1158,7 @@ impl CudaCandidateRuntime {
             deferred_operator_synchronizations: self.inner.deferred_operator_synchronizations.get(),
             context_synchronizations: self.inner.context_synchronizations.get(),
             device_argmax_launches: self.inner.device_argmax_launches.get(),
+            device_sampling_launches: self.inner.device_sampling_launches.get(),
         }
     }
 
@@ -1244,6 +1279,26 @@ impl CudaCandidateRuntime {
         })
     }
 
+    pub fn prepare_topk_topp_sampler(
+        &self,
+        max_values: usize,
+    ) -> Result<PreparedCudaTopKTopPSampler> {
+        if max_values == 0 || u32::try_from(max_values).is_err() {
+            return Err(EngineError::Shape(
+                "CUDA sampler capacity must be positive and fit u32".into(),
+            ));
+        }
+        let scratch_bytes = max_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA sampler scratch overflows".into()))?;
+        Ok(PreparedCudaTopKTopPSampler {
+            context: Rc::clone(&self.inner),
+            max_values,
+            scratch: DeviceBuffer::allocate(self, scratch_bytes)?,
+            result: DeviceBuffer::allocate(self, 4 * std::mem::size_of::<u32>())?,
+        })
+    }
+
     /// Sampling-adjacent greedy selection over an already resident finite f32
     /// distribution. Only the selected local index crosses the device boundary.
     pub fn dispatch_argmax_f32_device(
@@ -1295,6 +1350,124 @@ impl CudaCandidateRuntime {
             .device_argmax_launches
             .set(self.inner.device_argmax_launches.get().saturating_add(1));
         Ok(host[0])
+    }
+
+    /// Verifier-only bounded top-k/top-p selection over an already resident
+    /// finite f32 distribution. The caller supplies the canonical PCG draw;
+    /// only the selected token and compact evidence cross the boundary.
+    pub fn dispatch_topk_topp_sample_f32_device(
+        &self,
+        prepared: &PreparedCudaTopKTopPSampler,
+        values: CudaDeviceF32View<'_>,
+        config: SamplerConfig,
+        draw: f32,
+    ) -> Result<CudaSampledToken> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) || !Rc::ptr_eq(&self.inner, values.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA sampler crosses driver contexts".into(),
+            ));
+        }
+        if values.values() == 0 || values.values() > prepared.max_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA sampler received {} logits, capacity is {}",
+                values.values(),
+                prepared.max_values
+            )));
+        }
+        if !config.temperature.is_finite() || config.temperature <= 0.0 {
+            return Err(EngineError::InvalidArtifact(
+                "CUDA stochastic sampling requires a finite positive temperature".into(),
+            ));
+        }
+        if config.top_k == 0 || config.top_k > CUDA_SAMPLER_MAX_TOP_K {
+            return Err(EngineError::UnsupportedOperation {
+                backend: "cuda",
+                operation: "top-k/top-p sampling",
+                reason: format!(
+                    "verifier candidate requires top_k in 1..={CUDA_SAMPLER_MAX_TOP_K}"
+                ),
+            });
+        }
+        if !config.top_p.is_finite() || !(0.0..=1.0).contains(&config.top_p) || config.top_p == 0.0
+        {
+            return Err(EngineError::InvalidArtifact(
+                "CUDA top_p must be in (0, 1]".into(),
+            ));
+        }
+        if !draw.is_finite() || !(0.0..1.0).contains(&draw) {
+            return Err(EngineError::InvalidArtifact(
+                "CUDA sampler draw must be finite and in [0, 1)".into(),
+            ));
+        }
+        let inverse_temperature = config.temperature.recip();
+        if !inverse_temperature.is_finite() {
+            return Err(EngineError::InvalidArtifact(
+                "CUDA inverse temperature must be finite".into(),
+            ));
+        }
+
+        let mut input = values.ptr()?;
+        let mut scratch = prepared.scratch.ptr();
+        let mut result = prepared.result.ptr();
+        let mut count = cuda_u32(values.values(), "CUDA sampler value count")?;
+        let mut top_k = cuda_u32(config.top_k, "CUDA sampler top_k")?;
+        let mut top_p = config.top_p;
+        let mut draw = draw;
+        let mut inverse_temperature = inverse_temperature;
+        let mut params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut scratch as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut result as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut count as *mut u32).cast::<c_void>(),
+            (&mut top_k as *mut u32).cast::<c_void>(),
+            (&mut inverse_temperature as *mut f32).cast::<c_void>(),
+            (&mut top_p as *mut f32).cast::<c_void>(),
+            (&mut draw as *mut f32).cast::<c_void>(),
+        ];
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.topk_topp_sample_f32_function,
+                    1,
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "top-k/top-p sampler launch",
+            )?;
+        }
+        self.synchronize_after_launch("top-k/top-p sampler context synchronization")?;
+        let mut host = [0_u32; 4];
+        prepared.result.copy_to(as_bytes_mut(&mut host))?;
+        let expected_top_k = top_k.min(count);
+        let nucleus_total = f32::from_bits(host[3]);
+        if host[1] != 0
+            || host[0] >= count
+            || host[2] == 0
+            || host[2] > expected_top_k
+            || !nucleus_total.is_finite()
+            || nucleus_total <= 0.0
+        {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA sampler rejected logits or produced invalid evidence (status={}, token={}, nucleus_len={}, nucleus_total={nucleus_total})",
+                host[1], host[0], host[2]
+            )));
+        }
+        self.inner
+            .device_sampling_launches
+            .set(self.inner.device_sampling_launches.get().saturating_add(1));
+        Ok(CudaSampledToken {
+            token: host[0],
+            nucleus_len: host[2],
+            nucleus_total,
+        })
     }
 
     pub fn prepare_f32_checkpoint(&self, values: usize) -> Result<PreparedCudaF32Checkpoint> {
@@ -4607,6 +4780,16 @@ impl PreparedCudaGatheredA8Projection {
 impl PreparedCudaArgmax {
     pub fn resident_bytes(&self) -> usize {
         self.result.len()
+    }
+}
+
+impl PreparedCudaTopKTopPSampler {
+    pub fn max_values(&self) -> usize {
+        self.max_values
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.scratch.len() + self.result.len()
     }
 }
 

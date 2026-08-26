@@ -19,3 +19,17 @@ Per-file SHA-256 digests, purposes, and the list of required upstream
 includes deliberately NOT vendored (with reasons) are recorded in
 UPSTREAM.json. These files are correctness-baseline reference material;
 they are not compiled into the crate. See docs/CUDA_KERNEL_NOTES.md.
+
+CUDA sampling reference material vendored from TensorRT-LLM
+============================================================
+
+Source:     https://github.com/NVIDIA/TensorRT-LLM
+Revision:   8bde0105047a8fbf7599f22494f95b5a88dae907 (pinned, immutable)
+License:    Apache License 2.0, Copyright (c) 2019-2026 NVIDIA CORPORATION
+            and affiliates; samplingTopKKernels.cu also credits NAVER Corp.
+            (full text under tensorrt_llm/LICENSE)
+
+The two byte-identical reference files and their SHA-256 digests are recorded
+in tensorrt_llm/UPSTREAM.json. They are not compiled into the crate. CTOX's
+model-local candidate retains exact source anchors and uses only the direct
+CUDA Driver API.

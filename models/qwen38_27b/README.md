@@ -259,8 +259,10 @@ hardware verifier replays an identical checkpoint through both head variants
 and requires all 40,000 logits to match bit-for-bit. Its complete hardware run,
 quality gates, and roofline promotion remain open. Greedy MTP decisions now
 come from a finite-checking device argmax and are compared with the host oracle;
-the stable verifier ABI still returns compact logits, and stochastic device
-sampling remains open. For IPC
+the stable verifier ABI still returns compact logits. A pinned-TensorRT-derived
+top-k/top-p candidate now accepts canonical caller-supplied RNG draws without
+host logit readback; its same-device parity run, executor integration,
+unrestricted top-p, and stochastic MTP rejection sampling remain open. For IPC
 verification, a sendable adapter
 owns this deliberately thread-affine CUDA executor on one dedicated worker;
 the socket threads exchange typed commands and never move driver objects.

@@ -1261,3 +1261,149 @@ void ctox_argmax_f32_sm86(const float* __restrict__ values,
         result[0] = indices[0];
     }
 }
+
+// Single-request bounded top-k/top-p sampling over resident target logits.
+// The upstream two-stage implementation first copies logits into mutable
+// workspace, repeatedly reduces the next top-k item, then applies exponential
+// weights and a random cumulative threshold. This adaptation preserves that
+// ordering while specializing away batching, framework state and CURAND: the
+// caller supplies one canonical unit-interval draw so every backend can share
+// the same seeded RNG contract. `result` is {token, status, nucleus_len,
+// nucleus_total_bits}; status zero is the only successful result.
+//
+// This is an unpromoted candidate with a hard top-k ceiling of 256. top_k=0
+// and larger values fail closed until the separately planned full-vocabulary
+// AirTopP path is available.
+// ref: tensorrt_llm/cpp/tensorrt_llm/kernels/samplingTopKKernels.cu:69-129
+// ref: tensorrt_llm/cpp/tensorrt_llm/kernels/samplingTopKKernels.cu:132-234
+// ref: tensorrt_llm/cpp/tensorrt_llm/common/reduceKernelUtils.cuh:386-412
+extern "C" __global__ __launch_bounds__(256, 1)
+void ctox_topk_topp_sample_f32_sm86(const float* __restrict__ values,
+                                    float* __restrict__ scratch,
+                                    unsigned* __restrict__ result,
+                                    unsigned count,
+                                    unsigned top_k,
+                                    float inverse_temperature,
+                                    float top_p,
+                                    float draw) {
+    __shared__ unsigned ordered_keys[256];
+    __shared__ unsigned indices[256];
+    __shared__ unsigned selected_indices[256];
+    __shared__ float selected_logits[256];
+
+    if (threadIdx.x == 0u) {
+        result[0] = 0u;
+        result[1] = 0u;
+        result[2] = 0u;
+        result[3] = 0u;
+        if (count == 0u || top_k == 0u || top_k > 256u
+            || !isfinite(inverse_temperature) || inverse_temperature <= 0.0f
+            || !isfinite(top_p) || top_p <= 0.0f || top_p > 1.0f
+            || !isfinite(draw) || draw < 0.0f || draw >= 1.0f) {
+            result[1] = 1u;
+        }
+    }
+    __syncthreads();
+    if (result[1] != 0u) {
+        return;
+    }
+
+    for (unsigned index = threadIdx.x; index < count; index += blockDim.x) {
+        const float value = values[index];
+        const float scaled = value * inverse_temperature;
+        if (!isfinite(value) || !isfinite(scaled)) {
+            atomicOr(result + 1, 2u);
+        }
+        scratch[index] = scaled;
+    }
+    __syncthreads();
+    if (result[1] != 0u) {
+        return;
+    }
+
+    const unsigned selected_count = min(top_k, count);
+    for (unsigned rank = 0u; rank < selected_count; ++rank) {
+        unsigned best_key = 0u;
+        unsigned best_index = 0u;
+        bool has_value = false;
+        for (unsigned index = threadIdx.x; index < count; index += blockDim.x) {
+            const float value = scratch[index];
+            const unsigned bits = __float_as_uint(value);
+            const unsigned sign_mask = (bits & 0x80000000u) == 0u
+                ? 0u : 0xffffffffu;
+            const unsigned key = bits ^ (sign_mask | 0x80000000u);
+            if (!has_value || key > best_key
+                || (key == best_key && index > best_index)) {
+                best_key = key;
+                best_index = index;
+                has_value = true;
+            }
+        }
+        ordered_keys[threadIdx.x] = has_value ? best_key : 0u;
+        indices[threadIdx.x] = has_value ? best_index : 0u;
+        __syncthreads();
+
+        for (unsigned width = blockDim.x / 2u; width != 0u; width >>= 1u) {
+            if (threadIdx.x < width) {
+                const unsigned candidate_key = ordered_keys[threadIdx.x + width];
+                const unsigned candidate_index = indices[threadIdx.x + width];
+                if (candidate_key > ordered_keys[threadIdx.x]
+                    || (candidate_key == ordered_keys[threadIdx.x]
+                        && candidate_index > indices[threadIdx.x])) {
+                    ordered_keys[threadIdx.x] = candidate_key;
+                    indices[threadIdx.x] = candidate_index;
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0u) {
+            const unsigned selected = indices[0];
+            selected_indices[rank] = selected;
+            selected_logits[rank] = scratch[selected];
+            scratch[selected] = __uint_as_float(0xff800000u);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0u) {
+        const float maximum = selected_logits[0];
+        float normalization = 0.0f;
+        for (unsigned rank = 0u; rank < selected_count; ++rank) {
+            const float weight = expf(selected_logits[rank] - maximum);
+            selected_logits[rank] = weight;
+            normalization += weight;
+        }
+        const float nucleus_threshold = top_p * normalization;
+        float cumulative = 0.0f;
+        unsigned nucleus_len = selected_count;
+        for (unsigned rank = 0u; rank < selected_count; ++rank) {
+            cumulative += selected_logits[rank];
+            if (cumulative >= nucleus_threshold) {
+                nucleus_len = rank + 1u;
+                break;
+            }
+        }
+        float nucleus_total = 0.0f;
+        for (unsigned rank = 0u; rank < nucleus_len; ++rank) {
+            nucleus_total += selected_logits[rank];
+        }
+        const float sample_threshold = draw * nucleus_total;
+        cumulative = 0.0f;
+        unsigned sampled = selected_indices[nucleus_len - 1u];
+        for (unsigned rank = 0u; rank < nucleus_len; ++rank) {
+            cumulative += selected_logits[rank];
+            if (sample_threshold <= cumulative) {
+                sampled = selected_indices[rank];
+                break;
+            }
+        }
+        if (!isfinite(normalization) || normalization <= 0.0f
+            || !isfinite(nucleus_total) || nucleus_total <= 0.0f) {
+            result[1] = 4u;
+            return;
+        }
+        result[0] = sampled;
+        result[2] = nucleus_len;
+        result[3] = __float_as_uint(nucleus_total);
+    }
+}

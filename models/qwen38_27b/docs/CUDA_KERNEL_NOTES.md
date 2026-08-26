@@ -368,6 +368,21 @@ stable engine ABI, but the token used for the next speculative transition is
 the device result. Removing those verifier distributions and implementing
 probability-correct stochastic device sampling remain separate ABI work.
 
+A separate bounded stochastic candidate now derives the repeated top-k
+reduction, exponential weighting, nucleus boundary, and cumulative random
+threshold from the pinned Apache-2.0 TensorRT-LLM sampling stages. It consumes
+one resident finite-f32 distribution plus a caller-supplied canonical
+unit-interval draw and returns only the token and compact nucleus evidence.
+The direct Driver-API workspace is fixed at one f32 per admitted logit plus 16
+result bytes; no TensorRT runtime, CUDA Runtime API, CURAND allocation, or
+framework allocator is linked. The candidate deliberately rejects `top_k=0`
+and values above 256 until the full-vocabulary AirTopP path exists.
+`qwen38-cuda-sampling-verify` compares exact token decisions with the shared
+Rust sampler over full-tokenizer, tie, and wide-nucleus fixtures and proves
+workspace reclamation. Its GPU3 evidence is still pending, and even a passing
+primitive does not yet provide stochastic MTP accept/reject or production ABI
+integration.
+
 The Unix-socket service cannot move the private driver context among its
 connection threads. `ThreadedCudaModelExecutor` therefore creates the
 `CudaModelExecutor` inside one named worker and sends typed lifecycle commands

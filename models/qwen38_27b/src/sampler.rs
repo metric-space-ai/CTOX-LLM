@@ -43,9 +43,25 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> Result<usize> {
+        if self.config.temperature == 0.0 {
+            return self.sample_with_draw(logits, 0.0);
+        }
+        let draw = self.rng.next_f32();
+        self.sample_with_draw(logits, draw)
+    }
+
+    /// Deterministic sampling entry point used by accelerator parity
+    /// verifiers. `draw` is a canonical unit-interval RNG value and does not
+    /// advance this sampler's PCG state.
+    pub fn sample_with_draw(&self, logits: &[f32], draw: f32) -> Result<usize> {
         if logits.is_empty() || logits.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidArtifact(
                 "sampler logits are empty or non-finite".into(),
+            ));
+        }
+        if !draw.is_finite() || !(0.0..1.0).contains(&draw) {
+            return Err(EngineError::InvalidArtifact(
+                "sampler draw must be finite and in [0, 1)".into(),
             ));
         }
         if self.config.temperature == 0.0 {
@@ -57,12 +73,28 @@ impl Sampler {
                 .0);
         }
 
+        let inverse_temperature = self.config.temperature.recip();
+        if !inverse_temperature.is_finite() {
+            return Err(EngineError::InvalidArtifact(
+                "sampler inverse temperature must be finite".into(),
+            ));
+        }
         let mut candidates: Vec<(usize, f32)> = logits
             .iter()
             .enumerate()
-            .map(|(token, logit)| (token, *logit / self.config.temperature))
+            .map(|(token, logit)| (token, *logit * inverse_temperature))
             .collect();
-        candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+        if candidates.iter().any(|(_, value)| !value.is_finite()) {
+            return Err(EngineError::InvalidArtifact(
+                "sampler temperature produced non-finite scaled logits".into(),
+            ));
+        }
+        candidates.sort_unstable_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| right.0.cmp(&left.0))
+        });
         if self.config.top_k > 0 {
             candidates.truncate(self.config.top_k.min(candidates.len()));
         }
@@ -74,26 +106,28 @@ impl Sampler {
                 *value
             })
             .sum();
-        for (_, probability) in &mut candidates {
-            *probability /= normalization;
+        if !normalization.is_finite() || normalization <= 0.0 {
+            return Err(EngineError::InvalidArtifact(
+                "sampler probability normalization is invalid".into(),
+            ));
         }
 
         let mut cumulative = 0.0_f32;
         let mut nucleus_len = candidates.len();
         for (index, (_, probability)) in candidates.iter().enumerate() {
             cumulative += *probability;
-            if cumulative >= self.config.top_p {
+            if cumulative >= self.config.top_p * normalization {
                 nucleus_len = index + 1;
                 break;
             }
         }
         candidates.truncate(nucleus_len);
         let nucleus_total: f32 = candidates.iter().map(|(_, probability)| probability).sum();
-        let draw = self.rng.next_f32() * nucleus_total;
+        let threshold = draw * nucleus_total;
         let mut cumulative = 0.0_f32;
         for (token, probability) in &candidates {
             cumulative += *probability;
-            if draw <= cumulative {
+            if threshold <= cumulative {
                 return Ok(*token);
             }
         }
@@ -156,5 +190,55 @@ mod tests {
         let left_sequence: Vec<_> = (0..32).map(|_| left.sample(&logits).unwrap()).collect();
         let right_sequence: Vec<_> = (0..32).map(|_| right.sample(&logits).unwrap()).collect();
         assert_eq!(left_sequence, right_sequence);
+    }
+
+    #[test]
+    fn explicit_draw_is_replayable_without_advancing_rng() {
+        let mut sampler = Sampler::new(SamplerConfig {
+            temperature: 0.8,
+            top_k: 4,
+            top_p: 0.9,
+            seed: 17,
+        })
+        .unwrap();
+        let logits = [-0.5, 0.25, 1.5, 0.75];
+        let left = sampler.sample_with_draw(&logits, 0.625).unwrap();
+        let right = sampler.sample_with_draw(&logits, 0.625).unwrap();
+        assert_eq!(left, right);
+
+        let first_seeded = sampler.sample(&logits).unwrap();
+        let mut fresh = Sampler::new(SamplerConfig {
+            temperature: 0.8,
+            top_k: 4,
+            top_p: 0.9,
+            seed: 17,
+        })
+        .unwrap();
+        assert_eq!(first_seeded, fresh.sample(&logits).unwrap());
+    }
+
+    #[test]
+    fn tied_candidates_use_the_later_token_like_greedy_argmax() {
+        let sampler = Sampler::new(SamplerConfig {
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+            seed: 0,
+        })
+        .unwrap();
+        assert_eq!(sampler.sample_with_draw(&[2.0, 2.0], 0.0).unwrap(), 1);
+    }
+
+    #[test]
+    fn explicit_draw_and_scaled_logits_fail_closed() {
+        let sampler = Sampler::new(SamplerConfig {
+            temperature: f32::from_bits(1),
+            top_k: 2,
+            top_p: 1.0,
+            seed: 0,
+        })
+        .unwrap();
+        assert!(sampler.sample_with_draw(&[1.0, 0.0], 0.5).is_err());
+        assert!(sampler.sample_with_draw(&[1.0], 1.0).is_err());
     }
 }
