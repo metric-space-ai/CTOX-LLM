@@ -24,6 +24,7 @@ usage, no scalar fallback.
 | `q4_b64_recovered_row` | Q4_B64 embedding row | one packed byte/two corrected outputs per thread |
 | `qwen_rms_norm_1p_f32` | FP16 weight, f32 activation | one 32-wide simdgroup per row |
 | `qwen_partial_rope_f32` | f32 Q/K heads in place | one thread per non-interleaved rotary pair |
+| `qwen_paged_q2q4_gqa_decode_f32` | f32 query/output, packed Q2/Q4 K/V | one 32-wide simdgroup per query head |
 
 64 values per block, row-major block order, codebook matching
 `src/quant.rs` (Q2: {-1, -1/3, 1/3, 1}; Q4: (code - 7.5) / 7.5). Q3 does not
@@ -128,6 +129,24 @@ pairs with the pinned reference equation, retains those 256 bytes in reusable
 Metal buffers, and performs all head rotations on the GPU. Updating position
 rewrites only these tables and the 32-byte parameter block.
 
+The decode-only grouped-query-attention candidate keeps persistent K/V pages
+packed on the Metal device. Logical pages have deterministic Q2 arena slots;
+a bounded Q4 arena holds only sink pages, recent pages, and one
+precision-boundary page. One 16-byte descriptor per logical page selects the
+arena and physical slot. Stable three-pass softmax decodes Q2/Q4 blocks
+directly into registers and never creates an f32 K/V device cache. An append
+uploads only its changed page plus any page crossing the Q4-to-Q2 boundary.
+
+For the frozen 24-query-head/4-KV-head/256-wide topology, a token contains
+2,048 combined K/V values: 576 Q2 bytes or 1,088 Q4 bytes. A 128K layer with
+128-token pages, 128 sink tokens, and 256 recent tokens reserves 75,497,472
+Q2-arena bytes, 557,056 Q4-arena bytes, and 16,384 descriptor bytes:
+76,070,912 bytes (72.546875 MiB) per GQA layer and 1,217,134,592 bytes
+(1.133545 GiB) across all 16 attention layers. The verifier currently retains
+a CPU packed mirror for deterministic page transitions; that duplicate is not
+included in these device figures and must be eliminated by GPU-side packing
+and demotion before promotion.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -181,6 +200,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   12,345, encodes Q and K in one command, checks every value against the
   scalar oracle, proves every non-rotary tail value is bit-identical, rejects
   invalid contracts, and reuses buffers at position zero.
+- `paged_q2q4_gqa_decode_matches_quantized_oracle_and_demotes_pages` forces a
+  Q4-to-Q2 page transition, compares every decode step with the scalar GQA
+  oracle using the identical quantized cache, verifies bounded arena byte
+  counts, and proves reset/reuse without an f32 device cache.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
@@ -223,8 +246,10 @@ dequantization array before this source was accepted.
   evidence.
 - No controlled size/residue/thermal sweep or hardware-counter roofline
   evidence exists yet.
-- Recovered embedding rows, Qwen RMSNorm, and partial RoPE exist as verifier
-  candidates; no full GQA attention, GatedDeltaNet, MTP block, sampling, or
-  complete model-graph Metal execution exists yet.
+- Recovered embedding rows, Qwen RMSNorm, partial RoPE, and packed decode GQA
+  exist as verifier candidates. GQA still duplicates its packed pages in a
+  CPU correctness mirror and has no controlled performance evidence.
+  GatedDeltaNet, the MTP block, sampling, and complete model-graph Metal
+  execution do not exist yet.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

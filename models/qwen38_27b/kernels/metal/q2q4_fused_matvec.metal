@@ -62,6 +62,28 @@ struct PartialRopeParams {
     uint reserved2;
 };
 
+struct PagedKvDescriptor {
+    uint precision;             // 0 = Q2_B64, 1 = Q4_B64
+    uint physical_slot;         // arena slot for this logical page
+    uint tokens;                // populated tokens in this page
+    uint first_token;           // global token index of page start
+};
+
+struct PagedGqaParams {
+    uint query_heads;
+    uint key_value_heads;
+    uint head_dim;
+    uint tokens;
+    uint page_tokens;
+    uint page_count;
+    uint combined_values;       // [all K heads, all V heads] per token
+    uint q2_token_bytes;
+    uint q4_token_bytes;
+    uint q2_page_bytes;
+    uint q4_page_bytes;
+    float scale;
+};
+
 inline float apply_activation(float value, uint activation) {
     if (activation == 1u) {
         // SiLU: x / (1 + exp(-x)), matching the Rust oracle.
@@ -79,6 +101,35 @@ inline float q2_normalized(uint code) {
     // Exact src/quant.rs code order: {-1, -1/3, 1/3, 1}. The four values
     // form an affine sequence, so this avoids a lane-divergent select chain.
     return fma(float(code), 2.0f / 3.0f, -1.0f);
+}
+
+inline float decode_paged_kv(device const uchar* q2_pages,
+                             device const uchar* q4_pages,
+                             device const PagedKvDescriptor& descriptor,
+                             uint token_in_page,
+                             uint value_index,
+                             constant PagedGqaParams& params) {
+    if (descriptor.precision == 0u) {
+        device const uchar* token_base = q2_pages
+            + ulong(descriptor.physical_slot) * params.q2_page_bytes
+            + ulong(token_in_page) * params.q2_token_bytes;
+        uint block = value_index / Q2Q4_BLOCK_LEN;
+        uint index = value_index - block * Q2Q4_BLOCK_LEN;
+        device const uchar* block_base = token_base + ulong(block) * Q2_BLOCK_BYTES;
+        uint packed = uint(block_base[2u + index / 4u]);
+        uint code = (packed >> ((index & 3u) * 2u)) & 3u;
+        return read_scale(block_base) * q2_normalized(code);
+    }
+
+    device const uchar* token_base = q4_pages
+        + ulong(descriptor.physical_slot) * params.q4_page_bytes
+        + ulong(token_in_page) * params.q4_token_bytes;
+    uint block = value_index / Q2Q4_BLOCK_LEN;
+    uint index = value_index - block * Q2Q4_BLOCK_LEN;
+    device const uchar* block_base = token_base + ulong(block) * Q4_BLOCK_BYTES;
+    uint packed = uint(block_base[2u + index / 2u]);
+    uint code = (packed >> ((index & 1u) * 4u)) & 15u;
+    return read_scale(block_base) * (float(code) - 7.5f) * (1.0f / 7.5f);
 }
 
 constant uint ROWS_PER_SIMDGROUP = 4;
@@ -490,4 +541,82 @@ kernel void qwen_partial_rope_f32(
     float right = values[base + index + half_dim];
     values[base + index] = left * cosine[index] - right * sine[index];
     values[base + index + half_dim] = right * cosine[index] + left * sine[index];
+}
+
+// Decode-only grouped-query attention over a persistent mixed Q2/Q4 paged
+// cache. One 32-wide simdgroup owns one query head. The cache is never
+// expanded to f32: each key/value is decoded from its packed block directly
+// into registers for the score and value reductions.
+kernel void qwen_paged_q2q4_gqa_decode_f32(
+    device const float* query [[buffer(0)]],
+    device const uchar* q2_pages [[buffer(1)]],
+    device const uchar* q4_pages [[buffer(2)]],
+    device const PagedKvDescriptor* descriptors [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant PagedGqaParams& params [[buffer(5)]],
+    uint query_head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (query_head >= params.query_heads || params.tokens == 0u) {
+        return;
+    }
+
+    uint query_heads_per_kv = params.query_heads / params.key_value_heads;
+    uint key_value_head = query_head / query_heads_per_kv;
+    uint query_base = query_head * params.head_dim;
+    uint key_base = key_value_head * params.head_dim;
+    uint value_base = params.combined_values / 2u + key_base;
+
+    float maximum = -3.402823466e+38f;
+    for (uint page = 0u; page < params.page_count; ++page) {
+        device const PagedKvDescriptor& descriptor = descriptors[page];
+        for (uint token = 0u; token < descriptor.tokens; ++token) {
+            float partial = 0.0f;
+            for (uint dim = lane; dim < params.head_dim; dim += 32u) {
+                partial += query[query_base + dim]
+                    * decode_paged_kv(q2_pages, q4_pages, descriptor, token,
+                                      key_base + dim, params);
+            }
+            maximum = max(maximum, simd_sum(partial) * params.scale);
+        }
+    }
+
+    float denominator = 0.0f;
+    for (uint page = 0u; page < params.page_count; ++page) {
+        device const PagedKvDescriptor& descriptor = descriptors[page];
+        for (uint token = 0u; token < descriptor.tokens; ++token) {
+            float partial = 0.0f;
+            for (uint dim = lane; dim < params.head_dim; dim += 32u) {
+                partial += query[query_base + dim]
+                    * decode_paged_kv(q2_pages, q4_pages, descriptor, token,
+                                      key_base + dim, params);
+            }
+            denominator += exp(simd_sum(partial) * params.scale - maximum);
+        }
+    }
+
+    float accumulated[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint page = 0u; page < params.page_count; ++page) {
+        device const PagedKvDescriptor& descriptor = descriptors[page];
+        for (uint token = 0u; token < descriptor.tokens; ++token) {
+            float partial = 0.0f;
+            for (uint dim = lane; dim < params.head_dim; dim += 32u) {
+                partial += query[query_base + dim]
+                    * decode_paged_kv(q2_pages, q4_pages, descriptor, token,
+                                      key_base + dim, params);
+            }
+            float probability = exp(simd_sum(partial) * params.scale - maximum)
+                / denominator;
+            for (uint slot = 0u; slot < params.head_dim / 32u; ++slot) {
+                uint dim = lane + slot * 32u;
+                accumulated[slot] += probability
+                    * decode_paged_kv(q2_pages, q4_pages, descriptor, token,
+                                      value_base + dim, params);
+            }
+        }
+    }
+
+    for (uint slot = 0u; slot < params.head_dim / 32u; ++slot) {
+        uint dim = lane + slot * 32u;
+        output[query_base + dim] = accumulated[slot];
+    }
 }

@@ -17,21 +17,24 @@ use sha2::{Digest, Sha256};
 
 use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row, MetalBufferAbi,
-    MetalFusedMatVecParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
-    MetalRmsNormBufferAbi, MetalRmsNormParams, MAX_SIMDGROUPS_PER_THREADGROUP,
-    PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
-    Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
-    Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
+    MetalFusedMatVecParams, MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi,
+    MetalPartialRopeParams, MetalRmsNormBufferAbi, MetalRmsNormParams,
+    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
+    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
+    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
 };
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
+use crate::kv_cache::{KvPrecision, PagedKvCache};
 use crate::loader::{FloatTensorView, ModelArtifact, RecoveredMatrixView};
+use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
 
 const KERNEL_SOURCE: &str = include_str!("../../kernels/metal/q2q4_fused_matvec.metal");
 const MAX_THREADS_PER_GROUP: usize = MAX_SIMDGROUPS_PER_THREADGROUP * 32;
 const DEFAULT_SIMDGROUPS: usize = 2;
 const ROWS_PER_SIMDGROUP: usize = 4;
+const METAL_PAGED_KV_DESCRIPTOR_BYTES: usize = 16;
 
 /// An explicitly verifier-only Metal runtime owning compiled MSL pipelines.
 ///
@@ -50,6 +53,7 @@ pub struct MetalCandidateRuntime {
     q4_recovered_row_pipeline: ComputePipelineState,
     rms_norm_1p_pipeline: ComputePipelineState,
     partial_rope_pipeline: ComputePipelineState,
+    paged_gqa_decode_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -213,6 +217,45 @@ pub struct PreparedMetalPartialRope {
     sine_buffer: Buffer,
     params_buffer: Buffer,
     transient_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalPagedGqaConfig {
+    pub query_heads: usize,
+    pub key_value_heads: usize,
+    pub head_dim: usize,
+    pub maximum_tokens: usize,
+    pub page_tokens: usize,
+    pub sink_tokens: usize,
+    pub recent_tokens: usize,
+}
+
+/// Decode-only grouped-query attention retaining K/V pages in their packed
+/// Q2/Q4 representation. The Q2 arena has one deterministic slot per logical
+/// page; the bounded Q4 arena retains only sink, recent, and one boundary page.
+pub struct PreparedMetalPagedGqa {
+    query_heads: usize,
+    key_value_heads: usize,
+    head_dim: usize,
+    maximum_tokens: usize,
+    page_tokens: usize,
+    q2_token_bytes: usize,
+    q4_token_bytes: usize,
+    q2_page_bytes: usize,
+    q4_page_bytes: usize,
+    q4_slots: usize,
+    cache: PagedKvCache,
+    page_to_q4_slot: Vec<Option<usize>>,
+    free_q4_slots: Vec<usize>,
+    q2_pages_buffer: Buffer,
+    q4_pages_buffer: Buffer,
+    descriptors_buffer: Buffer,
+    query_buffer: Buffer,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    packed_device_bytes: usize,
+    transient_bytes: usize,
+    poisoned: bool,
 }
 
 impl PreparedMetalMatVec {
@@ -511,6 +554,63 @@ impl PreparedMetalPartialRope {
     }
 }
 
+impl PreparedMetalPagedGqa {
+    pub fn tokens(&self) -> usize {
+        self.cache.tokens()
+    }
+
+    pub fn maximum_tokens(&self) -> usize {
+        self.maximum_tokens
+    }
+
+    /// Fixed packed arenas plus the small descriptor table. No f32 K/V cache
+    /// is allocated on the device.
+    pub fn packed_device_bytes(&self) -> usize {
+        self.packed_device_bytes
+    }
+
+    pub fn q2_arena_bytes(&self) -> usize {
+        self.q2_page_bytes * self.page_to_q4_slot.len()
+    }
+
+    pub fn q4_arena_bytes(&self) -> usize {
+        self.q4_page_bytes * self.q4_slots
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    /// Verifier-only CPU packed mirror used to produce deterministic page
+    /// transitions. A production graph must replace this with GPU packing and
+    /// demotion before this candidate can be promoted.
+    pub fn verifier_cpu_packed_bytes(&self) -> usize {
+        self.cache.packed_bytes()
+    }
+
+    pub fn reset(&mut self) {
+        self.cache.reset();
+        self.page_to_q4_slot.fill(None);
+        self.free_q4_slots = (0..self.q4_slots).rev().collect();
+        zero_buffer(&self.q2_pages_buffer, self.q2_arena_bytes());
+        zero_buffer(&self.q4_pages_buffer, self.q4_arena_bytes());
+        zero_buffer(
+            &self.descriptors_buffer,
+            self.page_to_q4_slot.len() * METAL_PAGED_KV_DESCRIPTOR_BYTES,
+        );
+        zero_buffer(
+            &self.query_buffer,
+            self.query_heads * self.head_dim * std::mem::size_of::<f32>(),
+        );
+        zero_buffer(
+            &self.output_buffer,
+            self.query_heads * self.head_dim * std::mem::size_of::<f32>(),
+        );
+        zero_buffer(&self.params_buffer, MetalPagedGqaParams::BYTE_LEN);
+        self.poisoned = false;
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -579,6 +679,13 @@ impl MetalCandidateRuntime {
                     "Metal Qwen partial-RoPE function lookup failed: {message}"
                 ))
             })?;
+        let paged_gqa_decode_function = library
+            .get_function(PAGED_GQA_DECODE_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal paged GQA function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -637,6 +744,19 @@ impl MetalCandidateRuntime {
                     "Metal Qwen partial-RoPE pipeline creation failed: {message}"
                 ))
             })?;
+        let paged_gqa_decode_pipeline = device
+            .new_compute_pipeline_state_with_function(&paged_gqa_decode_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal paged GQA pipeline creation failed: {message}"
+                ))
+            })?;
+        if paged_gqa_decode_pipeline.thread_execution_width() != 32 {
+            return Err(EngineError::InvalidState(format!(
+                "Metal paged GQA requires a 32-wide simdgroup, device reports {}",
+                paged_gqa_decode_pipeline.thread_execution_width()
+            )));
+        }
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -649,6 +769,7 @@ impl MetalCandidateRuntime {
             q4_recovered_row_pipeline,
             rms_norm_1p_pipeline,
             partial_rope_pipeline,
+            paged_gqa_decode_pipeline,
         })
     }
 
@@ -1199,6 +1320,125 @@ impl MetalCandidateRuntime {
             sine_buffer,
             params_buffer,
             transient_bytes,
+        })
+    }
+
+    /// Allocate a verifier-only packed paged GQA cache. Device residency is
+    /// fixed at preparation time so decode never grows or expands K/V tensors
+    /// to f32. The CPU `PagedKvCache` mirror is temporary correctness plumbing
+    /// and remains an explicit promotion blocker.
+    pub fn prepare_paged_gqa_decode(
+        &self,
+        config: MetalPagedGqaConfig,
+    ) -> Result<PreparedMetalPagedGqa> {
+        let MetalPagedGqaConfig {
+            query_heads,
+            key_value_heads,
+            head_dim,
+            maximum_tokens,
+            page_tokens,
+            sink_tokens,
+            recent_tokens,
+        } = config;
+        if query_heads == 0
+            || key_value_heads == 0
+            || !query_heads.is_multiple_of(key_value_heads)
+            || head_dim == 0
+            || head_dim > 256
+            || !head_dim.is_multiple_of(32)
+        {
+            return Err(EngineError::Shape(
+                "invalid Metal paged GQA head geometry".into(),
+            ));
+        }
+        let component_values = key_value_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal KV width overflows".into()))?;
+        let combined_values = component_values
+            .checked_mul(2)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal combined KV width overflows".into()))?;
+        if !combined_values.is_multiple_of(BLOCK_LEN) {
+            return Err(EngineError::Shape(format!(
+                "Metal combined KV width must be a multiple of {BLOCK_LEN}"
+            )));
+        }
+        let cache = PagedKvCache::new(
+            maximum_tokens,
+            component_values,
+            page_tokens,
+            sink_tokens,
+            recent_tokens,
+        )?;
+        let maximum_pages = maximum_tokens.div_ceil(page_tokens);
+        let q2_token_bytes = combined_values
+            .checked_div(BLOCK_LEN)
+            .and_then(|blocks| blocks.checked_mul(Q2_BLOCK_BYTES))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q2 KV token bytes overflow".into()))?;
+        let q4_token_bytes = combined_values
+            .checked_div(BLOCK_LEN)
+            .and_then(|blocks| blocks.checked_mul(Q4_BLOCK_BYTES))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q4 KV token bytes overflow".into()))?;
+        let q2_page_bytes = page_tokens
+            .checked_mul(q2_token_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q2 KV page bytes overflow".into()))?;
+        let q4_page_bytes = page_tokens
+            .checked_mul(q4_token_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q4 KV page bytes overflow".into()))?;
+        let q4_slots = sink_tokens
+            .checked_div(page_tokens)
+            .and_then(|slots| slots.checked_add(recent_tokens.div_ceil(page_tokens)))
+            .and_then(|slots| slots.checked_add(1))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q4 KV slot count overflows".into()))?
+            .clamp(1, maximum_pages);
+        let q2_arena_bytes = maximum_pages
+            .checked_mul(q2_page_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q2 KV arena overflows".into()))?;
+        let q4_arena_bytes = q4_slots
+            .checked_mul(q4_page_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q4 KV arena overflows".into()))?;
+        let descriptor_bytes = maximum_pages
+            .checked_mul(METAL_PAGED_KV_DESCRIPTOR_BYTES)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal KV descriptors overflow".into()))?;
+        let value_bytes = query_heads
+            .checked_mul(head_dim)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal GQA values overflow".into()))?;
+        let packed_device_bytes = q2_arena_bytes
+            .checked_add(q4_arena_bytes)
+            .and_then(|bytes| bytes.checked_add(descriptor_bytes))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal packed KV residency overflows".into())
+            })?;
+        let transient_bytes = value_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(MetalPagedGqaParams::BYTE_LEN))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal GQA transient bytes overflow".into())
+            })?;
+
+        Ok(PreparedMetalPagedGqa {
+            query_heads,
+            key_value_heads,
+            head_dim,
+            maximum_tokens,
+            page_tokens,
+            q2_token_bytes,
+            q4_token_bytes,
+            q2_page_bytes,
+            q4_page_bytes,
+            q4_slots,
+            cache,
+            page_to_q4_slot: vec![None; maximum_pages],
+            free_q4_slots: (0..q4_slots).rev().collect(),
+            q2_pages_buffer: new_zeroed_buffer(&self.device, q2_arena_bytes)?,
+            q4_pages_buffer: new_zeroed_buffer(&self.device, q4_arena_bytes)?,
+            descriptors_buffer: new_zeroed_buffer(&self.device, descriptor_bytes)?,
+            query_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
+            output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
+            params_buffer: new_zeroed_buffer(&self.device, MetalPagedGqaParams::BYTE_LEN)?,
+            packed_device_bytes,
+            transient_bytes,
+            poisoned: false,
         })
     }
 
@@ -1938,6 +2178,250 @@ impl MetalCandidateRuntime {
             .collect()
     }
 
+    /// Append one K/V token to the persistent packed cache and execute one
+    /// decode-only GQA step. There is no CPU attention fallback and no f32 K/V
+    /// allocation. Any failure after cache mutation poisons the prepared state
+    /// until the caller explicitly resets it.
+    pub fn append_and_dispatch_paged_gqa(
+        &self,
+        prepared: &mut PreparedMetalPagedGqa,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<Vec<f32>> {
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "Metal paged GQA state is poisoned; reset is required".into(),
+            ));
+        }
+        let query_values = prepared
+            .query_heads
+            .checked_mul(prepared.head_dim)
+            .ok_or_else(|| EngineError::Shape("Metal GQA query shape overflows".into()))?;
+        let component_values = prepared
+            .key_value_heads
+            .checked_mul(prepared.head_dim)
+            .ok_or_else(|| EngineError::Shape("Metal GQA KV shape overflows".into()))?;
+        validate_metal_input(query, query_values)?;
+        validate_metal_input(key, component_values)?;
+        validate_metal_input(value, component_values)?;
+        if prepared.cache.tokens() >= prepared.maximum_tokens {
+            return Err(EngineError::MemoryBudget(format!(
+                "Metal paged GQA reached {} tokens",
+                prepared.maximum_tokens
+            )));
+        }
+
+        prepared.poisoned = true;
+        let result = self.append_and_dispatch_paged_gqa_inner(prepared, query, key, value);
+        if result.is_ok() {
+            prepared.poisoned = false;
+        }
+        result
+    }
+
+    fn append_and_dispatch_paged_gqa_inner(
+        &self,
+        prepared: &mut PreparedMetalPagedGqa,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<Vec<f32>> {
+        let update = prepared.cache.push(key, value)?;
+
+        for page_index in update.demoted_pages {
+            let page = metal_kv_page_snapshot(&prepared.cache, page_index)?;
+            if page.precision != KvPrecision::Q2 {
+                return Err(EngineError::InvalidState(
+                    "Metal demoted KV page did not become Q2".into(),
+                ));
+            }
+            write_buffer_range(
+                &prepared.q2_pages_buffer,
+                page_index
+                    .checked_mul(prepared.q2_page_bytes)
+                    .ok_or_else(|| EngineError::MemoryBudget("Metal Q2 slot overflows".into()))?,
+                &page.bytes,
+                prepared.q2_arena_bytes(),
+            )?;
+            let slot = prepared.page_to_q4_slot[page_index].take().ok_or_else(|| {
+                EngineError::InvalidState("Metal demoted page has no Q4 arena slot".into())
+            })?;
+            zero_buffer_range(
+                &prepared.q4_pages_buffer,
+                slot.checked_mul(prepared.q4_page_bytes)
+                    .ok_or_else(|| EngineError::MemoryBudget("Metal Q4 slot overflows".into()))?,
+                prepared.q4_page_bytes,
+                prepared.q4_arena_bytes(),
+            )?;
+            prepared.free_q4_slots.push(slot);
+        }
+
+        let current = metal_kv_page_snapshot(&prepared.cache, update.page_index)?;
+        if current.precision != KvPrecision::Q4 {
+            return Err(EngineError::InvalidState(
+                "Metal current KV page is not Q4".into(),
+            ));
+        }
+        let q4_slot = match prepared.page_to_q4_slot[update.page_index] {
+            Some(slot) => slot,
+            None => {
+                let slot = prepared.free_q4_slots.pop().ok_or_else(|| {
+                    EngineError::MemoryBudget(
+                        "Metal bounded Q4 KV arena has no free retention slot".into(),
+                    )
+                })?;
+                prepared.page_to_q4_slot[update.page_index] = Some(slot);
+                slot
+            }
+        };
+        write_buffer_range(
+            &prepared.q4_pages_buffer,
+            q4_slot
+                .checked_mul(prepared.q4_page_bytes)
+                .ok_or_else(|| EngineError::MemoryBudget("Metal Q4 slot overflows".into()))?,
+            &current.bytes,
+            prepared.q4_arena_bytes(),
+        )?;
+
+        let mut descriptor_words = Vec::with_capacity(
+            prepared.cache.page_views().len() * (METAL_PAGED_KV_DESCRIPTOR_BYTES / 4),
+        );
+        for page in prepared.cache.page_views() {
+            let (precision, slot) = match page.precision {
+                KvPrecision::Q2 => (0_u32, page.page_index),
+                KvPrecision::Q4 => (
+                    1_u32,
+                    prepared.page_to_q4_slot[page.page_index].ok_or_else(|| {
+                        EngineError::InvalidState("Metal Q4 page has no arena slot".into())
+                    })?,
+                ),
+            };
+            descriptor_words.extend_from_slice(&[
+                precision,
+                u32::try_from(slot)
+                    .map_err(|_| EngineError::Shape("Metal KV slot exceeds u32".into()))?,
+                u32::try_from(page.tokens)
+                    .map_err(|_| EngineError::Shape("Metal KV page tokens exceed u32".into()))?,
+                u32::try_from(page.first_token)
+                    .map_err(|_| EngineError::Shape("Metal KV token index exceeds u32".into()))?,
+            ]);
+        }
+        let descriptor_bytes = as_bytes(&descriptor_words);
+        write_buffer_range(
+            &prepared.descriptors_buffer,
+            0,
+            descriptor_bytes,
+            prepared.page_to_q4_slot.len() * METAL_PAGED_KV_DESCRIPTOR_BYTES,
+        )?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                query.as_ptr(),
+                prepared.query_buffer.contents().cast::<f32>(),
+                query.len(),
+            );
+        }
+        let page_count = prepared.cache.page_views().len();
+        let combined_values = prepared
+            .key_value_heads
+            .checked_mul(prepared.head_dim)
+            .and_then(|values| values.checked_mul(2))
+            .ok_or_else(|| EngineError::Shape("Metal combined KV width overflows".into()))?;
+        let params = MetalPagedGqaParams {
+            query_heads: usize_to_u32(prepared.query_heads, "Metal GQA query heads")?,
+            key_value_heads: usize_to_u32(prepared.key_value_heads, "Metal GQA KV heads")?,
+            head_dim: usize_to_u32(prepared.head_dim, "Metal GQA head dimension")?,
+            tokens: usize_to_u32(prepared.cache.tokens(), "Metal GQA token count")?,
+            page_tokens: usize_to_u32(prepared.page_tokens, "Metal GQA page tokens")?,
+            page_count: usize_to_u32(page_count, "Metal GQA page count")?,
+            combined_values: usize_to_u32(combined_values, "Metal combined KV width")?,
+            q2_token_bytes: usize_to_u32(prepared.q2_token_bytes, "Metal Q2 token bytes")?,
+            q4_token_bytes: usize_to_u32(prepared.q4_token_bytes, "Metal Q4 token bytes")?,
+            q2_page_bytes: usize_to_u32(prepared.q2_page_bytes, "Metal Q2 page bytes")?,
+            q4_page_bytes: usize_to_u32(prepared.q4_page_bytes, "Metal Q4 page bytes")?,
+            scale: 1.0 / (prepared.head_dim as f32).sqrt(),
+        };
+        write_buffer_range(
+            &prepared.params_buffer,
+            0,
+            &params.encode(),
+            MetalPagedGqaParams::BYTE_LEN,
+        )?;
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-paged-q2q4-gqa-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.paged_gqa_decode_pipeline);
+        encoder.set_buffer(
+            MetalPagedGqaBufferAbi::QUERY as u64,
+            Some(&prepared.query_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalPagedGqaBufferAbi::Q2_PAGES as u64,
+            Some(&prepared.q2_pages_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalPagedGqaBufferAbi::Q4_PAGES as u64,
+            Some(&prepared.q4_pages_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalPagedGqaBufferAbi::DESCRIPTORS as u64,
+            Some(&prepared.descriptors_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalPagedGqaBufferAbi::OUTPUT as u64,
+            Some(&prepared.output_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalPagedGqaBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: prepared.query_heads as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal paged GQA command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output_values = prepared
+            .query_heads
+            .checked_mul(prepared.head_dim)
+            .ok_or_else(|| EngineError::Shape("Metal GQA output shape overflows".into()))?;
+        let output = unsafe {
+            slice::from_raw_parts(
+                prepared.output_buffer.contents().cast::<f32>(),
+                output_values,
+            )
+            .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal paged GQA produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
     /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
     /// projection in a single command encoder. The projection consumes the
     /// RMSNorm output buffer directly and therefore owns no second activation
@@ -2331,6 +2815,80 @@ fn buffer_with_data(device: &Device, bytes: &[u8]) -> metal_driver::Buffer {
         bytes.len() as u64,
         MTLResourceOptions::StorageModeShared,
     )
+}
+
+#[derive(Debug)]
+struct MetalKvPageSnapshot {
+    precision: KvPrecision,
+    bytes: Vec<u8>,
+}
+
+fn metal_kv_page_snapshot(cache: &PagedKvCache, page_index: usize) -> Result<MetalKvPageSnapshot> {
+    let page = cache
+        .page_views()
+        .find(|page| page.page_index == page_index)
+        .ok_or_else(|| EngineError::InvalidState("Metal KV page is missing".into()))?;
+    Ok(MetalKvPageSnapshot {
+        precision: page.precision,
+        bytes: page.bytes.to_vec(),
+    })
+}
+
+fn usize_to_u32(value: usize, label: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| EngineError::Shape(format!("{label} exceeds u32")))
+}
+
+fn new_zeroed_buffer(device: &Device, bytes: usize) -> Result<Buffer> {
+    if bytes == 0 {
+        return Err(EngineError::Shape(
+            "Metal cannot allocate a zero-length verifier buffer".into(),
+        ));
+    }
+    let length = u64::try_from(bytes)
+        .map_err(|_| EngineError::MemoryBudget("Metal buffer length exceeds u64".into()))?;
+    let buffer = device.new_buffer(length, MTLResourceOptions::StorageModeShared);
+    zero_buffer(&buffer, bytes);
+    Ok(buffer)
+}
+
+fn write_buffer_range(buffer: &Buffer, offset: usize, bytes: &[u8], capacity: usize) -> Result<()> {
+    let end = offset
+        .checked_add(bytes.len())
+        .ok_or_else(|| EngineError::MemoryBudget("Metal buffer write range overflows".into()))?;
+    if end > capacity {
+        return Err(EngineError::MemoryBudget(format!(
+            "Metal buffer write ends at {end}, capacity is {capacity}"
+        )));
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            buffer.contents().cast::<u8>().add(offset),
+            bytes.len(),
+        );
+    }
+    Ok(())
+}
+
+fn zero_buffer_range(buffer: &Buffer, offset: usize, bytes: usize, capacity: usize) -> Result<()> {
+    let end = offset
+        .checked_add(bytes)
+        .ok_or_else(|| EngineError::MemoryBudget("Metal zero range overflows".into()))?;
+    if end > capacity {
+        return Err(EngineError::MemoryBudget(format!(
+            "Metal zero range ends at {end}, capacity is {capacity}"
+        )));
+    }
+    unsafe {
+        std::ptr::write_bytes(buffer.contents().cast::<u8>().add(offset), 0, bytes);
+    }
+    Ok(())
+}
+
+fn zero_buffer(buffer: &Buffer, bytes: usize) {
+    unsafe {
+        std::ptr::write_bytes(buffer.contents().cast::<u8>(), 0, bytes);
+    }
 }
 
 #[cfg(test)]
@@ -3250,5 +3808,165 @@ mod tests {
             .dispatch_partial_rope(&prepared_query)
             .expect("dispatch position-zero RoPE");
         assert_eq!(identity, query);
+    }
+
+    #[test]
+    fn paged_q2q4_gqa_decode_matches_quantized_oracle_and_demotes_pages() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let query_heads = 4;
+        let key_value_heads = 2;
+        let head_dim = 64;
+        let maximum_tokens = 8;
+        let page_tokens = 2;
+        let sink_tokens = 2;
+        let recent_tokens = 2;
+        let mut prepared = runtime
+            .prepare_paged_gqa_decode(MetalPagedGqaConfig {
+                query_heads,
+                key_value_heads,
+                head_dim,
+                maximum_tokens,
+                page_tokens,
+                sink_tokens,
+                recent_tokens,
+            })
+            .expect("prepare packed paged GQA");
+        assert_eq!(prepared.tokens(), 0);
+        assert_eq!(prepared.maximum_tokens(), maximum_tokens);
+        assert_eq!(prepared.q2_arena_bytes(), 4 * 2 * 4 * Q2_BLOCK_BYTES);
+        assert_eq!(prepared.q4_arena_bytes(), 3 * 2 * 4 * Q4_BLOCK_BYTES);
+        assert_eq!(
+            prepared.packed_device_bytes(),
+            prepared.q2_arena_bytes()
+                + prepared.q4_arena_bytes()
+                + 4 * METAL_PAGED_KV_DESCRIPTOR_BYTES
+        );
+        assert_eq!(
+            prepared.transient_bytes(),
+            2 * query_heads * head_dim * std::mem::size_of::<f32>() + MetalPagedGqaParams::BYTE_LEN
+        );
+
+        for token in 0..7 {
+            let query: Vec<f32> = (0..query_heads * head_dim)
+                .map(|index| ((index + token * 7) as f32 * 0.017).sin() * 0.35)
+                .collect();
+            let key: Vec<f32> = (0..key_value_heads * head_dim)
+                .map(|index| ((index + token * 11) as f32 * 0.021).cos() * 0.45)
+                .collect();
+            let value: Vec<f32> = (0..key_value_heads * head_dim)
+                .map(|index| ((index + token * 13) as f32 * 0.015).sin() * 0.55)
+                .collect();
+            let actual = runtime
+                .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
+                .expect("append packed K/V and dispatch GQA");
+            let cached_key = prepared
+                .cache
+                .flattened_key(key_value_heads, head_dim)
+                .expect("flatten quantized keys");
+            let cached_value = prepared
+                .cache
+                .flattened_value(key_value_heads, head_dim)
+                .expect("flatten quantized values");
+            let tokens = token + 1;
+            let expected = crate::reference::grouped_query_attention(
+                &query,
+                &cached_key,
+                &cached_value,
+                query_heads,
+                key_value_heads,
+                1,
+                tokens,
+                head_dim,
+                tokens - 1,
+            )
+            .expect("quantized paged GQA scalar oracle");
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 4.0e-4_f32.max(expected.abs() * 8.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "paged GQA token {token} value {index}: expected {expected}, got {actual}"
+                );
+            }
+        }
+
+        let precisions = prepared
+            .cache
+            .page_views()
+            .map(|page| page.precision)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            precisions,
+            vec![
+                KvPrecision::Q4,
+                KvPrecision::Q2,
+                KvPrecision::Q4,
+                KvPrecision::Q4
+            ]
+        );
+        assert!(prepared.verifier_cpu_packed_bytes() > 0);
+        assert_eq!(prepared.free_q4_slots.len(), 0);
+
+        prepared.reset();
+        assert_eq!(prepared.tokens(), 0);
+        assert_eq!(prepared.verifier_cpu_packed_bytes(), 0);
+        assert_eq!(prepared.free_q4_slots.len(), 3);
+        let query = vec![0.1; query_heads * head_dim];
+        let key = vec![0.2; key_value_heads * head_dim];
+        let value = vec![0.3; key_value_heads * head_dim];
+        let output = runtime
+            .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
+            .expect("reuse reset paged GQA");
+        assert!(output.iter().all(|actual| (*actual - 0.3).abs() < 0.02));
+    }
+
+    #[test]
+    fn paged_gqa_rejects_invalid_shapes_without_cpu_fallback() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        assert!(runtime
+            .prepare_paged_gqa_decode(MetalPagedGqaConfig {
+                query_heads: 3,
+                key_value_heads: 2,
+                head_dim: 64,
+                maximum_tokens: 8,
+                page_tokens: 2,
+                sink_tokens: 2,
+                recent_tokens: 2,
+            })
+            .is_err());
+        assert!(runtime
+            .prepare_paged_gqa_decode(MetalPagedGqaConfig {
+                query_heads: 4,
+                key_value_heads: 2,
+                head_dim: 80,
+                maximum_tokens: 8,
+                page_tokens: 2,
+                sink_tokens: 2,
+                recent_tokens: 2,
+            })
+            .is_err());
+        let mut prepared = runtime
+            .prepare_paged_gqa_decode(MetalPagedGqaConfig {
+                query_heads: 4,
+                key_value_heads: 2,
+                head_dim: 64,
+                maximum_tokens: 1,
+                page_tokens: 1,
+                sink_tokens: 0,
+                recent_tokens: 1,
+            })
+            .expect("prepare one-token GQA");
+        let query = vec![0.1; 4 * 64];
+        let key = vec![0.2; 2 * 64];
+        let value = vec![0.3; 2 * 64];
+        assert!(runtime
+            .append_and_dispatch_paged_gqa(&mut prepared, &query[..64], &key, &value)
+            .is_err());
+        runtime
+            .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
+            .expect("one permitted GQA token");
+        assert!(runtime
+            .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
+            .is_err());
+        assert!(!prepared.poisoned);
     }
 }

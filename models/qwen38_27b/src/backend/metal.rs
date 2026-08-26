@@ -25,6 +25,7 @@ pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
 pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
 pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
 pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
+pub const PAGED_GQA_DECODE_KERNEL_NAME: &str = "qwen_paged_q2q4_gqa_decode_f32";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -74,6 +75,18 @@ impl MetalPartialRopeBufferAbi {
     pub const COSINE: u32 = 1;
     pub const SINE: u32 = 2;
     pub const PARAMS: u32 = 3;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalPagedGqaBufferAbi;
+
+impl MetalPagedGqaBufferAbi {
+    pub const QUERY: u32 = 0;
+    pub const Q2_PAGES: u32 = 1;
+    pub const Q4_PAGES: u32 = 2;
+    pub const DESCRIPTORS: u32 = 3;
+    pub const OUTPUT: u32 = 4;
+    pub const PARAMS: u32 = 5;
 }
 
 /// Activation codes consumed by `apply_activation` in the MSL source.
@@ -155,6 +168,50 @@ impl MetalPartialRopeParams {
             self.reserved0,
             self.reserved1,
             self.reserved2,
+        ]
+        .iter()
+        .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalPagedGqaParams {
+    pub query_heads: u32,
+    pub key_value_heads: u32,
+    pub head_dim: u32,
+    pub tokens: u32,
+    pub page_tokens: u32,
+    pub page_count: u32,
+    pub combined_values: u32,
+    pub q2_token_bytes: u32,
+    pub q4_token_bytes: u32,
+    pub q2_page_bytes: u32,
+    pub q4_page_bytes: u32,
+    pub scale: f32,
+}
+
+impl MetalPagedGqaParams {
+    pub const BYTE_LEN: usize = 48;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.query_heads,
+            self.key_value_heads,
+            self.head_dim,
+            self.tokens,
+            self.page_tokens,
+            self.page_count,
+            self.combined_values,
+            self.q2_token_bytes,
+            self.q4_token_bytes,
+            self.q2_page_bytes,
+            self.q4_page_bytes,
+            self.scale.to_bits(),
         ]
         .iter()
         .enumerate()
@@ -634,6 +691,17 @@ mod tests {
         for (index, binding) in bindings.iter().enumerate() {
             assert_eq!(*binding, index as u32);
         }
+        assert_eq!(
+            [
+                MetalPagedGqaBufferAbi::QUERY,
+                MetalPagedGqaBufferAbi::Q2_PAGES,
+                MetalPagedGqaBufferAbi::Q4_PAGES,
+                MetalPagedGqaBufferAbi::DESCRIPTORS,
+                MetalPagedGqaBufferAbi::OUTPUT,
+                MetalPagedGqaBufferAbi::PARAMS,
+            ],
+            [0, 1, 2, 3, 4, 5]
+        );
     }
 
     #[test]
@@ -655,6 +723,7 @@ mod tests {
         assert!(Q4_RECOVERED_ROW_KERNEL_NAME.starts_with("q4_b64"));
         assert!(RMS_NORM_1P_KERNEL_NAME.starts_with("qwen_rms_norm"));
         assert!(PARTIAL_ROPE_KERNEL_NAME.starts_with("qwen_partial_rope"));
+        assert!(PAGED_GQA_DECODE_KERNEL_NAME.contains("paged_q2q4_gqa"));
     }
 
     #[test]
@@ -697,6 +766,44 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![3, 128, 2, 1, 1, 1, 1, 0]);
+
+        let paged = MetalPagedGqaParams {
+            query_heads: 24,
+            key_value_heads: 4,
+            head_dim: 256,
+            tokens: 131_072,
+            page_tokens: 128,
+            page_count: 1_024,
+            combined_values: 2_048,
+            q2_token_bytes: 576,
+            q4_token_bytes: 1_088,
+            q2_page_bytes: 73_728,
+            q4_page_bytes: 139_264,
+            scale: 0.0625,
+        };
+        let encoded = paged.encode();
+        assert_eq!(encoded.len(), MetalPagedGqaParams::BYTE_LEN);
+        let words: Vec<u32> = encoded
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            words,
+            vec![
+                24,
+                4,
+                256,
+                131_072,
+                128,
+                1_024,
+                2_048,
+                576,
+                1_088,
+                73_728,
+                139_264,
+                0.0625_f32.to_bits(),
+            ]
+        );
     }
 
     #[test]
@@ -919,6 +1026,7 @@ mod tests {
             Q4_RECOVERED_ROW_KERNEL_NAME,
             RMS_NORM_1P_KERNEL_NAME,
             PARTIAL_ROPE_KERNEL_NAME,
+            PAGED_GQA_DECODE_KERNEL_NAME,
         ] {
             assert!(
                 text.contains(&format!("kernel void {name}")),
