@@ -10,17 +10,20 @@ nvcc_path="$(readlink -f -- "$(command -v -- "${nvcc_command}")")"
 cuda_bin_dir="$(dirname -- "${nvcc_path}")"
 
 mkdir -p -- "${output_dir}"
+output_dir="$(cd -- "${output_dir}" && pwd)"
 
-"${nvcc_path}" \
-  --cubin \
-  --std=c++17 \
-  --gpu-architecture=sm_86 \
-  --generate-line-info \
-  --use_fast_math \
-  --ptxas-options=-v \
-  -O3 \
-  "${source_file}" \
-  -o "${output_dir}/q2q4_fused_matvec_sm86.cubin"
+(
+  cd -- "${crate_dir}"
+  "${nvcc_path}" \
+    --cubin \
+    --std=c++17 \
+    --gpu-architecture=sm_86 \
+    --use_fast_math \
+    --ptxas-options=-v \
+    -O3 \
+    "kernels/cuda/$(basename -- "${source_file}")" \
+    -o "${output_dir}/q2q4_fused_matvec_sm86.cubin"
+)
 
 sha256sum "${output_dir}/q2q4_fused_matvec_sm86.cubin" \
   > "${output_dir}/q2q4_fused_matvec_sm86.cubin.sha256"

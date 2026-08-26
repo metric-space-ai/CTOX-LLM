@@ -24,7 +24,9 @@ use super::cuda::{
     GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
     GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
     LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES,
-    PAGED_GQA_PARAMS_BYTES, PAGED_Q2Q4_GQA_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL,
+    PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, PAGED_GQA_SPLIT_SEGMENTS,
+    PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL,
+    PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL,
     Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
     Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL,
     Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL,
@@ -214,6 +216,8 @@ struct CudaContextInner {
     pack_paged_kv_q4_f32_function: CuFunction,
     demote_paged_kv_q4_to_q2_function: CuFunction,
     paged_q2q4_gqa_f32_function: CuFunction,
+    paged_q2q4_gqa_split_partial_f32_function: CuFunction,
+    paged_q2q4_gqa_split_combine_f32_function: CuFunction,
     argmax_f32_function: CuFunction,
     topk_topp_sample_f32_function: CuFunction,
     device_name: String,
@@ -756,6 +760,19 @@ pub struct PreparedCudaPagedGqa {
     speculative_checkpoint: Option<CudaPagedGqaCheckpoint>,
 }
 
+/// Fixed-address scratch for the unpromoted five-query split-KV verifier.
+/// It borrows the canonical cache at dispatch time and never owns or widens
+/// persistent K/V pages.
+pub struct PreparedCudaSplitPagedGqa {
+    context: Rc<CudaContextInner>,
+    query: DeviceBuffer,
+    output: DeviceBuffer,
+    partial_output: DeviceBuffer,
+    partial_maximum: DeviceBuffer,
+    partial_denominator: DeviceBuffer,
+    transient_bytes: usize,
+}
+
 #[derive(Clone)]
 struct CudaPagedGqaCheckpoint {
     tokens: usize,
@@ -1088,6 +1105,28 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let paged_q2q4_gqa_split_partial_f32_function =
+            match resolve_function(&driver, module, PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let paged_q2q4_gqa_split_combine_f32_function =
+            match resolve_function(&driver, module, PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let argmax_f32_function = match resolve_function(&driver, module, ARGMAX_F32_SYMBOL) {
             Ok(function) => function,
             Err(error) => {
@@ -1136,6 +1175,8 @@ impl CudaCandidateRuntime {
                 pack_paged_kv_q4_f32_function,
                 demote_paged_kv_q4_to_q2_function,
                 paged_q2q4_gqa_f32_function,
+                paged_q2q4_gqa_split_partial_f32_function,
+                paged_q2q4_gqa_split_combine_f32_function,
                 argmax_f32_function,
                 topk_topp_sample_f32_function,
                 device_name,
@@ -3213,6 +3254,244 @@ impl CudaCandidateRuntime {
         Ok(result)
     }
 
+    pub fn prepare_paged_q2q4_gqa_split(
+        &self,
+        paged: &PreparedCudaPagedGqa,
+    ) -> Result<PreparedCudaSplitPagedGqa> {
+        if !Rc::ptr_eq(&self.inner, &paged.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA split GQA cache belongs to another context".into(),
+            ));
+        }
+        let row_values = paged
+            .config
+            .query_heads
+            .checked_mul(paged.config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA split GQA row overflows".into()))?;
+        let query_values = row_values
+            .checked_mul(PAGED_GQA_SPLIT_MAX_QUERY_TOKENS)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA split GQA queries overflow".into()))?;
+        let partial_rows = paged
+            .config
+            .query_heads
+            .checked_mul(PAGED_GQA_SPLIT_MAX_QUERY_TOKENS)
+            .and_then(|rows| rows.checked_mul(PAGED_GQA_SPLIT_SEGMENTS))
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA split GQA partials overflow".into()))?;
+        let query_bytes = query_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA split GQA query bytes overflow".into())
+            })?;
+        let partial_output_bytes = partial_rows
+            .checked_mul(paged.config.head_dim)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA split GQA partial output overflows".into())
+            })?;
+        let partial_scalar_bytes = partial_rows
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA split GQA partial scalars overflow".into())
+            })?;
+        let transient_bytes = query_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(partial_output_bytes))
+            .and_then(|bytes| bytes.checked_add(partial_scalar_bytes.checked_mul(2)?))
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA split GQA scratch overflows".into()))?;
+        let query = DeviceBuffer::allocate(self, query_bytes)?;
+        let output = DeviceBuffer::allocate(self, query_bytes)?;
+        let partial_output = DeviceBuffer::allocate(self, partial_output_bytes)?;
+        let partial_maximum = DeviceBuffer::allocate(self, partial_scalar_bytes)?;
+        let partial_denominator = DeviceBuffer::allocate(self, partial_scalar_bytes)?;
+        query.zero()?;
+        output.zero()?;
+        partial_output.zero()?;
+        partial_maximum.zero()?;
+        partial_denominator.zero()?;
+        Ok(PreparedCudaSplitPagedGqa {
+            context: Rc::clone(&self.inner),
+            query,
+            output,
+            partial_output,
+            partial_maximum,
+            partial_denominator,
+            transient_bytes,
+        })
+    }
+
+    pub fn dispatch_paged_q2q4_gqa_split(
+        &self,
+        paged: &PreparedCudaPagedGqa,
+        prepared: &mut PreparedCudaSplitPagedGqa,
+        query: &[f32],
+        query_tokens: usize,
+    ) -> Result<Vec<f32>> {
+        let query_values =
+            self.validate_paged_q2q4_gqa_split(paged, prepared, query.len(), query_tokens)?;
+        if query.iter().any(|item| !item.is_finite()) {
+            return Err(EngineError::Shape(
+                "CUDA split GQA query contains non-finite values".into(),
+            ));
+        }
+        prepared.query.write_range(0, as_bytes(query))?;
+        self.dispatch_paged_q2q4_gqa_split_inner(
+            paged,
+            prepared,
+            prepared.query.ptr(),
+            query_tokens,
+        )?;
+        let mut result = vec![0.0_f32; query_values];
+        prepared
+            .output
+            .copy_range_to(0, as_bytes_mut(&mut result))?;
+        if result.iter().any(|item| !item.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA split GQA produced a non-finite output".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn dispatch_paged_q2q4_gqa_split_device<'a>(
+        &self,
+        paged: &PreparedCudaPagedGqa,
+        prepared: &'a mut PreparedCudaSplitPagedGqa,
+        query: CudaDeviceF32View<'_>,
+        query_tokens: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, query.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA split GQA query belongs to another context".into(),
+            ));
+        }
+        let query_values =
+            self.validate_paged_q2q4_gqa_split(paged, prepared, query.values(), query_tokens)?;
+        self.dispatch_paged_q2q4_gqa_split_inner(paged, prepared, query.ptr()?, query_tokens)?;
+        prepared.output.f32_view(0, query_values)
+    }
+
+    fn validate_paged_q2q4_gqa_split(
+        &self,
+        paged: &PreparedCudaPagedGqa,
+        prepared: &PreparedCudaSplitPagedGqa,
+        query_values: usize,
+        query_tokens: usize,
+    ) -> Result<usize> {
+        if !Rc::ptr_eq(&self.inner, &paged.context) || !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA split GQA operands belong to another context".into(),
+            ));
+        }
+        if paged.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA split GQA cannot read a poisoned cache".into(),
+            ));
+        }
+        if !(2..=PAGED_GQA_SPLIT_MAX_QUERY_TOKENS).contains(&query_tokens)
+            || query_tokens > paged.tokens
+        {
+            return Err(EngineError::Shape(format!(
+                "CUDA split GQA requires 2..={PAGED_GQA_SPLIT_MAX_QUERY_TOKENS} tail queries already present in the cache"
+            )));
+        }
+        let expected_values = query_tokens
+            .checked_mul(paged.config.query_heads)
+            .and_then(|values| values.checked_mul(paged.config.head_dim))
+            .ok_or_else(|| EngineError::Shape("CUDA split GQA query shape overflows".into()))?;
+        if query_values != expected_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA split GQA query has {query_values} values, expected {expected_values}"
+            )));
+        }
+        Ok(expected_values)
+    }
+
+    fn dispatch_paged_q2q4_gqa_split_inner(
+        &self,
+        paged: &PreparedCudaPagedGqa,
+        prepared: &mut PreparedCudaSplitPagedGqa,
+        mut query_ptr: CuDevicePtr,
+        query_tokens: usize,
+    ) -> Result<()> {
+        self.make_current()?;
+        let mut q2_pages = paged.q2_pages.ptr();
+        let mut q4_pages = paged.q4_pages.ptr();
+        let mut descriptors = paged.descriptors.ptr();
+        let mut partial_output = prepared.partial_output.ptr();
+        let mut partial_maximum = prepared.partial_maximum.ptr();
+        let mut partial_denominator = prepared.partial_denominator.ptr();
+        let mut params = paged.params.ptr();
+        let mut query_tokens_u32 = cuda_u32(query_tokens, "CUDA split GQA query tokens")?;
+        let mut segments_u32 = cuda_u32(PAGED_GQA_SPLIT_SEGMENTS, "CUDA split GQA segments")?;
+        let mut partial_params = [
+            (&mut query_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q2_pages as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q4_pages as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut descriptors as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_maximum as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_denominator as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut params as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut query_tokens_u32 as *mut u32).cast::<c_void>(),
+            (&mut segments_u32 as *mut u32).cast::<c_void>(),
+        ];
+        let partial_blocks = query_tokens
+            .checked_mul(paged.config.query_heads)
+            .and_then(|blocks| blocks.checked_mul(PAGED_GQA_SPLIT_SEGMENTS))
+            .ok_or_else(|| EngineError::Shape("CUDA split GQA grid overflows".into()))?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.paged_q2q4_gqa_split_partial_f32_function,
+                    cuda_u32(partial_blocks, "CUDA split GQA partial grid")?,
+                    1,
+                    1,
+                    WARP_SIZE,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    partial_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "paged Q2/Q4 split GQA partial kernel launch",
+            )?;
+        }
+
+        let mut output = prepared.output.ptr();
+        let mut combine_params = [
+            (&mut partial_output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_maximum as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_denominator as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut params as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut query_tokens_u32 as *mut u32).cast::<c_void>(),
+            (&mut segments_u32 as *mut u32).cast::<c_void>(),
+        ];
+        let combine_blocks = query_tokens
+            .checked_mul(paged.config.query_heads)
+            .ok_or_else(|| EngineError::Shape("CUDA split GQA combine grid overflows".into()))?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.paged_q2q4_gqa_split_combine_f32_function,
+                    cuda_u32(combine_blocks, "CUDA split GQA combine grid")?,
+                    1,
+                    1,
+                    WARP_SIZE,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    combine_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "paged Q2/Q4 split GQA combine kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("paged Q2/Q4 split GQA context synchronization")
+    }
+
     pub fn prepare_embedding_recovered(
         &self,
         recovered: RecoveredMatrixView<'_>,
@@ -5278,6 +5557,20 @@ impl PreparedCudaPagedGqa {
         self.poisoned = false;
         self.speculative_checkpoint = None;
         Ok(())
+    }
+}
+
+impl PreparedCudaSplitPagedGqa {
+    pub fn maximum_query_tokens(&self) -> usize {
+        PAGED_GQA_SPLIT_MAX_QUERY_TOKENS
+    }
+
+    pub fn segments(&self) -> usize {
+        PAGED_GQA_SPLIT_SEGMENTS
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
     }
 }
 

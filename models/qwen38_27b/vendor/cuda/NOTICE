@@ -33,3 +33,15 @@ The two byte-identical reference files and their SHA-256 digests are recorded
 in tensorrt_llm/UPSTREAM.json. They are not compiled into the crate. CTOX's
 model-local candidate retains exact source anchors and uses only the direct
 CUDA Driver API.
+
+CUDA speculative-decode reference material vendored from syv-ai
+================================================================
+
+Source:     https://github.com/syv-ai/qwen38-27b-rtx3090
+Revision:   60daef8255b6757d9791955a44bce27df1658ea6 (pinned, immutable)
+License:    Apache License 2.0
+
+The byte-identical split-KV speculative-decode patch and its SHA-256 digest
+are recorded in syv_ai/qwen38-27b-rtx3090/UPSTREAM.json. It is not applied to
+or compiled with vLLM. CTOX derives an isolated direct-Driver mixed-Q2/Q4
+candidate and retains an exact source anchor.

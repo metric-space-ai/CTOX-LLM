@@ -26,6 +26,13 @@ Vendored third-party source:
   models/qwen38_27b/vendor/cuda/LICENSE and
   models/qwen38_27b/vendor/cuda/UPSTREAM.json.
 
+- models/qwen38_27b/vendor/cuda/syv_ai/qwen38-27b-rtx3090/ contains an
+  Apache-2.0 speculative-decode split-KV reference patch from syv-ai
+  (https://github.com/syv-ai/qwen38-27b-rtx3090), pinned to revision
+  60daef8255b6757d9791955a44bce27df1658ea6. Its immutable source digest and
+  adaptation scope are recorded in the adjacent UPSTREAM.json. The patch is
+  reference material only; CTOX does not link vLLM or Triton.
+
 Direct driver binding dependency:
 
 - The optional macOS `metal` feature uses metal-rs 0.33.0

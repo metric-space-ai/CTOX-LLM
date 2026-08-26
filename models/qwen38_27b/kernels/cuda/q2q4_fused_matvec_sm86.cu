@@ -1202,6 +1202,180 @@ void ctox_paged_q2q4_gqa_decode_f32_sm86(
     }
 }
 
+// Split-KV attention candidate for the target's five-token MTP verification
+// block. The existing decode kernel launches only 24 blocks; this kernel
+// exposes query-token x query-head x KV-segment parallelism and merges the
+// online-softmax partials in a second launch. Queries are token-major
+// [query_token, query_head, head_dim] and correspond to the newest
+// `query_tokens` entries already present in the cache. Persistent K/V remains
+// in canonical mixed Q2/Q4 pages; only fixed verifier scratch is f32.
+//
+// This is deliberately not wired into the production scheduler yet. Promotion
+// requires numerical evidence plus a same-context comparison against the
+// single-query path. The segmentation/combine organization follows the pinned
+// speculative-decode patch while packed-value decoding follows FATTN.
+// ref: syv_ai/qwen38-27b-rtx3090/patches/spec-decode-attn.patch:140-337
+// ref: ggml/src/ggml-cuda/fattn-vec.cuh:1-611
+// ref: ggml/src/ggml-cuda/fattn-common.cuh:1-1274
+extern "C" __global__ __launch_bounds__(32, 16)
+void ctox_paged_q2q4_gqa_split_partial_f32_sm86(
+    const float* __restrict__ query,
+    const unsigned char* __restrict__ q2_pages,
+    const unsigned char* __restrict__ q4_pages,
+    const CtoxPagedKvDescriptor* __restrict__ descriptors,
+    float* __restrict__ partial_output,
+    float* __restrict__ partial_maximum,
+    float* __restrict__ partial_denominator,
+    const CtoxPagedGqaParams* __restrict__ params_ptr,
+    unsigned query_tokens,
+    unsigned segments) {
+    const CtoxPagedGqaParams params = *params_ptr;
+    const unsigned lane = threadIdx.x;
+    if (query_tokens < 2u || query_tokens > 5u || segments == 0u
+        || segments > 32u || params.tokens < query_tokens
+        || params.query_heads != 24u || params.key_value_heads != 4u
+        || params.head_dim != 256u || params.page_tokens == 0u) {
+        return;
+    }
+    const unsigned segment = blockIdx.x % segments;
+    const unsigned row = blockIdx.x / segments;
+    const unsigned query_head = row % params.query_heads;
+    const unsigned query_token = row / params.query_heads;
+    if (query_token >= query_tokens) {
+        return;
+    }
+
+    const unsigned query_heads_per_kv = params.query_heads / params.key_value_heads;
+    const unsigned key_value_head = query_head / query_heads_per_kv;
+    const unsigned query_base =
+        (query_token * params.query_heads + query_head) * params.head_dim;
+    const unsigned key_base = key_value_head * params.head_dim;
+    const unsigned value_base = params.combined_values / 2u + key_base;
+    const unsigned causal_tokens = params.tokens - query_tokens + query_token + 1u;
+    // Qwen's frozen maximum context is 262,144 and segments <= 32, so these
+    // products fit u32 and avoid the device helper call emitted for u64 divide.
+    const unsigned token_begin = causal_tokens * segment / segments;
+    const unsigned token_end = causal_tokens * (segment + 1u) / segments;
+
+    float query_values[8];
+    float accumulated[8] = {0.0f, 0.0f, 0.0f, 0.0f,
+                            0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        query_values[slot] = query[query_base + lane + slot * kWarpSize];
+    }
+    float maximum = -3.402823466e+38f;
+    float denominator = 0.0f;
+    for (unsigned logical_token = token_begin; logical_token < token_end;
+         ++logical_token) {
+        const unsigned page_index = logical_token / params.page_tokens;
+        if (page_index >= params.page_count) {
+            continue;
+        }
+        const CtoxPagedKvDescriptor descriptor = descriptors[page_index];
+        if (logical_token < descriptor.first_token
+            || logical_token >= descriptor.first_token + descriptor.tokens) {
+            continue;
+        }
+        const unsigned token_in_page = logical_token - descriptor.first_token;
+        float partial = 0.0f;
+#pragma unroll
+        for (unsigned slot = 0u; slot < 8u; ++slot) {
+            const unsigned dim = lane + slot * kWarpSize;
+            partial = fmaf(query_values[slot],
+                           decode_paged_kv(q2_pages, q4_pages, descriptor,
+                                           token_in_page, key_base + dim, params),
+                           partial);
+        }
+        const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
+            * params.scale;
+        const float next_maximum = fmaxf(maximum, score);
+        const float previous_factor = expf(maximum - next_maximum);
+        const float score_factor = expf(score - next_maximum);
+        denominator = denominator * previous_factor + score_factor;
+#pragma unroll
+        for (unsigned slot = 0u; slot < 8u; ++slot) {
+            const unsigned dim = lane + slot * kWarpSize;
+            accumulated[slot] = fmaf(
+                score_factor,
+                decode_paged_kv(q2_pages, q4_pages, descriptor,
+                                token_in_page, value_base + dim, params),
+                accumulated[slot] * previous_factor);
+        }
+        maximum = next_maximum;
+    }
+
+    const unsigned partial_index =
+        (query_token * params.query_heads + query_head) * segments + segment;
+    const unsigned partial_base = partial_index * params.head_dim;
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        partial_output[partial_base + lane + slot * kWarpSize] = accumulated[slot];
+    }
+    if (lane == 0u) {
+        partial_maximum[partial_index] = maximum;
+        partial_denominator[partial_index] = denominator;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(32, 16)
+void ctox_paged_q2q4_gqa_split_combine_f32_sm86(
+    const float* __restrict__ partial_output,
+    const float* __restrict__ partial_maximum,
+    const float* __restrict__ partial_denominator,
+    float* __restrict__ output,
+    const CtoxPagedGqaParams* __restrict__ params_ptr,
+    unsigned query_tokens,
+    unsigned segments) {
+    const CtoxPagedGqaParams params = *params_ptr;
+    const unsigned lane = threadIdx.x;
+    if (query_tokens < 2u || query_tokens > 5u || segments == 0u
+        || segments > 32u || params.query_heads != 24u
+        || params.head_dim != 256u) {
+        return;
+    }
+    const unsigned query_head = blockIdx.x % params.query_heads;
+    const unsigned query_token = blockIdx.x / params.query_heads;
+    if (query_token >= query_tokens) {
+        return;
+    }
+    const unsigned partial_row =
+        (query_token * params.query_heads + query_head) * segments;
+    float maximum = -3.402823466e+38f;
+    for (unsigned segment = 0u; segment < segments; ++segment) {
+        if (partial_denominator[partial_row + segment] > 0.0f) {
+            maximum = fmaxf(maximum, partial_maximum[partial_row + segment]);
+        }
+    }
+    float denominator = 0.0f;
+    for (unsigned segment = 0u; segment < segments; ++segment) {
+        const float partial_sum = partial_denominator[partial_row + segment];
+        if (partial_sum > 0.0f) {
+            denominator += partial_sum
+                * expf(partial_maximum[partial_row + segment] - maximum);
+        }
+    }
+    const unsigned output_base =
+        (query_token * params.query_heads + query_head) * params.head_dim;
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        const unsigned dim = lane + slot * kWarpSize;
+        float accumulated = 0.0f;
+        for (unsigned segment = 0u; segment < segments; ++segment) {
+            const unsigned partial_index = partial_row + segment;
+            const float partial_sum = partial_denominator[partial_index];
+            if (partial_sum > 0.0f) {
+                const float factor = expf(partial_maximum[partial_index] - maximum);
+                accumulated = fmaf(
+                    factor,
+                    partial_output[partial_index * params.head_dim + dim],
+                    accumulated);
+            }
+        }
+        output[output_base + dim] = accumulated / denominator;
+    }
+}
+
 // Deterministic greedy token boundary. The ordered-key transform matches
 // Rust f32::total_cmp for finite values, including signed zero; equal bit
 // patterns select the later index, matching Iterator::max_by. One block scans

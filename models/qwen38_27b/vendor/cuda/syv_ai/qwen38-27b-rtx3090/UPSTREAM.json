@@ -1,0 +1,25 @@
+{
+  "upstream": {
+    "repository": "https://github.com/syv-ai/qwen38-27b-rtx3090",
+    "revision": "60daef8255b6757d9791955a44bce27df1658ea6",
+    "license": "Apache-2.0",
+    "license_file": "../../../../../../LICENSE",
+    "fetched": "2026-08-26",
+    "archive": "https://codeload.github.com/syv-ai/qwen38-27b-rtx3090/tar.gz/60daef8255b6757d9791955a44bce27df1658ea6"
+  },
+  "scope": "Byte-identical speculative-decode split-KV patch used to derive CTOX's isolated mixed-Q2/Q4 SM86 five-query attention candidate. The upstream vLLM and Triton runtime are not linked or compiled into the model crate.",
+  "files": [
+    {
+      "path": "patches/spec-decode-attn.patch",
+      "upstream_path": "patches/spec-decode-attn.patch",
+      "sha256": "007791047a1d60143f8e3fe4e0a56dabadfc0134cb288847338b76ba7d1f9fe7",
+      "lines": 337,
+      "purpose": "Split the KV sequence into 16 online-softmax partials for multi-query speculative verification, then combine partial maximum, denominator, and output state on device."
+    }
+  ],
+  "notes": [
+    "The vendored patch is reference material only and remains byte-identical to the pinned upstream revision.",
+    "CTOX adapts the split/merge schedule to its canonical mixed Q2_B64/Q4_B64 paged cache and direct CUDA Driver API; it does not copy the upstream vLLM/Triton integration.",
+    "The candidate remains verifier-only until same-device numerical, lifecycle, and comparative latency evidence pass."
+  ]
+}

@@ -52,8 +52,10 @@ bytes moved, device bandwidth/compute ceilings, and same-hardware benchmarks.
 1. Implement optimized chained MTP draft scheduling plus block target
    verification with rollback/replay semantics; retain the scalar MTP4 replay
    path as the oracle.
-2. Add an SM86 split-KV verify-attention candidate with an immutable upstream
-   anchor before promotion.
+2. The isolated SM86 mixed-Q2/Q4 split-KV verify-attention candidate and its
+   immutable upstream source anchor are implemented. Run its five-query
+   numerical/lifecycle verifier and compare latency with five sequential
+   single-query launches before scheduler integration or promotion.
 3. Make recurrent-state dtype and speculative state strategy signed memory
    profile fields rather than ambient runtime toggles.
 4. Benchmark projection, recurrent update, attention, and whole-token traffic

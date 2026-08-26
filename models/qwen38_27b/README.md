@@ -268,6 +268,13 @@ verification, a sendable adapter
 owns this deliberately thread-affine CUDA executor on one dedicated worker;
 the socket threads exchange typed commands and never move driver objects.
 
+An isolated mixed-Q2/Q4 split-KV attention candidate now covers the five
+causal tail queries used by MTP4 verification. Sixteen KV segments expose
+1,920 partial blocks on SM86 and a second kernel combines their online-softmax
+state entirely on device. The byte-identical Apache-2.0 upstream patch is
+pinned beside the existing CUDA references. Scheduler integration remains
+closed until the GPU3 numerical, lifecycle, and latency comparison passes.
+
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight
 gated RMSNorm with fused `SiLU(z)`. Each operation matches its scalar state or

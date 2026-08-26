@@ -59,7 +59,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports twenty-one explicitly unpromoted
+- The same verifier cubin additionally exports twenty-four explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
@@ -83,7 +83,10 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
   - `ctox_pack_paged_kv_q4_f32_sm86`
   - `ctox_demote_paged_kv_q4_to_q2_sm86`
   - `ctox_paged_q2q4_gqa_decode_f32_sm86`
+  - `ctox_paged_q2q4_gqa_split_partial_f32_sm86`
+  - `ctox_paged_q2q4_gqa_split_combine_f32_sm86`
   - `ctox_argmax_f32_sm86`
+  - `ctox_topk_topp_sample_f32_sm86`
   These symbols are intentionally excluded from the production module ABI
   until their quality and complete-graph gates pass.
 - One launch fuses dequant, dot product, `s_in`, `s_out`, bias, and
@@ -108,8 +111,11 @@ cargo run --release --features cuda --bin qwen38-cuda-gated-delta-verify -- \
 ```
 
 The build script resolves the canonical `nvcc` target rather than trusting a
-misdirecting symlink, emits a native `sm_86` cubin, records its SHA-256, and
-captures `cuobjdump` resource usage. The Rust verifier dynamically loads only
+misdirecting symlink, invokes the source through its stable crate-relative
+path, and deliberately omits location-bearing line information from the
+release candidate. It emits a reproducible native `sm_86` cubin, records its
+SHA-256, and captures `cuobjdump` resource usage.
+The Rust verifier dynamically loads only
 the NVIDIA Driver API, requires compute capability 8.6, keeps the projection
 buffers resident across launches, and compares device output with the scalar
 CPU oracle before timing.
@@ -238,6 +244,28 @@ of the result. The slice-based upload/readback wrapper remains verifier-only.
 The complete decoder scheduler still has to connect projection, RoPE, GQA,
 gate and output-projection views, and the online-softmax path still needs
 controlled roofline evidence.
+
+The first mixed-Q2/Q4 split-KV candidate is now isolated beside that
+single-query path. It is derived from the Apache-2.0 syv-ai speculative-decode
+patch pinned at revision `60daef8255b6757d9791955a44bce27df1658ea6`; the
+byte-identical patch and digest live under
+`vendor/cuda/syv_ai/qwen38-27b-rtx3090/`. For MTP4 it launches
+`5 x 24 x 16 = 1,920` online-softmax partial blocks instead of only 24
+single-query attention blocks, then combines maximum, denominator, and output
+state in 120 device blocks. Queries cover the five newest cache entries and
+apply an independent causal boundary to each row. Persistent K/V remains in
+the same canonical mixed Q2/Q4 pages; fixed f32 partial scratch is reported
+separately and is one reusable 2,227,200-byte allocation, not one allocation
+per attention layer. Two builds from different absolute worktree paths produce
+the identical cubin SHA-256
+`aeb62585a7e4b46079b5110443bf5bd9b845ae9c7319d23429ea25c18b76c8f8`.
+CUDA 12.6 reports 128 registers for the partial kernel and 38 for the combine
+kernel, with zero stack, spill, local, or shared bytes for both. The v3
+paged-GQA verifier compares all five outputs with the
+scalar causal oracle, requires bit-identical results from host-staging and
+borrowed-device entry points, and proves scratch reclamation. Hardware
+numerics and latency versus five sequential launches remain pending, so the
+production scheduler still uses the verified sequential structure.
 
 The first GPU3 run is recorded in
 `benchmarks/cuda/sm86-q2q4-fused-matvec-20260826.json`. It proved both formats
