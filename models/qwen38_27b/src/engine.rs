@@ -292,6 +292,7 @@ pub struct EngineHealth {
 #[serde(rename_all = "snake_case")]
 pub enum LoadProgress {
     SignatureVerified,
+    TokenizerVerified,
     DraftVocabularyVerified,
     ArtifactOpened,
     ArtifactAdmitted,

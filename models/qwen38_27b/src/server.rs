@@ -1,10 +1,11 @@
 use crate::backend::{Backend, BackendKind, ExecutionPolicy, PromotionState};
 use crate::config::MODEL_ID;
 use crate::engine::{
-    AllocationSnapshot, CancellationToken, Engine, EngineLifecycle, GeneratedStep, ModelExecutor,
-    SessionOptions,
+    AllocationSnapshot, CancellationToken, Engine, EngineLifecycle, GeneratedStep, LoadProgress,
+    ModelExecutor, SessionOptions,
 };
 use crate::loader::{ChecksumPolicy, ModelArtifact};
+use crate::release::ReleaseManifest;
 use crate::sampler::SamplerConfig;
 use crate::tokenizer::{
     ChatMessage, ChatRole, ChatTemplateOptions, IncrementalDecoder, Qwen38Tokenizer, ToolCall,
@@ -276,6 +277,35 @@ impl<E: ModelExecutor + Send> EngineServer<E> {
             cancellations: Mutex::new(HashMap::new()),
             sequence_index: Mutex::new(0),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_signed(
+        release_root: impl AsRef<Path>,
+        release: &ReleaseManifest,
+        pack_id: &str,
+        memory_profile_id: &str,
+        expected_key_id: &str,
+        trusted_public_key: &[u8; 32],
+        policy: ExecutionPolicy,
+        executor: E,
+        mut progress: impl FnMut(LoadProgress),
+    ) -> Result<Self> {
+        let release_root = release_root.as_ref();
+        release.verify_signature(expected_key_id, trusted_public_key)?;
+        progress(LoadProgress::SignatureVerified);
+        let tokenizer = release.load_tokenizer(release_root)?;
+        progress(LoadProgress::TokenizerVerified);
+        let engine = Engine::load_preverified_release(
+            release_root,
+            release,
+            pack_id,
+            memory_profile_id,
+            policy,
+            executor,
+            progress,
+        )?;
+        Ok(Self::new(engine, tokenizer))
     }
 
     fn engine_error(request_id: u64, error: impl std::fmt::Display) -> Vec<WireResponse> {

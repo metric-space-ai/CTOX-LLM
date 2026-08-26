@@ -22,8 +22,9 @@ Production admission additionally requires:
 - an explicit guarantee of no hidden fallbacks;
 - executor context capacity at least as large as the selected memory profile.
 
-Progress events distinguish signature verification, draft-vocabulary
-verification, artifact opening, artifact admission, and backend loading.
+Progress events distinguish signature verification, tokenizer/template
+verification, draft-vocabulary verification, artifact opening, artifact
+admission, and backend loading.
 Cold-load and warmup times are reported separately.
 
 ## Session contract
@@ -116,6 +117,11 @@ does not own alternate sampling or model state: the server mutex owns one
 allows cancellation from a separate connection, and reports unload residue
 through the engine health contract. The Responses text renderer/detokenizer and
 the final promoted executor construction in the server binary remain open.
+`EngineServer::load_signed` is the single production assembly boundary: it
+verifies one manifest trust root and loads the selected backend pack, memory
+profile, MTP vocabulary, model container, tokenizer, and chat template from
+that same signed release. Callers cannot combine an authenticated engine with
+frontend bytes from another installation.
 
 [`WIRE_PROTOCOL_V1.md`](WIRE_PROTOCOL_V1.md) maps this lifecycle onto versioned
 JSON Lines. It carries distinct request, operation, and session identities so
