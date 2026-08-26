@@ -130,7 +130,7 @@ one thread owns one value column. Decay and update stores round immediately to
 FP16, matching the Rust and Metal oracle. CUDA 12.6 compiled the candidate for
 SM86 with 24 registers, 40 bytes shared memory, and zero stack/spill bytes
 (current unified cubin SHA-256
-`0f8b6ce454fab794f603fdc49683a4f60879302551d6b10a1d8f64bc3588cfac`).
+`060efe2ac64615b62a24e854360c7ca8fb21225fc65fff3fbf7c6c91d2362094`).
 The numerical verifier is built for a later physical-GPU-2 run after the
 teacher/evaluation/activation pipeline releases GPU 1+2; GPU 0 remains
 reserved for Greppy. No numerical or performance promotion is claimed yet.
@@ -175,7 +175,9 @@ Full-attention output uses the parallel fused path: packed GQA output is
 multiplied by `sigmoid(attention_gate)`, corrected by the output projection's
 FP16 `s_in`, and quantized to A8 before the Q2/Q4 projection without a
 6,144-value f32 gated-attention allocation. Its verifier checks every code and
-scale plus the directly chained projection output on the same device.
+scale plus the directly chained projection output on the same device. CUDA
+12.6 reports 18 registers, 12 bytes shared memory, and no stack or spill
+traffic.
 
 The general Qwen `(1 + weight)` RMSNorm candidate uses one 256-thread block
 per row and an eight-warp reduction, so hidden width 5,120 does not serialize
@@ -222,7 +224,7 @@ output scans. CUDA 12.6 reports 15 registers/76 bytes shared memory for Q4
 packing, 16 registers/no shared memory for demotion, and 128 registers/no
 shared memory for GQA; all three have zero stack/spill bytes. GQA's
 16-warps-per-SM launch bound is explicit. The current unified cubin SHA-256 is
-`0f8b6ce454fab794f603fdc49683a4f60879302551d6b10a1d8f64bc3588cfac`.
+`060efe2ac64615b62a24e854360c7ca8fb21225fc65fff3fbf7c6c91d2362094`.
 Its numerical/demotion/reset/unload verifier is queued on physical GPU 2 after
 the teacher, evaluation, activation and earlier verifier chain; GPU 0 is never
 eligible. The CPU `PagedKvCache` exists only in the separate verifier as an
