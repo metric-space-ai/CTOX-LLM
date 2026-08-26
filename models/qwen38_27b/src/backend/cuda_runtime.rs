@@ -31,6 +31,7 @@ use super::cuda::{
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
 use crate::kv_cache::KvPrecision;
+use crate::loader::RecoveredMatrixView;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
 
@@ -305,7 +306,7 @@ pub struct PreparedCudaA8Activation {
     context: Rc<CudaContextInner>,
     columns: u32,
     correction_identity: A8CorrectionIdentity,
-    input: DeviceBuffer,
+    input: Option<DeviceBuffer>,
     s_in: Option<DeviceBuffer>,
     q8_codes: DeviceBuffer,
     q8_scales: DeviceBuffer,
@@ -2787,7 +2788,41 @@ impl CudaCandidateRuntime {
             context: Rc::clone(&self.inner),
             columns: operation.columns as u32,
             correction_identity,
-            input,
+            input: Some(input),
+            s_in,
+            q8_codes,
+            q8_scales,
+            resident_bytes,
+        })
+    }
+
+    /// Prepares the shared corrected activation buffers directly from one
+    /// mmap-backed CTOXQ matrix. Model input is supplied later as a device
+    /// view, so this path deliberately allocates no host-staged device input.
+    pub fn prepare_shared_a8_activation_recovered(
+        &self,
+        recovered: RecoveredMatrixView<'_>,
+    ) -> Result<PreparedCudaA8Activation> {
+        validate_recovered_a8_projection_layout(recovered)?;
+        let s_in = recovered.s_in.as_recovery_scales()?;
+        let correction_identity = a8_correction_identity(recovered.matrix.columns, Some(s_in))?;
+        self.make_current()?;
+        let s_in = optional_scale_buffer(self, Some(s_in))?;
+        let q8_codes = DeviceBuffer::allocate(self, recovered.matrix.columns)?;
+        let q8_scales = DeviceBuffer::allocate(self, a8_scale_bytes(recovered.matrix.columns)?)?;
+        let resident_bytes = s_in
+            .as_ref()
+            .map_or(0, DeviceBuffer::len)
+            .checked_add(q8_codes.len())
+            .and_then(|total| total.checked_add(q8_scales.len()))
+            .ok_or_else(|| {
+                EngineError::Shape("mmap CUDA A8 activation byte count overflows".into())
+            })?;
+        Ok(PreparedCudaA8Activation {
+            context: Rc::clone(&self.inner),
+            columns: recovered.matrix.columns as u32,
+            correction_identity,
+            input: None,
             s_in,
             q8_codes,
             q8_scales,
@@ -2845,6 +2880,55 @@ impl CudaCandidateRuntime {
         })
     }
 
+    /// Uploads immutable packed Q2/Q4 weights and `s_out` directly from the
+    /// mmap-backed CTOXQ artifact. The logical codes are neither widened nor
+    /// repacked and no matrix-sized host allocation is introduced.
+    pub fn prepare_shared_a8_projection_recovered(
+        &self,
+        recovered: RecoveredMatrixView<'_>,
+        activation: Activation,
+    ) -> Result<PreparedCudaA8Projection> {
+        let layout = validate_recovered_a8_projection_layout(recovered)?;
+        let s_in = recovered.s_in.as_recovery_scales()?;
+        let s_out = recovered.s_out.as_recovery_scales()?;
+        let correction_identity = a8_correction_identity(recovered.matrix.columns, Some(s_in))?;
+        self.make_current()?;
+        let weights = DeviceBuffer::from_bytes(self, recovered.matrix.weights)?;
+        let s_out = optional_scale_buffer(self, Some(s_out))?;
+        let output_bytes = recovered
+            .matrix
+            .rows
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::Shape("mmap CUDA A8 projection output size overflows".into())
+            })?;
+        let output = DeviceBuffer::allocate(self, output_bytes)?;
+        let resident_bytes = weights
+            .len()
+            .checked_add(s_out.as_ref().map_or(0, DeviceBuffer::len))
+            .and_then(|total| total.checked_add(output.len()))
+            .ok_or_else(|| {
+                EngineError::Shape("mmap CUDA A8 projection byte count overflows".into())
+            })?;
+        Ok(PreparedCudaA8Projection {
+            context: Rc::clone(&self.inner),
+            dtype: recovered.matrix.dtype,
+            rows: recovered.matrix.rows as u32,
+            columns: recovered.matrix.columns as u32,
+            activation: match activation {
+                Activation::Identity => 0,
+                Activation::Silu => 1,
+            },
+            correction_identity,
+            layout,
+            weights,
+            s_out,
+            bias: None,
+            output,
+            resident_bytes,
+        })
+    }
+
     /// Quantizes the corrected activation once into symmetric Q8_B64 blocks.
     /// This legacy prepared object remains matrix-local. Use
     /// [`Self::prepare_shared_a8_activation`] for an actual fan-out.
@@ -2884,8 +2968,13 @@ impl CudaCandidateRuntime {
                 "prepared shared CUDA A8 activation belongs to another context".into(),
             ));
         }
+        let input = prepared.input.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "mmap-prepared shared CUDA A8 activation requires a producer device view".into(),
+            )
+        })?;
         self.launch_a8_quantization(
-            prepared.input.ptr(),
+            input.ptr(),
             prepared.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
             prepared.q8_codes.ptr(),
             prepared.q8_scales.ptr(),
@@ -3728,7 +3817,14 @@ impl PreparedCudaA8Activation {
                 "shared CUDA A8 input contains a non-finite value".into(),
             ));
         }
-        self.input.write(as_bytes(input))
+        self.input
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::InvalidState(
+                    "mmap-prepared shared CUDA A8 activation has no host staging buffer".into(),
+                )
+            })?
+            .write(as_bytes(input))
     }
 
     pub fn verifier_read_quantized(&self) -> Result<(Vec<i8>, Vec<f32>)> {
@@ -4419,6 +4515,149 @@ fn validate_a8_projection_layout(operation: &FusedMatVec<'_>) -> Result<CudaA8Pr
     }
 }
 
+fn validate_recovered_a8_projection_layout(
+    recovered: RecoveredMatrixView<'_>,
+) -> Result<CudaA8ProjectionLayout> {
+    let matrix = recovered.matrix;
+    if matrix.rows == 0 || matrix.columns == 0 || !matrix.columns.is_multiple_of(BLOCK_LEN) {
+        return Err(EngineError::Shape(
+            "mmap CUDA matrix dimensions must be non-zero and columns divisible by 64".into(),
+        ));
+    }
+    u32::try_from(matrix.rows)
+        .map_err(|_| EngineError::Shape("mmap CUDA rows exceed u32 launch limit".into()))?;
+    u32::try_from(matrix.columns)
+        .map_err(|_| EngineError::Shape("mmap CUDA columns exceed u32 launch limit".into()))?;
+
+    for (name, view, values) in [
+        ("s_in", recovered.s_in, matrix.columns),
+        ("s_out", recovered.s_out, matrix.rows),
+    ] {
+        let scales = view.as_recovery_scales()?;
+        let expected_bytes = values
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| EngineError::Shape(format!("mmap CUDA {name} size overflows")))?;
+        match scales {
+            ScaleSlice::F16Le(bytes) => validate_f16_buffer(bytes, expected_bytes, name)?,
+            ScaleSlice::F32(_) => unreachable!("recovered scales reject F32"),
+        }
+    }
+
+    let blocks_per_row = matrix.columns / BLOCK_LEN;
+    match matrix.dtype {
+        TensorDType::Q2B64 | TensorDType::Q4B64 => {
+            if !matrix.segments.is_empty() {
+                return Err(EngineError::InvalidArtifact(
+                    "pure mmap CUDA Q2/Q4 matrix declares mixed row segments".into(),
+                ));
+            }
+            let block_bytes = match matrix.dtype {
+                TensorDType::Q2B64 => Q2_BLOCK_BYTES,
+                TensorDType::Q4B64 => Q4_BLOCK_BYTES,
+                _ => unreachable!(),
+            };
+            let expected_weights = matrix
+                .rows
+                .checked_mul(blocks_per_row)
+                .and_then(|blocks| blocks.checked_mul(block_bytes))
+                .ok_or_else(|| EngineError::Shape("pure mmap CUDA weight size overflows".into()))?;
+            if matrix.weights.len() != expected_weights {
+                return Err(EngineError::Shape(format!(
+                    "mmap CUDA weight buffer has {} bytes, expected {expected_weights}",
+                    matrix.weights.len()
+                )));
+            }
+            Ok(CudaA8ProjectionLayout::Pure(matrix.dtype))
+        }
+        TensorDType::MixedQ2Q4B64 => {
+            if matrix.segments.is_empty() {
+                return Err(EngineError::InvalidArtifact(
+                    "mixed mmap CUDA Q2/Q4 matrix has no row segments".into(),
+                ));
+            }
+            let mut launches = Vec::with_capacity(matrix.segments.len());
+            let mut expected_row = 0_usize;
+            let mut expected_offset = 0_usize;
+            for (expected_group, segment) in matrix.segments.iter().enumerate() {
+                let group_index = usize::try_from(segment.group_index).map_err(|_| {
+                    EngineError::InvalidArtifact("mixed mmap CUDA group index overflows".into())
+                })?;
+                let row_start = usize::try_from(segment.row_start).map_err(|_| {
+                    EngineError::InvalidArtifact("mixed mmap CUDA row start overflows".into())
+                })?;
+                let row_end = usize::try_from(segment.row_end).map_err(|_| {
+                    EngineError::InvalidArtifact("mixed mmap CUDA row end overflows".into())
+                })?;
+                let offset = usize::try_from(segment.offset).map_err(|_| {
+                    EngineError::InvalidArtifact("mixed mmap CUDA offset overflows".into())
+                })?;
+                let length = usize::try_from(segment.length).map_err(|_| {
+                    EngineError::InvalidArtifact("mixed mmap CUDA length overflows".into())
+                })?;
+                if group_index != expected_group
+                    || row_start != expected_row
+                    || row_end <= row_start
+                    || row_end > matrix.rows
+                    || offset != expected_offset
+                {
+                    return Err(EngineError::InvalidArtifact(format!(
+                        "mixed mmap CUDA matrix has non-contiguous segment {}",
+                        segment.group_index
+                    )));
+                }
+                let (descriptor, block_bytes) = match segment.dtype {
+                    TensorDType::Q2B64 => (&Q2_B64_FUSED_MATVEC, Q2_BLOCK_BYTES),
+                    TensorDType::Q4B64 => (&Q4_B64_FUSED_MATVEC, Q4_BLOCK_BYTES),
+                    other => {
+                        return Err(EngineError::InvalidArtifact(format!(
+                            "mixed mmap CUDA segment {} has invalid dtype {other:?}",
+                            segment.group_index
+                        )));
+                    }
+                };
+                let expected_length = row_end
+                    .checked_sub(row_start)
+                    .and_then(|rows| rows.checked_mul(blocks_per_row))
+                    .and_then(|blocks| blocks.checked_mul(block_bytes))
+                    .ok_or_else(|| {
+                        EngineError::Shape("mixed mmap CUDA segment size overflows".into())
+                    })?;
+                if length != expected_length {
+                    return Err(EngineError::InvalidArtifact(format!(
+                        "mixed mmap CUDA segment {} has {length} bytes, expected {expected_length}",
+                        segment.group_index
+                    )));
+                }
+                launches.push(CudaMixedRowSegment {
+                    descriptor,
+                    row_start: u32::try_from(row_start).map_err(|_| {
+                        EngineError::Shape("mixed mmap CUDA row start exceeds u32".into())
+                    })?,
+                    row_count: u32::try_from(row_end - row_start).map_err(|_| {
+                        EngineError::Shape("mixed mmap CUDA row count exceeds u32".into())
+                    })?,
+                    weight_offset: offset,
+                });
+                expected_row = row_end;
+                expected_offset = expected_offset.checked_add(length).ok_or_else(|| {
+                    EngineError::Shape("mixed mmap CUDA weight size overflows".into())
+                })?;
+            }
+            if expected_row != matrix.rows || expected_offset != matrix.weights.len() {
+                return Err(EngineError::Shape(format!(
+                    "mixed mmap CUDA segments cover {expected_row}/{} rows and {expected_offset}/{} bytes",
+                    matrix.rows,
+                    matrix.weights.len()
+                )));
+            }
+            Ok(CudaA8ProjectionLayout::Mixed(launches))
+        }
+        other => Err(EngineError::UnsupportedDType(format!(
+            "mmap CUDA A8 projection does not support {other:?}"
+        ))),
+    }
+}
+
 fn a8_correction_identity(
     columns: usize,
     s_in: Option<ScaleSlice<'_>>,
@@ -4465,6 +4704,8 @@ fn device_ptr_offset(base: CuDevicePtr, offset: usize) -> Result<CuDevicePtr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::QuantSegment;
+    use crate::loader::{FloatTensorView, QuantizedMatrixView};
 
     #[test]
     fn launch_geometry_covers_partial_last_block() {
@@ -4511,6 +4752,103 @@ mod tests {
         assert_ne!(identity, a8_correction_identity(64, None).unwrap());
         assert!(a8_correction_identity(64, Some(ScaleSlice::F32(&[1.0; 64]))).is_err());
         assert!(a8_correction_identity(64, Some(ScaleSlice::F16Le(&second[..126]))).is_err());
+    }
+
+    #[test]
+    fn mmap_a8_layout_accepts_exact_pure_q2_payload() {
+        let weights = vec![0_u8; 2 * Q2_BLOCK_BYTES];
+        let scales = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let s_in = scales.repeat(BLOCK_LEN);
+        let s_out = scales.repeat(2);
+        let recovered = RecoveredMatrixView {
+            matrix: QuantizedMatrixView {
+                dtype: TensorDType::Q2B64,
+                weights: &weights,
+                segments: &[],
+                rows: 2,
+                columns: BLOCK_LEN,
+            },
+            s_in: FloatTensorView::F16Le(&s_in),
+            s_out: FloatTensorView::F16Le(&s_out),
+        };
+        assert!(matches!(
+            validate_recovered_a8_projection_layout(recovered).unwrap(),
+            CudaA8ProjectionLayout::Pure(TensorDType::Q2B64)
+        ));
+    }
+
+    #[test]
+    fn mmap_a8_layout_preserves_contiguous_mixed_segments() {
+        let q2_bytes = 2 * Q2_BLOCK_BYTES;
+        let q4_bytes = Q4_BLOCK_BYTES;
+        let weights = vec![0_u8; q2_bytes + q4_bytes];
+        let segments = vec![
+            QuantSegment {
+                group_index: 0,
+                row_start: 0,
+                row_end: 2,
+                dtype: TensorDType::Q2B64,
+                offset: 0,
+                length: q2_bytes as u64,
+            },
+            QuantSegment {
+                group_index: 1,
+                row_start: 2,
+                row_end: 3,
+                dtype: TensorDType::Q4B64,
+                offset: q2_bytes as u64,
+                length: q4_bytes as u64,
+            },
+        ];
+        let scales = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let s_in = scales.repeat(BLOCK_LEN);
+        let s_out = scales.repeat(3);
+        let recovered = RecoveredMatrixView {
+            matrix: QuantizedMatrixView {
+                dtype: TensorDType::MixedQ2Q4B64,
+                weights: &weights,
+                segments: &segments,
+                rows: 3,
+                columns: BLOCK_LEN,
+            },
+            s_in: FloatTensorView::F16Le(&s_in),
+            s_out: FloatTensorView::F16Le(&s_out),
+        };
+        let CudaA8ProjectionLayout::Mixed(launches) =
+            validate_recovered_a8_projection_layout(recovered).unwrap()
+        else {
+            panic!("expected mixed mmap CUDA layout");
+        };
+        assert_eq!(launches.len(), 2);
+        assert_eq!(launches[0].row_start, 0);
+        assert_eq!(launches[0].row_count, 2);
+        assert_eq!(launches[1].row_start, 2);
+        assert_eq!(launches[1].row_count, 1);
+        assert_eq!(launches[1].weight_offset, q2_bytes);
+    }
+
+    #[test]
+    fn mmap_a8_layout_rejects_nonfinite_recovery_scales() {
+        let weights = vec![0_u8; Q2_BLOCK_BYTES];
+        let one = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut s_in = one.repeat(BLOCK_LEN);
+        s_in[..2].copy_from_slice(&half::f16::INFINITY.to_bits().to_le_bytes());
+        let s_out = one.to_vec();
+        let recovered = RecoveredMatrixView {
+            matrix: QuantizedMatrixView {
+                dtype: TensorDType::Q2B64,
+                weights: &weights,
+                segments: &[],
+                rows: 1,
+                columns: BLOCK_LEN,
+            },
+            s_in: FloatTensorView::F16Le(&s_in),
+            s_out: FloatTensorView::F16Le(&s_out),
+        };
+        assert!(matches!(
+            validate_recovered_a8_projection_layout(recovered),
+            Err(EngineError::InvalidArtifact(_))
+        ));
     }
 
     #[test]

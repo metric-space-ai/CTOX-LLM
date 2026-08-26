@@ -213,7 +213,11 @@ The CUDA assembly contract is now a frozen 645-step device schedule covering
 all 64 target layers, final logits, and MTP verification with exactly one host
 barrier at token completion. It validates device-slot dataflow and rejects any
 topology other than the exact Qwen3.8-27B configuration. Binding every planned
-step to prepared artifact-backed operators remains in progress. The previously
+step to prepared artifact-backed operators remains in progress. The CUDA
+projection loader now validates and uploads pure or mixed Q2/Q4 matrices and
+packed FP16 recovery scales directly from mmap-backed `RecoveredMatrixView`
+objects, without widening/repacking model state or allocating a redundant f32
+input buffer per matrix. The previously
 open full-attention gate edge now has a fused sigmoid-gate/recovery/A8/output-
 projection CUDA candidate and dedicated hardware verifier.
 

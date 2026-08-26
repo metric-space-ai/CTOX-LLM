@@ -278,6 +278,16 @@ Canonical `MixedQ2Q4B64` tensors use the same transient activation across all
 manifest row groups. The host validates exact contiguous row/byte coverage,
 uploads the original mixed payload once, offsets device pointers into each
 homogeneous group, and synchronizes only after every Q2/Q4 segment has run.
+The production-loader preparation API now accepts `RecoveredMatrixView`
+directly. It validates packed FP16 `s_in`/`s_out`, pure payload length, or the
+complete mixed row/byte partition before allocating device state, then copies
+the immutable mapped weight and scale ranges straight to their long-lived
+CUDA allocations. It never constructs a matrix-sized `Vec`, widens recovery
+scales, repacks quantization codes, or allocates the legacy per-matrix f32
+input buffer. Producer-owned device views supply activations during graph
+execution. Unit fixtures cover exact pure Q2, exact mixed Q2/Q4, and rejection
+of non-finite recovery data; complete-artifact residency remains a hardware
+gate.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not
