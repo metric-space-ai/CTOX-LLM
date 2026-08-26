@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import struct
 import sys
@@ -26,6 +27,7 @@ from fanout_recovery import (
     fanout_group_sha256,
     qwen38_fanout_groups,
 )
+from cache_teacher import validate_local_model_provenance
 from quantization import quantize_components
 from run_ledger import GpuRun, require_budget
 
@@ -75,6 +77,10 @@ def validate_recovery_source(
         "plan_sha256": plan_sha256,
         "fixed_logical_qcodes": "true",
     }
+    if plan.get("local_model_provenance_sha256"):
+        required_metadata["local_model_provenance_sha256"] = plan[
+            "local_model_provenance_sha256"
+        ]
     for key, expected in required_metadata.items():
         actual = metadata.get(key)
         if actual != expected:
@@ -316,6 +322,8 @@ def assemble_artifact(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--local-model-provenance", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -339,6 +347,22 @@ def main() -> None:
         "ctox.q2q4.quant-plan.v2",
     } or not plan["fits_fold_limit"]:
         raise SystemExit("plan is unsupported or exceeds the Fold limit")
+    try:
+        _provenance, provenance_sha256 = validate_local_model_provenance(
+            args.checkpoint,
+            args.revision,
+            args.local_model_provenance,
+        )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
+    if provenance_sha256 is None:
+        raise SystemExit("checkpoint packing requires verified local BF16 provenance")
+    if plan.get("revision") != args.revision:
+        raise SystemExit("quant plan revision does not match --revision")
+    if plan.get("local_model_provenance_sha256") != provenance_sha256:
+        raise SystemExit("quant plan does not match the verified local BF16 provenance")
+    if plan.get("assignment") and args.recovery_scales is None:
+        raise SystemExit("assigned release plans require complete recovery scales")
 
     try:
         import torch
@@ -401,28 +425,35 @@ def main() -> None:
                 print(f"[{index}/{len(plan['tensors'])}] {entry['dtype']} {entry['name']}", flush=True)
             data.truncate(plan["total_bytes"])
             data.flush()
+        artifact_path = Path(temporary) / args.output.name
         assemble_artifact(
-            args.output,
+            artifact_path,
             data_path,
             plan,
             tensor_hashes,
             recovery_descriptor,
         )
-    package_limit = plan.get("fold_package_limit_bytes")
-    if package_limit is not None and args.output.stat().st_size > package_limit:
-        raise RuntimeError(
-            f"artifact is {args.output.stat().st_size} bytes, package limit is {package_limit}"
-        )
-    artifact_hash = hashlib.sha256()
-    with args.output.open("rb") as artifact:
-        for chunk in iter(lambda: artifact.read(16 * 1024 * 1024), b""):
-            artifact_hash.update(chunk)
+        package_limit = plan.get("fold_package_limit_bytes")
+        if package_limit is not None and artifact_path.stat().st_size > package_limit:
+            raise RuntimeError(
+                f"artifact is {artifact_path.stat().st_size} bytes, "
+                f"package limit is {package_limit}"
+            )
+        artifact_sha256 = sha256_path(artifact_path)
+        with artifact_path.open("rb") as artifact:
+            os.fsync(artifact.fileno())
+        artifact_path.replace(args.output)
+        directory = os.open(args.output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     print(
         json.dumps(
             {
                 "artifact": str(args.output),
                 "bytes": args.output.stat().st_size,
-                "sha256": artifact_hash.hexdigest(),
+                "sha256": artifact_sha256,
                 "recovery": recovery_descriptor,
             },
             indent=2,
