@@ -47,6 +47,8 @@ pub struct MetalBoundDecodeStep {
     pub schedule_index: usize,
     pub layer: Option<usize>,
     pub operation: MetalDecodeOperation,
+    pub reads: Vec<MetalBufferSlot>,
+    pub writes: Vec<MetalBufferSlot>,
     pub resources: Vec<MetalPreparedResource>,
 }
 
@@ -88,8 +90,8 @@ struct LiveInterval {
 ///
 /// The future executor advances this cursor only after an operation has been
 /// encoded successfully. Dropping an incomplete cursor cannot produce a new
-/// committed token position; session-state rollback remains the executor's
-/// responsibility until transactional Metal state owners are implemented.
+/// committed token position; the executor must reject the matching
+/// graph-wide speculative-state transaction before reusing the session.
 #[derive(Debug)]
 pub struct MetalDecodeExecutionCursor<'a> {
     plan: &'a MetalDecodeBindingPlan,
@@ -968,6 +970,8 @@ fn bind_decode_step(
         schedule_index,
         layer: step.layer,
         operation: step.operation,
+        reads: step.reads.clone(),
+        writes: step.writes.clone(),
         resources,
     })
 }

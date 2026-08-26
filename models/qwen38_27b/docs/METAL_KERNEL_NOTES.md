@@ -47,10 +47,14 @@ outside this transient plan. `prepare_decode_workspace` materializes it as
 exactly one zeroed shared Metal buffer for the plan and exposes the same buffer
 with validated per-slot offsets. The Apple-device verifier writes and reads an
 exact slot, rejects a wrong-sized write, proves distinct slot views share the
-one buffer, then drops and recreates the arena. This is allocation/lifetime
-evidence for the decode arena, not yet a complete allocator high-watermark or
-zero-residue unload measurement; per-step encoder binding remains executor
-work.
+one buffer, then drops and recreates the arena. `bind_decode_program` now
+resolves every logical read and write of all 645 resource-bound steps to a
+typed view containing the same real Metal buffer, exact offset, width, and byte
+range. It rejects non-contiguous step indices and duplicate per-step access
+slots. Its Apple-device verifier checks every resulting view and confirms the
+final barrier reads both target and MTP logits. This is allocation/lifetime and
+buffer-view evidence for the decode arena, not yet a complete allocator
+high-watermark, zero-residue unload measurement, or kernel encoder dispatch.
 
 `PreparedMetalF32Checkpoint` adds a bounded device-only snapshot for one arena
 slot. Snapshot and restore use a native Metal blit between the shared arena and
@@ -416,8 +420,8 @@ dequantization array before this source was accepted.
   exist yet. A deterministic shared decode arena and its single Metal buffer
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
-  target+MTP state transaction. Per-step encoder binding, the prefill arena,
-  removal of the verifier CPU KV mirror, and complete model-graph execution
-  remain unfinished.
+  target+MTP state transaction. All 645 steps have real shared-buffer views;
+  kernel encoder dispatch, the prefill arena, removal of the verifier CPU KV
+  mirror, and complete model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

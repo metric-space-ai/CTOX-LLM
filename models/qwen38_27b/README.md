@@ -213,8 +213,11 @@ only for non-overlapping produced-value intervals; target and MTP logits remain
 simultaneously live and therefore distinct. `MetalCandidateRuntime` now
 materializes that plan as exactly one shared Metal buffer, exposes only the
 validated buffer/offset pairs, and passes write/read plus drop/recreate device
-tests. Per-step encoder binding, persistent-state rollback, and the complete
-executor remain open. A bounded f32 checkpoint can now snapshot and restore an
+tests. Every logical read and write of all 645 bound decode steps now resolves
+to a typed view of that same real buffer and its exact schedule-derived offset;
+the final barrier retains target and MTP logits as explicit reads. Kernel
+encoder dispatch against those views and the complete executor remain open. A
+bounded f32 checkpoint can now snapshot and restore an
 exact arena slot through a Metal device-to-device blit with no host mirror. It
 is single-use and fail-closed across snapshot/restore/commit, providing the
 target-hidden primitive needed by MTP replay. FP16 causal-convolution and

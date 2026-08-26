@@ -4,6 +4,7 @@
 //! to generate same-device verifier and benchmark evidence while the public
 //! Metal backend remains fail-closed at `PromotionState::Contract`.
 
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::mem::size_of_val;
 use std::rc::Rc;
@@ -28,7 +29,10 @@ use super::metal::{
     Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
     RMS_NORM_GATED_KERNEL_NAME,
 };
-use super::metal_graph::{MetalDecodeBufferBinding, MetalDecodeWorkspacePlan};
+use super::metal_graph::{
+    MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
+    MetalDecodeWorkspacePlan,
+};
 use super::metal_schedule::MetalBufferSlot;
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
@@ -124,6 +128,27 @@ pub struct PreparedMetalProjection {
 pub struct PreparedMetalDecodeWorkspace {
     plan: MetalDecodeWorkspacePlan,
     buffer: Buffer,
+}
+
+/// One exact read or write view into the shared decode arena.
+pub struct PreparedMetalDecodeBufferView<'a> {
+    binding: MetalDecodeBufferBinding,
+    buffer: &'a Buffer,
+    offset: u64,
+}
+
+/// The actual shared-buffer views and immutable graph resources for one of the
+/// 645 frozen decode steps. Kernels consume these views without allocating
+/// operation-local activation buffers.
+pub struct PreparedMetalDecodeStepView<'a> {
+    step: &'a MetalBoundDecodeStep,
+    reads: Vec<PreparedMetalDecodeBufferView<'a>>,
+    writes: Vec<PreparedMetalDecodeBufferView<'a>>,
+}
+
+/// A complete, validated set of real Metal buffer views for one token program.
+pub struct PreparedMetalDecodeProgram<'a> {
+    steps: Vec<PreparedMetalDecodeStepView<'a>>,
 }
 
 /// Bounded device-only snapshot used to restore one f32 arena slot after a
@@ -532,6 +557,65 @@ impl PreparedMetalDecodeWorkspace {
         Ok((&self.buffer, offset))
     }
 
+    /// Resolve every logical read/write in the frozen binding plan to this
+    /// workspace's one real Metal allocation. The returned program borrows the
+    /// arena, preventing it from being dropped while encoders retain views.
+    pub fn bind_decode_program<'a>(
+        &'a self,
+        plan: &'a MetalDecodeBindingPlan,
+    ) -> Result<PreparedMetalDecodeProgram<'a>> {
+        if plan.steps().len() != 645 {
+            return Err(EngineError::InvalidState(format!(
+                "Metal decode program has {} steps, expected 645",
+                plan.steps().len()
+            )));
+        }
+        let steps = plan
+            .steps()
+            .iter()
+            .enumerate()
+            .map(|(expected_index, step)| {
+                if step.schedule_index != expected_index {
+                    return Err(EngineError::InvalidState(format!(
+                        "Metal decode program step {} has schedule index {}",
+                        expected_index, step.schedule_index
+                    )));
+                }
+                Ok(PreparedMetalDecodeStepView {
+                    step,
+                    reads: self.bind_decode_slots(&step.reads, "read")?,
+                    writes: self.bind_decode_slots(&step.writes, "write")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PreparedMetalDecodeProgram { steps })
+    }
+
+    fn bind_decode_slots<'a>(
+        &'a self,
+        slots: &[MetalBufferSlot],
+        access: &str,
+    ) -> Result<Vec<PreparedMetalDecodeBufferView<'a>>> {
+        let mut seen = BTreeSet::new();
+        slots
+            .iter()
+            .map(|&slot| {
+                if !seen.insert(slot) {
+                    return Err(EngineError::InvalidState(format!(
+                        "Metal decode step repeats {access} slot {slot:?}"
+                    )));
+                }
+                let binding = self.binding(slot)?;
+                let (buffer, offset) = self.buffer_and_offset(slot)?;
+                Ok(PreparedMetalDecodeBufferView {
+                    binding,
+                    buffer,
+                    offset,
+                })
+            })
+            .collect()
+    }
+
     /// Verifier-only host write into one exact slot. Complete graph execution
     /// binds producer kernels directly and does not round-trip activations.
     pub fn write_f32(&mut self, slot: MetalBufferSlot, values: &[f32]) -> Result<()> {
@@ -565,6 +649,48 @@ impl PreparedMetalDecodeWorkspace {
             )
         };
         Ok(values.to_vec())
+    }
+}
+
+impl PreparedMetalDecodeBufferView<'_> {
+    pub fn slot(&self) -> MetalBufferSlot {
+        self.binding.slot
+    }
+
+    pub fn values(&self) -> usize {
+        self.binding.values
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.binding.bytes
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn buffer(&self) -> &Buffer {
+        self.buffer
+    }
+}
+
+impl<'a> PreparedMetalDecodeStepView<'a> {
+    pub fn step(&self) -> &'a MetalBoundDecodeStep {
+        self.step
+    }
+
+    pub fn reads(&self) -> &[PreparedMetalDecodeBufferView<'a>] {
+        &self.reads
+    }
+
+    pub fn writes(&self) -> &[PreparedMetalDecodeBufferView<'a>] {
+        &self.writes
+    }
+}
+
+impl<'a> PreparedMetalDecodeProgram<'a> {
+    pub fn steps(&self) -> &[PreparedMetalDecodeStepView<'a>] {
+        &self.steps
     }
 }
 
@@ -5118,7 +5244,8 @@ fn zero_buffer(buffer: &Buffer, bytes: usize) {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
-    use crate::backend::metal_schedule::MetalDecodeSchedule;
+    use crate::backend::metal_graph::MetalProjectionPlan;
+    use crate::backend::metal_schedule::{MetalDecodeOperation, MetalDecodeSchedule};
     use crate::backend::{Activation, Backend};
     use crate::format::{
         ArtifactBuilder, FileHeader, ModelManifest, PackedTensor, QuantSegment, TensorEntry,
@@ -5325,6 +5452,88 @@ mod tests {
                 .total_bytes(),
             plan.total_bytes()
         );
+    }
+
+    #[test]
+    fn decode_program_binds_all_645_steps_to_one_real_metal_buffer() {
+        let config = Qwen38Config::default();
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let projections = MetalProjectionPlan::qwen38(&config).expect("Metal projection plan");
+        let bindings = MetalDecodeBindingPlan::qwen38(&schedule, &projections, &config)
+            .expect("complete Metal binding plan");
+        let workspace_plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("decode workspace plan");
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let workspace = runtime
+            .prepare_decode_workspace(&workspace_plan)
+            .expect("allocate one decode arena");
+        let program = workspace
+            .bind_decode_program(&bindings)
+            .expect("bind real buffer views for every decode step");
+
+        assert_eq!(program.steps().len(), 645);
+        assert_eq!(program.steps().len(), bindings.steps().len());
+        let expected_views = schedule
+            .steps
+            .iter()
+            .map(|step| step.reads.len() + step.writes.len())
+            .sum::<usize>();
+        assert_eq!(
+            program
+                .steps()
+                .iter()
+                .map(|step| step.reads().len() + step.writes().len())
+                .sum::<usize>(),
+            expected_views
+        );
+
+        let (shared_buffer, _) = workspace
+            .buffer_and_offset(MetalBufferSlot::HiddenA)
+            .expect("shared arena buffer");
+        for (index, prepared) in program.steps().iter().enumerate() {
+            let bound = &bindings.steps()[index];
+            assert_eq!(prepared.step(), bound);
+            assert_eq!(bound.schedule_index, index);
+            assert_eq!(
+                prepared
+                    .reads()
+                    .iter()
+                    .map(PreparedMetalDecodeBufferView::slot)
+                    .collect::<Vec<_>>(),
+                bound.reads
+            );
+            assert_eq!(
+                prepared
+                    .writes()
+                    .iter()
+                    .map(PreparedMetalDecodeBufferView::slot)
+                    .collect::<Vec<_>>(),
+                bound.writes
+            );
+            for view in prepared.reads().iter().chain(prepared.writes()) {
+                let expected = workspace
+                    .binding(view.slot())
+                    .expect("scheduled workspace slot");
+                assert!(std::ptr::eq(view.buffer(), shared_buffer));
+                assert_eq!(view.values(), expected.values);
+                assert_eq!(view.bytes(), expected.bytes);
+                assert_eq!(view.offset(), expected.offset as u64);
+            }
+        }
+        let final_step = program.steps().last().expect("final token barrier");
+        assert_eq!(
+            final_step.step().operation,
+            MetalDecodeOperation::TokenCommandBufferCommit
+        );
+        assert_eq!(
+            final_step
+                .reads()
+                .iter()
+                .map(PreparedMetalDecodeBufferView::slot)
+                .collect::<Vec<_>>(),
+            vec![MetalBufferSlot::TargetLogits, MetalBufferSlot::MtpDraft]
+        );
+        assert!(final_step.writes().is_empty());
     }
 
     #[test]
