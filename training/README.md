@@ -442,6 +442,31 @@ zero; ordinary CE is still reported but is not incorrectly treated as having
 zero BF16 baseline. This numerical gate does not replace task-level generation,
 tool-execution, weighted benchmark, or 128K retrieval gates.
 
+`build_recovery_run_plan.py` is the fail-closed admission boundary before the
+unbounded recovery run. It rehashes every training and held-out teacher
+artifact, requires exactly 2,328/642 disjoint identities under one BF16
+provenance and teacher contract, and checks the held-out cohort plus domain and
+service-mode sidecars for exact identity. It also verifies every tensor in the
+initializer CTOXQ pack and proves that its fixed logical codes came from the
+specified final v2 quant plan.
+
+The final sensitivity chain is deliberately stricter than a calibration
+pilot: the activation-statistics sample IDs must equal the complete 2,328-item
+training cohort, every quantized matrix must be observed, and the statistics,
+sensitivity report, measured Q2/Q4 assignment, rebuilt plan, and initializer
+pack must form one uninterrupted SHA-256 chain. A 256-sample assignment is
+useful for pilot training but cannot admit the release run. Admission also
+requires a one-step bounded smoke using the same stateful prefill chunking as
+the full run; a gradient-checkpointing-only smoke does not prove that path.
+
+The emitted `ctox.recovery.execution-plan.v1` contains argv arrays for complete
+training, trained packing, direct and recovered held-out evaluation, and the
+30% gap-closure comparison. It records exact output paths, expected optimizer
+steps, checkpoint/resume contract, current ledger usage, all remaining stage
+reserves, and refuses the whole sequence if its projected total exceeds 240
+GPU-hours. The plan is an admission artifact, not a scheduler: every stage
+still validates its inputs and appends measured usage to the ledger.
+
 Vision remains a separate phase-resident package. `build_vision_plan.py`
 zero-pads matrix columns to 64-value storage blocks so non-aligned vision MLPs
 can still use Q2/Q4 kernels. `plan_vision_residency.py` then selects whole
