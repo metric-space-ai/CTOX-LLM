@@ -6,6 +6,7 @@
 //! driver/shape/profile mismatch. There is no CUDA Runtime API, framework, or
 //! CPU fallback in this path.
 
+use std::cell::Cell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::mem::size_of_val;
 use std::ptr;
@@ -167,6 +168,14 @@ pub struct CudaCandidateRuntime {
     inner: Rc<CudaContextInner>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CudaSubmissionStats {
+    pub token_submission_attempts: u64,
+    pub token_submission_commits: u64,
+    pub deferred_operator_synchronizations: u64,
+    pub context_synchronizations: u64,
+}
+
 struct CudaContextInner {
     driver: CudaDriver,
     context: CuContext,
@@ -193,6 +202,11 @@ struct CudaContextInner {
     paged_q2q4_gqa_f32_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
+    token_submission_active: Cell<bool>,
+    token_submission_attempts: Cell<u64>,
+    token_submission_commits: Cell<u64>,
+    deferred_operator_synchronizations: Cell<u64>,
+    context_synchronizations: Cell<u64>,
 }
 
 /// Borrowed, context-bound f32 device tensor. The private buffer reference
@@ -929,8 +943,84 @@ impl CudaCandidateRuntime {
                 paged_q2q4_gqa_f32_function,
                 device_name,
                 compute_capability,
+                token_submission_active: Cell::new(false),
+                token_submission_attempts: Cell::new(0),
+                token_submission_commits: Cell::new(0),
+                deferred_operator_synchronizations: Cell::new(0),
+                context_synchronizations: Cell::new(0),
             }),
         })
+    }
+
+    pub fn submission_stats(&self) -> CudaSubmissionStats {
+        CudaSubmissionStats {
+            token_submission_attempts: self.inner.token_submission_attempts.get(),
+            token_submission_commits: self.inner.token_submission_commits.get(),
+            deferred_operator_synchronizations: self.inner.deferred_operator_synchronizations.get(),
+            context_synchronizations: self.inner.context_synchronizations.get(),
+        }
+    }
+
+    /// Submit one complete target or MTP token as an ordered default-stream
+    /// transaction. Per-operator helpers keep their standalone synchronous
+    /// behavior, but suppress intermediate context barriers while this scope
+    /// is active. The final synchronization is the commit point at which
+    /// asynchronous launch failures become visible to the graph owner.
+    pub(crate) fn run_token_submission<T>(
+        &self,
+        operation: &'static str,
+        execute: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if self.inner.token_submission_active.replace(true) {
+            return Err(EngineError::InvalidState(
+                "nested CUDA token submissions are forbidden".into(),
+            ));
+        }
+        self.inner
+            .token_submission_attempts
+            .set(self.inner.token_submission_attempts.get().saturating_add(1));
+        let launch_result = execute();
+        self.inner.token_submission_active.set(false);
+        let synchronize_result = self.synchronize_context(operation);
+        match (launch_result, synchronize_result) {
+            (Ok(value), Ok(())) => {
+                self.inner
+                    .token_submission_commits
+                    .set(self.inner.token_submission_commits.get().saturating_add(1));
+                Ok(value)
+            }
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(launch_error), Err(synchronize_error)) => Err(EngineError::InvalidState(format!(
+                "CUDA token submission failed before and at its commit barrier: \
+                     launch={launch_error}; synchronize={synchronize_error}"
+            ))),
+        }
+    }
+
+    fn synchronize_context(&self, operation: &'static str) -> Result<()> {
+        self.make_current()?;
+        self.inner
+            .context_synchronizations
+            .set(self.inner.context_synchronizations.get().saturating_add(1));
+        unsafe {
+            self.inner
+                .driver
+                .check((self.inner.driver.ctx_synchronize)(), operation)
+        }
+    }
+
+    fn synchronize_after_launch(&self, operation: &'static str) -> Result<()> {
+        if self.inner.token_submission_active.get() {
+            self.inner.deferred_operator_synchronizations.set(
+                self.inner
+                    .deferred_operator_synchronizations
+                    .get()
+                    .saturating_add(1),
+            );
+            Ok(())
+        } else {
+            self.synchronize_context(operation)
+        }
     }
 
     pub fn device_name(&self) -> &str {
@@ -1038,13 +1128,7 @@ impl CudaCandidateRuntime {
                 "CUDA verifier readback belongs to another context".into(),
             ));
         }
-        self.make_current()?;
-        unsafe {
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "verifier token-boundary synchronization",
-            )?;
-        }
+        self.synchronize_context("verifier token-boundary synchronization")?;
         let mut values = vec![0.0_f32; view.values()];
         let byte_offset = view
             .offset_values
@@ -1216,11 +1300,8 @@ impl CudaCandidateRuntime {
                 ),
                 "gated-delta input preparation kernel launch",
             )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "gated-delta input preparation context synchronization",
-            )?;
         }
+        self.synchronize_after_launch("gated-delta input preparation context synchronization")?;
         Ok(CudaGatedDeltaInputViews {
             query: prepared.query.f32_view(0, qk_values)?,
             key: prepared.key.f32_view(0, qk_values)?,
@@ -1439,12 +1520,8 @@ impl CudaCandidateRuntime {
                 ),
                 "gated-delta kernel launch",
             )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "gated-delta context synchronization",
-            )?;
         }
-        Ok(())
+        self.synchronize_after_launch("gated-delta context synchronization")
     }
 
     pub fn prepare_causal_conv_f16(
@@ -1574,12 +1651,8 @@ impl CudaCandidateRuntime {
                 ),
                 "causal-convolution kernel launch",
             )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "causal-convolution context synchronization",
-            )?;
         }
-        Ok(())
+        self.synchronize_after_launch("causal-convolution context synchronization")
     }
 
     pub fn prepare_gated_rms_norm_f16(
@@ -1715,12 +1788,8 @@ impl CudaCandidateRuntime {
                 ),
                 "gated RMSNorm kernel launch",
             )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "gated RMSNorm context synchronization",
-            )?;
         }
-        Ok(())
+        self.synchronize_after_launch("gated RMSNorm context synchronization")
     }
 
     pub fn prepare_qwen_rms_norm_f16(
@@ -1843,12 +1912,8 @@ impl CudaCandidateRuntime {
                 ),
                 "Qwen RMSNorm kernel launch",
             )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "Qwen RMSNorm context synchronization",
-            )?;
         }
-        Ok(())
+        self.synchronize_after_launch("Qwen RMSNorm context synchronization")
     }
 
     pub fn prepare_residual_rms_norm_f16(
@@ -1954,11 +2019,8 @@ impl CudaCandidateRuntime {
                 ),
                 "residual RMSNorm kernel launch",
             )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "residual RMSNorm context synchronization",
-            )?;
         }
+        self.synchronize_after_launch("residual RMSNorm context synchronization")?;
         Ok((
             prepared.residual_output.f32_view(0, expected)?,
             prepared.normalized_output.f32_view(0, expected)?,
@@ -2093,12 +2155,8 @@ impl CudaCandidateRuntime {
                 ),
                 "partial-RoPE kernel launch",
             )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "partial-RoPE context synchronization",
-            )?;
         }
-        Ok(())
+        self.synchronize_after_launch("partial-RoPE context synchronization")
     }
 
     pub fn prepare_query_gate_norm_rope_f32(
@@ -2219,11 +2277,8 @@ impl CudaCandidateRuntime {
                 ),
                 "query/gate norm+RoPE kernel launch",
             )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "query/gate norm+RoPE context synchronization",
-            )?;
         }
+        self.synchronize_after_launch("query/gate norm+RoPE context synchronization")?;
         Ok((
             prepared.query.f32_view(0, output_values)?,
             prepared.gate.f32_view(0, output_values)?,
@@ -2659,12 +2714,8 @@ impl CudaCandidateRuntime {
                 ),
                 "paged Q2/Q4 GQA kernel launch",
             )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "paged Q2/Q4 GQA context synchronization",
-            )?;
         }
-        Ok(())
+        self.synchronize_after_launch("paged Q2/Q4 GQA context synchronization")
     }
 
     fn read_paged_q2q4_gqa_output(&self, prepared: &PreparedCudaPagedGqa) -> Result<Vec<f32>> {
@@ -3276,12 +3327,7 @@ impl CudaCandidateRuntime {
         for projection in projections {
             self.launch_shared_a8_projection(activation, projection)?;
         }
-        unsafe {
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "shared SwiGLU A8 fan-out context synchronization",
-            )?;
-        }
+        self.synchronize_after_launch("shared SwiGLU A8 fan-out context synchronization")?;
         projections
             .iter()
             .map(|projection| (*projection).device_output())
@@ -3335,12 +3381,7 @@ impl CudaCandidateRuntime {
         for projection in projections {
             self.launch_shared_a8_projection(activation, projection)?;
         }
-        unsafe {
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "shared attention-gate A8 fan-out context synchronization",
-            )?;
-        }
+        self.synchronize_after_launch("shared attention-gate A8 fan-out context synchronization")?;
         projections
             .iter()
             .map(|projection| (*projection).device_output())
@@ -3391,12 +3432,7 @@ impl CudaCandidateRuntime {
         for projection in projections {
             self.launch_shared_a8_projection(activation, projection)?;
         }
-        unsafe {
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "shared A8 device fan-out context synchronization",
-            )?;
-        }
+        self.synchronize_after_launch("shared A8 device fan-out context synchronization")?;
         projections
             .iter()
             .map(|projection| (*projection).device_output())

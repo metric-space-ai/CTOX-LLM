@@ -318,10 +318,14 @@ permits exactly one token-boundary logits readback and proves state reset plus
 allocator reclamation. The same verifier now feeds the valid-vocabulary target
 argmax into the native one-layer MTP graph. Its two normalized inputs are joined
 with two driver device-to-device copies; no host tensor or backend-specific
-requantization is introduced. The SM86 run is pending; the current device entry
-points also synchronize per operation, so this code is not a production or
-roofline claim. A second complete target transition now verifies the greedy MTP
-proposal and records acceptance or fallback explicitly. Multi-draft replay and
+requantization is introduced. Operator-local barriers retain their standalone
+verifier semantics, but the complete graph suppresses them inside a
+transactional default-stream submission and synchronizes exactly once before
+committing each target or MTP state transition. The v2 SM86 verifier records
+attempts, commits, deferred operator barriers, and context synchronizations;
+its hardware run is pending, so this is not yet a production or roofline
+claim. A second complete target transition verifies the greedy MTP proposal
+and records acceptance or fallback explicitly. Multi-draft replay and
 production sampling remain unbound.
 
 The evidence in

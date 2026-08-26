@@ -233,8 +233,10 @@ projection CUDA candidate and dedicated hardware verifier. Dispatching the
 bound schedule has now reached a first complete target-token candidate:
 embedding, all 64 hybrid layers, final normalization, and the LM head pass
 device views directly with no tensor readback before the token boundary. The
-dedicated SM86 verifier is still pending, and the candidate retains per-op
-driver synchronizations that must be removed before performance promotion.
+complete graph now defers operator-local driver barriers and commits each
+target or MTP transition with one context synchronization. The dedicated SM86
+verifier records attempted/committed submissions, deferred barriers, and the
+three explicit verifier readbacks; its hardware result is still pending.
 The one-layer MTP draft is now connected to the final normalized target hidden
 state through a device-only concatenation buffer and reuses the same embedding,
 attention, FFN, norm, and LM-head operators. Its hardware run and subsequent

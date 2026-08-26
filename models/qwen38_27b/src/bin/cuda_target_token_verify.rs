@@ -60,6 +60,10 @@ struct Report<'a> {
     target_dispatch_milliseconds: f64,
     mtp_dispatch_milliseconds: f64,
     target_verify_milliseconds: f64,
+    token_submission_attempts: u64,
+    token_submission_commits: u64,
+    deferred_operator_synchronizations: u64,
+    context_synchronizations: u64,
     driver_free_bytes_before_prepare: usize,
     driver_free_bytes_after_prepare: usize,
     driver_free_bytes_after_drop: usize,
@@ -155,11 +159,29 @@ fn main() -> anyhow::Result<()> {
         "CUDA target graph retained {} bytes after drop",
         free_before_prepare.saturating_sub(free_after_drop)
     );
+    let submission_stats = runtime.submission_stats();
+    anyhow::ensure!(
+        submission_stats.token_submission_attempts == 3
+            && submission_stats.token_submission_commits == 3,
+        "CUDA target/MTP chain committed {}/{} token submissions, expected 3/3",
+        submission_stats.token_submission_commits,
+        submission_stats.token_submission_attempts,
+    );
+    anyhow::ensure!(
+        submission_stats.context_synchronizations == 6,
+        "CUDA target/MTP chain used {} context barriers, expected three commits and three verifier readbacks",
+        submission_stats.context_synchronizations,
+    );
+    anyhow::ensure!(
+        submission_stats.deferred_operator_synchronizations > 100,
+        "CUDA target/MTP chain deferred only {} operator barriers",
+        submission_stats.deferred_operator_synchronizations,
+    );
 
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.cuda-sm86-target-token.v1",
+            format: "ctox.cuda-sm86-target-token.v2",
             status: "finite_logits_verifier_only_not_promoted",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -188,10 +210,15 @@ fn main() -> anyhow::Result<()> {
             target_dispatch_milliseconds,
             mtp_dispatch_milliseconds,
             target_verify_milliseconds,
+            token_submission_attempts: submission_stats.token_submission_attempts,
+            token_submission_commits: submission_stats.token_submission_commits,
+            deferred_operator_synchronizations: submission_stats
+                .deferred_operator_synchronizations,
+            context_synchronizations: submission_stats.context_synchronizations,
             driver_free_bytes_before_prepare: free_before_prepare,
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
-            note: "Executes embedding, all 64 target layers, final norm, LM head, target-selected-token MTP draft, a second complete target step that verifies the draft, reset, and unload through device views. Logits cross the host only at explicit token boundaries. Draft rejection is a valid result and is reported, not hidden. Finite logits and exact unload are necessary but not sufficient: BF16/CPU logit comparison, removal of per-op synchronizations, production sampling/MTP4 replay, and roofline promotion remain open.",
+            note: "Executes embedding, all 64 target layers, final norm, LM head, target-selected-token MTP draft, a second complete target step that verifies the draft, reset, and unload through device views. Each target/MTP step has one commit barrier; logits cross the host only at explicit verifier boundaries. Draft rejection is a valid result and is reported, not hidden. Finite logits and exact unload are necessary but not sufficient: BF16/CPU logit comparison, production sampling/MTP4 replay, prefill, and roofline promotion remain open.",
         })?
     );
     Ok(())

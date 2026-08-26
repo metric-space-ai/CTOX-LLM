@@ -1250,131 +1250,134 @@ impl PreparedCudaProjectionGraph {
             ..
         } = self;
         *poisoned = true;
-        let embedded =
-            runtime.dispatch_embedding_row_device(embedding, token_id, embedding_scale)?;
-        let mut residual = embedded;
-        let mut normalized = runtime
-            .dispatch_qwen_rms_norm_f16_device(norms.regular("target:initial")?, residual)?;
+        let logits = runtime.run_token_submission("target token commit synchronization", || {
+            let embedded =
+                runtime.dispatch_embedding_row_device(embedding, token_id, embedding_scale)?;
+            let mut residual = embedded;
+            let mut normalized = runtime
+                .dispatch_qwen_rms_norm_f16_device(norms.regular("target:initial")?, residual)?;
 
-        for layer in 0..config.num_hidden_layers {
-            let prefix = format!("model.language_model.layers.{layer}");
-            let mixer_output = match config.layer_kind(layer).expect("frozen layer") {
-                LayerKind::FullAttention => {
-                    let [query_gate, key, value] = dispatch_projection_fanout_device(
-                        runtime,
-                        plan,
-                        activations,
-                        projections,
-                        normalized,
-                        [
-                            format!("{prefix}.self_attn.q_proj.weight"),
-                            format!("{prefix}.self_attn.k_proj.weight"),
-                            format!("{prefix}.self_attn.v_proj.weight"),
-                        ],
-                    )?;
-                    let attention = full_attention
-                        .get_mut(&format!("target:{layer}"))
-                        .ok_or_else(|| {
+            for layer in 0..config.num_hidden_layers {
+                let prefix = format!("model.language_model.layers.{layer}");
+                let mixer_output = match config.layer_kind(layer).expect("frozen layer") {
+                    LayerKind::FullAttention => {
+                        let [query_gate, key, value] = dispatch_projection_fanout_device(
+                            runtime,
+                            plan,
+                            activations,
+                            projections,
+                            normalized,
+                            [
+                                format!("{prefix}.self_attn.q_proj.weight"),
+                                format!("{prefix}.self_attn.k_proj.weight"),
+                                format!("{prefix}.self_attn.v_proj.weight"),
+                            ],
+                        )?;
+                        let attention = full_attention
+                            .get_mut(&format!("target:{layer}"))
+                            .ok_or_else(|| {
+                                EngineError::InvalidState(format!(
+                                    "CUDA full-attention layer {layer} is not resident"
+                                ))
+                            })?;
+                        let (attention_output, gate) = attention.dispatch_device(
+                            runtime,
+                            query_gate,
+                            key,
+                            value,
+                            position as u64,
+                        )?;
+                        dispatch_sigmoid_gate_projection_device(
+                            runtime,
+                            plan,
+                            activations,
+                            projections,
+                            attention_output,
+                            gate,
+                            &format!("{prefix}.self_attn.o_proj.weight"),
+                        )?
+                    }
+                    LayerKind::LinearAttention => {
+                        let [mixed_qkv, gate, raw_a, raw_b] = dispatch_projection_fanout_device(
+                            runtime,
+                            plan,
+                            activations,
+                            projections,
+                            normalized,
+                            [
+                                format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                                format!("{prefix}.linear_attn.in_proj_z.weight"),
+                                format!("{prefix}.linear_attn.in_proj_a.weight"),
+                                format!("{prefix}.linear_attn.in_proj_b.weight"),
+                            ],
+                        )?;
+                        let mixer = linear_mixers.get_mut(&layer).ok_or_else(|| {
                             EngineError::InvalidState(format!(
-                                "CUDA full-attention layer {layer} is not resident"
+                                "CUDA linear-attention layer {layer} is not resident"
                             ))
                         })?;
-                    let (attention_output, gate) = attention.dispatch_device(
-                        runtime,
-                        query_gate,
-                        key,
-                        value,
-                        position as u64,
-                    )?;
-                    dispatch_sigmoid_gate_projection_device(
-                        runtime,
-                        plan,
-                        activations,
-                        projections,
-                        attention_output,
-                        gate,
-                        &format!("{prefix}.self_attn.o_proj.weight"),
-                    )?
-                }
-                LayerKind::LinearAttention => {
-                    let [mixed_qkv, gate, raw_a, raw_b] = dispatch_projection_fanout_device(
-                        runtime,
-                        plan,
-                        activations,
-                        projections,
-                        normalized,
-                        [
-                            format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                            format!("{prefix}.linear_attn.in_proj_z.weight"),
-                            format!("{prefix}.linear_attn.in_proj_a.weight"),
-                            format!("{prefix}.linear_attn.in_proj_b.weight"),
-                        ],
-                    )?;
-                    let mixer = linear_mixers.get_mut(&layer).ok_or_else(|| {
-                        EngineError::InvalidState(format!(
-                            "CUDA linear-attention layer {layer} is not resident"
-                        ))
-                    })?;
-                    let mixed = mixer.dispatch_device(runtime, mixed_qkv, gate, raw_a, raw_b)?;
-                    dispatch_projection_device(
-                        runtime,
-                        plan,
-                        activations,
-                        projections,
-                        mixed,
-                        &format!("{prefix}.linear_attn.out_proj.weight"),
-                    )?
-                }
-            };
+                        let mixed =
+                            mixer.dispatch_device(runtime, mixed_qkv, gate, raw_a, raw_b)?;
+                        dispatch_projection_device(
+                            runtime,
+                            plan,
+                            activations,
+                            projections,
+                            mixed,
+                            &format!("{prefix}.linear_attn.out_proj.weight"),
+                        )?
+                    }
+                };
 
-            let post_attention_key = format!("target:{layer}:post_attention");
-            let post_attention = norms.residual(&post_attention_key)?;
-            (residual, normalized) = runtime.dispatch_residual_rms_norm_f16_device(
-                post_attention,
-                residual,
-                mixer_output,
-            )?;
+                let post_attention_key = format!("target:{layer}:post_attention");
+                let post_attention = norms.residual(&post_attention_key)?;
+                (residual, normalized) = runtime.dispatch_residual_rms_norm_f16_device(
+                    post_attention,
+                    residual,
+                    mixer_output,
+                )?;
 
-            let [gate, up] = dispatch_projection_fanout_device(
+                let [gate, up] = dispatch_projection_fanout_device(
+                    runtime,
+                    plan,
+                    activations,
+                    projections,
+                    normalized,
+                    [
+                        format!("{prefix}.mlp.gate_proj.weight"),
+                        format!("{prefix}.mlp.up_proj.weight"),
+                    ],
+                )?;
+                let down = dispatch_swiglu_projection_device(
+                    runtime,
+                    plan,
+                    activations,
+                    projections,
+                    gate,
+                    up,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                )?;
+                let post_ffn_key = if layer + 1 == config.num_hidden_layers {
+                    format!("target:{layer}:post_ffn:final")
+                } else {
+                    format!("target:{layer}:post_ffn:layer_{}", layer + 1)
+                };
+                (residual, normalized) = runtime.dispatch_residual_rms_norm_f16_device(
+                    norms.residual(&post_ffn_key)?,
+                    residual,
+                    down,
+                )?;
+            }
+
+            dispatch_projection_device(
                 runtime,
                 plan,
                 activations,
                 projections,
                 normalized,
-                [
-                    format!("{prefix}.mlp.gate_proj.weight"),
-                    format!("{prefix}.mlp.up_proj.weight"),
-                ],
-            )?;
-            let down = dispatch_swiglu_projection_device(
-                runtime,
-                plan,
-                activations,
-                projections,
-                gate,
-                up,
-                &format!("{prefix}.mlp.down_proj.weight"),
-            )?;
-            let post_ffn_key = if layer + 1 == config.num_hidden_layers {
-                format!("target:{layer}:post_ffn:final")
-            } else {
-                format!("target:{layer}:post_ffn:layer_{}", layer + 1)
-            };
-            (residual, normalized) = runtime.dispatch_residual_rms_norm_f16_device(
-                norms.residual(&post_ffn_key)?,
-                residual,
-                down,
-            )?;
-        }
-
-        let logits = dispatch_projection_device(
-            runtime,
-            plan,
-            activations,
-            projections,
-            normalized,
-            "lm_head.weight",
-        )?;
+                "lm_head.weight",
+            )
+        })?;
         *target_tokens = target_tokens
             .checked_add(1)
             .ok_or_else(|| EngineError::MemoryBudget("CUDA target token count overflows".into()))?;
@@ -1434,89 +1437,98 @@ impl PreparedCudaProjectionGraph {
             ..
         } = self;
         *mtp_poisoned = true;
-        let embedded =
-            runtime.dispatch_embedding_row_device(embedding, next_token_id, embedding_scale)?;
-        let embedded = runtime
-            .dispatch_qwen_rms_norm_f16_device(norms.regular("mtp:pre_embedding")?, embedded)?;
-        let previous_hidden = norms.residual(&final_target_norm)?.normalized_output()?;
-        let previous_hidden = runtime
-            .dispatch_qwen_rms_norm_f16_device(norms.regular("mtp:pre_hidden")?, previous_hidden)?;
-        let projection_input =
-            runtime.dispatch_f32_concat_device(mtp_concat, embedded, previous_hidden)?;
-        let mut residual = dispatch_projection_device(
-            runtime,
-            plan,
-            activations,
-            projections,
-            projection_input,
-            "mtp.fc.weight",
-        )?;
-        let mut normalized =
-            runtime.dispatch_qwen_rms_norm_f16_device(norms.regular("mtp:input")?, residual)?;
-        let [query_gate, key, value] = dispatch_projection_fanout_device(
-            runtime,
-            plan,
-            activations,
-            projections,
-            normalized,
-            [
-                "mtp.layers.0.self_attn.q_proj.weight".to_owned(),
-                "mtp.layers.0.self_attn.k_proj.weight".to_owned(),
-                "mtp.layers.0.self_attn.v_proj.weight".to_owned(),
-            ],
-        )?;
-        let attention = full_attention.get_mut("mtp:0").ok_or_else(|| {
-            EngineError::InvalidState("CUDA MTP full-attention state is not resident".into())
+        let logits = runtime.run_token_submission("MTP token commit synchronization", || {
+            let embedded =
+                runtime.dispatch_embedding_row_device(embedding, next_token_id, embedding_scale)?;
+            let embedded = runtime
+                .dispatch_qwen_rms_norm_f16_device(norms.regular("mtp:pre_embedding")?, embedded)?;
+            let previous_hidden = norms.residual(&final_target_norm)?.normalized_output()?;
+            let previous_hidden = runtime.dispatch_qwen_rms_norm_f16_device(
+                norms.regular("mtp:pre_hidden")?,
+                previous_hidden,
+            )?;
+            let projection_input =
+                runtime.dispatch_f32_concat_device(mtp_concat, embedded, previous_hidden)?;
+            let mut residual = dispatch_projection_device(
+                runtime,
+                plan,
+                activations,
+                projections,
+                projection_input,
+                "mtp.fc.weight",
+            )?;
+            let mut normalized =
+                runtime.dispatch_qwen_rms_norm_f16_device(norms.regular("mtp:input")?, residual)?;
+            let [query_gate, key, value] = dispatch_projection_fanout_device(
+                runtime,
+                plan,
+                activations,
+                projections,
+                normalized,
+                [
+                    "mtp.layers.0.self_attn.q_proj.weight".to_owned(),
+                    "mtp.layers.0.self_attn.k_proj.weight".to_owned(),
+                    "mtp.layers.0.self_attn.v_proj.weight".to_owned(),
+                ],
+            )?;
+            let attention = full_attention.get_mut("mtp:0").ok_or_else(|| {
+                EngineError::InvalidState("CUDA MTP full-attention state is not resident".into())
+            })?;
+            let (attention_output, gate) = attention.dispatch_device(
+                runtime,
+                query_gate,
+                key,
+                value,
+                absolute_position as u64,
+            )?;
+            let attention_output = dispatch_sigmoid_gate_projection_device(
+                runtime,
+                plan,
+                activations,
+                projections,
+                attention_output,
+                gate,
+                "mtp.layers.0.self_attn.o_proj.weight",
+            )?;
+            (residual, normalized) = runtime.dispatch_residual_rms_norm_f16_device(
+                norms.residual("mtp:post_attention")?,
+                residual,
+                attention_output,
+            )?;
+            let [gate, up] = dispatch_projection_fanout_device(
+                runtime,
+                plan,
+                activations,
+                projections,
+                normalized,
+                [
+                    "mtp.layers.0.mlp.gate_proj.weight".to_owned(),
+                    "mtp.layers.0.mlp.up_proj.weight".to_owned(),
+                ],
+            )?;
+            let down = dispatch_swiglu_projection_device(
+                runtime,
+                plan,
+                activations,
+                projections,
+                gate,
+                up,
+                "mtp.layers.0.mlp.down_proj.weight",
+            )?;
+            let (_, final_hidden) = runtime.dispatch_residual_rms_norm_f16_device(
+                norms.residual("mtp:final")?,
+                residual,
+                down,
+            )?;
+            dispatch_projection_device(
+                runtime,
+                plan,
+                activations,
+                projections,
+                final_hidden,
+                "lm_head.weight",
+            )
         })?;
-        let (attention_output, gate) =
-            attention.dispatch_device(runtime, query_gate, key, value, absolute_position as u64)?;
-        let attention_output = dispatch_sigmoid_gate_projection_device(
-            runtime,
-            plan,
-            activations,
-            projections,
-            attention_output,
-            gate,
-            "mtp.layers.0.self_attn.o_proj.weight",
-        )?;
-        (residual, normalized) = runtime.dispatch_residual_rms_norm_f16_device(
-            norms.residual("mtp:post_attention")?,
-            residual,
-            attention_output,
-        )?;
-        let [gate, up] = dispatch_projection_fanout_device(
-            runtime,
-            plan,
-            activations,
-            projections,
-            normalized,
-            [
-                "mtp.layers.0.mlp.gate_proj.weight".to_owned(),
-                "mtp.layers.0.mlp.up_proj.weight".to_owned(),
-            ],
-        )?;
-        let down = dispatch_swiglu_projection_device(
-            runtime,
-            plan,
-            activations,
-            projections,
-            gate,
-            up,
-            "mtp.layers.0.mlp.down_proj.weight",
-        )?;
-        let (_, final_hidden) = runtime.dispatch_residual_rms_norm_f16_device(
-            norms.residual("mtp:final")?,
-            residual,
-            down,
-        )?;
-        let logits = dispatch_projection_device(
-            runtime,
-            plan,
-            activations,
-            projections,
-            final_hidden,
-            "lm_head.weight",
-        )?;
         *mtp_tokens = mtp_tokens
             .checked_add(1)
             .ok_or_else(|| EngineError::MemoryBudget("CUDA MTP token count overflows".into()))?;
