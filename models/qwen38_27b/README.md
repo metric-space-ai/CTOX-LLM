@@ -194,7 +194,8 @@ device-resident edge into GQA. Shared A8 Q/K/V fan-out now also consumes a
 producer-owned activation and exposes its projection outputs as sliceable
 device views. Qwen RMSNorm and the post-attention gated RMSNorm accept the same
 device-view contract, closing the tensor-transfer edges around this decode
-subgraph. Its separate
+subgraph except for the canonical head-wise query/gate deinterleave, residual
+fusion, and final scheduler assembly. Its separate
 scalar-oracle verifier is queued on physical GPU 2 after the BF16 recovery
 pipeline; the production backend remains fail-closed until that evidence and
 the complete projection/RoPE/attention/output graph wiring exist.
