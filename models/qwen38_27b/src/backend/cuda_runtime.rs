@@ -1337,8 +1337,47 @@ impl CudaCandidateRuntime {
                 "prepared CUDA partial RoPE belongs to another context".into(),
             ));
         }
+        self.dispatch_partial_rope_f32_inner(prepared, prepared.values.ptr())?;
+        let mut result = vec![0.0_f32; prepared.config.heads * prepared.config.head_dim];
+        prepared.values.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA partial RoPE produced a non-finite output".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Applies Qwen partial RoPE in place to a producer-owned device tensor.
+    /// The returned view aliases the same allocation; no staging allocation or
+    /// host transfer is performed.
+    pub fn dispatch_partial_rope_f32_device<'a>(
+        &self,
+        prepared: &PreparedCudaPartialRope,
+        values: CudaDeviceF32View<'a>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) || !Rc::ptr_eq(&self.inner, values.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA partial RoPE device input belongs to another context".into(),
+            ));
+        }
+        let expected = prepared.config.heads * prepared.config.head_dim;
+        if values.values() != expected {
+            return Err(EngineError::Shape(format!(
+                "CUDA partial RoPE device input has {} values, expected {expected}",
+                values.values()
+            )));
+        }
+        self.dispatch_partial_rope_f32_inner(prepared, values.ptr()?)?;
+        Ok(values)
+    }
+
+    fn dispatch_partial_rope_f32_inner(
+        &self,
+        prepared: &PreparedCudaPartialRope,
+        mut values: CuDevicePtr,
+    ) -> Result<()> {
         self.make_current()?;
-        let mut values = prepared.values.ptr();
         let mut cosine = prepared.cosine.ptr();
         let mut sine = prepared.sine.ptr();
         let mut heads = prepared.config.heads as u32;
@@ -1377,14 +1416,7 @@ impl CudaCandidateRuntime {
                 "partial-RoPE context synchronization",
             )?;
         }
-        let mut result = vec![0.0_f32; prepared.config.heads * prepared.config.head_dim];
-        prepared.values.copy_to(as_bytes_mut(&mut result))?;
-        if result.iter().any(|value| !value.is_finite()) {
-            return Err(EngineError::InvalidState(
-                "CUDA partial RoPE produced a non-finite output".into(),
-            ));
-        }
-        Ok(result)
+        Ok(())
     }
 
     pub fn prepare_paged_q2q4_gqa(

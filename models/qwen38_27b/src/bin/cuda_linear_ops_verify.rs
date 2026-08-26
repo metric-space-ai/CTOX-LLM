@@ -51,6 +51,7 @@ struct Report<'a> {
     qwen_norm_model_bytes: usize,
     qwen_norm_transient_bytes: usize,
     partial_rope_transient_bytes: usize,
+    partial_rope_device_view_staging_bytes: usize,
     maximum_convolution_absolute_error: f32,
     maximum_convolution_relative_error: f32,
     maximum_gated_norm_absolute_error: f32,
@@ -59,6 +60,7 @@ struct Report<'a> {
     maximum_qwen_norm_relative_error: f32,
     maximum_partial_rope_absolute_error: f32,
     partial_rope_tail_exact: bool,
+    partial_rope_device_view_path_verified: bool,
     state_matches_oracle_exactly: bool,
     reset_zero_state_verified: bool,
     driver_free_bytes_before_prepare: usize,
@@ -101,7 +103,6 @@ fn main() -> anyhow::Result<()> {
             .map(|index| ((index + 1) as f32 * 0.031).cos() * 0.25),
     );
     let mut conv = runtime.prepare_causal_conv_f16(conv_config, &conv_weight_bytes)?;
-    let (free_after_prepare, _) = runtime.memory_info()?;
     let mut oracle_state = vec![f16::ZERO; conv_config.channels * conv_config.kernel_width];
     let mut maximum_convolution_absolute_error = 0.0_f32;
     let mut maximum_convolution_relative_error = 0.0_f32;
@@ -245,12 +246,16 @@ fn main() -> anyhow::Result<()> {
     )?;
     let query_rope = runtime.prepare_partial_rope_f32(query_rope_config)?;
     let key_rope = runtime.prepare_partial_rope_f32(key_rope_config)?;
-    query_rope.write_values(&query_input)?;
-    key_rope.write_values(&key_input)?;
+    let query_rope_staging = runtime.prepare_verifier_f32_tensor(&query_input)?;
+    let key_rope_staging = runtime.prepare_verifier_f32_tensor(&key_input)?;
     query_rope.write_position(131_071)?;
     key_rope.write_position(131_071)?;
-    let actual_query = runtime.dispatch_partial_rope_f32(&query_rope)?;
-    let actual_key = runtime.dispatch_partial_rope_f32(&key_rope)?;
+    let actual_query_view =
+        runtime.dispatch_partial_rope_f32_device(&query_rope, query_rope_staging.device_view()?)?;
+    let actual_query = runtime.verifier_read_f32(actual_query_view)?;
+    let actual_key_view =
+        runtime.dispatch_partial_rope_f32_device(&key_rope, key_rope_staging.device_view()?)?;
+    let actual_key = runtime.verifier_read_f32(actual_key_view)?;
     let mut maximum_partial_rope_absolute_error = 0.0_f32;
     let mut unused_relative = 0.0_f32;
     track_error(
@@ -290,11 +295,16 @@ fn main() -> anyhow::Result<()> {
     let qwen_norm_model_bytes = qwen_norm.model_bytes();
     let qwen_norm_transient_bytes = qwen_norm.transient_bytes();
     let partial_rope_transient_bytes = query_rope.transient_bytes() + key_rope.transient_bytes();
+    let partial_rope_device_view_staging_bytes =
+        query_rope_staging.resident_bytes() + key_rope_staging.resident_bytes();
+    let (free_after_prepare, _) = runtime.memory_info()?;
     drop(conv);
     drop(norm);
     drop(qwen_norm);
     drop(query_rope);
     drop(key_rope);
+    drop(query_rope_staging);
+    drop(key_rope_staging);
     let (free_after_drop, _) = runtime.memory_info()?;
     let observed_reclaimed_bytes = free_after_drop.saturating_sub(free_after_prepare);
     let requested_bytes = convolution_model_bytes
@@ -304,7 +314,8 @@ fn main() -> anyhow::Result<()> {
         + gated_norm_transient_bytes
         + qwen_norm_model_bytes
         + qwen_norm_transient_bytes
-        + partial_rope_transient_bytes;
+        + partial_rope_transient_bytes
+        + partial_rope_device_view_staging_bytes;
     anyhow::ensure!(
         observed_reclaimed_bytes >= requested_bytes,
         "dropping CUDA linear-op objects did not reclaim requested buffers"
@@ -313,7 +324,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v1",
+            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v2",
             status: "pass",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -337,6 +348,7 @@ fn main() -> anyhow::Result<()> {
             qwen_norm_model_bytes,
             qwen_norm_transient_bytes,
             partial_rope_transient_bytes,
+            partial_rope_device_view_staging_bytes,
             maximum_convolution_absolute_error,
             maximum_convolution_relative_error,
             maximum_gated_norm_absolute_error,
@@ -345,13 +357,14 @@ fn main() -> anyhow::Result<()> {
             maximum_qwen_norm_relative_error,
             maximum_partial_rope_absolute_error,
             partial_rope_tail_exact,
+            partial_rope_device_view_path_verified: true,
             state_matches_oracle_exactly,
             reset_zero_state_verified,
             driver_free_bytes_before_prepare: free_before_prepare,
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes,
-            note: "Verifier-only candidates; no CPU fallback and not promoted into the production CUDA ABI.",
+            note: "Verifier-only candidates; partial RoPE consumes and mutates producer-owned CUDA device views in place, with readback restricted to the verifier. No CPU fallback and not promoted into the production CUDA ABI.",
         })?
     );
     Ok(())

@@ -141,10 +141,13 @@ Qwen partial RoPE is implemented as an in-place non-interleaved/NeoX-pairing
 candidate anchored to the newly pinned upstream `rope.cu`/`rope.cuh`. Query
 (24x256) and key (4x256) profiles share the 64-value rotary prefix and leave
 the remaining 192 values per head byte-identical. Only two 32-value f32
-trigonometric tables are prepared per position. SM86 compilation uses 18
+trigonometric tables are prepared per position. Its context-bound device-view
+entry point mutates projection-owned Q/K allocations in place and returns the
+same borrowed view, so the production edge into paged GQA needs no staging
+copy. SM86 compilation uses 18
 registers with no stack, spills, or shared memory; the chained verifier checks
-position 131,071 against the Rust oracle and requires an exactly unchanged
-tail.
+this device-view path at position 131,071 against the Rust oracle and requires
+an exactly unchanged tail.
 
 The first packed paged-GQA correctness candidate fixes Qwen3.8-27B's exact
 24-query-head, 4-KV-head, 256-wide geometry. Persistent device storage consists

@@ -188,7 +188,9 @@ Q4-to-Q2 page demotion execute on device, persistent storage contains no
 expanded FP16/FP32 KV cache, and attention uses one-pass online softmax over
 the packed pages. A context-bound borrowed device-view API now accepts
 device-resident Q/K/V and returns device-resident attention output; only its
-standalone verifier wrapper uploads and reads f32 host slices. Its separate
+standalone verifier wrapper uploads and reads f32 host slices. Partial RoPE
+likewise transforms producer-owned Q/K views in place, completing that
+device-resident edge into GQA. Its separate
 scalar-oracle verifier is queued on physical GPU 2 after the BF16 recovery
 pipeline; the production backend remains fail-closed until that evidence and
 the complete projection/RoPE/attention/output graph wiring exist.
