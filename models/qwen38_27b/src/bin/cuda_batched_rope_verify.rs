@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use ctox_qwen38_27b::backend::cuda_runtime::{CudaCandidateRuntime, CudaPartialRopeConfig};
+use ctox_qwen38_27b::backend::cuda_runtime::{
+    CudaCandidateRuntime, CudaPartialRopeConfig, CudaQueryGateConfig,
+};
+use half::f16;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -40,6 +43,9 @@ struct Report<'a> {
     maximum_key_sequential_absolute_delta: f32,
     query_tail_exact: bool,
     key_tail_exact: bool,
+    maximum_query_gate_query_sequential_absolute_delta: f32,
+    maximum_query_gate_gate_sequential_absolute_delta: f32,
+    query_gate_output_bytes: usize,
     workspace_bytes: usize,
     staging_bytes: usize,
     driver_free_bytes_before_prepare: usize,
@@ -146,11 +152,67 @@ fn main() -> anyhow::Result<()> {
         "batched RoPE modified its tail"
     );
 
+    let query_gate_config = CudaQueryGateConfig::QWEN38_27B;
+    let query_gate_row_values = query_gate_config.heads * query_gate_config.head_dim * 2;
+    let query_gate_input: Vec<f32> = (0..args.tokens * query_gate_row_values)
+        .map(|index| ((index + 41) as f32 * 0.011).sin() * 0.65)
+        .collect();
+    let q_norm_weight: Vec<u8> = (0..query_gate_config.head_dim)
+        .map(|index| ((index % 31) as f32 - 15.0) * 0.002)
+        .map(f16::from_f32)
+        .flat_map(|value| value.to_bits().to_le_bytes())
+        .collect();
+    let query_gate = runtime.prepare_query_gate_norm_rope_f32(query_gate_config, &q_norm_weight)?;
+    let query_gate_single_staging =
+        runtime.prepare_verifier_f32_tensor(&query_gate_input[..query_gate_row_values])?;
+    let query_gate_output_values = query_gate_config.heads * query_gate_config.head_dim;
+    let mut sequential_query_gate_query =
+        Vec::with_capacity(args.tokens * query_gate_output_values);
+    let mut sequential_query_gate_gate = Vec::with_capacity(args.tokens * query_gate_output_values);
+    for token in 0..args.tokens {
+        let start = token * query_gate_row_values;
+        query_gate_single_staging.write(&query_gate_input[start..start + query_gate_row_values])?;
+        query_gate.write_position(args.start_position + token as u64)?;
+        let (query, gate) = runtime.dispatch_query_gate_norm_rope_device(
+            &query_gate,
+            query_gate_single_staging.device_view()?,
+        )?;
+        sequential_query_gate_query.extend(runtime.verifier_read_f32(query)?);
+        sequential_query_gate_gate.extend(runtime.verifier_read_f32(gate)?);
+    }
+    let query_gate_batch_staging = runtime.prepare_verifier_f32_tensor(&query_gate_input)?;
+    let query_gate_batch_output =
+        runtime.prepare_batched_query_gate_output(query_gate_config, args.tokens)?;
+    let (query_gate_query_view, query_gate_gate_view) = runtime
+        .dispatch_batched_query_gate_norm_rope_with_table_device(
+            &query_gate,
+            &workspace,
+            &query_gate_batch_output,
+            query_gate_batch_staging.device_view()?,
+            args.tokens,
+        )?;
+    let actual_query_gate_query = runtime.verifier_read_f32(query_gate_query_view)?;
+    let actual_query_gate_gate = runtime.verifier_read_f32(query_gate_gate_view)?;
+    let maximum_query_gate_query_sequential_absolute_delta =
+        maximum_delta(&sequential_query_gate_query, &actual_query_gate_query);
+    let maximum_query_gate_gate_sequential_absolute_delta =
+        maximum_delta(&sequential_query_gate_gate, &actual_query_gate_gate);
+    anyhow::ensure!(
+        maximum_query_gate_query_sequential_absolute_delta <= args.absolute_tolerance
+            && maximum_query_gate_gate_sequential_absolute_delta == 0.0,
+        "batched query/gate fusion differs from sequential CUDA: query {}, gate {}",
+        maximum_query_gate_query_sequential_absolute_delta,
+        maximum_query_gate_gate_sequential_absolute_delta
+    );
+
     let workspace_bytes = workspace.transient_bytes();
+    let query_gate_output_bytes = query_gate_batch_output.transient_bytes();
     let staging_bytes = query_single_staging.resident_bytes()
         + key_single_staging.resident_bytes()
         + query_batch.resident_bytes()
-        + key_batch.resident_bytes();
+        + key_batch.resident_bytes()
+        + query_gate_single_staging.resident_bytes()
+        + query_gate_batch_staging.resident_bytes();
     let single_operator_bytes = query_single.transient_bytes() + key_single.transient_bytes();
     let (free_after_prepare, _) = runtime.memory_info()?;
     drop(query_single);
@@ -160,10 +222,15 @@ fn main() -> anyhow::Result<()> {
     drop(workspace);
     drop(query_batch);
     drop(key_batch);
+    drop(query_gate);
+    drop(query_gate_single_staging);
+    drop(query_gate_batch_staging);
+    drop(query_gate_batch_output);
     let (free_after_drop, _) = runtime.memory_info()?;
     let observed_reclaimed_bytes = free_after_drop.saturating_sub(free_after_prepare);
     anyhow::ensure!(
-        observed_reclaimed_bytes >= workspace_bytes + staging_bytes + single_operator_bytes,
+        observed_reclaimed_bytes
+            >= workspace_bytes + query_gate_output_bytes + staging_bytes + single_operator_bytes,
         "batched RoPE verifier did not reclaim all owned allocations"
     );
 
@@ -190,13 +257,16 @@ fn main() -> anyhow::Result<()> {
             maximum_key_sequential_absolute_delta,
             query_tail_exact,
             key_tail_exact,
+            maximum_query_gate_query_sequential_absolute_delta,
+            maximum_query_gate_gate_sequential_absolute_delta,
+            query_gate_output_bytes,
             workspace_bytes,
             staging_bytes,
             driver_free_bytes_before_prepare: free_before_prepare,
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes,
-            note: "One device-built [token, rotary-pair] table is shared by token-major query and key in-place kernels. Sequential CUDA is the oracle; no host token loop exists in the batched path and no model operation falls back to CPU.",
+            note: "One device-built [token, rotary-pair] table is shared by token-major query and key in-place kernels. The same table drives batched Q/Gate deinterleave, resident Q RMSNorm, and query RoPE. Sequential CUDA is the oracle; no host token loop exists in the batched path and no model operation falls back to CPU.",
         })?
     );
     Ok(())

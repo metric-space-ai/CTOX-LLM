@@ -307,8 +307,11 @@ the pack kernel uses 16 registers with no spills. Batched partial RoPE now
 builds one compact position table on device and shares it across token-major
 query and key views; at position 131,071 both remain within `5.97e-8` of the
 sequential CUDA path and preserve every non-rotary tail value bit-for-bit.
-Batched query/gate deinterleave+RMSNorm and executor replacement of the current
-sequential loop remain open. The schedule names batched key RoPE and persistent KV append
+The batched Query/Gate fusion now consumes that same table, deinterleaves all
+prompt rows, applies the resident Q RMSNorm, and rotates Q in one launch per
+chunk; Query differs by at most `2.39e-7` from sequential CUDA and Gate is
+bit-identical. Executor replacement of the current sequential loop remains
+open. The schedule names batched key RoPE and persistent KV append
 explicitly before every causal GQA scan; these state mutations can no longer
 be hidden by a nominal attention step.
 

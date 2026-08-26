@@ -1393,6 +1393,72 @@ void ctox_qwen_query_gate_norm_rope_f32_sm86(
     }
 }
 
+// Token-major prompt form of the query/gate fusion above. One block owns one
+// (token, head) row and consumes the same shared RoPE table as batched key
+// rotation, so no host token loop or duplicated trigonometric table exists.
+// ref: ggml/src/ggml-cuda/norm.cu:48-148
+// ref: ggml/src/ggml-cuda/rope.cu:116-183
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_qwen_query_gate_norm_rope_batch_f32_sm86(
+    const float* __restrict__ query_gate,
+    const __half* __restrict__ q_norm_weight,
+    const float* __restrict__ cosine,
+    const float* __restrict__ sine,
+    float* __restrict__ query,
+    float* __restrict__ gate,
+    unsigned token_count,
+    unsigned heads,
+    unsigned head_dim,
+    unsigned rotary_dim,
+    float epsilon) {
+    const unsigned head = blockIdx.x;
+    const unsigned token = blockIdx.y;
+    const unsigned column = threadIdx.x;
+    const unsigned lane = column & (kWarpSize - 1u);
+    const unsigned warp = column / kWarpSize;
+    if (token >= token_count || head >= heads || head_dim != 256u
+        || rotary_dim != 64u) {
+        return;
+    }
+    const unsigned input_base = (token * heads + head) * head_dim * 2u;
+    const unsigned output_base = (token * heads + head) * head_dim;
+    const unsigned table_base = token * (rotary_dim / 2u);
+    const float query_value = query_gate[input_base + column];
+    gate[output_base + column] = query_gate[input_base + head_dim + column];
+
+    float sum_squares = query_value * query_value;
+    sum_squares = warp_sum(sum_squares);
+    __shared__ float warp_sums[8];
+    __shared__ float inverse;
+    if (lane == 0u) {
+        warp_sums[warp] = sum_squares;
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        sum_squares = lane < 8u ? warp_sums[lane] : 0.0f;
+        sum_squares = warp_sum(sum_squares);
+        if (lane == 0u) {
+            inverse = rsqrtf(sum_squares * (1.0f / 256.0f) + epsilon);
+        }
+    }
+    __syncthreads();
+
+    if (column < rotary_dim / 2u) {
+        const unsigned right_column = column + rotary_dim / 2u;
+        const float left = query_value * inverse
+            * (1.0f + __half2float(q_norm_weight[column]));
+        const float right = query_gate[input_base + right_column] * inverse
+            * (1.0f + __half2float(q_norm_weight[right_column]));
+        query[output_base + column] = left * cosine[table_base + column]
+            - right * sine[table_base + column];
+        query[output_base + right_column] = right * cosine[table_base + column]
+            + left * sine[table_base + column];
+    } else if (column >= rotary_dim) {
+        query[output_base + column] = query_value * inverse
+            * (1.0f + __half2float(q_norm_weight[column]));
+    }
+}
+
 struct CtoxPagedKvDescriptor {
     unsigned precision;
     unsigned physical_slot;

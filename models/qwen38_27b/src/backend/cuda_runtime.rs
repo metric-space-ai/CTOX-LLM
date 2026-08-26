@@ -33,9 +33,10 @@ use super::cuda::{
     Q2_B64_A8_BATCHED_MMQ_SYMBOL, Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
     Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_BATCHED_MATMUL_SYMBOL,
     Q4_B64_A8_BATCHED_MMQ_SYMBOL, Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL,
-    Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL,
-    QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL, ROPE_TABLE_BATCH_F32_SYMBOL,
-    SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL, TOPK_TOPP_SAMPLE_F32_SYMBOL,
+    Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_BATCH_F32_SYMBOL,
+    QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL,
+    ROPE_TABLE_BATCH_F32_SYMBOL, SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
+    TOPK_TOPP_SAMPLE_F32_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -239,6 +240,7 @@ struct CudaContextInner {
     rope_table_batch_f32_function: CuFunction,
     partial_rope_batch_f32_function: CuFunction,
     query_gate_norm_rope_f32_function: CuFunction,
+    query_gate_norm_rope_batch_f32_function: CuFunction,
     pack_paged_kv_q4_f32_function: CuFunction,
     pack_paged_kv_q4_batch_f32_function: CuFunction,
     demote_paged_kv_q4_to_q2_function: CuFunction,
@@ -867,6 +869,18 @@ pub struct PreparedCudaQueryGate {
     transient_bytes: usize,
 }
 
+/// Shared token-major outputs for one full-attention prompt chunk. Q-norm
+/// weights remain in the resident per-layer [`PreparedCudaQueryGate`] owner.
+pub struct PreparedCudaBatchedQueryGateOutput {
+    context: Rc<CudaContextInner>,
+    token_capacity: u32,
+    heads: u32,
+    head_dim: u32,
+    query: DeviceBuffer,
+    gate: DeviceBuffer,
+    transient_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaPagedGqaConfig {
     pub query_heads: usize,
@@ -1340,6 +1354,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let query_gate_norm_rope_batch_f32_function =
+            match resolve_function(&driver, module, QUERY_GATE_NORM_ROPE_BATCH_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let pack_paged_kv_q4_f32_function =
             match resolve_function(&driver, module, PACK_PAGED_KV_Q4_F32_SYMBOL) {
                 Ok(function) => function,
@@ -1472,6 +1497,7 @@ impl CudaCandidateRuntime {
                 rope_table_batch_f32_function,
                 partial_rope_batch_f32_function,
                 query_gate_norm_rope_f32_function,
+                query_gate_norm_rope_batch_f32_function,
                 pack_paged_kv_q4_f32_function,
                 pack_paged_kv_q4_batch_f32_function,
                 demote_paged_kv_q4_to_q2_function,
@@ -3499,6 +3525,36 @@ impl CudaCandidateRuntime {
         Ok(prepared)
     }
 
+    pub fn prepare_batched_query_gate_output(
+        &self,
+        config: CudaQueryGateConfig,
+        token_capacity: usize,
+    ) -> Result<PreparedCudaBatchedQueryGateOutput> {
+        if config != CudaQueryGateConfig::QWEN38_27B {
+            return Err(EngineError::Shape(
+                "CUDA batched query/gate output requires the exact Qwen3.8-27B profile".into(),
+            ));
+        }
+        let token_capacity = validate_a8_batch_capacity(token_capacity)?;
+        let output_bytes = (token_capacity as usize)
+            .checked_mul(config.heads)
+            .and_then(|values| values.checked_mul(config.head_dim))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA batched query/gate output overflows".into())
+            })?;
+        self.make_current()?;
+        Ok(PreparedCudaBatchedQueryGateOutput {
+            context: Rc::clone(&self.inner),
+            token_capacity,
+            heads: config.heads as u32,
+            head_dim: config.head_dim as u32,
+            query: DeviceBuffer::allocate(self, output_bytes)?,
+            gate: DeviceBuffer::allocate(self, output_bytes)?,
+            transient_bytes: output_bytes * 2,
+        })
+    }
+
     pub fn prepare_batched_rope_workspace(
         &self,
         config: CudaPartialRopeConfig,
@@ -3910,6 +3966,102 @@ impl CudaCandidateRuntime {
         Ok((
             prepared.query.f32_view(0, output_values)?,
             prepared.gate.f32_view(0, output_values)?,
+        ))
+    }
+
+    /// Deinterleaves token-major Q/Gate rows, applies the resident per-layer
+    /// Q RMSNorm, and consumes the same device RoPE table used by batched K.
+    pub fn dispatch_batched_query_gate_norm_rope_with_table_device<'a>(
+        &self,
+        prepared: &PreparedCudaQueryGate,
+        rope: &PreparedCudaBatchedRopeWorkspace,
+        output: &'a PreparedCudaBatchedQueryGateOutput,
+        query_gate: CudaDeviceF32View<'_>,
+        token_count: usize,
+    ) -> Result<(CudaDeviceF32View<'a>, CudaDeviceF32View<'a>)> {
+        let token_count = validate_a8_batch_capacity(token_count)?;
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &rope.context)
+            || !Rc::ptr_eq(&self.inner, &output.context)
+            || !Rc::ptr_eq(&self.inner, query_gate.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA batched query/gate path crosses driver contexts".into(),
+            ));
+        }
+        if prepared.config != CudaQueryGateConfig::QWEN38_27B
+            || output.heads != prepared.config.heads as u32
+            || output.head_dim != prepared.config.head_dim as u32
+            || rope.rotary_dim != prepared.config.rotary_dim as u32
+            || rope.theta.to_bits() != prepared.config.theta.to_bits()
+            || token_count > output.token_capacity
+            || token_count > rope.token_capacity
+        {
+            return Err(EngineError::Shape(
+                "CUDA batched query/gate workspace/config mismatch".into(),
+            ));
+        }
+        let output_values = (token_count as usize)
+            .checked_mul(prepared.config.heads)
+            .and_then(|values| values.checked_mul(prepared.config.head_dim))
+            .ok_or_else(|| EngineError::Shape("CUDA batched query/gate output overflows".into()))?;
+        let expected_input = output_values
+            .checked_mul(2)
+            .ok_or_else(|| EngineError::Shape("CUDA batched query/gate input overflows".into()))?;
+        if query_gate.values() != expected_input {
+            return Err(EngineError::Shape(format!(
+                "CUDA batched query/gate input has {} values, expected {expected_input}",
+                query_gate.values()
+            )));
+        }
+
+        self.make_current()?;
+        let mut query_gate_ptr = query_gate.ptr()?;
+        let mut q_norm_weight = prepared.q_norm_weight.ptr();
+        let mut cosine = rope.cosine.ptr();
+        let mut sine = rope.sine.ptr();
+        let mut query = output.query.ptr();
+        let mut gate = output.gate.ptr();
+        let mut tokens = token_count;
+        let mut heads = prepared.config.heads as u32;
+        let mut head_dim = prepared.config.head_dim as u32;
+        let mut rotary_dim = prepared.config.rotary_dim as u32;
+        let mut epsilon = prepared.config.epsilon;
+        let mut params = [
+            (&mut query_gate_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q_norm_weight as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut cosine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut sine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut query as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut gate as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut tokens as *mut u32).cast::<c_void>(),
+            (&mut heads as *mut u32).cast::<c_void>(),
+            (&mut head_dim as *mut u32).cast::<c_void>(),
+            (&mut rotary_dim as *mut u32).cast::<c_void>(),
+            (&mut epsilon as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.query_gate_norm_rope_batch_f32_function,
+                    heads,
+                    token_count,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "batched query/gate norm+RoPE kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("batched query/gate norm+RoPE context synchronization")?;
+        Ok((
+            output.query.f32_view(0, output_values)?,
+            output.gate.f32_view(0, output_values)?,
         ))
     }
 
@@ -7930,6 +8082,16 @@ impl PreparedCudaQueryGate {
         }
         self.cosine.write(as_bytes(&cosine))?;
         self.sine.write(as_bytes(&sine))
+    }
+}
+
+impl PreparedCudaBatchedQueryGateOutput {
+    pub fn token_capacity(&self) -> usize {
+        self.token_capacity as usize
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
     }
 }
 

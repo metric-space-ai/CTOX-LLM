@@ -536,6 +536,8 @@ pub const PARTIAL_ROPE_F32_SYMBOL: &str = "ctox_partial_rope_f32_sm86";
 pub const ROPE_TABLE_BATCH_F32_SYMBOL: &str = "ctox_rope_table_batch_f32_sm86";
 pub const PARTIAL_ROPE_BATCH_F32_SYMBOL: &str = "ctox_partial_rope_batch_f32_sm86";
 pub const QUERY_GATE_NORM_ROPE_F32_SYMBOL: &str = "ctox_qwen_query_gate_norm_rope_f32_sm86";
+pub const QUERY_GATE_NORM_ROPE_BATCH_F32_SYMBOL: &str =
+    "ctox_qwen_query_gate_norm_rope_batch_f32_sm86";
 pub const PACK_PAGED_KV_Q4_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_f32_sm86";
 pub const PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_batch_f32_sm86";
 pub const DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL: &str = "ctox_demote_paged_kv_q4_to_q2_sm86";
@@ -1658,6 +1660,7 @@ mod tests {
             ROPE_TABLE_BATCH_F32_SYMBOL,
             PARTIAL_ROPE_BATCH_F32_SYMBOL,
             QUERY_GATE_NORM_ROPE_F32_SYMBOL,
+            QUERY_GATE_NORM_ROPE_BATCH_F32_SYMBOL,
             PACK_PAGED_KV_Q4_F32_SYMBOL,
             PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL,
             DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
