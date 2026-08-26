@@ -273,7 +273,9 @@ causal tail queries used by MTP4 verification. Sixteen KV segments expose
 1,920 partial blocks on SM86 and a second kernel combines their online-softmax
 state entirely on device. The byte-identical Apache-2.0 upstream patch is
 pinned beside the existing CUDA references. Scheduler integration remains
-closed until the GPU3 numerical, lifecycle, and latency comparison passes.
+closed until the GPU3 numerical/lifecycle verifier and representative-context
+latency sweep pass; the verifier now reports a one-barrier comparison with
+five sequential full-cache attention launches.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight

@@ -264,7 +264,12 @@ kernel, with zero stack, spill, local, or shared bytes for both. The v3
 paged-GQA verifier compares all five outputs with the
 scalar causal oracle, requires bit-identical results from host-staging and
 borrowed-device entry points, and proves scratch reclamation. Hardware
-numerics and latency versus five sequential launches remain pending, so the
+numerics and latency versus five sequential launches remain pending. The
+verifier now alternates both paths with one final context barrier per block
+and reports their mean latency and speedup; the sequential comparison scans
+the full cache for every query and is therefore a conservative traffic
+baseline, not the causality oracle. A short-context result cannot promote the
+kernel, so the
 production scheduler still uses the verified sequential structure.
 
 The first GPU3 run is recorded in

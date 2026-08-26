@@ -23,6 +23,8 @@ struct Args {
     absolute_tolerance: f32,
     #[arg(long, default_value_t = 2.0e-4)]
     relative_tolerance: f32,
+    #[arg(long, default_value_t = 20)]
+    benchmark_iterations: usize,
 }
 
 #[derive(Serialize)]
@@ -50,6 +52,10 @@ struct Report<'a> {
     split_maximum_relative_error: f32,
     split_device_view_path_verified: bool,
     split_tail_causality_verified: bool,
+    benchmark_iterations: usize,
+    sequential_full_context_microseconds: f64,
+    split_causal_microseconds: f64,
+    split_speedup: f64,
     device_view_path_verified: bool,
     demotion_verified: bool,
     reset_verified: bool,
@@ -93,6 +99,7 @@ fn main() -> anyhow::Result<()> {
     let split_transient_bytes;
     let free_after_prepare;
     let reset_verified;
+    let benchmark;
     {
         let mut prepared = runtime.prepare_paged_q2q4_gqa(config)?;
         let mut split = runtime.prepare_paged_q2q4_gqa_split(&prepared)?;
@@ -236,6 +243,13 @@ fn main() -> anyhow::Result<()> {
                 "split-KV output {index}: expected {left}, got {right}"
             );
         }
+        benchmark = runtime.benchmark_paged_q2q4_gqa_split(
+            &prepared,
+            &mut split,
+            split_staging.device_view()?,
+            PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+            args.benchmark_iterations,
+        )?;
         verifier_cpu_packed_bytes = oracle.packed_bytes();
         q4_tokens = prepared.q4_tokens();
         anyhow::ensure!(
@@ -286,6 +300,11 @@ fn main() -> anyhow::Result<()> {
             split_maximum_relative_error,
             split_device_view_path_verified: true,
             split_tail_causality_verified: true,
+            benchmark_iterations: benchmark.iterations,
+            sequential_full_context_microseconds: benchmark
+                .sequential_full_context_microseconds,
+            split_causal_microseconds: benchmark.split_causal_microseconds,
+            split_speedup: benchmark.speedup,
             device_view_path_verified: true,
             demotion_verified: true,
             reset_verified,
@@ -293,7 +312,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
-            note: "Q/K/V enter the GQA dispatcher as context-bound device views and its output is read back only by the explicit verifier API. The CPU cache exists solely as the external numerical oracle; CUDA packs Q4 and demotes Q4-to-Q2 entirely on device with no host packed-cache mirror. The isolated five-query path splits canonical mixed Q2/Q4 KV across 16 partial blocks per head, combines online-softmax state on device, and verifies tail causality against the scalar oracle before scheduler integration.",
+            note: "Q/K/V enter the GQA dispatcher as context-bound device views and its output is read back only by the explicit verifier API. The CPU cache exists solely as the external numerical oracle; CUDA packs Q4 and demotes Q4-to-Q2 entirely on device with no host packed-cache mirror. The isolated five-query path splits canonical mixed Q2/Q4 KV across 16 partial blocks per head, combines online-softmax state on device, and verifies tail causality against the scalar oracle before scheduler integration. The latency comparison gives both paths one final context barrier; its five-launch sequential baseline conservatively exposes the full cache to every query, while the split path applies exact per-tail-query causality.",
         })?
     );
     Ok(())

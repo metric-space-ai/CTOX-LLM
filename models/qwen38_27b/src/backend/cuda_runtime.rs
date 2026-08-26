@@ -12,6 +12,7 @@ use std::mem::size_of_val;
 use std::ptr;
 use std::rc::Rc;
 use std::slice;
+use std::time::Instant;
 
 use libloading::Library;
 use sha2::{Digest, Sha256};
@@ -188,6 +189,14 @@ pub struct CudaSampledToken {
     pub token: u32,
     pub nucleus_len: u32,
     pub nucleus_total: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CudaSplitGqaBenchmark {
+    pub iterations: usize,
+    pub sequential_full_context_microseconds: f64,
+    pub split_causal_microseconds: f64,
+    pub speedup: f64,
 }
 
 struct CudaContextInner {
@@ -3036,7 +3045,7 @@ impl CudaCandidateRuntime {
     fn append_and_dispatch_paged_q2q4_gqa_inner(
         &self,
         prepared: &mut PreparedCudaPagedGqa,
-        mut query_ptr: CuDevicePtr,
+        query_ptr: CuDevicePtr,
         mut key_ptr: CuDevicePtr,
         mut value_ptr: CuDevicePtr,
     ) -> Result<()> {
@@ -3208,11 +3217,25 @@ impl CudaCandidateRuntime {
         ];
         prepared.params.write(as_bytes(&params_words))?;
 
+        self.launch_paged_q2q4_gqa(
+            prepared,
+            query_ptr,
+            prepared.output.ptr(),
+            "paged Q2/Q4 GQA context synchronization",
+        )
+    }
+
+    fn launch_paged_q2q4_gqa(
+        &self,
+        prepared: &PreparedCudaPagedGqa,
+        mut query_ptr: CuDevicePtr,
+        mut output: CuDevicePtr,
+        synchronization: &'static str,
+    ) -> Result<()> {
         self.make_current()?;
         let mut q2_pages = prepared.q2_pages.ptr();
         let mut q4_pages = prepared.q4_pages.ptr();
         let mut descriptors = prepared.descriptors.ptr();
-        let mut output = prepared.output.ptr();
         let mut params_ptr = prepared.params.ptr();
         let mut kernel_params = [
             (&mut query_ptr as *mut CuDevicePtr).cast::<c_void>(),
@@ -3240,7 +3263,7 @@ impl CudaCandidateRuntime {
                 "paged Q2/Q4 GQA kernel launch",
             )?;
         }
-        self.synchronize_after_launch("paged Q2/Q4 GQA context synchronization")
+        self.synchronize_after_launch(synchronization)
     }
 
     fn read_paged_q2q4_gqa_output(&self, prepared: &PreparedCudaPagedGqa) -> Result<Vec<f32>> {
@@ -3490,6 +3513,131 @@ impl CudaCandidateRuntime {
             )?;
         }
         self.synchronize_after_launch("paged Q2/Q4 split GQA context synchronization")
+    }
+
+    /// Compares one five-query split-KV verification block with five
+    /// sequential single-query launches over the same resident cache. The
+    /// sequential baseline intentionally exposes the full cache to every
+    /// query; it is a conservative traffic/launch baseline rather than a
+    /// second causality oracle. Both sides use one final context barrier per
+    /// measured block.
+    pub fn benchmark_paged_q2q4_gqa_split(
+        &self,
+        paged: &PreparedCudaPagedGqa,
+        prepared: &mut PreparedCudaSplitPagedGqa,
+        query: CudaDeviceF32View<'_>,
+        query_tokens: usize,
+        iterations: usize,
+    ) -> Result<CudaSplitGqaBenchmark> {
+        if !(1..=10_000).contains(&iterations) {
+            return Err(EngineError::Shape(
+                "CUDA split GQA benchmark iterations must be within 1..=10000".into(),
+            ));
+        }
+        if !Rc::ptr_eq(&self.inner, query.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA split GQA benchmark query belongs to another context".into(),
+            ));
+        }
+        self.validate_paged_q2q4_gqa_split(paged, prepared, query.values(), query_tokens)?;
+        let query_ptr = query.ptr()?;
+
+        self.run_token_submission("CUDA sequential GQA benchmark warmup", || {
+            self.dispatch_paged_q2q4_gqa_sequential_full_context_inner(
+                paged,
+                prepared,
+                query_ptr,
+                query_tokens,
+            )
+        })?;
+        self.run_token_submission("CUDA split GQA benchmark warmup", || {
+            self.dispatch_paged_q2q4_gqa_split_inner(paged, prepared, query_ptr, query_tokens)
+        })?;
+
+        let mut sequential_seconds = 0.0_f64;
+        let mut split_seconds = 0.0_f64;
+        for iteration in 0..iterations {
+            if iteration.is_multiple_of(2) {
+                let started = Instant::now();
+                self.run_token_submission("CUDA sequential GQA benchmark", || {
+                    self.dispatch_paged_q2q4_gqa_sequential_full_context_inner(
+                        paged,
+                        prepared,
+                        query_ptr,
+                        query_tokens,
+                    )
+                })?;
+                sequential_seconds += started.elapsed().as_secs_f64();
+
+                let started = Instant::now();
+                self.run_token_submission("CUDA split GQA benchmark", || {
+                    self.dispatch_paged_q2q4_gqa_split_inner(
+                        paged,
+                        prepared,
+                        query_ptr,
+                        query_tokens,
+                    )
+                })?;
+                split_seconds += started.elapsed().as_secs_f64();
+            } else {
+                let started = Instant::now();
+                self.run_token_submission("CUDA split GQA benchmark", || {
+                    self.dispatch_paged_q2q4_gqa_split_inner(
+                        paged,
+                        prepared,
+                        query_ptr,
+                        query_tokens,
+                    )
+                })?;
+                split_seconds += started.elapsed().as_secs_f64();
+
+                let started = Instant::now();
+                self.run_token_submission("CUDA sequential GQA benchmark", || {
+                    self.dispatch_paged_q2q4_gqa_sequential_full_context_inner(
+                        paged,
+                        prepared,
+                        query_ptr,
+                        query_tokens,
+                    )
+                })?;
+                sequential_seconds += started.elapsed().as_secs_f64();
+            }
+        }
+        let sequential_full_context_microseconds = sequential_seconds * 1.0e6 / iterations as f64;
+        let split_causal_microseconds = split_seconds * 1.0e6 / iterations as f64;
+        Ok(CudaSplitGqaBenchmark {
+            iterations,
+            sequential_full_context_microseconds,
+            split_causal_microseconds,
+            speedup: sequential_full_context_microseconds / split_causal_microseconds,
+        })
+    }
+
+    fn dispatch_paged_q2q4_gqa_sequential_full_context_inner(
+        &self,
+        paged: &PreparedCudaPagedGqa,
+        prepared: &PreparedCudaSplitPagedGqa,
+        query_ptr: CuDevicePtr,
+        query_tokens: usize,
+    ) -> Result<()> {
+        let row_bytes = paged
+            .config
+            .query_heads
+            .checked_mul(paged.config.head_dim)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| EngineError::Shape("CUDA sequential GQA row overflows".into()))?;
+        for query_token in 0..query_tokens {
+            let offset = query_token
+                .checked_mul(row_bytes)
+                .ok_or_else(|| EngineError::Shape("CUDA sequential GQA offset overflows".into()))?;
+            self.launch_paged_q2q4_gqa(
+                paged,
+                device_ptr_offset(query_ptr, offset)?,
+                device_ptr_offset(prepared.output.ptr(), offset)?,
+                "paged Q2/Q4 sequential GQA benchmark synchronization",
+            )?;
+        }
+        Ok(())
     }
 
     pub fn prepare_embedding_recovered(
