@@ -44,6 +44,13 @@ struct FusedMatVecParams {
     uint reserved0;
 };
 
+struct RmsNormParams {
+    uint rows;
+    uint columns;
+    float epsilon;
+    uint reserved0;
+};
+
 inline float apply_activation(float value, uint activation) {
     if (activation == 1u) {
         // SiLU: x / (1 + exp(-x)), matching the Rust oracle.
@@ -422,4 +429,31 @@ kernel void q4_b64_recovered_row(
     float normalized1 = (float((packed >> 4u) & 0xfu) - 7.5f) * (1.0f / 7.5f);
     output[column] = scale * normalized0 * float(s_in[column]);
     output[column + 1u] = scale * normalized1 * float(s_in[column + 1u]);
+}
+
+// Qwen RMSNorm uses normalized * (1 + weight), unlike Llama's direct weight
+// convention. One 32-wide simdgroup owns one complete row, accumulates the
+// variance in f32, and writes strided columns without threadgroup scratch.
+kernel void qwen_rms_norm_1p_f32(
+    device const float* input [[buffer(0)]],
+    device const half* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant RmsNormParams& params [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= params.rows) {
+        return;
+    }
+    ulong row_offset = ulong(row) * params.columns;
+    float sum_squares = 0.0f;
+    for (uint column = lane; column < params.columns; column += 32u) {
+        float value = input[row_offset + column];
+        sum_squares = fma(value, value, sum_squares);
+    }
+    float variance = simd_sum(sum_squares) / float(params.columns);
+    float inverse = rsqrt(variance + params.epsilon);
+    for (uint column = lane; column < params.columns; column += 32u) {
+        float value = input[row_offset + column];
+        output[row_offset + column] = value * inverse * (1.0f + float(weight[column]));
+    }
 }

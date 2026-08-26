@@ -17,13 +17,14 @@ use sha2::{Digest, Sha256};
 
 use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row, MetalBufferAbi,
-    MetalFusedMatVecParams, MAX_SIMDGROUPS_PER_THREADGROUP, Q2_GATHERED_KERNEL_NAME,
-    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
-    Q4_RECOVERED_ROW_KERNEL_NAME,
+    MetalFusedMatVecParams, MetalRmsNormBufferAbi, MetalRmsNormParams,
+    MAX_SIMDGROUPS_PER_THREADGROUP, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
+    Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
+    Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
 };
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
-use crate::loader::{ModelArtifact, RecoveredMatrixView};
+use crate::loader::{FloatTensorView, ModelArtifact, RecoveredMatrixView};
 use crate::{EngineError, Result};
 
 const KERNEL_SOURCE: &str = include_str!("../../kernels/metal/q2q4_fused_matvec.metal");
@@ -46,6 +47,7 @@ pub struct MetalCandidateRuntime {
     q4_gathered_pipeline: ComputePipelineState,
     q2_recovered_row_pipeline: ComputePipelineState,
     q4_recovered_row_pipeline: ComputePipelineState,
+    rms_norm_1p_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -177,6 +179,20 @@ pub struct PreparedMappedMetalRecoveredRow {
     weights_offset: u64,
     s_in_offset: u64,
     s_out_offset: u64,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    transient_bytes: usize,
+}
+
+/// Qwen `(1 + weight)` RMSNorm with an mmap-backed FP16 weight vector.
+/// Input/output remain reusable f32 graph buffers; no expanded f32 weight
+/// copy is created at load time.
+pub struct PreparedMappedMetalRmsNorm {
+    rows: usize,
+    columns: usize,
+    mapping: MappedMetalArtifact,
+    weight_offset: u64,
+    input_buffer: Buffer,
     output_buffer: Buffer,
     params_buffer: Buffer,
     transient_bytes: usize,
@@ -375,6 +391,40 @@ impl PreparedMappedMetalRecoveredRow {
     }
 }
 
+impl PreparedMappedMetalRmsNorm {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.mapping.copied_model_bytes()
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        let expected = self
+            .rows
+            .checked_mul(self.columns)
+            .ok_or_else(|| EngineError::Shape("Metal RMSNorm input shape overflows".into()))?;
+        validate_metal_input(input, expected)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                self.input_buffer.contents().cast::<f32>(),
+                input.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -429,6 +479,13 @@ impl MetalCandidateRuntime {
                     "Metal Q4 recovered-row function lookup failed: {message}"
                 ))
             })?;
+        let rms_norm_1p_function = library
+            .get_function(RMS_NORM_1P_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Qwen RMSNorm function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -467,6 +524,19 @@ impl MetalCandidateRuntime {
                     "Metal Q4 recovered-row pipeline creation failed: {message}"
                 ))
             })?;
+        let rms_norm_1p_pipeline = device
+            .new_compute_pipeline_state_with_function(&rms_norm_1p_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Qwen RMSNorm pipeline creation failed: {message}"
+                ))
+            })?;
+        if rms_norm_1p_pipeline.thread_execution_width() != 32 {
+            return Err(EngineError::InvalidState(format!(
+                "Metal Qwen RMSNorm requires a 32-wide simdgroup, device reports {}",
+                rms_norm_1p_pipeline.thread_execution_width()
+            )));
+        }
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -477,6 +547,7 @@ impl MetalCandidateRuntime {
             q4_gathered_pipeline,
             q2_recovered_row_pipeline,
             q4_recovered_row_pipeline,
+            rms_norm_1p_pipeline,
         })
     }
 
@@ -883,6 +954,84 @@ impl MetalCandidateRuntime {
             weights_offset,
             s_in_offset,
             s_out_offset,
+            output_buffer,
+            params_buffer,
+            transient_bytes,
+        })
+    }
+
+    /// Prepare Qwen's `(1 + weight)` RMSNorm with an exact mmap-backed FP16
+    /// weight vector. The candidate supports one decode row and multi-row
+    /// prefill without changing the weight representation.
+    pub fn prepare_mapped_rms_norm_1p(
+        &self,
+        mapping: &MappedMetalArtifact,
+        weight: FloatTensorView<'_>,
+        input: &[f32],
+        rows: usize,
+        columns: usize,
+        epsilon: f32,
+    ) -> Result<PreparedMappedMetalRmsNorm> {
+        let value_count = rows
+            .checked_mul(columns)
+            .ok_or_else(|| EngineError::Shape("Metal RMSNorm shape overflows".into()))?;
+        if rows == 0 || columns == 0 || input.len() != value_count {
+            return Err(EngineError::Shape(format!(
+                "Metal RMSNorm input has {} values, expected {rows}x{columns}",
+                input.len()
+            )));
+        }
+        validate_metal_input(input, value_count)?;
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(EngineError::Shape(
+                "Metal RMSNorm epsilon must be finite and positive".into(),
+            ));
+        }
+        let expected_weight_bytes = columns
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| EngineError::Shape("Metal RMSNorm weight bytes overflow".into()))?;
+        let weight_bytes = match weight {
+            FloatTensorView::F16Le(bytes) if bytes.len() == expected_weight_bytes => bytes,
+            FloatTensorView::F16Le(bytes) => {
+                return Err(EngineError::Shape(format!(
+                    "Metal RMSNorm weight has {} bytes, expected {}",
+                    bytes.len(),
+                    expected_weight_bytes
+                )))
+            }
+            FloatTensorView::F32Le(_) => {
+                return Err(EngineError::UnsupportedDType(
+                    "Metal RMSNorm weight must remain packed FP16".into(),
+                ))
+            }
+        };
+        let weight_offset = mapping.byte_offset(weight_bytes, "RMSNorm weight")?;
+        let params = MetalRmsNormParams {
+            rows: u32::try_from(rows)
+                .map_err(|_| EngineError::Shape("Metal RMSNorm rows exceed u32".into()))?,
+            columns: u32::try_from(columns)
+                .map_err(|_| EngineError::Shape("Metal RMSNorm columns exceed u32".into()))?,
+            epsilon,
+            reserved0: 0,
+        };
+        let value_bytes = value_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("Metal RMSNorm value bytes overflow".into()))?;
+        let input_buffer = buffer_with_data(&self.device, as_bytes(input));
+        let output_buffer = self
+            .device
+            .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let params_buffer = buffer_with_data(&self.device, &params.encode());
+        let transient_bytes = value_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(MetalRmsNormParams::BYTE_LEN))
+            .ok_or_else(|| EngineError::Shape("Metal RMSNorm transient bytes overflow".into()))?;
+        Ok(PreparedMappedMetalRmsNorm {
+            rows,
+            columns,
+            mapping: mapping.clone(),
+            weight_offset,
+            input_buffer,
             output_buffer,
             params_buffer,
             transient_bytes,
@@ -1426,6 +1575,88 @@ impl MetalCandidateRuntime {
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
                 "Metal recovered embedding row produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    pub fn dispatch_mapped_rms_norm_1p(
+        &self,
+        prepared: &PreparedMappedMetalRmsNorm,
+    ) -> Result<Vec<f32>> {
+        self.dispatch_mapped_rms_norm_1p_repeated(prepared, 1)
+    }
+
+    /// Record repeated resident RMSNorm operations in one command buffer.
+    /// This remains an isolated verifier primitive, not production graph
+    /// promotion or evidence of a complete decoder.
+    pub fn dispatch_mapped_rms_norm_1p_repeated(
+        &self,
+        prepared: &PreparedMappedMetalRmsNorm,
+        dispatches: usize,
+    ) -> Result<Vec<f32>> {
+        if dispatches == 0 {
+            return Err(EngineError::Shape(
+                "Metal RMSNorm dispatch count must be positive".into(),
+            ));
+        }
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-rms-norm-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.rms_norm_1p_pipeline);
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::INPUT as u64,
+            Some(&prepared.input_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::WEIGHT as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.weight_offset,
+        );
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::OUTPUT as u64,
+            Some(&prepared.output_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        let grid = MTLSize {
+            width: prepared.rows as u64,
+            height: 1,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        for _ in 0..dispatches {
+            encoder.dispatch_thread_groups(grid, threads);
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal RMSNorm command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let value_count = prepared
+            .rows
+            .checked_mul(prepared.columns)
+            .ok_or_else(|| EngineError::Shape("Metal RMSNorm output shape overflows".into()))?;
+        let output = unsafe {
+            slice::from_raw_parts(prepared.output_buffer.contents().cast::<f32>(), value_count)
+                .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal RMSNorm produced a non-finite output".into(),
             ));
         }
         Ok(output)
@@ -2304,5 +2535,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mapped_qwen_rms_norm_matches_oracle_and_reuses_input_buffer() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let rows_q2 = 3;
+        let rows_q4 = 5;
+        let rows = 3;
+        let columns = 3 * BLOCK_LEN;
+        let epsilon = 1.0e-6;
+        let directory = tempdir().expect("temporary RMSNorm artifact directory");
+        let path = directory.path().join("rms-norm.ctoxq");
+        write_mixed_fixture(&path, rows_q2, rows_q4, columns);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open RMSNorm mmap fixture");
+        let weight = artifact
+            .float_tensor("matrix.weight.s_in")
+            .expect("resolve mmap-backed FP16 norm weight");
+        let weight_f32 = weight.to_f32_vec().expect("widen norm oracle weight");
+        let input: Vec<f32> = (0..rows * columns)
+            .map(|index| (index as f32 * 0.017).sin() * 0.7 + 0.1)
+            .collect();
+        let expected =
+            crate::reference::rms_norm_1p_weight(&input, rows, columns, &weight_f32, epsilon)
+                .expect("RMSNorm scalar oracle");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import RMSNorm mmap without copy");
+        let prepared = runtime
+            .prepare_mapped_rms_norm_1p(&mapping, weight, &input, rows, columns, epsilon)
+            .expect("prepare mmap-backed RMSNorm");
+        assert_eq!(prepared.rows(), rows);
+        assert_eq!(prepared.columns(), columns);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert_eq!(
+            prepared.transient_bytes(),
+            2 * size_of_val(input.as_slice()) + MetalRmsNormParams::BYTE_LEN
+        );
+        assert!(runtime
+            .dispatch_mapped_rms_norm_1p_repeated(&prepared, 0)
+            .is_err());
+        assert!(runtime
+            .prepare_mapped_rms_norm_1p(&mapping, weight, &input, rows, columns, 0.0)
+            .is_err());
+        let copied_weight = f16_bytes(&vec![1.125; columns]);
+        assert!(runtime
+            .prepare_mapped_rms_norm_1p(
+                &mapping,
+                FloatTensorView::F16Le(&copied_weight),
+                &input,
+                rows,
+                columns,
+                epsilon,
+            )
+            .is_err());
+        drop(mapping);
+        drop(artifact);
+        let actual = runtime
+            .dispatch_mapped_rms_norm_1p_repeated(&prepared, 3)
+            .expect("dispatch RMSNorm after loader drop");
+        for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+            let tolerance = 3.0e-5_f32.max(expected.abs() * 4.0e-5);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "RMSNorm value {index}: expected {expected}, got {actual}"
+            );
+        }
+        prepared
+            .write_input(&vec![0.0; rows * columns])
+            .expect("update RMSNorm input in place");
+        let zero = runtime
+            .dispatch_mapped_rms_norm_1p(&prepared)
+            .expect("dispatch zero RMSNorm input");
+        assert!(zero.iter().all(|value| value.abs() <= f32::EPSILON));
     }
 }

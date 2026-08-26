@@ -170,6 +170,9 @@ that mapping in one batched Q2/Q4 command path instead of copying or expanding
 the vocabulary matrix. Embedding lookup resolves one pure or mixed Q2/Q4 row
 and decodes it with its packed FP16 `s_in`/`s_out` corrections directly from
 the same mapping; only the resulting hidden vector is transient.
+Qwen `(1 + weight)` RMSNorm is also a direct Metal candidate: its FP16 weight
+stays mapping-backed, while reusable f32 input/output graph buffers support
+both one-row decode and multi-row prefill.
 Complete-graph residency and unload measurements on the 7.8-GiB artifact are
 still required before this changes backend promotion state.
 

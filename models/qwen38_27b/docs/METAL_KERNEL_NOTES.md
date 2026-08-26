@@ -22,6 +22,7 @@ usage, no scalar fallback.
 | `q4_b64_fused_matvec` | Q4_B64 | 34 bytes: fp16-LE scale + 32 code bytes (2 x 4-bit values per byte) |
 | `q2_b64_recovered_row` | Q2_B64 embedding row | one packed byte/four corrected outputs per thread |
 | `q4_b64_recovered_row` | Q4_B64 embedding row | one packed byte/two corrected outputs per thread |
+| `qwen_rms_norm_1p_f32` | FP16 weight, f32 activation | one 32-wide simdgroup per row |
 
 64 values per block, row-major block order, codebook matching
 `src/quant.rs` (Q2: {-1, -1/3, 1/3, 1}; Q4: (code - 7.5) / 7.5). Q3 does not
@@ -106,6 +107,12 @@ packed `s_out` half as offsets into the shared mapping. Q2 threads decode four
 adjacent columns and Q4 threads decode two; the only new allocation is the
 f32 hidden vector plus the fixed parameter block.
 
+The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
+convention rather than Llama's direct-weight convention. One simdgroup owns a
+complete row, reduces the f32 sum of squares without threadgroup scratch, and
+writes corrected columns using an mmap-backed FP16 weight. Reusable f32
+input/output buffers cover single-token decode and multi-row prefill.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -145,6 +152,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   one Q2 and one Q4 row from the same mixed container, drops all loader
   handles, and matches the recovered CPU embedding oracle while reporting zero
   copied model bytes.
+- `mapped_qwen_rms_norm_matches_oracle_and_reuses_input_buffer` dispatches
+  multi-row Qwen RMSNorm after dropping loader ownership, rejects copied
+  same-valued weights and invalid epsilon, supports an in-place input update,
+  and matches the exact scalar `(1 + weight)` equation.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
@@ -187,7 +198,8 @@ dequantization array before this source was accepted.
   evidence.
 - No controlled size/residue/thermal sweep or hardware-counter roofline
   evidence exists yet.
-- Recovered embedding rows exist as verifier candidates; no full attention,
-  GatedDeltaNet, MTP block, sampling, or model-graph Metal execution exists yet.
+- Recovered embedding rows and Qwen RMSNorm exist as verifier candidates; no
+  full attention, GatedDeltaNet, MTP block, sampling, or model-graph Metal
+  execution exists yet.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

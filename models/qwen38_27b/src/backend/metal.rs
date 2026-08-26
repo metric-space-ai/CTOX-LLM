@@ -23,6 +23,7 @@ pub const Q2_GATHERED_KERNEL_NAME: &str = "q2_b64_gathered_matvec";
 pub const Q4_GATHERED_KERNEL_NAME: &str = "q4_b64_gathered_matvec";
 pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
 pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
+pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -54,6 +55,16 @@ impl MetalBufferAbi {
     pub const ROW_IDS: u32 = 7;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalRmsNormBufferAbi;
+
+impl MetalRmsNormBufferAbi {
+    pub const INPUT: u32 = 0;
+    pub const WEIGHT: u32 = 1;
+    pub const OUTPUT: u32 = 2;
+    pub const PARAMS: u32 = 3;
+}
+
 /// Activation codes consumed by `apply_activation` in the MSL source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -83,6 +94,28 @@ pub struct MetalFusedMatVecParams {
     pub has_bias: u32,
     pub activation: u32,
     pub reserved0: u32,
+}
+
+/// Packed ABI shared with `RmsNormParams` in the MSL candidate source.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalRmsNormParams {
+    pub rows: u32,
+    pub columns: u32,
+    pub epsilon: f32,
+    pub reserved0: u32,
+}
+
+impl MetalRmsNormParams {
+    pub const BYTE_LEN: usize = 16;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        encoded[0..4].copy_from_slice(&self.rows.to_le_bytes());
+        encoded[4..8].copy_from_slice(&self.columns.to_le_bytes());
+        encoded[8..12].copy_from_slice(&self.epsilon.to_bits().to_le_bytes());
+        encoded[12..16].copy_from_slice(&self.reserved0.to_le_bytes());
+        encoded
+    }
 }
 
 /// One contiguous homogeneous row range inside a canonical mixed Q2/Q4
@@ -573,6 +606,7 @@ mod tests {
         assert!(Q4_GATHERED_KERNEL_NAME.starts_with("q4_b64"));
         assert!(Q2_RECOVERED_ROW_KERNEL_NAME.starts_with("q2_b64"));
         assert!(Q4_RECOVERED_ROW_KERNEL_NAME.starts_with("q4_b64"));
+        assert!(RMS_NORM_1P_KERNEL_NAME.starts_with("qwen_rms_norm"));
     }
 
     #[test]
@@ -615,6 +649,25 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![3, 128, 2, 1, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn rms_norm_params_encode_matches_msl_struct() {
+        let params = MetalRmsNormParams {
+            rows: 7,
+            columns: 5_120,
+            epsilon: 1.0e-6,
+            reserved0: 0,
+        };
+        let encoded = params.encode();
+        assert_eq!(encoded.len(), MetalRmsNormParams::BYTE_LEN);
+        assert_eq!(u32::from_le_bytes(encoded[0..4].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(encoded[4..8].try_into().unwrap()), 5_120);
+        assert_eq!(
+            f32::from_bits(u32::from_le_bytes(encoded[8..12].try_into().unwrap())),
+            1.0e-6
+        );
+        assert_eq!(u32::from_le_bytes(encoded[12..16].try_into().unwrap()), 0);
     }
 
     #[test]
@@ -793,6 +846,7 @@ mod tests {
             Q4_GATHERED_KERNEL_NAME,
             Q2_RECOVERED_ROW_KERNEL_NAME,
             Q4_RECOVERED_ROW_KERNEL_NAME,
+            RMS_NORM_1P_KERNEL_NAME,
         ] {
             assert!(
                 text.contains(&format!("kernel void {name}")),
