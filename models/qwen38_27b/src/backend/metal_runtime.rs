@@ -16,8 +16,8 @@ use metal_driver::{
 use sha2::{Digest, Sha256};
 
 use super::metal::{
-    validate_operation, MetalBufferAbi, MAX_SIMDGROUPS_PER_THREADGROUP, Q2_KERNEL_NAME,
-    Q4_KERNEL_NAME,
+    validate_mixed_operation, validate_operation, MetalBufferAbi, MetalFusedMatVecParams,
+    MAX_SIMDGROUPS_PER_THREADGROUP, Q2_KERNEL_NAME, Q4_KERNEL_NAME,
 };
 use super::{FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
@@ -112,16 +112,24 @@ pub struct PreparedMappedMetalMatVec {
     dtype: TensorDType,
     rows: usize,
     columns: usize,
-    thread_width: usize,
-    weights_offset: u64,
     s_in_offset: u64,
-    s_out_offset: u64,
+    dispatches: Vec<MappedMetalDispatch>,
     mapping: MappedMetalArtifact,
     input_buffer: Buffer,
     bias_buffer: Buffer,
     output_buffer: Buffer,
-    params_buffer: Buffer,
     transient_bytes: usize,
+}
+
+struct MappedMetalDispatch {
+    dtype: TensorDType,
+    rows: usize,
+    thread_width: usize,
+    weights_offset: u64,
+    s_out_offset: u64,
+    bias_offset: u64,
+    output_offset: u64,
+    params_buffer: Buffer,
 }
 
 impl PreparedMetalMatVec {
@@ -362,13 +370,23 @@ impl MetalCandidateRuntime {
         operation: &FusedMatVec<'_>,
         simdgroups: usize,
     ) -> Result<PreparedMappedMetalMatVec> {
-        let (layout, params) = validate_operation(operation)?;
-        let pipeline = match layout.dtype {
-            TensorDType::Q2B64 => &self.q2_pipeline,
-            TensorDType::Q4B64 => &self.q4_pipeline,
-            _ => unreachable!("Metal validation accepts only Q2/Q4"),
-        };
-        let thread_width = dispatch_width(pipeline, simdgroups)?;
+        let segment_contracts: Vec<(TensorDType, usize, usize, MetalFusedMatVecParams)> =
+            if operation.dtype == TensorDType::MixedQ2Q4B64 {
+                validate_mixed_operation(operation)?
+                    .into_iter()
+                    .map(|segment| {
+                        (
+                            segment.layout.dtype,
+                            segment.row_start,
+                            segment.weight_offset,
+                            segment.params,
+                        )
+                    })
+                    .collect()
+            } else {
+                let (layout, params) = validate_operation(operation)?;
+                vec![(layout.dtype, 0, 0, params)]
+            };
         let s_in = match operation.s_in {
             Some(ScaleSlice::F16Le(bytes)) => bytes,
             _ => {
@@ -385,9 +403,9 @@ impl MetalCandidateRuntime {
                 ))
             }
         };
-        let weights_offset = mapping.byte_offset(operation.weights, "weights")?;
+        let weights_base = mapping.byte_offset(operation.weights, "weights")?;
         let s_in_offset = mapping.byte_offset(s_in, "s_in")?;
-        let s_out_offset = mapping.byte_offset(s_out, "s_out")?;
+        let s_out_base = mapping.byte_offset(s_out, "s_out")?;
         let input_buffer = buffer_with_data(&self.device, as_bytes(operation.input));
         let dummy_bias = [0.0_f32];
         let bias = operation.bias.unwrap_or(&dummy_bias);
@@ -399,26 +417,70 @@ impl MetalCandidateRuntime {
         let output_buffer = self
             .device
             .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
-        let params = params.encode();
-        let params_buffer = buffer_with_data(&self.device, &params);
+        let mut dispatches = Vec::with_capacity(segment_contracts.len());
+        for (dtype, row_start, weight_offset, params) in segment_contracts {
+            let pipeline = match dtype {
+                TensorDType::Q2B64 => &self.q2_pipeline,
+                TensorDType::Q4B64 => &self.q4_pipeline,
+                _ => unreachable!("mapped Metal segment is Q2/Q4"),
+            };
+            let thread_width = dispatch_width(pipeline, simdgroups)?;
+            let weight_offset = weights_base
+                .checked_add(u64::try_from(weight_offset).map_err(|_| {
+                    EngineError::Shape("Metal segment weight offset exceeds u64".into())
+                })?)
+                .ok_or_else(|| EngineError::Shape("Metal weight binding overflows u64".into()))?;
+            let s_out_offset = s_out_base
+                .checked_add(
+                    u64::try_from(row_start)
+                        .map_err(|_| EngineError::Shape("Metal row start exceeds u64".into()))?
+                        .checked_mul(2)
+                        .ok_or_else(|| {
+                            EngineError::Shape("Metal s_out binding overflows u64".into())
+                        })?,
+                )
+                .ok_or_else(|| EngineError::Shape("Metal s_out binding overflows u64".into()))?;
+            let bias_offset = if operation.bias.is_some() {
+                u64::try_from(row_start)
+                    .map_err(|_| EngineError::Shape("Metal row start exceeds u64".into()))?
+                    .checked_mul(std::mem::size_of::<f32>() as u64)
+                    .ok_or_else(|| EngineError::Shape("Metal bias binding overflows u64".into()))?
+            } else {
+                0
+            };
+            let output_offset = u64::try_from(row_start)
+                .map_err(|_| EngineError::Shape("Metal row start exceeds u64".into()))?
+                .checked_mul(std::mem::size_of::<f32>() as u64)
+                .ok_or_else(|| EngineError::Shape("Metal output binding overflows u64".into()))?;
+            dispatches.push(MappedMetalDispatch {
+                dtype,
+                rows: params.rows as usize,
+                thread_width,
+                weights_offset: weight_offset,
+                s_out_offset,
+                bias_offset,
+                output_offset,
+                params_buffer: buffer_with_data(&self.device, &params.encode()),
+            });
+        }
+        let parameter_bytes = MetalFusedMatVecParams::BYTE_LEN
+            .checked_mul(dispatches.len())
+            .ok_or_else(|| EngineError::Shape("Metal parameter bytes overflow usize".into()))?;
         let transient_bytes = size_of_val(operation.input)
             .checked_add(size_of_val(bias))
             .and_then(|total| total.checked_add(output_bytes))
-            .and_then(|total| total.checked_add(params.len()))
+            .and_then(|total| total.checked_add(parameter_bytes))
             .ok_or_else(|| EngineError::Shape("Metal transient byte count overflows".into()))?;
         Ok(PreparedMappedMetalMatVec {
-            dtype: layout.dtype,
+            dtype: operation.dtype,
             rows: operation.rows,
             columns: operation.columns,
-            thread_width,
-            weights_offset,
             s_in_offset,
-            s_out_offset,
+            dispatches,
             mapping: mapping.clone(),
             input_buffer,
             bias_buffer,
             output_buffer,
-            params_buffer,
             transient_bytes,
         })
     }
@@ -699,20 +761,9 @@ impl MetalCandidateRuntime {
     }
 
     pub fn dispatch_mapped(&self, prepared: &PreparedMappedMetalMatVec) -> Result<Vec<f32>> {
-        let pipeline = match prepared.dtype {
-            TensorDType::Q2B64 => &self.q2_pipeline,
-            TensorDType::Q4B64 => &self.q4_pipeline,
-            _ => unreachable!("prepared mapped Metal operation is Q2/Q4"),
-        };
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-q2q4-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(
-            MetalBufferAbi::WEIGHTS as u64,
-            Some(&prepared.mapping.inner.buffer),
-            prepared.weights_offset,
-        );
         encoder.set_buffer(
             MetalBufferAbi::INPUT as u64,
             Some(&prepared.input_buffer),
@@ -723,36 +774,53 @@ impl MetalCandidateRuntime {
             Some(&prepared.mapping.inner.buffer),
             prepared.s_in_offset,
         );
-        encoder.set_buffer(
-            MetalBufferAbi::S_OUT as u64,
-            Some(&prepared.mapping.inner.buffer),
-            prepared.s_out_offset,
-        );
-        encoder.set_buffer(MetalBufferAbi::BIAS as u64, Some(&prepared.bias_buffer), 0);
-        encoder.set_buffer(
-            MetalBufferAbi::OUTPUT as u64,
-            Some(&prepared.output_buffer),
-            0,
-        );
-        encoder.set_buffer(
-            MetalBufferAbi::PARAMS as u64,
-            Some(&prepared.params_buffer),
-            0,
-        );
-        let grid = MTLSize {
-            width: prepared
-                .rows
-                .div_ceil((prepared.thread_width / 32) * ROWS_PER_SIMDGROUP)
-                as u64,
-            height: 1,
-            depth: 1,
-        };
-        let threads = MTLSize {
-            width: prepared.thread_width as u64,
-            height: 1,
-            depth: 1,
-        };
-        encoder.dispatch_thread_groups(grid, threads);
+        for dispatch in &prepared.dispatches {
+            let pipeline = match dispatch.dtype {
+                TensorDType::Q2B64 => &self.q2_pipeline,
+                TensorDType::Q4B64 => &self.q4_pipeline,
+                _ => unreachable!("mapped Metal dispatch is Q2/Q4"),
+            };
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(
+                MetalBufferAbi::WEIGHTS as u64,
+                Some(&prepared.mapping.inner.buffer),
+                dispatch.weights_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::S_OUT as u64,
+                Some(&prepared.mapping.inner.buffer),
+                dispatch.s_out_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::BIAS as u64,
+                Some(&prepared.bias_buffer),
+                dispatch.bias_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::OUTPUT as u64,
+                Some(&prepared.output_buffer),
+                dispatch.output_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::PARAMS as u64,
+                Some(&dispatch.params_buffer),
+                0,
+            );
+            let grid = MTLSize {
+                width: dispatch
+                    .rows
+                    .div_ceil((dispatch.thread_width / 32) * ROWS_PER_SIMDGROUP)
+                    as u64,
+                height: 1,
+                depth: 1,
+            };
+            let threads = MTLSize {
+                width: dispatch.thread_width as u64,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_thread_groups(grid, threads);
+        }
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -980,10 +1048,15 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::backend::{Activation, Backend};
-    use crate::format::{ArtifactBuilder, PackedTensor, DEFAULT_ALIGNMENT};
+    use crate::format::{
+        ArtifactBuilder, FileHeader, ModelManifest, PackedTensor, QuantSegment, TensorEntry,
+        DEFAULT_ALIGNMENT, HEADER_BYTES,
+    };
     use crate::loader::{ChecksumPolicy, ModelArtifact};
     use crate::quant::{Q2Block64, Q4Block64, BLOCK_LEN};
     use half::f16;
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use tempfile::tempdir;
 
     fn f16_bytes(values: &[f32]) -> Vec<u8> {
@@ -1015,6 +1088,116 @@ mod tests {
             }
         }
         packed
+    }
+
+    fn aligned(value: usize) -> usize {
+        value.div_ceil(DEFAULT_ALIGNMENT as usize) * DEFAULT_ALIGNMENT as usize
+    }
+
+    fn write_mixed_fixture(
+        path: &std::path::Path,
+        rows_q2: usize,
+        rows_q4: usize,
+        columns: usize,
+    ) -> Vec<QuantSegment> {
+        let q2 = packed_weights(TensorDType::Q2B64, rows_q2, columns);
+        let q4 = packed_weights(TensorDType::Q4B64, rows_q4, columns);
+        let mut weights = q2.clone();
+        weights.extend_from_slice(&q4);
+        let s_in = f16_bytes(&vec![1.125; columns]);
+        let s_out = f16_bytes(&vec![0.875; rows_q2 + rows_q4]);
+        let s_in_offset = aligned(weights.len());
+        let s_out_offset = aligned(s_in_offset + s_in.len());
+        let segments = vec![
+            QuantSegment {
+                group_index: 0,
+                row_start: 0,
+                row_end: rows_q2 as u64,
+                dtype: TensorDType::Q2B64,
+                offset: 0,
+                length: q2.len() as u64,
+            },
+            QuantSegment {
+                group_index: 1,
+                row_start: rows_q2 as u64,
+                row_end: (rows_q2 + rows_q4) as u64,
+                dtype: TensorDType::Q4B64,
+                offset: q2.len() as u64,
+                length: q4.len() as u64,
+            },
+        ];
+        let tensors = vec![
+            TensorEntry {
+                name: "matrix.weight".into(),
+                dtype: TensorDType::MixedQ2Q4B64,
+                shape: vec![(rows_q2 + rows_q4) as u64, columns as u64],
+                offset: 0,
+                length: weights.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&weights)),
+                segments: segments.clone(),
+            },
+            TensorEntry {
+                name: "matrix.weight.s_in".into(),
+                dtype: TensorDType::F16,
+                shape: vec![columns as u64],
+                offset: s_in_offset as u64,
+                length: s_in.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&s_in)),
+                segments: Vec::new(),
+            },
+            TensorEntry {
+                name: "matrix.weight.s_out".into(),
+                dtype: TensorDType::F16,
+                shape: vec![(rows_q2 + rows_q4) as u64],
+                offset: s_out_offset as u64,
+                length: s_out.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&s_out)),
+                segments: Vec::new(),
+            },
+        ];
+        let manifest = ModelManifest {
+            format: "ctox.q2q4.v2".into(),
+            model: "test/qwen38".into(),
+            revision: "0123456789abcdef".into(),
+            alignment: DEFAULT_ALIGNMENT,
+            target: "canonical-b64".into(),
+            recovery: None,
+            tensors,
+        };
+        let data_bytes = s_out_offset + s_out.len();
+        manifest
+            .validate(data_bytes as u64)
+            .expect("mixed manifest");
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize mixed manifest");
+        let file_data_offset = aligned(HEADER_BYTES + manifest_bytes.len());
+        let header = FileHeader {
+            version: 2,
+            manifest_len: manifest_bytes.len() as u64,
+            data_offset: file_data_offset as u64,
+            tensor_count: manifest.tensors.len() as u32,
+            alignment: DEFAULT_ALIGNMENT,
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create mixed artifact");
+        file.write_all(&header.encode()).expect("write header");
+        file.write_all(&manifest_bytes).expect("write manifest");
+        file.write_all(&vec![
+            0;
+            file_data_offset - HEADER_BYTES - manifest_bytes.len()
+        ])
+        .expect("align data");
+        file.write_all(&weights).expect("write mixed weights");
+        file.write_all(&vec![0; s_in_offset - weights.len()])
+            .expect("align s_in");
+        file.write_all(&s_in).expect("write s_in");
+        file.write_all(&vec![0; s_out_offset - s_in_offset - s_in.len()])
+            .expect("align s_out");
+        file.write_all(&s_out).expect("write s_out");
+        file.sync_all().expect("sync mixed artifact");
+        segments
     }
 
     #[test]
@@ -1331,5 +1514,63 @@ mod tests {
         assert!(runtime
             .prepare_mapped_fused_matvec(&prepared.mapping, &copied_operation)
             .is_err());
+    }
+
+    #[test]
+    fn mixed_mmap_segments_dispatch_without_repacking_or_duplicate_weights() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let rows_q2 = 3;
+        let rows_q4 = 5;
+        let rows = rows_q2 + rows_q4;
+        let columns = 3 * BLOCK_LEN;
+        let directory = tempdir().expect("temporary mixed artifact directory");
+        let path = directory.path().join("mixed.ctoxq");
+        let expected_segments = write_mixed_fixture(&path, rows_q2, rows_q4, columns);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open mixed mmap fixture");
+        let input: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.019).cos())
+            .collect();
+        let matrix = artifact
+            .recovered_matrix("matrix.weight")
+            .expect("resolve mixed recovered matrix");
+        assert_eq!(matrix.matrix.segments, expected_segments);
+        let operation = matrix
+            .operation(&input, Activation::Silu)
+            .expect("construct mixed mmap operation");
+        let expected = cpu.fused_matvec(&operation).expect("mixed scalar oracle");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import mixed mmap without copy");
+        let prepared = runtime
+            .prepare_mapped_fused_matvec(&mapping, &operation)
+            .expect("prepare mixed mmap projection");
+        assert_eq!(prepared.dtype(), TensorDType::MixedQ2Q4B64);
+        assert_eq!(prepared.rows(), rows);
+        assert_eq!(prepared.columns(), columns);
+        assert_eq!(prepared.dispatches.len(), 2);
+        assert_eq!(prepared.dispatches[0].dtype, TensorDType::Q2B64);
+        assert_eq!(prepared.dispatches[0].rows, rows_q2);
+        assert_eq!(prepared.dispatches[1].dtype, TensorDType::Q4B64);
+        assert_eq!(prepared.dispatches[1].rows, rows_q4);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert_eq!(
+            prepared.transient_bytes(),
+            size_of_val(input.as_slice())
+                + size_of_val(&[0.0_f32])
+                + rows * std::mem::size_of::<f32>()
+                + 2 * MetalFusedMatVecParams::BYTE_LEN
+        );
+        let actual = runtime
+            .dispatch_mapped(&prepared)
+            .expect("dispatch mixed mmap row groups");
+        for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+            let tolerance = 2.0e-4_f32.max(expected.abs() * 3.0e-5);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "mixed row {row}: expected {expected}, got {actual}"
+            );
+        }
     }
 }

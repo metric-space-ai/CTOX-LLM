@@ -81,6 +81,12 @@ matches the scalar recovered-Q4 oracle, reports zero copied model bytes, and
 updates only the existing input buffer for a second dispatch. This proves the
 no-copy ownership primitive; the complete 506-matrix graph still needs a
 single shared mapping, measured allocator high-watermark, and unload evidence.
+Canonical `MixedQ2Q4B64` matrices now use the same ownership path. The host
+validates contiguous manifest group indices, rows, payload offsets, lengths,
+and per-row block sizes, then encodes one existing Q2/Q4 kernel dispatch per
+homogeneous segment in a single command encoder. Weight, row-scale, bias, and
+output bindings advance by checked offsets; the logical codes remain in their
+original tensor and the input correction is shared across all segments.
 
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
@@ -109,6 +115,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   binds quant codes and both recovery scales by offset, survives the original
   mmap owners being dropped, matches the scalar oracle, and rejects copied
   same-valued tensor slices.
+- `mixed_mmap_segments_dispatch_without_repacking_or_duplicate_weights` opens
+  a checksummed CTOXQ-v2 container with Q2 and Q4 row groups, validates its
+  exact manifest coverage, dispatches both groups from one no-copy buffer, and
+  matches every row against the mixed CPU oracle.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.

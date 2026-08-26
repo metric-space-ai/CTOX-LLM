@@ -163,6 +163,8 @@ Metal now has a verified no-copy CTOXQ ownership primitive: one shared Metal
 buffer wraps the complete immutable file mapping, while projections bind
 weights and packed recovery scales by validated offsets. The fixture survives
 the original loader handles being dropped and reports zero copied model bytes.
+Mixed Q2/Q4 matrices dispatch their original contiguous row groups through the
+same mapping and one command encoder, with no backend-specific repacking.
 Complete-graph residency and unload measurements on the 7.8-GiB artifact are
 still required before this changes backend promotion state.
 

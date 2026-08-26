@@ -80,6 +80,17 @@ pub struct MetalFusedMatVecParams {
     pub reserved0: u32,
 }
 
+/// One contiguous homogeneous row range inside a canonical mixed Q2/Q4
+/// tensor. The Metal runtime binds offsets into the original artifact and
+/// dispatches the existing Q2 or Q4 kernel without repacking any codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetalMixedRowSegment {
+    pub layout: MetalBlockLayout,
+    pub params: MetalFusedMatVecParams,
+    pub row_start: usize,
+    pub weight_offset: usize,
+}
+
 impl MetalFusedMatVecParams {
     pub const BYTE_LEN: usize = 32;
 
@@ -146,6 +157,11 @@ pub fn validate_operation(
     operation: &FusedMatVec<'_>,
 ) -> Result<(MetalBlockLayout, MetalFusedMatVecParams)> {
     let layout = block_layout(operation.dtype)?;
+    if !operation.segments.is_empty() {
+        return Err(EngineError::InvalidArtifact(
+            "pure Metal Q2/Q4 operation declares mixed row segments".into(),
+        ));
+    }
     if operation.columns == 0 || operation.rows == 0 || !operation.columns.is_multiple_of(BLOCK_LEN)
     {
         return Err(EngineError::Shape(
@@ -220,6 +236,142 @@ pub fn validate_operation(
     Ok((layout, params))
 }
 
+/// Validate the exact manifest row groups of a mixed Q2/Q4 operation. Every
+/// returned dispatch covers one contiguous row and byte range exactly once.
+pub(crate) fn validate_mixed_operation(
+    operation: &FusedMatVec<'_>,
+) -> Result<Vec<MetalMixedRowSegment>> {
+    if operation.dtype != TensorDType::MixedQ2Q4B64 {
+        return Err(EngineError::UnsupportedDType(format!(
+            "mixed Metal validation requires MixedQ2Q4B64, got {:?}",
+            operation.dtype
+        )));
+    }
+    if operation.columns == 0 || operation.rows == 0 || !operation.columns.is_multiple_of(BLOCK_LEN)
+    {
+        return Err(EngineError::Shape(
+            "mixed Metal dimensions must be non-zero and columns divisible by 64".into(),
+        ));
+    }
+    if operation.input.len() != operation.columns {
+        return Err(EngineError::Shape(format!(
+            "input has {} values, expected {}",
+            operation.input.len(),
+            operation.columns
+        )));
+    }
+    for (name, scales, expected) in [
+        ("s_in", operation.s_in, operation.columns),
+        ("s_out", operation.s_out, operation.rows),
+    ] {
+        if let Some(scales) = scales {
+            if !matches!(scales, ScaleSlice::F16Le(_)) {
+                return Err(EngineError::UnsupportedDType(format!(
+                    "Metal {name} recovery scales must remain packed FP16"
+                )));
+            }
+            if scales.len() != expected {
+                return Err(EngineError::Shape(format!(
+                    "{name} has {} values, expected {expected}",
+                    scales.len()
+                )));
+            }
+        }
+    }
+    if operation
+        .bias
+        .is_some_and(|values| values.len() != operation.rows)
+    {
+        return Err(EngineError::Shape("bias length differs from rows".into()));
+    }
+    if operation.segments.is_empty() {
+        return Err(EngineError::InvalidArtifact(
+            "mixed Metal Q2/Q4 operation has no row segments".into(),
+        ));
+    }
+    let columns = u32::try_from(operation.columns)
+        .map_err(|_| EngineError::Shape("columns exceed u32 dispatch limit".into()))?;
+    let blocks_per_row = operation.columns / BLOCK_LEN;
+    let mut expected_row = 0_usize;
+    let mut expected_offset = 0_usize;
+    let mut dispatches = Vec::with_capacity(operation.segments.len());
+    for (expected_group, segment) in operation.segments.iter().enumerate() {
+        let group_index = usize::try_from(segment.group_index).map_err(|_| {
+            EngineError::InvalidArtifact("mixed Metal group index overflows usize".into())
+        })?;
+        let row_start = usize::try_from(segment.row_start).map_err(|_| {
+            EngineError::InvalidArtifact("mixed Metal row start overflows usize".into())
+        })?;
+        let row_end = usize::try_from(segment.row_end).map_err(|_| {
+            EngineError::InvalidArtifact("mixed Metal row end overflows usize".into())
+        })?;
+        let weight_offset = usize::try_from(segment.offset).map_err(|_| {
+            EngineError::InvalidArtifact("mixed Metal weight offset overflows usize".into())
+        })?;
+        let length = usize::try_from(segment.length).map_err(|_| {
+            EngineError::InvalidArtifact("mixed Metal segment length overflows usize".into())
+        })?;
+        if group_index != expected_group
+            || row_start != expected_row
+            || row_end <= row_start
+            || row_end > operation.rows
+            || weight_offset != expected_offset
+        {
+            return Err(EngineError::InvalidArtifact(format!(
+                "mixed Metal operation has non-contiguous segment {}",
+                segment.group_index
+            )));
+        }
+        let layout = block_layout(segment.dtype).map_err(|_| {
+            EngineError::InvalidArtifact(format!(
+                "mixed Metal segment {} has invalid dtype {:?}",
+                segment.group_index, segment.dtype
+            ))
+        })?;
+        let row_count = row_end - row_start;
+        let expected_length = row_count
+            .checked_mul(blocks_per_row)
+            .and_then(|blocks| blocks.checked_mul(layout.block_bytes))
+            .ok_or_else(|| EngineError::Shape("mixed Metal segment size overflows".into()))?;
+        if length != expected_length {
+            return Err(EngineError::InvalidArtifact(format!(
+                "mixed Metal segment {} has {length} bytes, expected {expected_length}",
+                segment.group_index
+            )));
+        }
+        dispatches.push(MetalMixedRowSegment {
+            layout,
+            params: MetalFusedMatVecParams {
+                rows: u32::try_from(row_count)
+                    .map_err(|_| EngineError::Shape("mixed Metal row count exceeds u32".into()))?,
+                columns,
+                blocks_per_row: u32::try_from(blocks_per_row).map_err(|_| {
+                    EngineError::Shape("mixed Metal blocks per row exceed u32".into())
+                })?,
+                has_s_in: u32::from(operation.s_in.is_some()),
+                has_s_out: u32::from(operation.s_out.is_some()),
+                has_bias: u32::from(operation.bias.is_some()),
+                activation: MetalActivation::from_backend(operation.activation) as u32,
+                reserved0: 0,
+            },
+            row_start,
+            weight_offset,
+        });
+        expected_row = row_end;
+        expected_offset = expected_offset
+            .checked_add(length)
+            .ok_or_else(|| EngineError::Shape("mixed Metal byte coverage overflows".into()))?;
+    }
+    if expected_row != operation.rows || expected_offset != operation.weights.len() {
+        return Err(EngineError::InvalidArtifact(format!(
+            "mixed Metal segments cover {expected_row}/{} rows and {expected_offset}/{} bytes",
+            operation.rows,
+            operation.weights.len()
+        )));
+    }
+    Ok(dispatches)
+}
+
 impl Backend for MetalBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Metal
@@ -271,6 +423,7 @@ impl Backend for MetalBackend {
 mod tests {
     use super::*;
     use crate::backend::{Activation, ExecutionPolicy};
+    use crate::format::QuantSegment;
     use crate::quant::{Q2Block64, Q4Block64};
     use half::f16;
 
@@ -407,6 +560,75 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![3, 128, 2, 1, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn mixed_segments_preserve_manifest_rows_bytes_and_kernel_choice() {
+        let columns = 2 * BLOCK_LEN;
+        let q2_rows = 3;
+        let q4_rows = 5;
+        let q2 = encode_weights(TensorDType::Q2B64, q2_rows, columns);
+        let q4 = encode_weights(TensorDType::Q4B64, q4_rows, columns);
+        let mut weights = q2.clone();
+        weights.extend_from_slice(&q4);
+        let input = vec![0.5_f32; columns];
+        let s_in = f16_bytes(&vec![1.0; columns]);
+        let s_out = f16_bytes(&vec![1.0; q2_rows + q4_rows]);
+        let segments = vec![
+            QuantSegment {
+                group_index: 0,
+                row_start: 0,
+                row_end: q2_rows as u64,
+                dtype: TensorDType::Q2B64,
+                offset: 0,
+                length: q2.len() as u64,
+            },
+            QuantSegment {
+                group_index: 1,
+                row_start: q2_rows as u64,
+                row_end: (q2_rows + q4_rows) as u64,
+                dtype: TensorDType::Q4B64,
+                offset: q2.len() as u64,
+                length: q4.len() as u64,
+            },
+        ];
+        let operation = FusedMatVec {
+            dtype: TensorDType::MixedQ2Q4B64,
+            weights: &weights,
+            segments: &segments,
+            rows: q2_rows + q4_rows,
+            columns,
+            input: &input,
+            s_in: Some(ScaleSlice::F16Le(&s_in)),
+            s_out: Some(ScaleSlice::F16Le(&s_out)),
+            bias: None,
+            activation: Activation::Silu,
+        };
+        let dispatches = validate_mixed_operation(&operation).expect("valid mixed layout");
+        assert_eq!(dispatches.len(), 2);
+        assert_eq!(dispatches[0].layout.dtype, TensorDType::Q2B64);
+        assert_eq!(dispatches[0].row_start, 0);
+        assert_eq!(dispatches[0].weight_offset, 0);
+        assert_eq!(dispatches[0].params.rows, q2_rows as u32);
+        assert_eq!(dispatches[1].layout.dtype, TensorDType::Q4B64);
+        assert_eq!(dispatches[1].row_start, q2_rows);
+        assert_eq!(dispatches[1].weight_offset, q2.len());
+        assert_eq!(dispatches[1].params.rows, q4_rows as u32);
+        assert_eq!(
+            dispatches[1].params.activation,
+            MetalActivation::Silu as u32
+        );
+
+        let mut gapped = segments.clone();
+        gapped[1].row_start -= 1;
+        let invalid = FusedMatVec {
+            segments: &gapped,
+            ..operation
+        };
+        assert!(matches!(
+            validate_mixed_operation(&invalid),
+            Err(EngineError::InvalidArtifact(_))
+        ));
     }
 
     #[test]
