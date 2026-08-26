@@ -1,0 +1,121 @@
+{
+  "format": "ctox.cuda-sm86-a8-dp4a-candidate-evidence.v1",
+  "status": "verifier_only_not_promotion_evidence",
+  "captured_at": "2026-08-26",
+  "host": "gpu3",
+  "device": {
+    "physical_index": 1,
+    "name": "NVIDIA RTX A4500",
+    "compute_capability": "8.6",
+    "cuda_toolkit": "12.6.85",
+    "rust_toolchain": "1.93.0"
+  },
+  "module": {
+    "source": "kernels/cuda/q2q4_fused_matvec_sm86.cu",
+    "source_sha256": "d82321e1653d2736b4d5e3e73ffad5f25d68c6f81540a83e912580e6eb478cd7",
+    "cubin_sha256": "c6f9f7bfe3f6fbc75be572fdd8f6eef01a01d7c03e16ecf00f165b2505406be0",
+    "target": "sm_86",
+    "a8_quantize_registers": 18,
+    "q2_dp4a_registers": 40,
+    "q4_dp4a_registers": 40,
+    "spill_load_bytes": 0,
+    "spill_store_bytes": 0
+  },
+  "semantic_contract": {
+    "logical_weight_codes": "unchanged_q2_b64_or_q4_b64",
+    "activation": "transient_symmetric_a8_b64",
+    "activation_scale": "f32_max_abs_div_127_per_64_values",
+    "activation_code_range": [-127, 127],
+    "rounding": "round_to_nearest_ties_to_even",
+    "recovery_order": "apply_packed_fp16_s_in_then_quantize_a8",
+    "serialization": "activation_codes_and_scales_are_transient_and_never_enter_the_model_pack",
+    "weight_requantization": false
+  },
+  "correctness": {
+    "kernel_oracle": "CpuBackend::scalar_verifier over A8Block64-dequantized corrected activations",
+    "quality_reference": "CpuBackend::scalar_verifier over exact f32 corrected activations",
+    "absolute_tolerance": 0.0002,
+    "relative_tolerance": 0.0002,
+    "partial_row_shape": {
+      "rows": 257,
+      "columns": 512,
+      "q2_kernel_maximum_absolute_error": 0.000008583069,
+      "q2_a8_quality_delta_maximum_absolute": 0.013885021,
+      "q4_kernel_maximum_absolute_error": 0.000008583069,
+      "q4_a8_quality_delta_maximum_absolute": 0.011193991
+    },
+    "large_shape": {
+      "rows": 5120,
+      "columns": 5120,
+      "q2_kernel_maximum_absolute_error": 0.000026226044,
+      "q2_a8_quality_delta_maximum_absolute": 0.04283285,
+      "q4_kernel_maximum_absolute_error": 0.00002503395,
+      "q4_a8_quality_delta_maximum_absolute": 0.03768587
+    }
+  },
+  "amortized_measurements": [
+    {
+      "dtype": "q2_b64",
+      "rows": 5120,
+      "columns": 5120,
+      "warmup_syncs_per_replicate": 5,
+      "measured_syncs_per_replicate": 20,
+      "dispatches_per_sync": 20,
+      "activation_quantizations_per_sync": 1,
+      "replicates": 5,
+      "packed_weight_bytes": 7372800,
+      "requested_resident_buffer_bytes": 7460160,
+      "packed_weight_gb_per_second": [264.4546282384622, 264.3012858285517, 263.2557818177728, 266.70821924386547, 265.49229441996437],
+      "median_packed_weight_gb_per_second": 264.4546282384622,
+      "range_packed_weight_gb_per_second": [263.2557818177728, 266.70821924386547],
+      "mean_dispatch_milliseconds": [0.0278792625, 0.0278954375, 0.0280062225, 0.0276436925, 0.0277702975],
+      "median_mean_dispatch_milliseconds": 0.0278792625
+    },
+    {
+      "dtype": "q4_b64",
+      "rows": 5120,
+      "columns": 5120,
+      "warmup_syncs_per_replicate": 5,
+      "measured_syncs_per_replicate": 20,
+      "dispatches_per_sync": 20,
+      "activation_quantizations_per_sync": 1,
+      "replicates": 5,
+      "packed_weight_bytes": 13926400,
+      "requested_resident_buffer_bytes": 14013760,
+      "packed_weight_gb_per_second": [391.02971147996954, 391.74974981873726, 390.98445392929, 387.2101159977398, 388.05485220427835],
+      "median_packed_weight_gb_per_second": 390.98445392929,
+      "range_packed_weight_gb_per_second": [387.2101159977398, 391.74974981873726],
+      "mean_dispatch_milliseconds": [0.035614685, 0.035549225, 0.0356188075, 0.0359660025, 0.03588771],
+      "median_mean_dispatch_milliseconds": 0.0356188075
+    }
+  ],
+  "single_projection_measurements": [
+    {
+      "dtype": "q2_b64",
+      "activation_quantizations_per_sync": 1,
+      "dispatches_per_sync": 1,
+      "replicates": 5,
+      "median_packed_weight_gb_per_second": 139.18966498613824,
+      "median_mean_dispatch_milliseconds": 0.05296945
+    },
+    {
+      "dtype": "q4_b64",
+      "activation_quantizations_per_sync": 1,
+      "dispatches_per_sync": 1,
+      "replicates": 5,
+      "median_packed_weight_gb_per_second": 236.4392183095064,
+      "median_mean_dispatch_milliseconds": 0.05890055
+    }
+  ],
+  "limitations": [
+    "A BF16 teacher process remained resident on all three GPUs and active primarily on physical GPU 0.",
+    "The candidate ran on physical GPU 1, which was compute-idle at admission but already held teacher weights.",
+    "Clocks, thermals, power state, ECC effects, and hardware counters were not controlled or captured.",
+    "Requested resident bytes exclude CUDA context and allocator overhead.",
+    "Packed-weight GB/s is an application-level ratio, not a sustainable-bandwidth roofline measurement.",
+    "Repeated-dispatch measurements amortize one A8 activation quantization across 20 projections; the single-projection section does not.",
+    "A8 activation quality has not passed recovery, full-model logit, multilingual, coding, agentic, tool-calling, or long-context gates.",
+    "The verifier candidate is not wired into the production Backend trait or complete model graph."
+  ],
+  "conclusion": "The direct Rust CUDA Driver API executes the explicit A8/Q2 and A8/Q4 dp4a candidates correctly against a distinct CPU A8 oracle. Relative to the earlier scalar-unpack candidate, instruction throughput improved materially, but this remains non-promotion evidence until A8 quality and controlled full-graph roofline gates pass."
+}

@@ -5,10 +5,12 @@ use std::time::Instant;
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use ctox_qwen38_27b::backend::cpu::CpuBackend;
-use ctox_qwen38_27b::backend::cuda_runtime::CudaCandidateRuntime;
+use ctox_qwen38_27b::backend::cuda_runtime::{
+    CudaCandidateRuntime, PreparedCudaA8MatVec, PreparedCudaMatVec,
+};
 use ctox_qwen38_27b::backend::{Activation, Backend, FusedMatVec, ScaleSlice};
 use ctox_qwen38_27b::format::TensorDType;
-use ctox_qwen38_27b::quant::{Q2Block64, Q4Block64, BLOCK_LEN};
+use ctox_qwen38_27b::quant::{A8Block64, Q2Block64, Q4Block64, BLOCK_LEN};
 use half::f16;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -19,6 +21,12 @@ enum DTypeArg {
     Q4,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExecutionPathArg {
+    Exact,
+    A8Dp4a,
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Verify and benchmark resident Q2/Q4 CUDA SM86 matvec")]
 struct Args {
@@ -27,6 +35,8 @@ struct Args {
     module: PathBuf,
     #[arg(long, value_enum, default_value_t = DTypeArg::Q2)]
     dtype: DTypeArg,
+    #[arg(long, value_enum, default_value_t = ExecutionPathArg::Exact)]
+    execution_path: ExecutionPathArg,
     #[arg(long, default_value_t = 0)]
     device: i32,
     #[arg(long, default_value_t = 5_120)]
@@ -54,11 +64,13 @@ struct Report<'a> {
     module_path: String,
     module_sha256: String,
     dtype: &'static str,
+    execution_path: &'static str,
     rows: usize,
     columns: usize,
     warmup: usize,
     iterations: usize,
     dispatches_per_sync: usize,
+    quantizations_per_sync: usize,
     total_dispatches: usize,
     packed_weight_bytes: usize,
     requested_resident_buffer_bytes: usize,
@@ -68,9 +80,24 @@ struct Report<'a> {
     packed_weight_gb_per_second: f64,
     maximum_absolute_error: f32,
     maximum_relative_error: f32,
+    maximum_a8_quality_delta_vs_exact: f32,
     absolute_tolerance: f32,
     relative_tolerance: f32,
     note: &'static str,
+}
+
+enum Prepared<'runtime> {
+    Exact(PreparedCudaMatVec<'runtime>),
+    A8(PreparedCudaA8MatVec<'runtime>),
+}
+
+impl Prepared<'_> {
+    fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Exact(prepared) => prepared.resident_bytes(),
+            Self::A8(prepared) => prepared.resident_bytes(),
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -127,12 +154,22 @@ fn main() -> anyhow::Result<()> {
     };
 
     let scalar_output = CpuBackend::scalar_verifier().fused_matvec(&operation)?;
+    let execution_oracle = match args.execution_path {
+        ExecutionPathArg::Exact => scalar_output.clone(),
+        ExecutionPathArg::A8Dp4a => a8_execution_oracle(&operation)?,
+    };
     let runtime = CudaCandidateRuntime::new(&module, args.device)?;
-    let prepared = runtime.prepare_fused_matvec(&operation)?;
-    let cuda_output = runtime.dispatch_prepared(&prepared)?;
+    let prepared = match args.execution_path {
+        ExecutionPathArg::Exact => Prepared::Exact(runtime.prepare_fused_matvec(&operation)?),
+        ExecutionPathArg::A8Dp4a => Prepared::A8(runtime.prepare_a8_fused_matvec(&operation)?),
+    };
+    let cuda_output = match &prepared {
+        Prepared::Exact(prepared) => runtime.dispatch_prepared(prepared)?,
+        Prepared::A8(prepared) => runtime.dispatch_a8_fused_matvec(prepared)?,
+    };
     let mut maximum_absolute_error = 0.0_f32;
     let mut maximum_relative_error = 0.0_f32;
-    for (expected, actual) in scalar_output.iter().zip(&cuda_output) {
+    for (expected, actual) in execution_oracle.iter().zip(&cuda_output) {
         let absolute = (expected - actual).abs();
         let relative = absolute / expected.abs().max(f32::MIN_POSITIVE);
         maximum_absolute_error = maximum_absolute_error.max(absolute);
@@ -142,17 +179,38 @@ fn main() -> anyhow::Result<()> {
             "CUDA result {actual} differs from scalar {expected} by {absolute}"
         );
     }
+    let maximum_a8_quality_delta_vs_exact = scalar_output
+        .iter()
+        .zip(&execution_oracle)
+        .map(|(exact, a8)| (exact - a8).abs())
+        .fold(0.0_f32, f32::max);
 
     for _ in 0..args.warmup {
-        std::hint::black_box(
-            runtime.dispatch_prepared_repeated(&prepared, args.dispatches_per_sync)?,
-        );
+        match &prepared {
+            Prepared::Exact(prepared) => std::hint::black_box(
+                runtime.dispatch_prepared_repeated(prepared, args.dispatches_per_sync)?,
+            ),
+            Prepared::A8(prepared) => {
+                runtime.quantize_prepared_a8(prepared)?;
+                std::hint::black_box(
+                    runtime.dispatch_prepared_a8_repeated(prepared, args.dispatches_per_sync)?,
+                )
+            }
+        };
     }
     let started = Instant::now();
     for _ in 0..args.iterations {
-        std::hint::black_box(
-            runtime.dispatch_prepared_repeated(&prepared, args.dispatches_per_sync)?,
-        );
+        match &prepared {
+            Prepared::Exact(prepared) => std::hint::black_box(
+                runtime.dispatch_prepared_repeated(prepared, args.dispatches_per_sync)?,
+            ),
+            Prepared::A8(prepared) => {
+                runtime.quantize_prepared_a8(prepared)?;
+                std::hint::black_box(
+                    runtime.dispatch_prepared_a8_repeated(prepared, args.dispatches_per_sync)?,
+                )
+            }
+        };
     }
     let elapsed = started.elapsed().as_secs_f64();
     let total_dispatches = args
@@ -175,11 +233,19 @@ fn main() -> anyhow::Result<()> {
                 TensorDType::Q4B64 => "q4_b64",
                 _ => unreachable!(),
             },
+            execution_path: match args.execution_path {
+                ExecutionPathArg::Exact => "exact_f32_activation",
+                ExecutionPathArg::A8Dp4a => "symmetric_a8_b64_dp4a",
+            },
             rows: args.rows,
             columns: args.columns,
             warmup: args.warmup,
             iterations: args.iterations,
             dispatches_per_sync: args.dispatches_per_sync,
+            quantizations_per_sync: usize::from(matches!(
+                args.execution_path,
+                ExecutionPathArg::A8Dp4a
+            )),
             total_dispatches,
             packed_weight_bytes: weights.len(),
             requested_resident_buffer_bytes: prepared.resident_bytes(),
@@ -189,12 +255,44 @@ fn main() -> anyhow::Result<()> {
             packed_weight_gb_per_second: weights.len() as f64 / mean_seconds / 1.0e9,
             maximum_absolute_error,
             maximum_relative_error,
+            maximum_a8_quality_delta_vs_exact,
             absolute_tolerance: args.absolute_tolerance,
             relative_tolerance: args.relative_tolerance,
-            note: "Synchronous resident verifier interval. Requested bytes exclude CUDA allocator/context overhead; packed-weight GB/s is not yet a hardware-counter roofline measurement.",
+            note: "Synchronous resident verifier interval. The A8 path includes one activation quantization per sync and amortizes it across dispatches-per-sync. Requested bytes exclude CUDA allocator/context overhead; packed-weight GB/s is not yet a hardware-counter roofline measurement.",
         })?
     );
     Ok(())
+}
+
+fn a8_execution_oracle(operation: &FusedMatVec<'_>) -> anyhow::Result<Vec<f32>> {
+    let mut corrected = Vec::with_capacity(operation.columns);
+    for (index, value) in operation.input.iter().enumerate() {
+        corrected.push(
+            *value
+                * operation
+                    .s_in
+                    .map(|scales| scales.value(index))
+                    .transpose()?
+                    .unwrap_or(1.0),
+        );
+    }
+    let mut dequantized = Vec::with_capacity(operation.columns);
+    for block in corrected.chunks_exact(BLOCK_LEN) {
+        dequantized.extend_from_slice(&A8Block64::quantize(block)?.dequantize());
+    }
+    let a8_operation = FusedMatVec {
+        dtype: operation.dtype,
+        weights: operation.weights,
+        segments: operation.segments,
+        rows: operation.rows,
+        columns: operation.columns,
+        input: &dequantized,
+        s_in: None,
+        s_out: operation.s_out,
+        bias: operation.bias,
+        activation: operation.activation,
+    };
+    Ok(CpuBackend::scalar_verifier().fused_matvec(&a8_operation)?)
 }
 
 fn packed_weights(dtype: TensorDType, rows: usize, columns: usize) -> anyhow::Result<Vec<u8>> {

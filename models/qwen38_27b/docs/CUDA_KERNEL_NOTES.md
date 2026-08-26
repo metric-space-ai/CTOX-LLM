@@ -47,6 +47,13 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
+- The same verifier cubin additionally exports three explicitly unpromoted
+  A8/dp4a candidates:
+  - `ctox_quantize_a8_b64_sm86`
+  - `ctox_q2_b64_a8_matvec_sm86`
+  - `ctox_q4_b64_a8_matvec_sm86`
+  These symbols are intentionally excluded from the production module ABI
+  until the activation-quality gates pass.
 - One launch fuses dequant, dot product, `s_in`, `s_out`, bias, and
   activation (Identity/Silu). Parameter buffer is 60 bytes, tightly packed:
   six device pointers (weights, input, s_in, s_out, bias, output) then
@@ -82,21 +89,44 @@ promotion evidence: another BF16 job occupied the other GPUs, clocks and
 thermals were uncontrolled, allocator overhead and hardware counters were not
 captured, and both kernels remain below the required practical roofline. The
 near-identical Q2/Q4 latency shows that scalar unpack/FMA instruction
-throughput, not weight bandwidth, is the current Q2 limiter. The next
-candidate therefore needs the pinned upstream Q8-activation plus `dp4a`/MMQ
-organization rather than more launch tuning.
+throughput, not weight bandwidth, is the baseline Q2 limiter.
+
+An explicit symmetric A8_B64 activation path is now implemented as the next
+verifier candidate. It applies packed FP16 `s_in` first, deterministically
+quantizes each 64-value activation block to signed int8 with one f32 scale,
+and runs half-warp-per-row Q2/Q4 `dp4a` matvecs. The logical Q2/Q4 weight codes
+are unchanged; there is no backend-specific weight requantization, and A8
+buffers are transient rather than serialized model state. One quantized
+activation may be shared across related projections such as Q/K/V or gate/up.
+
+The evidence in
+`benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not
+be conflated. The CUDA implementation differs from a CPU A8 oracle by at most
+`2.63e-5` on the 5120x5120 cases, while A8 itself differs from the exact f32
+activation oracle by as much as `0.04284` (Q2) and `0.03769` (Q4) for this
+synthetic fixture. Five uncontrolled replicates reached median amortized rates
+of 264.45 GB/s for Q2 and 390.98 GB/s for Q4 when one activation quantization
+was shared over 20 projections. With one quantization per single projection,
+the medians were 139.19 GB/s and 236.44 GB/s. These remain application-level
+packed-byte ratios under a concurrent teacher workload, not roofline claims.
+
+The A8 path is therefore computationally validated but not promoted. Its
+quality must be measured after recovery on full-model logits and the held-out
+multilingual, general, coding, agentic, tool-calling, and long-context suite.
 
 ## Promotion evidence still required (per `docs/PROMOTION_GATES.md`)
 
-1. Controlled sustainable-bandwidth and typed-throughput roofline probes on
+1. Full-model A8 activation-quality gates after recovery, including the
+   multilingual/domain-balanced held-out suite and end-to-end logits.
+2. Controlled sustainable-bandwidth and typed-throughput roofline probes on
    the exact GPU3 device/profile.
-2. Complete same-device verifier: every production fused op compared against the scalar/BF16
+3. Complete same-device verifier: every production fused op compared against the scalar/BF16
    oracle within recorded tolerances (packed round-trip, decoder block,
    end-to-end logits).
-3. Same-device benchmark: pinned reference, identical artifact/prompt/
+4. Same-device benchmark: pinned reference, identical artifact/prompt/
    context/batch/sampler/thermal state; no prefill or decode regression and
    at least one improved by >= 10%.
 
-Until all three exist, `CudaBackend::promotion_state()` remains `Contract` and
+Until all four exist, `CudaBackend::promotion_state()` remains `Contract` and
 `fused_matvec` returns `UnsupportedOperation`. The isolated
 `CudaCandidateRuntime` cannot be selected by production dispatch.

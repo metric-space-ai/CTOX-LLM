@@ -13,7 +13,10 @@ use std::slice;
 
 use libloading::Library;
 
-use super::cuda::{validate_operation, Q2_B64_FUSED_MATVEC, Q4_B64_FUSED_MATVEC};
+use super::cuda::{
+    validate_operation, A8_QUANTIZE_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
+    Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
+};
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
 use crate::{EngineError, Result};
@@ -29,6 +32,7 @@ type CuDevicePtr = u64;
 const CUDA_SUCCESS: CuResult = 0;
 const THREADS_PER_BLOCK: u32 = 128;
 const WARP_SIZE: u32 = 32;
+const A8_ROWS_PER_BLOCK: u32 = (THREADS_PER_BLOCK / WARP_SIZE) * 2;
 
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
 type CuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
@@ -141,6 +145,9 @@ pub struct CudaCandidateRuntime {
     module: CuModule,
     q2_function: CuFunction,
     q4_function: CuFunction,
+    a8_quantize_function: CuFunction,
+    q2_a8_function: CuFunction,
+    q4_a8_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
 }
@@ -159,6 +166,16 @@ pub struct PreparedCudaMatVec<'runtime> {
     s_out: Option<DeviceBuffer<'runtime>>,
     bias: Option<DeviceBuffer<'runtime>>,
     output: DeviceBuffer<'runtime>,
+    resident_bytes: usize,
+}
+
+/// Explicit A8 activation buffers paired with the same immutable logical
+/// Q2/Q4 weights. The activation codes are transient per input and never
+/// become part of a backend-specific model artifact.
+pub struct PreparedCudaA8MatVec<'runtime> {
+    base: PreparedCudaMatVec<'runtime>,
+    q8_codes: DeviceBuffer<'runtime>,
+    q8_scales: DeviceBuffer<'runtime>,
     resident_bytes: usize,
 }
 
@@ -262,12 +279,45 @@ impl CudaCandidateRuntime {
                 return Err(error);
             }
         };
+        let a8_quantize_function = match resolve_function(&driver, module, A8_QUANTIZE_SYMBOL) {
+            Ok(function) => function,
+            Err(error) => {
+                unsafe {
+                    let _ = (driver.module_unload)(module);
+                    let _ = (driver.ctx_destroy)(context);
+                }
+                return Err(error);
+            }
+        };
+        let q2_a8_function = match resolve_function(&driver, module, Q2_B64_A8_MATVEC_SYMBOL) {
+            Ok(function) => function,
+            Err(error) => {
+                unsafe {
+                    let _ = (driver.module_unload)(module);
+                    let _ = (driver.ctx_destroy)(context);
+                }
+                return Err(error);
+            }
+        };
+        let q4_a8_function = match resolve_function(&driver, module, Q4_B64_A8_MATVEC_SYMBOL) {
+            Ok(function) => function,
+            Err(error) => {
+                unsafe {
+                    let _ = (driver.module_unload)(module);
+                    let _ = (driver.ctx_destroy)(context);
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             driver,
             context,
             module,
             q2_function,
             q4_function,
+            a8_quantize_function,
+            q2_a8_function,
+            q4_a8_function,
             device_name,
             compute_capability,
         })
@@ -334,6 +384,157 @@ impl CudaCandidateRuntime {
 
     pub fn dispatch_prepared(&self, prepared: &PreparedCudaMatVec<'_>) -> Result<Vec<f32>> {
         self.dispatch_prepared_repeated(prepared, 1)
+    }
+
+    pub fn prepare_a8_fused_matvec<'runtime>(
+        &'runtime self,
+        operation: &FusedMatVec<'_>,
+    ) -> Result<PreparedCudaA8MatVec<'runtime>> {
+        let base = self.prepare_fused_matvec(operation)?;
+        let q8_codes = DeviceBuffer::allocate(self, operation.columns)?;
+        let scale_bytes = a8_scale_bytes(operation.columns)?;
+        let q8_scales = DeviceBuffer::allocate(self, scale_bytes)?;
+        let resident_bytes = base
+            .resident_bytes()
+            .checked_add(q8_codes.len())
+            .and_then(|total| total.checked_add(q8_scales.len()))
+            .ok_or_else(|| EngineError::Shape("CUDA A8 resident byte count overflows".into()))?;
+        Ok(PreparedCudaA8MatVec {
+            base,
+            q8_codes,
+            q8_scales,
+            resident_bytes,
+        })
+    }
+
+    /// Quantizes the corrected activation once into symmetric Q8_B64 blocks.
+    /// Callers may share this result across projections that consume the same
+    /// input, such as Q/K/V or gate/up matrices.
+    pub fn quantize_prepared_a8(&self, prepared: &PreparedCudaA8MatVec<'_>) -> Result<()> {
+        if !ptr::eq(self, prepared.base.runtime) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA A8 operation belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        let mut input = prepared.base.input.ptr();
+        let mut s_in = prepared.base.s_in.as_ref().map_or(0, DeviceBuffer::ptr);
+        let mut q8_codes = prepared.q8_codes.ptr();
+        let mut q8_scales = prepared.q8_scales.ptr();
+        let mut columns = prepared.base.columns;
+        let mut params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_in as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.driver.check(
+                (self.driver.launch_kernel)(
+                    self.a8_quantize_function,
+                    prepared.base.columns.div_ceil(64),
+                    1,
+                    1,
+                    64,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "A8 quantization launch",
+            )
+        }
+    }
+
+    pub fn dispatch_a8_fused_matvec(
+        &self,
+        prepared: &PreparedCudaA8MatVec<'_>,
+    ) -> Result<Vec<f32>> {
+        self.quantize_prepared_a8(prepared)?;
+        self.dispatch_prepared_a8_repeated(prepared, 1)
+    }
+
+    /// Executes only the dp4a weight projection. The caller must quantize the
+    /// current input first; repeated execution is a verifier/roofline tool.
+    pub fn dispatch_prepared_a8_repeated(
+        &self,
+        prepared: &PreparedCudaA8MatVec<'_>,
+        dispatches: usize,
+    ) -> Result<Vec<f32>> {
+        if dispatches == 0 {
+            return Err(EngineError::Shape(
+                "CUDA A8 repeated dispatch count must be positive".into(),
+            ));
+        }
+        if !ptr::eq(self, prepared.base.runtime) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA A8 operation belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        let function = match prepared.base.dtype {
+            TensorDType::Q2B64 => self.q2_a8_function,
+            TensorDType::Q4B64 => self.q4_a8_function,
+            _ => unreachable!("CUDA validation accepts only Q2/Q4"),
+        };
+        let grid_x = prepared.base.rows.div_ceil(A8_ROWS_PER_BLOCK);
+        for _ in 0..dispatches {
+            let mut weights = prepared.base.weights.ptr();
+            let mut q8_codes = prepared.q8_codes.ptr();
+            let mut q8_scales = prepared.q8_scales.ptr();
+            let mut s_out = prepared.base.s_out.as_ref().map_or(0, DeviceBuffer::ptr);
+            let mut bias = prepared.base.bias.as_ref().map_or(0, DeviceBuffer::ptr);
+            let mut output = prepared.base.output.ptr();
+            let mut rows = prepared.base.rows;
+            let mut columns = prepared.base.columns;
+            let mut activation = prepared.base.activation;
+            let mut params = [
+                (&mut weights as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut s_out as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut bias as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut rows as *mut u32).cast::<c_void>(),
+                (&mut columns as *mut u32).cast::<c_void>(),
+                (&mut activation as *mut u32).cast::<c_void>(),
+            ];
+            unsafe {
+                self.driver.check(
+                    (self.driver.launch_kernel)(
+                        function,
+                        grid_x,
+                        1,
+                        1,
+                        THREADS_PER_BLOCK,
+                        1,
+                        1,
+                        0,
+                        ptr::null_mut(),
+                        params.as_mut_ptr(),
+                        ptr::null_mut(),
+                    ),
+                    "A8 dp4a matvec launch",
+                )?;
+            }
+        }
+        unsafe {
+            self.driver.check(
+                (self.driver.ctx_synchronize)(),
+                "A8 context synchronization",
+            )?;
+        }
+        let mut output = vec![0.0_f32; prepared.base.rows as usize];
+        prepared.base.output.copy_to(as_bytes_mut(&mut output))?;
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA A8 candidate produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
     }
 
     /// Launches a resident operation repeatedly and synchronizes once. This
@@ -457,6 +658,28 @@ impl PreparedCudaMatVec<'_> {
             ));
         }
         self.input.write(as_bytes(input))
+    }
+}
+
+impl PreparedCudaA8MatVec<'_> {
+    pub fn dtype(&self) -> TensorDType {
+        self.base.dtype()
+    }
+
+    pub fn rows(&self) -> usize {
+        self.base.rows()
+    }
+
+    pub fn columns(&self) -> usize {
+        self.base.columns()
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        self.base.write_input(input)
     }
 }
 
@@ -633,6 +856,13 @@ fn as_bytes_mut<T>(values: &mut [T]) -> &mut [u8] {
     unsafe { slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), size_of_val(values)) }
 }
 
+fn a8_scale_bytes(columns: usize) -> Result<usize> {
+    columns
+        .checked_div(64)
+        .and_then(|blocks| blocks.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| EngineError::Shape("CUDA A8 scale size overflows usize".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,6 +875,22 @@ mod tests {
         assert_eq!(4_u32.div_ceil(warps), 1);
         assert_eq!(5_u32.div_ceil(warps), 2);
         assert_eq!(11_u32.div_ceil(warps), 3);
+    }
+
+    #[test]
+    fn a8_launch_geometry_assigns_two_rows_per_warp() {
+        assert_eq!(A8_ROWS_PER_BLOCK, 8);
+        assert_eq!(1_u32.div_ceil(A8_ROWS_PER_BLOCK), 1);
+        assert_eq!(8_u32.div_ceil(A8_ROWS_PER_BLOCK), 1);
+        assert_eq!(9_u32.div_ceil(A8_ROWS_PER_BLOCK), 2);
+        assert_eq!(257_u32.div_ceil(A8_ROWS_PER_BLOCK), 33);
+    }
+
+    #[test]
+    fn a8_transient_layout_is_one_code_per_value_and_one_scale_per_block() {
+        assert_eq!(a8_scale_bytes(64).unwrap(), 4);
+        assert_eq!(a8_scale_bytes(512).unwrap(), 32);
+        assert_eq!(512 + a8_scale_bytes(512).unwrap(), 544);
     }
 
     #[test]

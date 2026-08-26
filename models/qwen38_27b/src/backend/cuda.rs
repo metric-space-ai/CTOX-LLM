@@ -148,6 +148,15 @@ pub const Q4_B64_FUSED_MATVEC: CudaKernelAbi = CudaKernelAbi {
     params: FUSED_MATVEC_PARAMS,
 };
 
+/// Verifier-only explicit A8 activation quantizer and dp4a matvec symbols.
+/// They are deliberately outside [`SM86_MODULE_ABI`]: production promotion
+/// first requires an activation-quantization quality gate shared by every
+/// backend, not merely successful symbol resolution.
+// ref: ggml/src/ggml-cuda/vecdotq.cuh:115-137
+pub const A8_QUANTIZE_SYMBOL: &str = "ctox_quantize_a8_b64_sm86";
+pub const Q2_B64_A8_MATVEC_SYMBOL: &str = "ctox_q2_b64_a8_matvec_sm86";
+pub const Q4_B64_A8_MATVEC_SYMBOL: &str = "ctox_q4_b64_a8_matvec_sm86";
+
 /// Module-level ABI contract for the SM86 kernel image: the compute
 /// capability the cubin must target and every kernel it must export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +455,9 @@ mod tests {
         assert_eq!(abi.kernels.len(), 2);
         let symbols: Vec<_> = abi.expected_symbols().collect();
         assert_eq!(symbols.len(), 2);
+        assert!(!symbols.contains(&A8_QUANTIZE_SYMBOL));
+        assert!(!symbols.contains(&Q2_B64_A8_MATVEC_SYMBOL));
+        assert!(!symbols.contains(&Q4_B64_A8_MATVEC_SYMBOL));
         for kernel in abi.kernels {
             assert_eq!(kernel.block_len, BLOCK_LEN);
             assert_eq!(kernel.max_threads_per_block % SM86_WARP_SIZE, 0);

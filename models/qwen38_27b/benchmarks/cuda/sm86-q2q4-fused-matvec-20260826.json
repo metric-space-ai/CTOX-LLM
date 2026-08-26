@@ -12,6 +12,8 @@
   },
   "module": {
     "source": "kernels/cuda/q2q4_fused_matvec_sm86.cu",
+    "source_git_commit": "b9c485e11da0a2f0f04e2392b078948d52f9987e",
+    "artifact_kind": "cubin",
     "sha256": "89a7adc21111448abd46a2039a438dba3aac7917e54ee7746c1e86e5e9a5fbe6",
     "target": "sm_86",
     "q2_registers": 56,

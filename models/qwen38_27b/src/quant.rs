@@ -7,6 +7,15 @@ pub const Q2_BLOCK_BYTES: usize = 2 + 16;
 pub const Q4_BLOCK_BYTES: usize = 2 + 32;
 pub const Q2_CODEBOOK: [f32; 4] = [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0];
 
+/// Transient symmetric activation block used by explicit A8 hardware paths.
+/// This is never serialized into the logical model checkpoint: all backends
+/// must derive it deterministically from the same corrected activation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct A8Block64 {
+    pub scale: f32,
+    pub codes: [i8; BLOCK_LEN],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Q2Block64 {
     pub scale: f16,
@@ -32,6 +41,33 @@ fn require_block(values: &[f32]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+impl A8Block64 {
+    pub fn quantize(values: &[f32]) -> Result<Self> {
+        require_block(values)?;
+        let maximum = values
+            .iter()
+            .fold(0.0_f32, |current, value| current.max(value.abs()));
+        let mut codes = [0_i8; BLOCK_LEN];
+        if maximum == 0.0 {
+            return Ok(Self { scale: 0.0, codes });
+        }
+        let scale = maximum / 127.0;
+        for (code, value) in codes.iter_mut().zip(values) {
+            *code = (*value / scale).round_ties_even().clamp(-127.0, 127.0) as i8;
+        }
+        Ok(Self { scale, codes })
+    }
+
+    #[inline]
+    pub fn value(&self, index: usize) -> f32 {
+        self.scale * f32::from(self.codes[index])
+    }
+
+    pub fn dequantize(&self) -> [f32; BLOCK_LEN] {
+        std::array::from_fn(|index| self.value(index))
+    }
 }
 
 impl Q2Block64 {
@@ -205,5 +241,25 @@ mod tests {
         let mut values = fixture();
         values[3] = f32::NAN;
         assert!(Q2Block64::quantize(&values).is_err());
+    }
+
+    #[test]
+    fn a8_activation_contract_is_deterministic_and_symmetric() {
+        let values = fixture();
+        let block = A8Block64::quantize(&values).unwrap();
+        assert_eq!(block.codes[0], -127);
+        assert_eq!(block.codes[BLOCK_LEN - 1], 127);
+        assert!(block
+            .dequantize()
+            .iter()
+            .zip(values)
+            .all(|(actual, expected)| (actual - expected).abs() <= block.scale * 0.501));
+    }
+
+    #[test]
+    fn zero_a8_block_has_zero_scale_and_codes() {
+        let block = A8Block64::quantize(&[0.0; BLOCK_LEN]).unwrap();
+        assert_eq!(block.scale, 0.0);
+        assert_eq!(block.codes, [0; BLOCK_LEN]);
     }
 }
