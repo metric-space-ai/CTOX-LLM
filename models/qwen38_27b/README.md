@@ -238,7 +238,9 @@ driver synchronizations that must be removed before performance promotion.
 The one-layer MTP draft is now connected to the final normalized target hidden
 state through a device-only concatenation buffer and reuses the same embedding,
 attention, FFN, norm, and LM-head operators. Its hardware run and subsequent
-target verification of every draft token remain open.
+target verification use a second complete target transition and report either
+an accepted draft or the target fallback without hiding rejection. The hardware
+run, multi-draft replay policy, and production sampler integration remain open.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight

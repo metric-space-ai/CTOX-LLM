@@ -51,9 +51,15 @@ struct Report<'a> {
     mtp_logits: usize,
     mtp_logits_f32le_sha256: String,
     mtp_top_logits: Vec<RankedLogit>,
+    mtp_draft_token: usize,
+    verification_logits_f32le_sha256: String,
+    verification_top_logits: Vec<RankedLogit>,
+    target_verified_token: usize,
+    mtp_draft_accepted: bool,
     graph_prepare_milliseconds: f64,
     target_dispatch_milliseconds: f64,
     mtp_dispatch_milliseconds: f64,
+    target_verify_milliseconds: f64,
     driver_free_bytes_before_prepare: usize,
     driver_free_bytes_after_prepare: usize,
     driver_free_bytes_after_drop: usize,
@@ -115,8 +121,27 @@ fn main() -> anyhow::Result<()> {
         Qwen38Config::default().vocab_size
     );
     let mtp_top_logits = rank_valid_logits(&mtp_logits)?;
+    let mtp_draft_token = mtp_top_logits[0].token_id;
     let mtp_logits_f32le_sha256 = digest_logits(&mtp_logits);
     anyhow::ensure!(graph.mtp_tokens() == 1, "CUDA MTP token did not commit");
+
+    let verify_started = Instant::now();
+    let verification_view = graph.dispatch_target_token_device(
+        &runtime,
+        &Qwen38Config::default(),
+        selected_target_token,
+        1,
+    )?;
+    let verification_logits = runtime.verifier_read_f32_device(verification_view)?;
+    let target_verify_milliseconds = verify_started.elapsed().as_secs_f64() * 1.0e3;
+    let verification_top_logits = rank_valid_logits(&verification_logits)?;
+    let target_verified_token = verification_top_logits[0].token_id;
+    let mtp_draft_accepted = mtp_draft_token == target_verified_token;
+    let verification_logits_f32le_sha256 = digest_logits(&verification_logits);
+    anyhow::ensure!(
+        graph.target_tokens() == 2,
+        "CUDA target verifier token did not commit"
+    );
     graph.reset_session()?;
     anyhow::ensure!(
         graph.target_tokens() == 0,
@@ -154,13 +179,19 @@ fn main() -> anyhow::Result<()> {
             mtp_logits: mtp_logits.len(),
             mtp_logits_f32le_sha256,
             mtp_top_logits,
+            mtp_draft_token,
+            verification_logits_f32le_sha256,
+            verification_top_logits,
+            target_verified_token,
+            mtp_draft_accepted,
             graph_prepare_milliseconds,
             target_dispatch_milliseconds,
             mtp_dispatch_milliseconds,
+            target_verify_milliseconds,
             driver_free_bytes_before_prepare: free_before_prepare,
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
-            note: "Executes embedding, all 64 target layers, final norm, LM head, target-selected-token MTP draft, reset, and unload through device views. Logits cross the host only at explicit token boundaries. Finite logits and exact unload are necessary but not sufficient: BF16/CPU logit comparison, target verification of the draft, removal of per-op synchronizations, production sampling, and roofline promotion remain open.",
+            note: "Executes embedding, all 64 target layers, final norm, LM head, target-selected-token MTP draft, a second complete target step that verifies the draft, reset, and unload through device views. Logits cross the host only at explicit token boundaries. Draft rejection is a valid result and is reported, not hidden. Finite logits and exact unload are necessary but not sufficient: BF16/CPU logit comparison, removal of per-op synchronizations, production sampling/MTP4 replay, and roofline promotion remain open.",
         })?
     );
     Ok(())

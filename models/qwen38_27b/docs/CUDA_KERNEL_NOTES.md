@@ -320,8 +320,9 @@ argmax into the native one-layer MTP graph. Its two normalized inputs are joined
 with two driver device-to-device copies; no host tensor or backend-specific
 requantization is introduced. The SM86 run is pending; the current device entry
 points also synchronize per operation, so this code is not a production or
-roofline claim. Target verification of the MTP proposal and sampling remain
-unbound.
+roofline claim. A second complete target transition now verifies the greedy MTP
+proposal and records acceptance or fallback explicitly. Multi-draft replay and
+production sampling remain unbound.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not
