@@ -125,9 +125,18 @@ and for the 48x128 direct-weight gated RMSNorm. Convolution weight and history
 remain FP16 (81,920 bytes each per layer); the gated-norm weight remains 256
 bytes of FP16. CUDA 12.6 reports 22 and 31 registers respectively, with zero
 stack and spill bytes for both. `qwen38-cuda-linear-ops-verify` checks six
-stateful convolution steps, exact FP16 history, reset, gated-norm output, and
-buffer reclamation against the Rust oracles. Its physical-GPU-2 run is chained
+stateful convolution steps through producer-owned device views, exact FP16
+history, reset, gated-norm output, and buffer reclamation against the Rust
+oracles. Its physical-GPU-2 run is chained
 after the GatedDelta verifier; neither job may use GPU 0.
+
+The FP16 GatedDelta recurrence now has an equivalent device-view entry point
+for Q, K, V, log-decay, and beta, returning its device-resident output while
+retaining the state-poison/reset contract. Its verifier stages host fixtures in
+separate explicit verifier tensors and tests the production-facing pointer
+path; graph execution itself does not use those staging owners. Compact
+16-head Q/K repetition and raw A/B-to-decay/beta transforms still need fusion
+before the complete linear-attention layer is copy-free.
 
 The general Qwen `(1 + weight)` RMSNorm candidate uses one 256-thread block
 per row and an eight-warp reduction, so hidden width 5,120 does not serialize

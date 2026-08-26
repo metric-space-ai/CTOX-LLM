@@ -42,6 +42,7 @@ struct Report<'a> {
     convolution_model_bytes: usize,
     convolution_state_bytes: usize,
     convolution_transient_bytes: usize,
+    convolution_device_view_staging_bytes: usize,
     gated_norm_rows: usize,
     gated_norm_columns: usize,
     gated_norm_model_bytes: usize,
@@ -106,6 +107,8 @@ fn main() -> anyhow::Result<()> {
             .map(|index| ((index + 1) as f32 * 0.031).cos() * 0.25),
     );
     let mut conv = runtime.prepare_causal_conv_f16(conv_config, &conv_weight_bytes)?;
+    let conv_input_staging =
+        runtime.prepare_verifier_f32_tensor(&vec![0.0; conv_config.channels])?;
     let mut oracle_state = vec![f16::ZERO; conv_config.channels * conv_config.kernel_width];
     let mut maximum_convolution_absolute_error = 0.0_f32;
     let mut maximum_convolution_relative_error = 0.0_f32;
@@ -121,8 +124,10 @@ fn main() -> anyhow::Result<()> {
             conv_config.channels,
             conv_config.kernel_width,
         )?;
-        conv.write_input(&input)?;
-        let actual = runtime.dispatch_causal_conv_f16(&mut conv)?;
+        conv_input_staging.write(&input)?;
+        let actual_view = runtime
+            .dispatch_causal_conv_f16_device(&mut conv, conv_input_staging.device_view()?)?;
+        let actual = runtime.verifier_read_f32(actual_view)?;
         track_error(
             &expected,
             &actual,
@@ -301,6 +306,7 @@ fn main() -> anyhow::Result<()> {
     let convolution_model_bytes = conv.model_bytes();
     let convolution_state_bytes = conv.resident_state_bytes();
     let convolution_transient_bytes = conv.transient_bytes();
+    let convolution_device_view_staging_bytes = conv_input_staging.resident_bytes();
     let gated_norm_model_bytes = norm.model_bytes();
     let gated_norm_transient_bytes = norm.transient_bytes();
     let gated_norm_device_view_staging_bytes =
@@ -313,6 +319,7 @@ fn main() -> anyhow::Result<()> {
         query_rope_staging.resident_bytes() + key_rope_staging.resident_bytes();
     let (free_after_prepare, _) = runtime.memory_info()?;
     drop(conv);
+    drop(conv_input_staging);
     drop(norm);
     drop(norm_input_staging);
     drop(norm_gate_staging);
@@ -327,6 +334,7 @@ fn main() -> anyhow::Result<()> {
     let requested_bytes = convolution_model_bytes
         + convolution_state_bytes
         + convolution_transient_bytes
+        + convolution_device_view_staging_bytes
         + gated_norm_model_bytes
         + gated_norm_transient_bytes
         + gated_norm_device_view_staging_bytes
@@ -343,7 +351,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v3",
+            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v4",
             status: "pass",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -358,6 +366,7 @@ fn main() -> anyhow::Result<()> {
             convolution_model_bytes,
             convolution_state_bytes,
             convolution_transient_bytes,
+            convolution_device_view_staging_bytes,
             gated_norm_rows: norm_config.rows,
             gated_norm_columns: norm_config.columns,
             gated_norm_model_bytes,
@@ -386,7 +395,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes,
-            note: "Verifier-only candidates; Qwen RMSNorm and gated RMSNorm consume producer-owned CUDA device views, while partial RoPE mutates its producer-owned view in place. Readback is restricted to the verifier. No CPU fallback and not promoted into the production CUDA ABI.",
+            note: "Verifier-only candidates; causal convolution, Qwen RMSNorm, and gated RMSNorm consume producer-owned CUDA device views, while partial RoPE mutates its producer-owned view in place. Readback is restricted to the verifier. No CPU fallback and not promoted into the production CUDA ABI.",
         })?
     );
     Ok(())

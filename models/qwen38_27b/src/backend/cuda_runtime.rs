@@ -964,12 +964,94 @@ impl CudaCandidateRuntime {
             ));
         }
         prepared.poisoned = true;
+        self.dispatch_gated_delta_f16_inner(
+            prepared,
+            prepared.query.ptr(),
+            prepared.key.ptr(),
+            prepared.value.ptr(),
+            prepared.log_decay.ptr(),
+            prepared.beta.ptr(),
+        )?;
+        let output_values = prepared
+            .config
+            .heads
+            .checked_mul(prepared.config.value_dim)
+            .ok_or_else(|| EngineError::Shape("CUDA delta output shape overflows".into()))?;
+        let mut result = vec![0.0_f32; output_values];
+        prepared.output.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA gated-delta produced a non-finite output".into(),
+            ));
+        }
+        prepared.poisoned = false;
+        Ok(result)
+    }
+
+    pub fn dispatch_gated_delta_f16_device<'a>(
+        &self,
+        prepared: &'a mut PreparedCudaGatedDelta,
+        query: CudaDeviceF32View<'_>,
+        key: CudaDeviceF32View<'_>,
+        value: CudaDeviceF32View<'_>,
+        log_decay: CudaDeviceF32View<'_>,
+        beta: CudaDeviceF32View<'_>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA gated-delta belongs to another context".into(),
+            ));
+        }
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA gated-delta state is poisoned; reset is required".into(),
+            ));
+        }
+        let qk_values = prepared.config.heads * prepared.config.key_dim;
+        let value_values = prepared.config.heads * prepared.config.value_dim;
+        for (name, view, expected) in [
+            ("query", query, qk_values),
+            ("key", key, qk_values),
+            ("value", value, value_values),
+            ("log_decay", log_decay, prepared.config.heads),
+            ("beta", beta, prepared.config.heads),
+        ] {
+            if !Rc::ptr_eq(&self.inner, view.context) {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA gated-delta {name} belongs to another context"
+                )));
+            }
+            if view.values() != expected {
+                return Err(EngineError::Shape(format!(
+                    "CUDA gated-delta {name} has {} values, expected {expected}",
+                    view.values()
+                )));
+            }
+        }
+        prepared.poisoned = true;
+        self.dispatch_gated_delta_f16_inner(
+            prepared,
+            query.ptr()?,
+            key.ptr()?,
+            value.ptr()?,
+            log_decay.ptr()?,
+            beta.ptr()?,
+        )?;
+        prepared.poisoned = false;
+        prepared.output.f32_view(0, value_values)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_gated_delta_f16_inner(
+        &self,
+        prepared: &PreparedCudaGatedDelta,
+        mut query: CuDevicePtr,
+        mut key: CuDevicePtr,
+        mut value: CuDevicePtr,
+        mut log_decay: CuDevicePtr,
+        mut beta: CuDevicePtr,
+    ) -> Result<()> {
         self.make_current()?;
-        let mut query = prepared.query.ptr();
-        let mut key = prepared.key.ptr();
-        let mut value = prepared.value.ptr();
-        let mut log_decay = prepared.log_decay.ptr();
-        let mut beta = prepared.beta.ptr();
         let mut state = prepared.state.ptr();
         let mut output = prepared.output.ptr();
         let mut heads = prepared.config.heads as u32;
@@ -1011,20 +1093,7 @@ impl CudaCandidateRuntime {
                 "gated-delta context synchronization",
             )?;
         }
-        let output_values = prepared
-            .config
-            .heads
-            .checked_mul(prepared.config.value_dim)
-            .ok_or_else(|| EngineError::Shape("CUDA delta output shape overflows".into()))?;
-        let mut result = vec![0.0_f32; output_values];
-        prepared.output.copy_to(as_bytes_mut(&mut result))?;
-        if result.iter().any(|value| !value.is_finite()) {
-            return Err(EngineError::InvalidState(
-                "CUDA gated-delta produced a non-finite output".into(),
-            ));
-        }
-        prepared.poisoned = false;
-        Ok(result)
+        Ok(())
     }
 
     pub fn prepare_causal_conv_f16(
@@ -1078,8 +1147,52 @@ impl CudaCandidateRuntime {
             ));
         }
         prepared.poisoned = true;
+        self.dispatch_causal_conv_f16_inner(prepared, prepared.input.ptr())?;
+        let mut result = vec![0.0_f32; prepared.config.channels];
+        prepared.output.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA causal convolution produced a non-finite output".into(),
+            ));
+        }
+        prepared.poisoned = false;
+        Ok(result)
+    }
+
+    pub fn dispatch_causal_conv_f16_device<'a>(
+        &self,
+        prepared: &'a mut PreparedCudaCausalConv,
+        input: CudaDeviceF32View<'_>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) || !Rc::ptr_eq(&self.inner, input.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA causal convolution device input belongs to another context".into(),
+            ));
+        }
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA convolution state is poisoned; reset is required".into(),
+            ));
+        }
+        if input.values() != prepared.config.channels {
+            return Err(EngineError::Shape(format!(
+                "CUDA convolution device input has {} values, expected {}",
+                input.values(),
+                prepared.config.channels
+            )));
+        }
+        prepared.poisoned = true;
+        self.dispatch_causal_conv_f16_inner(prepared, input.ptr()?)?;
+        prepared.poisoned = false;
+        prepared.output.f32_view(0, prepared.config.channels)
+    }
+
+    fn dispatch_causal_conv_f16_inner(
+        &self,
+        prepared: &PreparedCudaCausalConv,
+        mut input: CuDevicePtr,
+    ) -> Result<()> {
         self.make_current()?;
-        let mut input = prepared.input.ptr();
         let mut weight = prepared.weight.ptr();
         let mut state = prepared.state.ptr();
         let mut output = prepared.output.ptr();
@@ -1115,15 +1228,7 @@ impl CudaCandidateRuntime {
                 "causal-convolution context synchronization",
             )?;
         }
-        let mut result = vec![0.0_f32; prepared.config.channels];
-        prepared.output.copy_to(as_bytes_mut(&mut result))?;
-        if result.iter().any(|value| !value.is_finite()) {
-            return Err(EngineError::InvalidState(
-                "CUDA causal convolution produced a non-finite output".into(),
-            ));
-        }
-        prepared.poisoned = false;
-        Ok(result)
+        Ok(())
     }
 
     pub fn prepare_gated_rms_norm_f16(
