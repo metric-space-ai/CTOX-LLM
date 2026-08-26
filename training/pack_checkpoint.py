@@ -20,6 +20,12 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from fanout_recovery import (
+    POLICIES,
+    QWEN38_FANOUT_POLICY,
+    fanout_group_sha256,
+    qwen38_fanout_groups,
+)
 from quantization import quantize_components
 from run_ledger import GpuRun, require_budget
 
@@ -103,6 +109,48 @@ def validate_recovery_source(
         value = descriptor[key]
         if len(value) != 64 or not all(character in "0123456789abcdef" for character in value):
             raise RuntimeError(f"recovery metadata {key} is not a lowercase SHA-256")
+    policy = metadata.get("fanout_s_in_policy")
+    if policy is not None:
+        if policy not in POLICIES:
+            raise RuntimeError(f"unsupported recovery fanout_s_in_policy {policy}")
+        group_digest = metadata.get("fanout_group_sha256", "")
+        if len(group_digest) != 64 or not all(
+            character in "0123456789abcdef" for character in group_digest
+        ):
+            raise RuntimeError("recovery fanout_group_sha256 is not a lowercase SHA-256")
+        groups = (
+            qwen38_fanout_groups(
+                (
+                    entry["name"]
+                    for entry in plan["tensors"]
+                    if entry.get("dtype")
+                    in {"q2_b64", "q4_b64", "mixed_q2_q4_b64"}
+                )
+            )
+            if policy == QWEN38_FANOUT_POLICY
+            else []
+        )
+        if fanout_group_sha256(groups) != group_digest:
+            raise RuntimeError("recovery fanout group digest differs from the quant plan")
+        for group in groups:
+            tensors = [recovery.get_tensor(name) for name in group["scale_names"]]
+            reference = tensors[0]
+            if any(not reference.equal(tensor) for tensor in tensors[1:]):
+                raise RuntimeError(
+                    f"recovery fanout scales differ at {group['prefix']}"
+                )
+        descriptor.update(
+            {
+                "fanout_s_in_policy": policy,
+                "fanout_group_sha256": group_digest,
+                "fanout_group_count": len(groups),
+                "fanout_logical_s_in_tensors": sum(
+                    len(group["scale_names"]) for group in groups
+                ),
+            }
+        )
+    elif metadata.get("fanout_group_sha256") is not None:
+        raise RuntimeError("recovery fanout group digest lacks a policy")
     return descriptor
 
 

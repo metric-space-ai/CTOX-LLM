@@ -67,6 +67,13 @@ from prompt_format import normalize_content, normalize_messages, normalize_tool_
 from filter_recovery_cohort import filter_records  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
 from fit_recovery_scales import quant_dtype_ranges  # noqa: E402
+from fanout_recovery import (  # noqa: E402
+    INDEPENDENT_POLICY,
+    QWEN38_FANOUT_POLICY,
+    fanout_group_sha256,
+    qwen38_fanout_groups,
+    tie_fanout_s_in,
+)
 from recovery_training_state import (  # noqa: E402
     normalize_accumulated_gradients,
     recovery_training_status,
@@ -76,6 +83,7 @@ from recovery_training_state import (  # noqa: E402
 
 try:  # Optional local training dependency; exercised in the pinned GPU venv.
     import torch  # noqa: E402
+    from end_to_end_recovery import unique_scale_parameters  # noqa: E402
     from recovery_modules import (  # noqa: E402
         normalized_hidden_loss,
         end_to_end_recovery_loss,
@@ -86,6 +94,7 @@ try:  # Optional local training dependency; exercised in the pinned GPU venv.
     )
 except ModuleNotFoundError:
     torch = None
+    unique_scale_parameters = None
 from pack_checkpoint import validate_recovery_source  # noqa: E402
 from packed_recovery_ops import (  # noqa: E402
     packed_linear,
@@ -123,6 +132,42 @@ from run_teacher_batches import cache_environment, completed_batch_matches  # no
 
 
 class DatasetPipelineTests(unittest.TestCase):
+    @staticmethod
+    def qwen38_fanout_weight_names() -> set[str]:
+        names: set[str] = set()
+        for layer in range(64):
+            prefix = f"model.language_model.layers.{layer}"
+            names.update(
+                {
+                    f"{prefix}.mlp.gate_proj.weight",
+                    f"{prefix}.mlp.up_proj.weight",
+                }
+            )
+            if (layer + 1) % 4 == 0:
+                names.update(
+                    f"{prefix}.self_attn.{projection}.weight"
+                    for projection in ("q_proj", "k_proj", "v_proj")
+                )
+            else:
+                names.update(
+                    f"{prefix}.linear_attn.{projection}.weight"
+                    for projection in (
+                        "in_proj_qkv",
+                        "in_proj_z",
+                        "in_proj_a",
+                        "in_proj_b",
+                    )
+                )
+        names.update(
+            f"mtp.layers.0.self_attn.{projection}.weight"
+            for projection in ("q_proj", "k_proj", "v_proj")
+        )
+        names.update(
+            f"mtp.layers.0.mlp.{projection}.weight"
+            for projection in ("gate_proj", "up_proj")
+        )
+        return names
+
     @staticmethod
     def recovery_record(sample_id: str, prompt: str, answer: str) -> dict:
         record = {
@@ -1649,6 +1694,85 @@ class DatasetPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lacks"):
             PackedRecoveryRegistry(artifact, torch)
 
+    def test_qwen38_fanout_contract_covers_every_same_input_projection(self) -> None:
+        names = self.qwen38_fanout_weight_names()
+        groups = qwen38_fanout_groups(names)
+        counts = Counter(group["kind"] for group in groups)
+        self.assertEqual(
+            counts,
+            {
+                "mlp_gate_up": 65,
+                "full_attention_qkv": 17,
+                "linear_attention_inputs": 48,
+            },
+        )
+        self.assertEqual(len(groups), 130)
+        self.assertEqual(sum(len(group["weights"]) for group in groups), 373)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            qwen38_fanout_groups(
+                {
+                    "model.language_model.layers.3.self_attn.q_proj.weight",
+                    "model.language_model.layers.3.self_attn.k_proj.weight",
+                },
+                require_frozen_topology=False,
+            )
+
+    def test_fanout_tying_uses_one_geometric_mean_parameter_and_exact_alias_gate(
+        self,
+    ) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+
+        class RecoveryModule(torch.nn.Module):
+            def __init__(self, name: str, s_in: float) -> None:
+                super().__init__()
+                self.name = name
+                self.log_s_in = torch.nn.Parameter(
+                    torch.full((4,), s_in).log()
+                )
+                self.log_s_out = torch.nn.Parameter(torch.zeros(2))
+
+        main = torch.nn.Module()
+        main.projections = torch.nn.ModuleList(
+            [
+                RecoveryModule(
+                    f"model.language_model.layers.3.self_attn.{projection}.weight",
+                    value,
+                )
+                for projection, value in zip(
+                    ("q_proj", "k_proj", "v_proj"),
+                    (1.0, 2.0, 4.0),
+                )
+            ]
+        )
+        mtp = torch.nn.Module()
+        independent = tie_fanout_s_in(main, mtp, torch, INDEPENDENT_POLICY)
+        independent_parameters = unique_scale_parameters(main, mtp, independent)
+        self.assertEqual(len({id(module.log_s_in) for module in main.projections}), 3)
+        self.assertEqual(independent["group_count"], 0)
+
+        evidence = tie_fanout_s_in(
+            main,
+            mtp,
+            torch,
+            QWEN38_FANOUT_POLICY,
+            require_frozen_topology=False,
+        )
+        parameters = unique_scale_parameters(main, mtp, evidence)
+        expected = torch.tensor(8.0 ** (1.0 / 3.0))
+        self.assertTrue(
+            torch.allclose(
+                main.projections[0].log_s_in.exp(),
+                torch.full((4,), expected),
+            )
+        )
+        self.assertEqual(len({id(module.log_s_in) for module in main.projections}), 1)
+        self.assertEqual(len(independent_parameters), len(parameters))
+        self.assertEqual(evidence["group_count"], 1)
+        self.assertEqual(evidence["a8_quantizations_avoided_per_complete_fanout_pass"], 2)
+        with self.assertRaisesRegex(ValueError, "aliases differ"):
+            unique_scale_parameters(main, mtp, {"policy": INDEPENDENT_POLICY, "groups": []})
+
     def test_packed_student_assignment_replaces_only_exact_qualified_target(
         self,
     ) -> None:
@@ -2242,6 +2366,30 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(descriptor["mode"], "trained")
         self.assertEqual(descriptor["activation_stats_sha256"], "c" * 64)
 
+        fanout_metadata = dict(
+            metadata,
+            fanout_s_in_policy=INDEPENDENT_POLICY,
+            fanout_group_sha256=fanout_group_sha256([]),
+        )
+        fanout_descriptor = validate_recovery_source(
+            plan,
+            plan_hash,
+            self.FakeRecovery(fanout_metadata, tensors),
+        )
+        self.assertEqual(
+            fanout_descriptor["fanout_s_in_policy"], INDEPENDENT_POLICY
+        )
+        self.assertEqual(fanout_descriptor["fanout_group_count"], 0)
+        with self.assertRaisesRegex(RuntimeError, "group digest differs"):
+            validate_recovery_source(
+                plan,
+                plan_hash,
+                self.FakeRecovery(
+                    dict(fanout_metadata, fanout_group_sha256="e" * 64),
+                    tensors,
+                ),
+            )
+
         incomplete = dict(tensors)
         incomplete.pop("matrix.weight.s_out")
         with self.assertRaisesRegex(RuntimeError, "1 missing"):
@@ -2257,6 +2405,66 @@ class DatasetPipelineTests(unittest.TestCase):
                 plan,
                 plan_hash,
                 self.FakeRecovery(wrong_plan, tensors),
+            )
+
+    def test_packer_requires_byte_identical_declared_qwen_fanout_scales(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+        weight_names = self.qwen38_fanout_weight_names()
+        plan = {
+            "model": "Qwen/Qwen3.8-27B",
+            "revision": "b" * 40,
+            "tensors": [],
+        }
+        tensors = {}
+        for name in sorted(weight_names):
+            plan["tensors"].extend(
+                [
+                    {"name": name, "dtype": "q2_b64", "shape": [2, 4]},
+                    {
+                        "name": f"{name}.s_in",
+                        "dtype": "f16",
+                        "shape": [4],
+                        "group": "recovery",
+                    },
+                    {
+                        "name": f"{name}.s_out",
+                        "dtype": "f16",
+                        "shape": [2],
+                        "group": "recovery",
+                    },
+                ]
+            )
+            tensors[f"{name}.s_in"] = torch.ones(4, dtype=torch.float16)
+            tensors[f"{name}.s_out"] = torch.ones(2, dtype=torch.float16)
+        groups = qwen38_fanout_groups(weight_names)
+        metadata = {
+            "format": "ctox.recovery.channel-scales.v2",
+            "status": "complete",
+            "model": plan["model"],
+            "revision": plan["revision"],
+            "plan_sha256": "a" * 64,
+            "activation_stats_sha256": "c" * 64,
+            "report_sha256": "d" * 64,
+            "fixed_logical_qcodes": "true",
+            "fanout_s_in_policy": QWEN38_FANOUT_POLICY,
+            "fanout_group_sha256": fanout_group_sha256(groups),
+        }
+        descriptor = validate_recovery_source(
+            plan,
+            "a" * 64,
+            self.FakeRecovery(metadata, tensors),
+        )
+        self.assertEqual(descriptor["fanout_group_count"], 130)
+        self.assertEqual(descriptor["fanout_logical_s_in_tensors"], 373)
+        tensors[groups[0]["scale_names"][0]] = torch.full(
+            (4,), 2.0, dtype=torch.float16
+        )
+        with self.assertRaisesRegex(RuntimeError, "fanout scales differ"):
+            validate_recovery_source(
+                plan,
+                "a" * 64,
+                self.FakeRecovery(metadata, tensors),
             )
 
     def test_fold_package_budget_reserves_manifest_bytes(self) -> None:

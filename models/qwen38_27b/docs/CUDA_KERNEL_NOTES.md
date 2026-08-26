@@ -99,8 +99,12 @@ verifier candidate. It applies packed FP16 `s_in` first, deterministically
 quantizes each 64-value activation block to signed int8 with one f32 scale,
 and runs half-warp-per-row Q2/Q4 `dp4a` matvecs. The logical Q2/Q4 weight codes
 are unchanged; there is no backend-specific weight requantization, and A8
-buffers are transient rather than serialized model state. One quantized
-activation may be shared across related projections such as Q/K/V or gate/up.
+buffers are transient rather than serialized model state. The current prepared
+object retains that activation only for one projection. Repeated benchmark
+dispatches reuse the same matrix; they do not yet prove cross-matrix Q/K/V or
+gate/up sharing. Such sharing is legal only for a checkpoint carrying the
+`qwen38_fanout_s_in_v1` contract, whose participating FP16 `s_in` tensors are
+byte-identical, and still requires a dedicated shared-activation dispatcher.
 Canonical `MixedQ2Q4B64` tensors use the same transient activation across all
 manifest row groups. The host validates exact contiguous row/byte coverage,
 uploads the original mixed payload once, offsets device pointers into each
@@ -113,7 +117,8 @@ be conflated. The CUDA implementation differs from a CPU A8 oracle by at most
 activation oracle by as much as `0.04284` (Q2) and `0.03769` (Q4) for this
 synthetic fixture. Five uncontrolled replicates reached median amortized rates
 of 264.45 GB/s for Q2 and 390.98 GB/s for Q4 when one activation quantization
-was shared over 20 projections. With one quantization per single projection,
+was reused for 20 launches of the same projection. With one quantization per
+launch,
 the medians were 139.19 GB/s and 236.44 GB/s. These remain application-level
 packed-byte ratios under a concurrent teacher workload, not roofline claims.
 The 50/50 mixed 5120x5120 verifier reached a median 284.30 GB/s over five

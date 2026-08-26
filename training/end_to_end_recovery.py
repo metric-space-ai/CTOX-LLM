@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from cache_teacher import transformer_layers
+from fanout_recovery import tie_fanout_s_in, validate_parameter_aliases
 from mtp_teacher import forward_mtp_activations
 from packed_student_model import install_packed_base_model, install_packed_mtp_model
 from recovery_modules import (
@@ -106,9 +107,9 @@ def validate_teacher_tensors(
 def unique_scale_parameters(
     main_model: Any,
     mtp_model: Any,
+    fanout_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parameters: dict[str, Any] = {}
-    identities: dict[str, int] = {}
     for root in (main_model, mtp_model):
         for module in root.modules():
             name = getattr(module, "name", None)
@@ -124,16 +125,18 @@ def unique_scale_parameters(
                 if scale_name in parameters and parameters[scale_name] is not parameter:
                     raise ValueError(f"duplicate recovery owner for {scale_name}")
                 parameters[scale_name] = parameter
-                identities[scale_name] = id(parameter)
     if not parameters:
         raise ValueError("packed student exposes no recovery-scale parameters")
-    reverse: dict[int, str] = {}
-    for name, identity in identities.items():
-        prior = reverse.get(identity)
-        if prior is not None and prior != name:
-            raise ValueError(f"one recovery parameter aliases {prior} and {name}")
-        reverse[identity] = name
-    return dict(sorted(parameters.items()))
+    parameters = dict(sorted(parameters.items()))
+    validate_parameter_aliases(
+        parameters,
+        fanout_evidence
+        or {
+            "policy": "independent",
+            "groups": [],
+        },
+    )
+    return parameters
 
 
 def validate_scale_parameter_contract(
@@ -330,8 +333,9 @@ def build_packed_student(
     top_k: int,
     logit_chunk: int,
     gradient_checkpointing: bool,
+    fanout_s_in_policy: str,
     torch: Any,
-) -> tuple[PackedStudentRuntime, dict[str, Any], dict[str, Any]]:
+) -> tuple[PackedStudentRuntime, dict[str, Any], dict[str, Any], dict[str, Any]]:
     from accelerate import init_empty_weights
     from transformers import AutoConfig, AutoModelForCausalLM
     from transformers.cache_utils import MtpCache
@@ -360,6 +364,12 @@ def build_packed_student(
         compute_dtype,
         rows_per_chunk,
     )
+    fanout_evidence = tie_fanout_s_in(
+        model,
+        mtp_model,
+        torch,
+        fanout_s_in_policy,
+    )
     model.config.use_cache = False
     if gradient_checkpointing:
         model.gradient_checkpointing_enable(
@@ -377,7 +387,7 @@ def build_packed_student(
         torch,
         device,
     )
-    return runtime, base_evidence, mtp_evidence
+    return runtime, base_evidence, mtp_evidence, fanout_evidence
 
 
 def optimizer_parameters(parameters: dict[str, Any]) -> list[Any]:
@@ -494,6 +504,26 @@ def restore_training_checkpoint(
     }
     if set(tensors) != expected:
         raise ValueError("recovery checkpoint tensor set differs")
+    aliases: dict[int, list[str]] = {}
+    for name, parameter in parameters.items():
+        aliases.setdefault(id(parameter), []).append(name)
+    for names in aliases.values():
+        if len(names) < 2:
+            continue
+        reference = names[0]
+        for name in names[1:]:
+            for prefix in (
+                "parameter",
+                "optimizer_step",
+                "optimizer_exp_avg",
+                "optimizer_exp_avg_sq",
+            ):
+                if not torch.equal(
+                    tensors[f"{prefix}/{reference}"], tensors[f"{prefix}/{name}"]
+                ):
+                    raise ValueError(
+                        f"recovery checkpoint alias state differs for {reference} and {name}"
+                    )
     for name, parameter in parameters.items():
         value = tensors[f"parameter/{name}"]
         if tuple(value.shape) != tuple(parameter.shape) or not bool(

@@ -138,6 +138,10 @@ evidence is 593/2,328 complete.
 3. Keep quantization codes fixed and train `s_in`/`s_out`, compatible
    Hadamard/incoherence transforms, and recovery parameters using logit KL,
    cross-entropy, hidden-state, and activation reconstruction losses.
+   Compare independent corrections against the plan-bound
+   `qwen38_fanout_s_in_v1` candidate. The tied candidate may share corrected
+   A8 activations only when every exported FP16 `s_in` in the declared group
+   is byte-identical and its held-out quality gates pass.
 4. Run ablations for correction scales, transforms, layer allocation, LM head,
    embedding, and MTP. Reject improvements that only move the calibration set.
 5. Fold inference-time corrections into scales and fused-kernel metadata, then

@@ -274,6 +274,20 @@ parallel scale file after a checkpoint has been packed.
 parameters are logarithmic positive channel corrections. Packed weights and
 bias stay frozen, and export returns the exact `<weight>.s_in`/`.s_out` FP16
 names required by the native manifest.
+`fanout_recovery.py` defines the optional, immutable
+`qwen38_fanout_s_in_v1` training policy. It ties input corrections only for
+operations proven by the frozen graph to consume the same activation: all
+Q/K/V projections, MLP gate/up pairs, and the four linear-attention input
+projections. The complete text+MTP graph contains 130 such groups covering 373
+logical `s_in` tensors, so a backend can avoid 243 redundant A8 quantizations
+per complete fan-out pass. Independent per-matrix scales remain the quality
+baseline; tied recovery begins at the geometric mean of the initializer scales
+and must win its held-out ablation before release. The run contract, scale-file
+metadata, and packed checkpoint bind the policy and exact group digest.
+Every logical scale name remains present in the checkpoint, and the packer
+requires all FP16 values in a declared group to be byte-identical. A backend
+may not share a corrected/A8 activation merely because matrix shapes happen to
+match.
 `PackedRecoveryRegistry` scans the native artifact for every quantized matrix,
 requires an exact FP16 scale pair with matching channel shapes, and constructs
 modules on demand. This prevents the trainer from optimizing a partial tensor

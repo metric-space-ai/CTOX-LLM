@@ -26,6 +26,7 @@ from end_to_end_recovery import (
     unique_scale_parameters,
     validate_scale_parameter_contract,
 )
+from fanout_recovery import INDEPENDENT_POLICY, POLICIES
 from recovery_training_state import (
     normalize_accumulated_gradients,
     recovery_training_status,
@@ -163,6 +164,15 @@ def main() -> None:
     parser.add_argument("--loss-weights", default="{}")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--use-fla-kernel", action="store_true")
+    parser.add_argument(
+        "--fanout-s-in-policy",
+        choices=POLICIES,
+        default=INDEPENDENT_POLICY,
+        help=(
+            "tie same-input projection corrections for a named, run-bound "
+            "Qwen fan-out ablation; independent remains the quality baseline"
+        ),
+    )
     args = parser.parse_args()
     require_budget(args.ledger, args.reserved_gpu_hours)
     try:
@@ -199,7 +209,7 @@ def main() -> None:
             kernel_evidence = (
                 install_pinned_fla_kernel() if args.use_fla_kernel else None
             )
-            runtime, base_evidence, mtp_evidence = build_packed_student(
+            runtime, base_evidence, mtp_evidence, fanout_evidence = build_packed_student(
                 args.model_source,
                 args.revision,
                 artifact,
@@ -210,9 +220,14 @@ def main() -> None:
                 top_k,
                 args.logit_chunk,
                 args.gradient_checkpointing,
+                args.fanout_s_in_policy,
                 torch,
             )
-            parameters = unique_scale_parameters(runtime.main_model, runtime.mtp_model)
+            parameters = unique_scale_parameters(
+                runtime.main_model,
+                runtime.mtp_model,
+                fanout_evidence,
+            )
             validate_scale_parameter_contract(parameters, artifact)
             trainable = optimizer_parameters(parameters)
             optimizer = torch.optim.AdamW(
@@ -246,6 +261,8 @@ def main() -> None:
                 "seed": args.seed,
                 "loss_weights": loss_weights,
                 "gradient_checkpointing": args.gradient_checkpointing,
+                "fanout_s_in_policy": args.fanout_s_in_policy,
+                "fanout_group_sha256": fanout_evidence["group_sha256"],
                 "fixed_logical_qcodes": True,
             }
             _contract_json, run_contract_sha256 = immutable_run_contract(run_contract)
@@ -441,6 +458,7 @@ def main() -> None:
                 "skipped_oversize_samples": skipped,
                 "base_graph": base_evidence,
                 "mtp_graph": mtp_evidence,
+                "fanout_s_in": fanout_evidence,
                 "fla_kernel": kernel_evidence,
             }
             atomic_json(args.output_report, report)
@@ -459,6 +477,8 @@ def main() -> None:
                     "teacher_cache_set_sha256": args.teacher_cache_set_sha256,
                     "input_artifact_sha256": artifact_sha256,
                     "fixed_logical_qcodes": "true",
+                    "fanout_s_in_policy": args.fanout_s_in_policy,
+                    "fanout_group_sha256": str(fanout_evidence["group_sha256"]),
                     "trained_scale_root_sha256": scale_root,
                 },
             )
@@ -472,6 +492,8 @@ def main() -> None:
                 "cursor": cursor,
                 "skipped_oversize_samples": len(skipped),
                 "fixed_logical_qcodes": True,
+                "fanout_s_in_policy": args.fanout_s_in_policy,
+                "fanout_group_sha256": fanout_evidence["group_sha256"],
             }
             atomic_json(args.output_evidence, evidence)
     except (OSError, ValueError, RuntimeError, KeyError, json.JSONDecodeError) as error:
