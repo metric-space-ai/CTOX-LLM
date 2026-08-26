@@ -19,20 +19,21 @@ use sha2::{Digest, Sha256};
 
 use super::cuda::{
     validate_mixed_operation, validate_operation, validate_recovered_row, CudaMixedRowSegment,
-    A8_QUANTIZE_SYMBOL, ARGMAX_F32_SYMBOL, CAUSAL_CONV_F16_SYMBOL, CUDA_SAMPLER_MAX_TOP_K,
-    DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL, GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS,
-    GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS, GATED_DELTA_PREP_F32_SYMBOL,
+    A8_BATCHED_QUANTIZE_SYMBOL, A8_QUANTIZE_SYMBOL, ARGMAX_F32_SYMBOL, CAUSAL_CONV_F16_SYMBOL,
+    CUDA_SAMPLER_MAX_TOP_K, DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL, GATED_DELTA_F16_SYMBOL,
+    GATED_DELTA_HEADS, GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS, GATED_DELTA_PREP_F32_SYMBOL,
     GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
     GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
     LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES,
     PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, PAGED_GQA_SPLIT_SEGMENTS,
     PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL,
     PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL,
-    Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
-    Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL,
-    Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL,
-    QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL, SIGMOID_GATE_A8_QUANTIZE_SYMBOL,
-    SWIGLU_A8_QUANTIZE_SYMBOL, TOPK_TOPP_SAMPLE_F32_SYMBOL,
+    Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
+    Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_BATCHED_MATMUL_SYMBOL,
+    Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
+    Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
+    RESIDUAL_RMS_NORM_F16_SYMBOL, SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
+    TOPK_TOPP_SAMPLE_F32_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -55,6 +56,7 @@ const THREADS_PER_BLOCK: u32 = 128;
 const LINEAR_THREADS_PER_BLOCK: u32 = 256;
 const WARP_SIZE: u32 = 32;
 const A8_ROWS_PER_BLOCK: u32 = (THREADS_PER_BLOCK / WARP_SIZE) * 2;
+const CUDA_GRID_Y_MAX: u32 = 65_535;
 
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
 type CuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
@@ -210,6 +212,9 @@ struct CudaContextInner {
     sigmoid_gate_a8_quantize_function: CuFunction,
     q2_a8_function: CuFunction,
     q4_a8_function: CuFunction,
+    a8_batched_quantize_function: CuFunction,
+    q2_a8_batched_function: CuFunction,
+    q4_a8_batched_function: CuFunction,
     q2_a8_gathered_function: CuFunction,
     q4_a8_gathered_function: CuFunction,
     q2_recovered_row_function: CuFunction,
@@ -350,6 +355,29 @@ pub struct PreparedCudaMixedA8MatVec {
     columns: u32,
     activation: u32,
     segments: Vec<CudaMixedRowSegment>,
+    weights: DeviceBuffer,
+    input: DeviceBuffer,
+    s_in: Option<DeviceBuffer>,
+    s_out: Option<DeviceBuffer>,
+    bias: Option<DeviceBuffer>,
+    output: DeviceBuffer,
+    q8_codes: DeviceBuffer,
+    q8_scales: DeviceBuffer,
+    resident_bytes: usize,
+}
+
+/// Multi-token projection owner for the CUDA prefill verifier baseline. One
+/// row-major activation batch is quantized in a single 2-D launch and consumes
+/// the same immutable pure or mixed Q2/Q4 payload as decode. This establishes
+/// the graph/storage ABI; production promotion still requires the SM86 MMQ
+/// tile implementation and roofline evidence.
+pub struct PreparedCudaBatchedA8MatMul {
+    context: Rc<CudaContextInner>,
+    batch_rows: u32,
+    rows: u32,
+    columns: u32,
+    activation: u32,
+    layout: CudaA8ProjectionLayout,
     weights: DeviceBuffer,
     input: DeviceBuffer,
     s_in: Option<DeviceBuffer>,
@@ -949,6 +977,39 @@ impl CudaCandidateRuntime {
                 return Err(error);
             }
         };
+        let a8_batched_quantize_function =
+            match resolve_function(&driver, module, A8_BATCHED_QUANTIZE_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let q2_a8_batched_function =
+            match resolve_function(&driver, module, Q2_B64_A8_BATCHED_MATMUL_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let q4_a8_batched_function =
+            match resolve_function(&driver, module, Q4_B64_A8_BATCHED_MATMUL_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let q2_a8_gathered_function =
             match resolve_function(&driver, module, Q2_B64_A8_GATHERED_MATVEC_SYMBOL) {
                 Ok(function) => function,
@@ -1169,6 +1230,9 @@ impl CudaCandidateRuntime {
                 sigmoid_gate_a8_quantize_function,
                 q2_a8_function,
                 q4_a8_function,
+                a8_batched_quantize_function,
+                q2_a8_batched_function,
+                q4_a8_batched_function,
                 q2_a8_gathered_function,
                 q4_a8_gathered_function,
                 q2_recovered_row_function,
@@ -4033,6 +4097,71 @@ impl CudaCandidateRuntime {
         })
     }
 
+    /// Prepares a row-major prompt batch against one immutable logical Q2/Q4
+    /// matrix. This is the correctness baseline for prefill: it removes the
+    /// per-token launch loop without changing or repacking model weights.
+    pub fn prepare_batched_a8_matmul(
+        &self,
+        operation: &FusedMatVec<'_>,
+        batch_inputs: &[f32],
+        batch_rows: usize,
+    ) -> Result<PreparedCudaBatchedA8MatMul> {
+        let (layout, batch_rows_u32, input_values) =
+            validate_batched_a8_inputs(operation, batch_inputs, batch_rows)?;
+
+        self.make_current()?;
+        let weights = DeviceBuffer::from_bytes(self, operation.weights)?;
+        let input = DeviceBuffer::from_bytes(self, as_bytes(batch_inputs))?;
+        let s_in = optional_scale_buffer(self, operation.s_in)?;
+        let s_out = optional_scale_buffer(self, operation.s_out)?;
+        let bias = operation
+            .bias
+            .map(|values| DeviceBuffer::from_bytes(self, as_bytes(values)))
+            .transpose()?;
+        let output_values = batch_rows.checked_mul(operation.rows).ok_or_else(|| {
+            EngineError::Shape("CUDA batched A8 output value count overflows".into())
+        })?;
+        let output_bytes = output_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("CUDA batched A8 output bytes overflow".into()))?;
+        let output = DeviceBuffer::allocate(self, output_bytes)?;
+        let q8_codes = DeviceBuffer::allocate(self, input_values)?;
+        let q8_scale_bytes = batch_rows
+            .checked_mul(a8_scale_bytes(operation.columns)?)
+            .ok_or_else(|| EngineError::Shape("CUDA batched A8 scale bytes overflow".into()))?;
+        let q8_scales = DeviceBuffer::allocate(self, q8_scale_bytes)?;
+        let resident_bytes = weights
+            .len()
+            .checked_add(input.len())
+            .and_then(|total| total.checked_add(s_in.as_ref().map_or(0, DeviceBuffer::len)))
+            .and_then(|total| total.checked_add(s_out.as_ref().map_or(0, DeviceBuffer::len)))
+            .and_then(|total| total.checked_add(bias.as_ref().map_or(0, DeviceBuffer::len)))
+            .and_then(|total| total.checked_add(output.len()))
+            .and_then(|total| total.checked_add(q8_codes.len()))
+            .and_then(|total| total.checked_add(q8_scales.len()))
+            .ok_or_else(|| EngineError::Shape("CUDA batched A8 residency overflows".into()))?;
+        Ok(PreparedCudaBatchedA8MatMul {
+            context: Rc::clone(&self.inner),
+            batch_rows: batch_rows_u32,
+            rows: operation.rows as u32,
+            columns: operation.columns as u32,
+            activation: match operation.activation {
+                Activation::Identity => 0,
+                Activation::Silu => 1,
+            },
+            layout,
+            weights,
+            input,
+            s_in,
+            s_out,
+            bias,
+            output,
+            q8_codes,
+            q8_scales,
+            resident_bytes,
+        })
+    }
+
     /// Prepares one corrected activation independently of its fan-out
     /// projections. The exact packed FP16 `s_in` bytes form part of the
     /// identity checked by every consuming projection.
@@ -4862,6 +4991,205 @@ impl CudaCandidateRuntime {
         Ok(output)
     }
 
+    /// Quantizes and projects a complete row-major prompt batch with one
+    /// synchronization. Mixed Q2/Q4 row ranges write into disjoint slices of
+    /// the same `[batch_rows, rows]` output allocation.
+    pub fn dispatch_batched_a8_matmul(
+        &self,
+        prepared: &PreparedCudaBatchedA8MatMul,
+    ) -> Result<Vec<f32>> {
+        self.dispatch_batched_a8_matmul_device(prepared)?;
+        let output_values = (prepared.batch_rows as usize)
+            .checked_mul(prepared.rows as usize)
+            .ok_or_else(|| EngineError::Shape("CUDA batched A8 output read overflows".into()))?;
+        let mut output = vec![0.0_f32; output_values];
+        prepared.output.copy_to(as_bytes_mut(&mut output))?;
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA batched A8 candidate produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    /// Device-resident form used by the future chunked prefill graph. No
+    /// activation or projection output crosses host memory.
+    pub fn dispatch_batched_a8_matmul_device<'a>(
+        &self,
+        prepared: &'a PreparedCudaBatchedA8MatMul,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared batched CUDA A8 operation belongs to another context".into(),
+            ));
+        }
+        self.launch_batched_a8_quantization(
+            prepared.input.ptr(),
+            prepared.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            prepared.q8_codes.ptr(),
+            prepared.q8_scales.ptr(),
+            prepared.columns,
+            prepared.batch_rows,
+        )?;
+        match &prepared.layout {
+            CudaA8ProjectionLayout::Pure(dtype) => self.launch_batched_a8_projection(
+                *dtype,
+                prepared.weights.ptr(),
+                prepared.q8_codes.ptr(),
+                prepared.q8_scales.ptr(),
+                prepared.s_out.as_ref().map_or(0, DeviceBuffer::ptr),
+                prepared.bias.as_ref().map_or(0, DeviceBuffer::ptr),
+                prepared.output.ptr(),
+                prepared.rows,
+                prepared.columns,
+                prepared.batch_rows,
+                prepared.rows,
+                prepared.activation,
+            )?,
+            CudaA8ProjectionLayout::Mixed(segments) => {
+                for segment in segments {
+                    let row_start = segment.row_start as usize;
+                    self.launch_batched_a8_projection(
+                        segment.descriptor.dtype,
+                        device_ptr_offset(prepared.weights.ptr(), segment.weight_offset)?,
+                        prepared.q8_codes.ptr(),
+                        prepared.q8_scales.ptr(),
+                        prepared
+                            .s_out
+                            .as_ref()
+                            .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 2))
+                            .transpose()?
+                            .unwrap_or(0),
+                        prepared
+                            .bias
+                            .as_ref()
+                            .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 4))
+                            .transpose()?
+                            .unwrap_or(0),
+                        device_ptr_offset(prepared.output.ptr(), row_start * 4)?,
+                        segment.row_count,
+                        prepared.columns,
+                        prepared.batch_rows,
+                        prepared.rows,
+                        prepared.activation,
+                    )?;
+                }
+            }
+        }
+        self.synchronize_after_launch("batched A8 matmul context synchronization")?;
+        prepared.device_output()
+    }
+
+    fn launch_batched_a8_quantization(
+        &self,
+        input_ptr: CuDevicePtr,
+        s_in_ptr: CuDevicePtr,
+        q8_codes_ptr: CuDevicePtr,
+        q8_scales_ptr: CuDevicePtr,
+        column_count: u32,
+        batch_rows_count: u32,
+    ) -> Result<()> {
+        self.make_current()?;
+        let mut input = input_ptr;
+        let mut s_in = s_in_ptr;
+        let mut q8_codes = q8_codes_ptr;
+        let mut q8_scales = q8_scales_ptr;
+        let mut columns = column_count;
+        let mut batch_rows = batch_rows_count;
+        let mut params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_in as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut batch_rows as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.a8_batched_quantize_function,
+                    column_count.div_ceil(BLOCK_LEN as u32),
+                    batch_rows_count,
+                    1,
+                    BLOCK_LEN as u32,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "batched A8 quantization launch",
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_batched_a8_projection(
+        &self,
+        dtype: TensorDType,
+        weights_ptr: CuDevicePtr,
+        q8_codes_ptr: CuDevicePtr,
+        q8_scales_ptr: CuDevicePtr,
+        s_out_ptr: CuDevicePtr,
+        bias_ptr: CuDevicePtr,
+        output_ptr: CuDevicePtr,
+        row_count: u32,
+        column_count: u32,
+        batch_rows_count: u32,
+        output_stride_count: u32,
+        activation_code: u32,
+    ) -> Result<()> {
+        self.make_current()?;
+        let function = match dtype {
+            TensorDType::Q2B64 => self.inner.q2_a8_batched_function,
+            TensorDType::Q4B64 => self.inner.q4_a8_batched_function,
+            _ => unreachable!("validated batched CUDA A8 segment is Q2 or Q4"),
+        };
+        let mut weights = weights_ptr;
+        let mut q8_codes = q8_codes_ptr;
+        let mut q8_scales = q8_scales_ptr;
+        let mut s_out = s_out_ptr;
+        let mut bias = bias_ptr;
+        let mut output = output_ptr;
+        let mut rows = row_count;
+        let mut columns = column_count;
+        let mut batch_rows = batch_rows_count;
+        let mut output_stride = output_stride_count;
+        let mut activation = activation_code;
+        let mut params = [
+            (&mut weights as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_out as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut bias as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rows as *mut u32).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut batch_rows as *mut u32).cast::<c_void>(),
+            (&mut output_stride as *mut u32).cast::<c_void>(),
+            (&mut activation as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    function,
+                    row_count.div_ceil(A8_ROWS_PER_BLOCK),
+                    batch_rows_count,
+                    1,
+                    THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "batched A8 dp4a matmul launch",
+            )
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_a8_projection(
         &self,
@@ -5183,6 +5511,51 @@ impl PreparedCudaMixedA8MatVec {
             ));
         }
         self.input.write(as_bytes(input))
+    }
+}
+
+impl PreparedCudaBatchedA8MatMul {
+    pub fn batch_rows(&self) -> usize {
+        self.batch_rows as usize
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows as usize
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        let values = self
+            .batch_rows()
+            .checked_mul(self.rows())
+            .ok_or_else(|| EngineError::Shape("CUDA batched A8 output view overflows".into()))?;
+        self.output.f32_view(0, values)
+    }
+
+    pub fn write_inputs(&self, inputs: &[f32]) -> Result<()> {
+        let expected = self
+            .batch_rows()
+            .checked_mul(self.columns())
+            .ok_or_else(|| EngineError::Shape("CUDA batched A8 input shape overflows".into()))?;
+        if inputs.len() != expected {
+            return Err(EngineError::Shape(format!(
+                "CUDA batched A8 input has {} values, expected {expected}",
+                inputs.len()
+            )));
+        }
+        if inputs.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidArtifact(
+                "CUDA batched A8 input contains a non-finite value".into(),
+            ));
+        }
+        self.input.write(as_bytes(inputs))
     }
 }
 
@@ -6203,6 +6576,41 @@ fn validate_a8_projection_layout(operation: &FusedMatVec<'_>) -> Result<CudaA8Pr
     }
 }
 
+fn validate_batched_a8_inputs(
+    operation: &FusedMatVec<'_>,
+    batch_inputs: &[f32],
+    batch_rows: usize,
+) -> Result<(CudaA8ProjectionLayout, u32, usize)> {
+    let layout = validate_a8_projection_layout(operation)?;
+    if batch_rows == 0 {
+        return Err(EngineError::Shape(
+            "CUDA batched A8 matmul requires at least one input row".into(),
+        ));
+    }
+    let batch_rows_u32 = u32::try_from(batch_rows)
+        .map_err(|_| EngineError::Shape("CUDA A8 batch rows exceed u32".into()))?;
+    if batch_rows_u32 > CUDA_GRID_Y_MAX {
+        return Err(EngineError::Shape(format!(
+            "CUDA A8 batch has {batch_rows} rows, maximum is {CUDA_GRID_Y_MAX}; chunk longer prefills"
+        )));
+    }
+    let input_values = batch_rows
+        .checked_mul(operation.columns)
+        .ok_or_else(|| EngineError::Shape("CUDA batched A8 input value count overflows".into()))?;
+    if batch_inputs.len() != input_values {
+        return Err(EngineError::Shape(format!(
+            "CUDA batched A8 input has {} values, expected {input_values}",
+            batch_inputs.len()
+        )));
+    }
+    if batch_inputs.iter().any(|value| !value.is_finite()) {
+        return Err(EngineError::InvalidArtifact(
+            "CUDA batched A8 input contains a non-finite value".into(),
+        ));
+    }
+    Ok((layout, batch_rows_u32, input_values))
+}
+
 fn embedding_row_location(
     layout: &CudaA8ProjectionLayout,
     rows: u32,
@@ -6478,6 +6886,40 @@ mod tests {
         assert_eq!(a8_scale_bytes(64).unwrap(), 4);
         assert_eq!(a8_scale_bytes(512).unwrap(), 32);
         assert_eq!(512 + a8_scale_bytes(512).unwrap(), 544);
+    }
+
+    #[test]
+    fn batched_a8_shape_validation_is_fail_closed_before_cuda_allocation() {
+        let weights = vec![0_u8; 3 * Q2_BLOCK_BYTES];
+        let placeholder = vec![0.0_f32; BLOCK_LEN];
+        let operation = FusedMatVec {
+            dtype: TensorDType::Q2B64,
+            weights: &weights,
+            segments: &[],
+            rows: 3,
+            columns: BLOCK_LEN,
+            input: &placeholder,
+            s_in: None,
+            s_out: None,
+            bias: None,
+            activation: Activation::Identity,
+        };
+        let batch = vec![0.25_f32; 5 * BLOCK_LEN];
+        let (layout, rows, values) = validate_batched_a8_inputs(&operation, &batch, 5).unwrap();
+        assert!(matches!(
+            layout,
+            CudaA8ProjectionLayout::Pure(TensorDType::Q2B64)
+        ));
+        assert_eq!(rows, 5);
+        assert_eq!(values, batch.len());
+        assert!(validate_batched_a8_inputs(&operation, &batch, 0).is_err());
+        assert!(validate_batched_a8_inputs(&operation, &batch[..batch.len() - 1], 5).is_err());
+        let mut nonfinite = batch;
+        nonfinite[BLOCK_LEN] = f32::NAN;
+        assert!(matches!(
+            validate_batched_a8_inputs(&operation, &nonfinite, 5),
+            Err(EngineError::InvalidArtifact(_))
+        ));
     }
 
     #[test]

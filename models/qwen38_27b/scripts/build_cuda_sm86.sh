@@ -8,6 +8,13 @@ output_dir="${1:-${crate_dir}/target/cuda-sm86}"
 nvcc_command="${NVCC:-nvcc}"
 nvcc_path="$(readlink -f -- "$(command -v -- "${nvcc_command}")")"
 cuda_bin_dir="$(dirname -- "${nvcc_path}")"
+cuda_root="$(cd -- "${cuda_bin_dir}/.." && pwd)"
+cuda_include_dir="${cuda_root}/include"
+
+if [[ ! -f "${cuda_include_dir}/cuda_runtime.h" ]]; then
+  printf 'CUDA runtime header not found under %s\n' "${cuda_include_dir}" >&2
+  exit 1
+fi
 
 mkdir -p -- "${output_dir}"
 output_dir="$(cd -- "${output_dir}" && pwd)"
@@ -21,6 +28,7 @@ output_dir="$(cd -- "${output_dir}" && pwd)"
     --use_fast_math \
     --ptxas-options=-v \
     -O3 \
+    -I"${cuda_include_dir}" \
     "kernels/cuda/$(basename -- "${source_file}")" \
     -o "${output_dir}/q2q4_fused_matvec_sm86.cubin"
 )

@@ -234,6 +234,59 @@ void ctox_quantize_a8_b64_sm86(const float* __restrict__ input,
     q8_codes[index] = static_cast<int8_t>(code);
 }
 
+// Multi-token verifier baseline for CUDA prefill. The row-major input is
+// quantized independently per token and 64-column block. This preserves the
+// exact decode A8 contract while removing one kernel launch per prompt token.
+// It is intentionally not the promoted SM86 MMQ path: the pinned MMQ/MMA tile
+// adaptation and roofline gate remain separate work.
+// ref: ggml/src/ggml-cuda/vecdotq.cuh:115-137
+// ref: ggml/src/ggml-cuda/mmq.cuh:3542-3615
+extern "C" __global__ __launch_bounds__(64, 4)
+void ctox_quantize_a8_b64_batched_sm86(
+    const float* __restrict__ input,
+    const __half* __restrict__ s_in,
+    int8_t* __restrict__ q8_codes,
+    float* __restrict__ q8_scales,
+    unsigned columns,
+    unsigned batch_rows) {
+    const unsigned local = threadIdx.x;
+    const unsigned block = blockIdx.x;
+    const unsigned batch_row = blockIdx.y;
+    const unsigned blocks_per_row = columns / kBlockLen;
+    if (local >= kBlockLen || batch_row >= batch_rows || block >= blocks_per_row) {
+        return;
+    }
+    const unsigned column = block * kBlockLen + local;
+    const unsigned long long row_base =
+        static_cast<unsigned long long>(batch_row) * columns;
+    const unsigned long long index = row_base + column;
+    const float value = input[index] * load_optional_f16(s_in, column);
+    float maximum = fabsf(value);
+#pragma unroll
+    for (unsigned offset = 16; offset != 0; offset >>= 1) {
+        maximum = fmaxf(maximum,
+                        __shfl_down_sync(0xffffffffu, maximum, offset));
+    }
+    __shared__ float warp_maximum[2];
+    __shared__ float block_scale;
+    if ((local & 31u) == 0u) {
+        warp_maximum[local / 32u] = maximum;
+    }
+    __syncthreads();
+    if (local == 0u) {
+        block_scale = fmaxf(warp_maximum[0], warp_maximum[1]) * (1.0f / 127.0f);
+        q8_scales[static_cast<unsigned long long>(batch_row) * blocks_per_row + block]
+            = block_scale;
+    }
+    __syncthreads();
+    int code = 0;
+    if (block_scale != 0.0f) {
+        code = __float2int_rn(value / block_scale);
+        code = max(-127, min(127, code));
+    }
+    q8_codes[index] = static_cast<int8_t>(code);
+}
+
 // Qwen FFN down-projection input: fuse SiLU(gate) * up, recovery s_in, and
 // symmetric A8 block quantization. The two producer projections remain f32;
 // no 17,408-value SwiGLU tensor is materialized or reread.
@@ -414,6 +467,123 @@ void ctox_q4_b64_a8_matvec_sm86(const unsigned char* __restrict__ weights,
         const float shifted = total + (bias == nullptr ? 0.0f : bias[row]);
         output[row] = apply_activation(
             shifted * load_optional_f16(s_out, row), activation);
+    }
+}
+
+// Batched prefill verifier projection. Grid Y owns independent prompt tokens;
+// Grid X retains the decode two-output-rows-per-warp organization. The same
+// immutable packed weights and FP16 s_out are reused by the complete batch.
+// This establishes the resident batch ABI before the upstream-derived MMA
+// tiling replaces its dp4a baseline.
+// ref: ggml/src/ggml-cuda/vecdotq.cuh:115-137
+// ref: ggml/src/ggml-cuda/mmq.cuh:3542-3615
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_q2_b64_a8_batched_matmul_sm86(
+    const unsigned char* __restrict__ weights,
+    const int8_t* __restrict__ q8_codes,
+    const float* __restrict__ q8_scales,
+    const __half* __restrict__ s_out,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    unsigned rows,
+    unsigned columns,
+    unsigned batch_rows,
+    unsigned output_stride,
+    unsigned activation) {
+    const unsigned batch_row = blockIdx.y;
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned local_lane = lane & 15u;
+    const unsigned half_warp = lane / 16u;
+    const unsigned warp = threadIdx.x / kWarpSize;
+    const unsigned rows_per_block =
+        (blockDim.x / kWarpSize) * kRowsPerWarpA8;
+    const unsigned row =
+        blockIdx.x * rows_per_block + warp * kRowsPerWarpA8 + half_warp;
+    if (batch_row >= batch_rows || row >= rows) {
+        return;
+    }
+    const unsigned blocks_per_row = columns / kBlockLen;
+    const unsigned long long row_stride =
+        static_cast<unsigned long long>(blocks_per_row) * kQ2BlockBytes;
+    const unsigned char* row_weights = weights + row * row_stride;
+    const unsigned long long activation_base =
+        static_cast<unsigned long long>(batch_row) * columns;
+    const unsigned long long scale_base =
+        static_cast<unsigned long long>(batch_row) * blocks_per_row;
+    float partial = 0.0f;
+    for (unsigned block = 0; block < blocks_per_row; ++block) {
+        const unsigned char* packed = row_weights + block * kQ2BlockBytes;
+        const int weights4 = pack_signed_q2(packed[2u + local_lane]);
+        const int activations4 = *reinterpret_cast<const int*>(
+            q8_codes + activation_base + block * kBlockLen + local_lane * 4u);
+        const int dot = __dp4a(weights4, activations4, 0);
+        partial = fmaf(static_cast<float>(dot),
+                       load_f16(packed) * q8_scales[scale_base + block]
+                           * (1.0f / 3.0f),
+                       partial);
+    }
+    const float total = half_warp_sum(partial);
+    if (local_lane == 0u) {
+        const float shifted = total + (bias == nullptr ? 0.0f : bias[row]);
+        output[static_cast<unsigned long long>(batch_row) * output_stride + row]
+            = apply_activation(
+                shifted * load_optional_f16(s_out, row), activation);
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_q4_b64_a8_batched_matmul_sm86(
+    const unsigned char* __restrict__ weights,
+    const int8_t* __restrict__ q8_codes,
+    const float* __restrict__ q8_scales,
+    const __half* __restrict__ s_out,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    unsigned rows,
+    unsigned columns,
+    unsigned batch_rows,
+    unsigned output_stride,
+    unsigned activation) {
+    const unsigned batch_row = blockIdx.y;
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned local_lane = lane & 15u;
+    const unsigned half_warp = lane / 16u;
+    const unsigned warp = threadIdx.x / kWarpSize;
+    const unsigned rows_per_block =
+        (blockDim.x / kWarpSize) * kRowsPerWarpA8;
+    const unsigned row =
+        blockIdx.x * rows_per_block + warp * kRowsPerWarpA8 + half_warp;
+    if (batch_row >= batch_rows || row >= rows) {
+        return;
+    }
+    const unsigned blocks_per_row = columns / kBlockLen;
+    const unsigned long long row_stride =
+        static_cast<unsigned long long>(blocks_per_row) * kQ4BlockBytes;
+    const unsigned char* row_weights = weights + row * row_stride;
+    const unsigned long long activation_base =
+        static_cast<unsigned long long>(batch_row) * columns;
+    const unsigned long long scale_base =
+        static_cast<unsigned long long>(batch_row) * blocks_per_row;
+    float partial = 0.0f;
+    for (unsigned block = 0; block < blocks_per_row; ++block) {
+        const unsigned char* packed = row_weights + block * kQ4BlockBytes;
+        const unsigned codes = static_cast<unsigned>(packed[2u + local_lane * 2u])
+            | (static_cast<unsigned>(packed[3u + local_lane * 2u]) << 8u);
+        const int weights4 = pack_signed_q4(codes);
+        const int activations4 = *reinterpret_cast<const int*>(
+            q8_codes + activation_base + block * kBlockLen + local_lane * 4u);
+        const int dot = __dp4a(weights4, activations4, 0);
+        partial = fmaf(static_cast<float>(dot),
+                       load_f16(packed) * q8_scales[scale_base + block]
+                           * (1.0f / 15.0f),
+                       partial);
+    }
+    const float total = half_warp_sum(partial);
+    if (local_lane == 0u) {
+        const float shifted = total + (bias == nullptr ? 0.0f : bias[row]);
+        output[static_cast<unsigned long long>(batch_row) * output_stride + row]
+            = apply_activation(
+                shifted * load_optional_f16(s_out, row), activation);
     }
 }
 

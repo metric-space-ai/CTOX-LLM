@@ -453,6 +453,27 @@ The A8 path is therefore computationally validated but not promoted. Its
 quality must be measured after recovery on full-model logits and the held-out
 multilingual, general, coding, agentic, tool-calling, and long-context suite.
 
+The first multi-token prefill baseline now uses the same immutable logical
+Q2/Q4 codes and recovery scales with row-major `[batch, columns]` activations.
+One two-dimensional launch quantizes every token to A8_B64, then one Q2 or Q4
+two-dimensional projection launch writes `[batch, rows]`. Canonical mixed
+matrices dispatch their Q2/Q4 segments into disjoint row ranges of that same
+output matrix without repacking weights or synchronizing between segments.
+The runtime caps one launch at 65,535 prompt rows and requires longer contexts
+to be chunked. `qwen38-cuda-prefill-verify` compares every batch element with
+the scalar symmetric-A8 oracle for pure Q2, pure Q4, or mixed Q2/Q4 payloads.
+This is deliberately a graph/storage correctness baseline, not the production
+SM86 MMQ kernel. CUDA 12.6 compiled source SHA-256
+`7d8294304e53644d8f0a1cb5c399b745b01c68f30458ec4358f842670fc09629`
+to cubin SHA-256
+`1421c9bc48740a5a21afdcee0bb119d9c0267d5e08efbad22ce7a5a6f239aae7`.
+The batched quantizer used 18 registers and 12 bytes shared memory; Q2 and Q4
+projection kernels used 40 and 48 registers respectively, all with zero stack
+or spill bytes. The numerical GPU run remains queued because GPU 0 is reserved
+for Greppy and the recovery pipeline owns GPU 1+2. The upstream-derived
+tensor-core/MMQ replacement and controlled roofline evidence are still
+required before promotion.
+
 The loader-resolved embedding-row candidate decodes one canonical Q2 or Q4 row
 and fuses packed FP16 `s_in` plus scalar `s_out` on device. The production
 owner now keeps the entire pure/mixed table resident and launches directly at
