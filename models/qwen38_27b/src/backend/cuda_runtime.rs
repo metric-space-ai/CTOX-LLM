@@ -1134,9 +1134,55 @@ impl CudaCandidateRuntime {
                 "prepared CUDA gated RMSNorm belongs to another context".into(),
             ));
         }
+        self.dispatch_gated_rms_norm_f16_inner(
+            prepared,
+            prepared.input.ptr(),
+            prepared.gate.ptr(),
+        )?;
+        let mut result = vec![0.0_f32; prepared.config.rows * prepared.config.columns];
+        prepared.output.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA gated RMSNorm produced a non-finite output".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn dispatch_gated_rms_norm_f16_device<'a>(
+        &self,
+        prepared: &'a PreparedCudaGatedRmsNorm,
+        input: CudaDeviceF32View<'_>,
+        gate: CudaDeviceF32View<'_>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, input.context)
+            || !Rc::ptr_eq(&self.inner, gate.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA gated RMSNorm device input belongs to another context".into(),
+            ));
+        }
+        let expected = prepared.config.rows * prepared.config.columns;
+        for (name, view) in [("input", input), ("gate", gate)] {
+            if view.values() != expected {
+                return Err(EngineError::Shape(format!(
+                    "CUDA gated RMSNorm device {name} has {} values, expected {expected}",
+                    view.values()
+                )));
+            }
+        }
+        self.dispatch_gated_rms_norm_f16_inner(prepared, input.ptr()?, gate.ptr()?)?;
+        prepared.output.f32_view(0, expected)
+    }
+
+    fn dispatch_gated_rms_norm_f16_inner(
+        &self,
+        prepared: &PreparedCudaGatedRmsNorm,
+        mut input: CuDevicePtr,
+        mut gate: CuDevicePtr,
+    ) -> Result<()> {
         self.make_current()?;
-        let mut input = prepared.input.ptr();
-        let mut gate = prepared.gate.ptr();
         let mut weight = prepared.weight.ptr();
         let mut output = prepared.output.ptr();
         let mut rows = prepared.config.rows as u32;
@@ -1174,14 +1220,7 @@ impl CudaCandidateRuntime {
                 "gated RMSNorm context synchronization",
             )?;
         }
-        let mut result = vec![0.0_f32; prepared.config.rows * prepared.config.columns];
-        prepared.output.copy_to(as_bytes_mut(&mut result))?;
-        if result.iter().any(|value| !value.is_finite()) {
-            return Err(EngineError::InvalidState(
-                "CUDA gated RMSNorm produced a non-finite output".into(),
-            ));
-        }
-        Ok(result)
+        Ok(())
     }
 
     pub fn prepare_qwen_rms_norm_f16(
@@ -1236,8 +1275,44 @@ impl CudaCandidateRuntime {
                 "prepared CUDA Qwen RMSNorm belongs to another context".into(),
             ));
         }
+        self.dispatch_qwen_rms_norm_f16_inner(prepared, prepared.input.ptr())?;
+        let mut result = vec![0.0_f32; prepared.config.rows * prepared.config.columns];
+        prepared.output.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA Qwen RMSNorm produced a non-finite output".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn dispatch_qwen_rms_norm_f16_device<'a>(
+        &self,
+        prepared: &'a PreparedCudaRmsNorm,
+        input: CudaDeviceF32View<'_>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) || !Rc::ptr_eq(&self.inner, input.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA Qwen RMSNorm device input belongs to another context".into(),
+            ));
+        }
+        let expected = prepared.config.rows * prepared.config.columns;
+        if input.values() != expected {
+            return Err(EngineError::Shape(format!(
+                "CUDA Qwen RMSNorm device input has {} values, expected {expected}",
+                input.values()
+            )));
+        }
+        self.dispatch_qwen_rms_norm_f16_inner(prepared, input.ptr()?)?;
+        prepared.output.f32_view(0, expected)
+    }
+
+    fn dispatch_qwen_rms_norm_f16_inner(
+        &self,
+        prepared: &PreparedCudaRmsNorm,
+        mut input: CuDevicePtr,
+    ) -> Result<()> {
         self.make_current()?;
-        let mut input = prepared.input.ptr();
         let mut weight = prepared.weight.ptr();
         let mut output = prepared.output.ptr();
         let mut rows = prepared.config.rows as u32;
@@ -1273,14 +1348,7 @@ impl CudaCandidateRuntime {
                 "Qwen RMSNorm context synchronization",
             )?;
         }
-        let mut result = vec![0.0_f32; prepared.config.rows * prepared.config.columns];
-        prepared.output.copy_to(as_bytes_mut(&mut result))?;
-        if result.iter().any(|value| !value.is_finite()) {
-            return Err(EngineError::InvalidState(
-                "CUDA Qwen RMSNorm produced a non-finite output".into(),
-            ));
-        }
-        Ok(result)
+        Ok(())
     }
 
     pub fn prepare_partial_rope_f32(

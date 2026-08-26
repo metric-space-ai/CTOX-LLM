@@ -134,8 +134,10 @@ per row and an eight-warp reduction, so hidden width 5,120 does not serialize
 through a single warp. It accepts positive 32-aligned widths, keeps its learned
 weight FP16, and has no f32 weight expansion. SM86 compilation uses 16
 registers, 36 bytes shared memory, and zero stack/spill bytes. The same chained
-linear-op verifier now includes a two-row 5,120-wide oracle comparison and
-accounts for its model/transient buffers in the unload proof.
+linear-op verifier now feeds both this operation and the direct-weight gated
+RMSNorm from producer-owned device views, includes a two-row 5,120-wide oracle
+comparison, and accounts for model, transient, and explicit verifier-staging
+buffers in the unload proof.
 
 Qwen partial RoPE is implemented as an in-place non-interleaved/NeoX-pairing
 candidate anchored to the newly pinned upstream `rope.cu`/`rope.cuh`. Query

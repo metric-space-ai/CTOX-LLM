@@ -46,10 +46,12 @@ struct Report<'a> {
     gated_norm_columns: usize,
     gated_norm_model_bytes: usize,
     gated_norm_transient_bytes: usize,
+    gated_norm_device_view_staging_bytes: usize,
     qwen_norm_rows: usize,
     qwen_norm_columns: usize,
     qwen_norm_model_bytes: usize,
     qwen_norm_transient_bytes: usize,
+    qwen_norm_device_view_staging_bytes: usize,
     partial_rope_transient_bytes: usize,
     partial_rope_device_view_staging_bytes: usize,
     maximum_convolution_absolute_error: f32,
@@ -60,6 +62,7 @@ struct Report<'a> {
     maximum_qwen_norm_relative_error: f32,
     maximum_partial_rope_absolute_error: f32,
     partial_rope_tail_exact: bool,
+    norm_device_view_paths_verified: bool,
     partial_rope_device_view_path_verified: bool,
     state_matches_oracle_exactly: bool,
     reset_zero_state_verified: bool,
@@ -161,8 +164,14 @@ fn main() -> anyhow::Result<()> {
         &norm_weight,
         norm_config.epsilon,
     )?;
-    norm.write_inputs(&input, &gate)?;
-    let actual_norm = runtime.dispatch_gated_rms_norm_f16(&norm)?;
+    let norm_input_staging = runtime.prepare_verifier_f32_tensor(&input)?;
+    let norm_gate_staging = runtime.prepare_verifier_f32_tensor(&gate)?;
+    let actual_norm_view = runtime.dispatch_gated_rms_norm_f16_device(
+        &norm,
+        norm_input_staging.device_view()?,
+        norm_gate_staging.device_view()?,
+    )?;
+    let actual_norm = runtime.verifier_read_f32(actual_norm_view)?;
     let mut maximum_gated_norm_absolute_error = 0.0_f32;
     let mut maximum_gated_norm_relative_error = 0.0_f32;
     track_error(
@@ -197,8 +206,10 @@ fn main() -> anyhow::Result<()> {
         &qwen_norm_weight,
         qwen_norm_config.epsilon,
     )?;
-    qwen_norm.write_input(&qwen_norm_input)?;
-    let actual_qwen_norm = runtime.dispatch_qwen_rms_norm_f16(&qwen_norm)?;
+    let qwen_norm_input_staging = runtime.prepare_verifier_f32_tensor(&qwen_norm_input)?;
+    let actual_qwen_norm_view = runtime
+        .dispatch_qwen_rms_norm_f16_device(&qwen_norm, qwen_norm_input_staging.device_view()?)?;
+    let actual_qwen_norm = runtime.verifier_read_f32(actual_qwen_norm_view)?;
     let mut maximum_qwen_norm_absolute_error = 0.0_f32;
     let mut maximum_qwen_norm_relative_error = 0.0_f32;
     track_error(
@@ -292,15 +303,21 @@ fn main() -> anyhow::Result<()> {
     let convolution_transient_bytes = conv.transient_bytes();
     let gated_norm_model_bytes = norm.model_bytes();
     let gated_norm_transient_bytes = norm.transient_bytes();
+    let gated_norm_device_view_staging_bytes =
+        norm_input_staging.resident_bytes() + norm_gate_staging.resident_bytes();
     let qwen_norm_model_bytes = qwen_norm.model_bytes();
     let qwen_norm_transient_bytes = qwen_norm.transient_bytes();
+    let qwen_norm_device_view_staging_bytes = qwen_norm_input_staging.resident_bytes();
     let partial_rope_transient_bytes = query_rope.transient_bytes() + key_rope.transient_bytes();
     let partial_rope_device_view_staging_bytes =
         query_rope_staging.resident_bytes() + key_rope_staging.resident_bytes();
     let (free_after_prepare, _) = runtime.memory_info()?;
     drop(conv);
     drop(norm);
+    drop(norm_input_staging);
+    drop(norm_gate_staging);
     drop(qwen_norm);
+    drop(qwen_norm_input_staging);
     drop(query_rope);
     drop(key_rope);
     drop(query_rope_staging);
@@ -312,8 +329,10 @@ fn main() -> anyhow::Result<()> {
         + convolution_transient_bytes
         + gated_norm_model_bytes
         + gated_norm_transient_bytes
+        + gated_norm_device_view_staging_bytes
         + qwen_norm_model_bytes
         + qwen_norm_transient_bytes
+        + qwen_norm_device_view_staging_bytes
         + partial_rope_transient_bytes
         + partial_rope_device_view_staging_bytes;
     anyhow::ensure!(
@@ -324,7 +343,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v2",
+            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v3",
             status: "pass",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -343,10 +362,12 @@ fn main() -> anyhow::Result<()> {
             gated_norm_columns: norm_config.columns,
             gated_norm_model_bytes,
             gated_norm_transient_bytes,
+            gated_norm_device_view_staging_bytes,
             qwen_norm_rows: qwen_norm_config.rows,
             qwen_norm_columns: qwen_norm_config.columns,
             qwen_norm_model_bytes,
             qwen_norm_transient_bytes,
+            qwen_norm_device_view_staging_bytes,
             partial_rope_transient_bytes,
             partial_rope_device_view_staging_bytes,
             maximum_convolution_absolute_error,
@@ -357,6 +378,7 @@ fn main() -> anyhow::Result<()> {
             maximum_qwen_norm_relative_error,
             maximum_partial_rope_absolute_error,
             partial_rope_tail_exact,
+            norm_device_view_paths_verified: true,
             partial_rope_device_view_path_verified: true,
             state_matches_oracle_exactly,
             reset_zero_state_verified,
@@ -364,7 +386,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes,
-            note: "Verifier-only candidates; partial RoPE consumes and mutates producer-owned CUDA device views in place, with readback restricted to the verifier. No CPU fallback and not promoted into the production CUDA ABI.",
+            note: "Verifier-only candidates; Qwen RMSNorm and gated RMSNorm consume producer-owned CUDA device views, while partial RoPE mutates its producer-owned view in place. Readback is restricted to the verifier. No CPU fallback and not promoted into the production CUDA ABI.",
         })?
     );
     Ok(())
