@@ -453,7 +453,7 @@ The A8 path is therefore computationally validated but not promoted. Its
 quality must be measured after recovery on full-model logits and the held-out
 multilingual, general, coding, agentic, tool-calling, and long-context suite.
 
-The first multi-token prefill baseline now uses the same immutable logical
+The first multi-token prefill baseline uses the same immutable logical
 Q2/Q4 codes and recovery scales with row-major `[batch, columns]` activations.
 One two-dimensional launch quantizes every token to A8_B64, then one Q2 or Q4
 two-dimensional projection launch writes `[batch, rows]`. Canonical mixed
@@ -469,10 +469,30 @@ to cubin SHA-256
 `1421c9bc48740a5a21afdcee0bb119d9c0267d5e08efbad22ce7a5a6f239aae7`.
 The batched quantizer used 18 registers and 12 bytes shared memory; Q2 and Q4
 projection kernels used 40 and 48 registers respectively, all with zero stack
-or spill bytes. The numerical GPU run remains queued because GPU 0 is reserved
-for Greppy and the recovery pipeline owns GPU 1+2. The upstream-derived
-tensor-core/MMQ replacement and controlled roofline evidence are still
-required before promotion.
+or spill bytes.
+
+The upstream-derived SM86 MMQ candidate expands each packed Q2/Q4 block into
+one shared signed-int8 tile, loads the A operand with Ampere `ldmatrix`, reuses
+every weight tile across eight prompt tokens, and issues
+`mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`. It consumes the exact same
+logical packed weights, A8 codes/scales, FP16 recovery scales, bias, activation,
+and output allocation as the dp4a baseline; it creates no backend-specific
+requantization or model copy. Q2 and Q4 compile with 40 registers, 8,704 bytes
+shared memory, and no stack or spills.
+
+On an RTX A4500, the mixed 257x512x17 fixture matched the CPU A8 oracle with a
+maximum absolute error of `1.43e-5`, and MMQ differed from the dp4a CUDA
+baseline by at most `3.82e-6`. At the representative 17408x5120 FFN projection
+with 512 prompt rows, MMQ improved over dp4a by 1.66x for Q2, 1.77x for Q4,
+and 2.06x for a 50/50 mixed matrix; maximum MMQ-vs-dp4a absolute deltas stayed
+below `1.72e-5`. Full evidence and immutable hashes are in
+`benchmarks/cuda/sm86-batched-mmq-20260826.json`.
+
+This candidate remains unpromoted. GPU 0 stayed reserved for Greppy and the
+measurement ran on physical GPU 2 alongside the teacher workload, so it is not
+a controlled roofline result. It also has not yet replaced the sequential
+token loop in the complete prefill graph. Controlled sustainable-bandwidth,
+full-graph numerical, and end-to-end prefill evidence remain required.
 
 The loader-resolved embedding-row candidate decodes one canonical Q2 or Q4 row
 and fuses packed FP16 `s_in` plus scalar `s_out` on device. The production

@@ -43,6 +43,8 @@ struct Args {
     absolute_tolerance: f32,
     #[arg(long, default_value_t = 1.0e-3)]
     relative_tolerance: f32,
+    #[arg(long)]
+    skip_cpu_oracle: bool,
 }
 
 #[derive(Serialize)]
@@ -56,12 +58,18 @@ struct Report<'a> {
     rows: usize,
     columns: usize,
     batch_rows: usize,
+    cpu_oracle_executed: bool,
     resident_bytes: usize,
-    elapsed_milliseconds: f64,
-    mean_batch_milliseconds: f64,
-    prompt_rows_per_second: f64,
-    maximum_absolute_error: f32,
-    maximum_relative_error: f32,
+    baseline_mean_batch_milliseconds: f64,
+    mmq_mean_batch_milliseconds: f64,
+    mmq_speedup: f64,
+    mmq_prompt_rows_per_second: f64,
+    baseline_maximum_absolute_error: Option<f32>,
+    baseline_maximum_relative_error: Option<f32>,
+    mmq_maximum_absolute_error: Option<f32>,
+    mmq_maximum_relative_error: Option<f32>,
+    baseline_mmq_maximum_absolute_delta: f32,
+    baseline_mmq_maximum_relative_delta: f32,
     note: &'static str,
 }
 
@@ -116,29 +124,70 @@ fn main() -> anyhow::Result<()> {
         bias: Some(&bias),
         activation: Activation::Silu,
     };
-    let mut oracle = Vec::with_capacity(args.batch_rows * args.rows);
-    for input in inputs.chunks_exact(args.columns) {
-        oracle.extend(a8_execution_oracle(&operation, input)?);
-    }
+    let oracle = if args.skip_cpu_oracle {
+        None
+    } else {
+        let mut values = Vec::with_capacity(args.batch_rows * args.rows);
+        for input in inputs.chunks_exact(args.columns) {
+            values.extend(a8_execution_oracle(&operation, input)?);
+        }
+        Some(values)
+    };
 
     let runtime = CudaCandidateRuntime::new(&module, args.device)?;
     let prepared = runtime.prepare_batched_a8_matmul(&operation, &inputs, args.batch_rows)?;
-    let output = runtime.dispatch_batched_a8_matmul(&prepared)?;
-    let (maximum_absolute_error, maximum_relative_error) = compare(
-        &oracle,
-        &output,
+    let baseline_output = runtime.dispatch_batched_a8_matmul(&prepared)?;
+    let (baseline_maximum_absolute_error, baseline_maximum_relative_error) = oracle
+        .as_ref()
+        .map(|oracle| {
+            compare(
+                oracle,
+                &baseline_output,
+                args.absolute_tolerance,
+                args.relative_tolerance,
+            )
+        })
+        .transpose()?
+        .map_or((None, None), |(absolute, relative)| {
+            (Some(absolute), Some(relative))
+        });
+    let mmq_output = runtime.dispatch_batched_a8_mmq(&prepared)?;
+    let (mmq_maximum_absolute_error, mmq_maximum_relative_error) = oracle
+        .as_ref()
+        .map(|oracle| {
+            compare(
+                oracle,
+                &mmq_output,
+                args.absolute_tolerance,
+                args.relative_tolerance,
+            )
+        })
+        .transpose()?
+        .map_or((None, None), |(absolute, relative)| {
+            (Some(absolute), Some(relative))
+        });
+    let (baseline_mmq_maximum_absolute_delta, baseline_mmq_maximum_relative_delta) = compare(
+        &baseline_output,
+        &mmq_output,
         args.absolute_tolerance,
         args.relative_tolerance,
     )?;
     for _ in 0..args.warmup {
         std::hint::black_box(runtime.dispatch_batched_a8_matmul(&prepared)?);
+        std::hint::black_box(runtime.dispatch_batched_a8_mmq(&prepared)?);
     }
-    let started = Instant::now();
+    let baseline_started = Instant::now();
     for _ in 0..args.iterations {
         std::hint::black_box(runtime.dispatch_batched_a8_matmul(&prepared)?);
     }
-    let elapsed = started.elapsed().as_secs_f64();
-    let mean_batch_seconds = elapsed / args.iterations as f64;
+    let baseline_elapsed = baseline_started.elapsed().as_secs_f64();
+    let mmq_started = Instant::now();
+    for _ in 0..args.iterations {
+        std::hint::black_box(runtime.dispatch_batched_a8_mmq(&prepared)?);
+    }
+    let mmq_elapsed = mmq_started.elapsed().as_secs_f64();
+    let baseline_mean_batch_seconds = baseline_elapsed / args.iterations as f64;
+    let mmq_mean_batch_seconds = mmq_elapsed / args.iterations as f64;
     let (major, minor) = runtime.compute_capability();
     println!(
         "{}",
@@ -157,13 +206,19 @@ fn main() -> anyhow::Result<()> {
             rows: prepared.rows(),
             columns: prepared.columns(),
             batch_rows: prepared.batch_rows(),
+            cpu_oracle_executed: !args.skip_cpu_oracle,
             resident_bytes: prepared.resident_bytes(),
-            elapsed_milliseconds: elapsed * 1_000.0,
-            mean_batch_milliseconds: mean_batch_seconds * 1_000.0,
-            prompt_rows_per_second: args.batch_rows as f64 / mean_batch_seconds,
-            maximum_absolute_error,
-            maximum_relative_error,
-            note: "Correctness baseline only: one 2-D A8 quantization and one 2-D dp4a projection per pure matrix or mixed row segment. Promotion requires the upstream-derived SM86 MMQ tile and roofline gate.",
+            baseline_mean_batch_milliseconds: baseline_mean_batch_seconds * 1_000.0,
+            mmq_mean_batch_milliseconds: mmq_mean_batch_seconds * 1_000.0,
+            mmq_speedup: baseline_mean_batch_seconds / mmq_mean_batch_seconds,
+            mmq_prompt_rows_per_second: args.batch_rows as f64 / mmq_mean_batch_seconds,
+            baseline_maximum_absolute_error,
+            baseline_maximum_relative_error,
+            mmq_maximum_absolute_error,
+            mmq_maximum_relative_error,
+            baseline_mmq_maximum_absolute_delta,
+            baseline_mmq_maximum_relative_delta,
+            note: "Verifier-only same-buffer comparison of the 2-D dp4a baseline and upstream-derived SM86 tensor-core MMQ tile. Production promotion still requires representative Qwen shapes, stable roofline evidence, and full graph integration.",
         })?
     );
     Ok(())

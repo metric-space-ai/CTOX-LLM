@@ -161,6 +161,8 @@ pub const Q4_B64_A8_MATVEC_SYMBOL: &str = "ctox_q4_b64_a8_matvec_sm86";
 pub const A8_BATCHED_QUANTIZE_SYMBOL: &str = "ctox_quantize_a8_b64_batched_sm86";
 pub const Q2_B64_A8_BATCHED_MATMUL_SYMBOL: &str = "ctox_q2_b64_a8_batched_matmul_sm86";
 pub const Q4_B64_A8_BATCHED_MATMUL_SYMBOL: &str = "ctox_q4_b64_a8_batched_matmul_sm86";
+pub const Q2_B64_A8_BATCHED_MMQ_SYMBOL: &str = "ctox_q2_b64_a8_batched_mmq_sm86";
+pub const Q4_B64_A8_BATCHED_MMQ_SYMBOL: &str = "ctox_q4_b64_a8_batched_mmq_sm86";
 pub const Q2_B64_A8_GATHERED_MATVEC_SYMBOL: &str = "ctox_q2_b64_a8_gathered_matvec_sm86";
 pub const Q4_B64_A8_GATHERED_MATVEC_SYMBOL: &str = "ctox_q4_b64_a8_gathered_matvec_sm86";
 pub const ARGMAX_F32_SYMBOL: &str = "ctox_argmax_f32_sm86";
@@ -1292,6 +1294,8 @@ mod tests {
         assert!(!symbols.contains(&A8_BATCHED_QUANTIZE_SYMBOL));
         assert!(!symbols.contains(&Q2_B64_A8_BATCHED_MATMUL_SYMBOL));
         assert!(!symbols.contains(&Q4_B64_A8_BATCHED_MATMUL_SYMBOL));
+        assert!(!symbols.contains(&Q2_B64_A8_BATCHED_MMQ_SYMBOL));
+        assert!(!symbols.contains(&Q4_B64_A8_BATCHED_MMQ_SYMBOL));
         assert!(!symbols.contains(&TOPK_TOPP_SAMPLE_F32_SYMBOL));
         assert!(!symbols.contains(&Q2_B64_RECOVERED_ROW_SYMBOL));
         assert!(!symbols.contains(&Q4_B64_RECOVERED_ROW_SYMBOL));

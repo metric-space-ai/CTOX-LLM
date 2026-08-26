@@ -1751,3 +1751,8 @@ void ctox_topk_topp_sample_f32_sm86(const float* __restrict__ values,
         result[3] = __float_as_uint(nucleus_total);
     }
 }
+
+// Emit the isolated tensor-core prefill candidate into the verifier module.
+// Its symbols stay outside the promoted ABI until same-device numerical and
+// roofline gates pass.
+#include "q2q4_batched_mmq_sm86.cu"

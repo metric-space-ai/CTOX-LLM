@@ -28,8 +28,9 @@ use super::cuda::{
     PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, PAGED_GQA_SPLIT_SEGMENTS,
     PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL,
     PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL,
-    Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
-    Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_BATCHED_MATMUL_SYMBOL,
+    Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_BATCHED_MMQ_SYMBOL,
+    Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
+    Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_BATCHED_MATMUL_SYMBOL, Q4_B64_A8_BATCHED_MMQ_SYMBOL,
     Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
     Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
     RESIDUAL_RMS_NORM_F16_SYMBOL, SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
@@ -56,6 +57,9 @@ const THREADS_PER_BLOCK: u32 = 128;
 const LINEAR_THREADS_PER_BLOCK: u32 = 256;
 const WARP_SIZE: u32 = 32;
 const A8_ROWS_PER_BLOCK: u32 = (THREADS_PER_BLOCK / WARP_SIZE) * 2;
+const MMQ_THREADS_PER_BLOCK: u32 = 256;
+const MMQ_ROWS_PER_BLOCK: u32 = 128;
+const MMQ_BATCH_ROWS_PER_BLOCK: u32 = 8;
 const CUDA_GRID_Y_MAX: u32 = 65_535;
 
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
@@ -215,6 +219,8 @@ struct CudaContextInner {
     a8_batched_quantize_function: CuFunction,
     q2_a8_batched_function: CuFunction,
     q4_a8_batched_function: CuFunction,
+    q2_a8_batched_mmq_function: CuFunction,
+    q4_a8_batched_mmq_function: CuFunction,
     q2_a8_gathered_function: CuFunction,
     q4_a8_gathered_function: CuFunction,
     q2_recovered_row_function: CuFunction,
@@ -1010,6 +1016,28 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let q2_a8_batched_mmq_function =
+            match resolve_function(&driver, module, Q2_B64_A8_BATCHED_MMQ_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let q4_a8_batched_mmq_function =
+            match resolve_function(&driver, module, Q4_B64_A8_BATCHED_MMQ_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let q2_a8_gathered_function =
             match resolve_function(&driver, module, Q2_B64_A8_GATHERED_MATVEC_SYMBOL) {
                 Ok(function) => function,
@@ -1233,6 +1261,8 @@ impl CudaCandidateRuntime {
                 a8_batched_quantize_function,
                 q2_a8_batched_function,
                 q4_a8_batched_function,
+                q2_a8_batched_mmq_function,
+                q4_a8_batched_mmq_function,
                 q2_a8_gathered_function,
                 q4_a8_gathered_function,
                 q2_recovered_row_function,
@@ -5012,6 +5042,94 @@ impl CudaCandidateRuntime {
         Ok(output)
     }
 
+    /// Runs the isolated SM86 tensor-core candidate against the exact same
+    /// prepared weights, A8 scratch, recovery scales, and output allocation as
+    /// the dp4a baseline. This remains verifier-only until the numerical and
+    /// roofline gates promote it.
+    pub fn dispatch_batched_a8_mmq(
+        &self,
+        prepared: &PreparedCudaBatchedA8MatMul,
+    ) -> Result<Vec<f32>> {
+        self.dispatch_batched_a8_mmq_device(prepared)?;
+        let output_values = (prepared.batch_rows as usize)
+            .checked_mul(prepared.rows as usize)
+            .ok_or_else(|| EngineError::Shape("CUDA batched MMQ output read overflows".into()))?;
+        let mut output = vec![0.0_f32; output_values];
+        prepared.output.copy_to(as_bytes_mut(&mut output))?;
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA batched MMQ candidate produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    pub fn dispatch_batched_a8_mmq_device<'a>(
+        &self,
+        prepared: &'a PreparedCudaBatchedA8MatMul,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared batched CUDA MMQ operation belongs to another context".into(),
+            ));
+        }
+        self.launch_batched_a8_quantization(
+            prepared.input.ptr(),
+            prepared.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            prepared.q8_codes.ptr(),
+            prepared.q8_scales.ptr(),
+            prepared.columns,
+            prepared.batch_rows,
+        )?;
+        match &prepared.layout {
+            CudaA8ProjectionLayout::Pure(dtype) => self.launch_batched_a8_mmq_projection(
+                *dtype,
+                prepared.weights.ptr(),
+                prepared.q8_codes.ptr(),
+                prepared.q8_scales.ptr(),
+                prepared.s_out.as_ref().map_or(0, DeviceBuffer::ptr),
+                prepared.bias.as_ref().map_or(0, DeviceBuffer::ptr),
+                prepared.output.ptr(),
+                prepared.rows,
+                prepared.columns,
+                prepared.batch_rows,
+                prepared.rows,
+                prepared.activation,
+            )?,
+            CudaA8ProjectionLayout::Mixed(segments) => {
+                for segment in segments {
+                    let row_start = segment.row_start as usize;
+                    self.launch_batched_a8_mmq_projection(
+                        segment.descriptor.dtype,
+                        device_ptr_offset(prepared.weights.ptr(), segment.weight_offset)?,
+                        prepared.q8_codes.ptr(),
+                        prepared.q8_scales.ptr(),
+                        prepared
+                            .s_out
+                            .as_ref()
+                            .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 2))
+                            .transpose()?
+                            .unwrap_or(0),
+                        prepared
+                            .bias
+                            .as_ref()
+                            .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 4))
+                            .transpose()?
+                            .unwrap_or(0),
+                        device_ptr_offset(prepared.output.ptr(), row_start * 4)?,
+                        segment.row_count,
+                        prepared.columns,
+                        prepared.batch_rows,
+                        prepared.rows,
+                        prepared.activation,
+                    )?;
+                }
+            }
+        }
+        self.synchronize_after_launch("batched A8 MMQ context synchronization")?;
+        prepared.device_output()
+    }
+
     /// Device-resident form used by the future chunked prefill graph. No
     /// activation or projection output crosses host memory.
     pub fn dispatch_batched_a8_matmul_device<'a>(
@@ -5186,6 +5304,72 @@ impl CudaCandidateRuntime {
                     ptr::null_mut(),
                 ),
                 "batched A8 dp4a matmul launch",
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_batched_a8_mmq_projection(
+        &self,
+        dtype: TensorDType,
+        weights_ptr: CuDevicePtr,
+        q8_codes_ptr: CuDevicePtr,
+        q8_scales_ptr: CuDevicePtr,
+        s_out_ptr: CuDevicePtr,
+        bias_ptr: CuDevicePtr,
+        output_ptr: CuDevicePtr,
+        row_count: u32,
+        column_count: u32,
+        batch_rows_count: u32,
+        output_stride_count: u32,
+        activation_code: u32,
+    ) -> Result<()> {
+        self.make_current()?;
+        let function = match dtype {
+            TensorDType::Q2B64 => self.inner.q2_a8_batched_mmq_function,
+            TensorDType::Q4B64 => self.inner.q4_a8_batched_mmq_function,
+            _ => unreachable!("validated batched CUDA MMQ segment is Q2 or Q4"),
+        };
+        let mut weights = weights_ptr;
+        let mut q8_codes = q8_codes_ptr;
+        let mut q8_scales = q8_scales_ptr;
+        let mut s_out = s_out_ptr;
+        let mut bias = bias_ptr;
+        let mut output = output_ptr;
+        let mut rows = row_count;
+        let mut columns = column_count;
+        let mut batch_rows = batch_rows_count;
+        let mut output_stride = output_stride_count;
+        let mut activation = activation_code;
+        let mut params = [
+            (&mut weights as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_out as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut bias as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rows as *mut u32).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut batch_rows as *mut u32).cast::<c_void>(),
+            (&mut output_stride as *mut u32).cast::<c_void>(),
+            (&mut activation as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    function,
+                    row_count.div_ceil(MMQ_ROWS_PER_BLOCK),
+                    batch_rows_count.div_ceil(MMQ_BATCH_ROWS_PER_BLOCK),
+                    1,
+                    MMQ_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "batched A8 tensor-core MMQ launch",
             )
         }
     }
@@ -6879,6 +7063,15 @@ mod tests {
         assert_eq!(8_u32.div_ceil(A8_ROWS_PER_BLOCK), 1);
         assert_eq!(9_u32.div_ceil(A8_ROWS_PER_BLOCK), 2);
         assert_eq!(257_u32.div_ceil(A8_ROWS_PER_BLOCK), 33);
+    }
+
+    #[test]
+    fn mmq_launch_geometry_reuses_each_weight_tile_across_eight_tokens() {
+        assert_eq!(MMQ_THREADS_PER_BLOCK, 256);
+        assert_eq!(MMQ_ROWS_PER_BLOCK, 128);
+        assert_eq!(MMQ_BATCH_ROWS_PER_BLOCK, 8);
+        assert_eq!(257_u32.div_ceil(MMQ_ROWS_PER_BLOCK), 3);
+        assert_eq!(17_u32.div_ceil(MMQ_BATCH_ROWS_PER_BLOCK), 3);
     }
 
     #[test]
