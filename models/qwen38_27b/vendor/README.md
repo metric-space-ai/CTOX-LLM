@@ -18,4 +18,10 @@ evidence.
 CI runs `training/verify_vendor_manifest.py` so a local source change without a
 matching reviewed pin fails immediately.
 
+`models/qwen38_27b/scripts/fetch_cuda_vendor.py` reproduces declared files
+directly from the immutable upstream revision, verifies each digest before an
+atomic replacement, and refuses undeclared paths. Fetched framework sources
+remain reference-only unless a separate CTOX candidate, dispatcher, verifier,
+and benchmark satisfy the promotion contract.
+
 Qualcomm SDK files never enter this directory.

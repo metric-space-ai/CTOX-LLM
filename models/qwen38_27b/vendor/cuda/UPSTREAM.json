@@ -50,6 +50,48 @@
       "sha256": "550b1f1baf1db0e349b0974754e4810bfb90fc9e7c97873622daf06f02e8a63c",
       "lines": 379,
       "purpose": "Host-side MMQ dispatch: stream-k selection for Volta+ (lines 121-122, 252-260) and per-architecture MMQ eligibility in ggml_cuda_should_use_mmq (lines 267-378). Reference for SM86 profile gating in the Rust ABI descriptor."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/gated_delta_net.cu",
+      "upstream_path": "ggml/src/ggml-cuda/gated_delta_net.cu",
+      "sha256": "fe5cfe4a35195fac999e8bd93d3ed18c68830096d4019bafa60e5da91d6ef4bf",
+      "lines": 327,
+      "purpose": "Qwen-compatible fused recurrent update, register-resident state shards, warp reduction, decode/prefill traversal, and rollback-slot organization. Reference for CTOX's FP16-state SM86 GatedDeltaNet candidate; the upstream state is FP32 and must not be represented as satisfying the Fold memory profile."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/gated_delta_net.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/gated_delta_net.cuh",
+      "sha256": "5a155069868ffb238d90503ae380e68a6d1baa4abb9c0292f369fb0045ffffda",
+      "lines": 14,
+      "purpose": "Unmodified public host/cache declaration paired with gated_delta_net.cu."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/norm.cu",
+      "upstream_path": "ggml/src/ggml-cuda/norm.cu",
+      "sha256": "37e670ad50f8b0c3fb9acaaba54ad520b143b0e73994de5c10f8635e334ff0cd",
+      "lines": 698,
+      "purpose": "RMSNorm block reduction and fused multiply/add organization. Reference for Qwen (1+weight) and direct-weight gated RMSNorm candidates."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/norm.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/norm.cuh",
+      "sha256": "0f2d6b743ff349012424cddc8866eb0fa504ea16b7a58cb47b31b392d1f78a73",
+      "lines": 18,
+      "purpose": "Unmodified public host declaration paired with norm.cu."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/ssm-conv.cu",
+      "upstream_path": "ggml/src/ggml-cuda/ssm-conv.cu",
+      "sha256": "684ef5e8180ba88bb1f389310b28f8a694cb107a924492c43682a5c5c1754424",
+      "lines": 206,
+      "purpose": "Depthwise state-space causal convolution with fused SiLU and width-4 specialization. Reference for CTOX's persistent FP16-history Qwen causal-convolution candidate."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/ssm-conv.cuh",
+      "upstream_path": "ggml/src/ggml-cuda/ssm-conv.cuh",
+      "sha256": "36de452e725fd79f445fba170e1f361255be602e1fd52a3d87745b63735f3852",
+      "lines": 3,
+      "purpose": "Unmodified public host declaration paired with ssm-conv.cu."
     }
   ],
   "required_includes_not_vendored": [
@@ -80,10 +122,14 @@
     {
       "path": "ggml/src/ggml-cuda/mmid.cuh",
       "reason": "Required by mmq.cu for MoE expert routing; out of scope for the dense fused matvec baseline."
+    },
+    {
+      "path": "ggml/src/ggml-cuda/unary.cuh",
+      "reason": "Required by the unmodified ssm-conv.cu only for ggml's generic SiLU helper. The CTOX adaptation provides its model-specific fused activation directly and does not compile framework glue."
     }
   ],
   "notes": [
-    "The vendored files are reference material for the correctness baseline only. They are not compiled into the crate and no production CUDA kernel is derived from them yet.",
+    "The vendored files are reference material for correctness baselines only and are not compiled into the crate. CTOX model-format candidates must remain separate, retain ref anchors, and pass same-device verifier and benchmark gates.",
     "Upstream layouts (Q2_K/Q4_K super-blocks) differ from the crate Q2_B64/Q4_B64 layouts (64-value blocks, f16 scale, no zero-point); the vendored files pin the dp4a/mma techniques and launch geometry, not the block format.",
     "Q3 formats exist upstream but are deliberately out of scope; this crate supports only Q2_B64 and Q4_B64.",
     "Promotion to Verifier requires the same-device evidence described in docs/CUDA_KERNEL_NOTES.md and docs/PROMOTION_GATES.md."

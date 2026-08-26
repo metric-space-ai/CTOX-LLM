@@ -35,6 +35,16 @@ The minimum 2-bit/4-bit reference set:
 | `ggml/src/ggml-cuda/mma.cuh` | Ampere-gated mma.sync / ldmatrix wrappers (923-1022, 1162-1224) |
 | `ggml/src/ggml-cuda/mmq.cuh` | MMQ tile sizes (186-229), tile loaders (1628+, 2093+), kernel entry (3542) |
 | `ggml/src/ggml-cuda/mmq.cu` | stream-k and per-arch eligibility gating (121-122, 267-378) |
+| `ggml/src/ggml-cuda/gated_delta_net.cu` | register-sharded recurrent update, warp reductions, prefill traversal, rollback slots |
+| `ggml/src/ggml-cuda/norm.cu` | RMSNorm block reduction and fused multiply organization |
+| `ggml/src/ggml-cuda/ssm-conv.cu` | width-4 depthwise convolution and fused SiLU organization |
+
+All twelve vendored files are byte-identical to the same immutable revision and
+are verified by `training/verify_vendor_manifest.py`. The three newly pinned
+operator families are reference baselines, not compiled ggml dependencies.
+Their CTOX adaptations must preserve `// ref:` anchors while changing state
+storage to FP16 where the signed memory profile requires it, keeping immutable
+float weights mapping-/pack-owned, and exposing only the frozen Qwen geometry.
 
 Layout divergence: upstream Q2_K/Q4_K use 256-value super-blocks with
 sub-scales; this crate uses Q2_B64/Q4_B64 (64 values, one f16 scale, no
