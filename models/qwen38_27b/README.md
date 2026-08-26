@@ -193,7 +193,12 @@ candidate. It returns only the selected token and invalid-count words, matches
 the engine's larger-token tie rule on Apple Silicon, and rejects non-finite
 logits. A composed final RMSNorm -> recovered Q2/Q4 LM-head -> argmax verifier
 now binds the selector directly to resident logits in one command encoder; the
-complete Metal decoder executor remains open.
+complete Metal decoder executor remains open. Its host assembly now has a
+frozen 645-step decode schedule covering all 64 layers, target LM head, native
+MTP transition, and exactly one final command-buffer wait. The contract proves
+16 paged-attention and 48 linear-attention layers, both residual norms per
+layer, and every KV/convolution/recurrent state mutation before runtime binding
+is admitted.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

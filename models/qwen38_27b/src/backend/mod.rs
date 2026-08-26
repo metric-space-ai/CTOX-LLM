@@ -10,6 +10,7 @@ pub mod cuda_schedule;
 pub mod metal;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod metal_runtime;
+pub mod metal_schedule;
 pub mod snapdragon;
 
 use serde::{Deserialize, Serialize};

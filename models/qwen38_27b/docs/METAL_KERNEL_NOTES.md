@@ -12,7 +12,15 @@ usage, no scalar fallback.
 
 - Kernel source: `kernels/metal/q2q4_fused_matvec.metal`
 - Rust ABI/dispatch contract: `src/backend/metal.rs`
+- Frozen complete-decode schedule: `src/backend/metal_schedule.rs`
 - Direct verifier runtime: `src/backend/metal_runtime.rs`
+
+The model-specific schedule contains exactly 645 ordered steps: embedding and
+initial norm, ten operations for each of 64 frozen layers, target LM head,
+native MTP verification, and one command-buffer commit/wait. Validation rejects
+an altered topology, an unavailable producer slot, a missing causal state
+mutation, or any intermediate host wait. This is an assembly contract, not yet
+a complete Metal executor or promotion result.
 
 ## Entry points
 
