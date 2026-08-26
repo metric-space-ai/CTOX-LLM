@@ -121,7 +121,10 @@ decode chain encodes embedding lookup, Qwen RMSNorm, and an external-input
 mixed projection in one command encoder; neither the embedding nor normalized
 hidden vector returns to the host between operations. The same prepared table
 selects Q2 and Q4 tokens repeatedly and remains valid after the original loader
-handles are dropped.
+handles are dropped. A fan-out variant encodes RMSNorm once and binds its exact
+resident output plus one byte-identical packed `s_in` to every Q/K/V or Gate/Up
+projection branch; a mismatched mapping or correction offset fails before a
+command buffer is submitted.
 
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a

@@ -3768,6 +3768,16 @@ impl MetalCandidateRuntime {
         projection: &PreparedMappedMetalMatVec,
         input_buffer: &Buffer,
     ) {
+        self.encode_mapped_norm_with_input(encoder, norm, input_buffer);
+        self.encode_mapped_projection_with_input(encoder, projection, &norm.output_buffer);
+    }
+
+    fn encode_mapped_norm_with_input(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        norm: &PreparedMappedMetalRmsNorm,
+        input_buffer: &Buffer,
+    ) {
         encoder.set_compute_pipeline_state(&self.rms_norm_1p_pipeline);
         encoder.set_buffer(MetalRmsNormBufferAbi::INPUT as u64, Some(input_buffer), 0);
         encoder.set_buffer(
@@ -3797,8 +3807,15 @@ impl MetalCandidateRuntime {
                 depth: 1,
             },
         );
+    }
 
-        encoder.set_buffer(MetalBufferAbi::INPUT as u64, Some(&norm.output_buffer), 0);
+    fn encode_mapped_projection_with_input(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        projection: &PreparedMappedMetalMatVec,
+        input_buffer: &Buffer,
+    ) {
+        encoder.set_buffer(MetalBufferAbi::INPUT as u64, Some(input_buffer), 0);
         encoder.set_buffer(
             MetalBufferAbi::S_IN as u64,
             Some(&projection.mapping.inner.buffer),
@@ -3908,6 +3925,75 @@ impl MetalCandidateRuntime {
             ));
         }
         Ok(output)
+    }
+
+    /// Encode one resident embedding lookup, one RMSNorm, and a complete
+    /// recovery-bound projection fan-out in a single command encoder. All
+    /// projections consume the exact same normalized buffer and packed
+    /// `s_in`; only matrix-local outputs remain distinct.
+    pub fn dispatch_mapped_embedding_rms_norm_fanout(
+        &self,
+        embedding: &PreparedMappedMetalEmbedding,
+        token: usize,
+        norm: &PreparedMappedMetalRmsNorm,
+        projections: &[&PreparedMappedMetalMatVec],
+    ) -> Result<Vec<Vec<f32>>> {
+        let first = projections.first().ok_or_else(|| {
+            EngineError::Shape("Metal embedding fan-out requires at least one projection".into())
+        })?;
+        if token >= embedding.rows
+            || embedding.columns != norm.columns
+            || norm.rows != 1
+            || !Rc::ptr_eq(&embedding.mapping.inner, &norm.mapping.inner)
+        {
+            return Err(EngineError::InvalidState(
+                "Metal embedding/norm/fan-out has incompatible token, shape, or mapping".into(),
+            ));
+        }
+        for projection in projections {
+            self.validate_mapped_norm_projection(norm, projection)?;
+            if projection.s_in_offset != first.s_in_offset {
+                return Err(EngineError::InvalidArtifact(
+                    "Metal embedding fan-out projections do not share exact packed s_in".into(),
+                ));
+            }
+        }
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-embedding-norm-fanout-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_embedding(encoder, embedding, token)?;
+        self.encode_mapped_norm_with_input(encoder, norm, &embedding.output_buffer);
+        for projection in projections {
+            self.encode_mapped_projection_with_input(encoder, projection, &norm.output_buffer);
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal embedding/norm/fan-out command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        projections
+            .iter()
+            .map(|projection| {
+                let output = unsafe {
+                    slice::from_raw_parts(
+                        projection.output_buffer.contents().cast::<f32>(),
+                        projection.rows,
+                    )
+                    .to_vec()
+                };
+                if output.iter().any(|value| !value.is_finite()) {
+                    return Err(EngineError::InvalidState(
+                        "Metal embedding/norm/fan-out produced a non-finite output".into(),
+                    ));
+                }
+                Ok(output)
+            })
+            .collect()
     }
 
     /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
@@ -5137,6 +5223,12 @@ mod tests {
         let projection = runtime
             .prepare_mapped_fused_matvec_external_input(&mapping, &projection_contract)
             .expect("prepare embedding chain projection");
+        let projection_b = runtime
+            .prepare_mapped_fused_matvec_external_input(&mapping, &projection_contract)
+            .expect("prepare second embedding fan-out projection");
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_fanout(&embedding, 0, &norm, &[])
+            .is_err());
         assert!(runtime
             .dispatch_mapped_embedding_rms_norm_projection(
                 &embedding,
@@ -5186,6 +5278,24 @@ mod tests {
                     (expected - actual).abs() <= tolerance,
                     "embedding chain token {token} row {row}: expected {expected}, got {actual}"
                 );
+            }
+            let fanout = runtime
+                .dispatch_mapped_embedding_rms_norm_fanout(
+                    &embedding,
+                    token,
+                    &norm,
+                    &[&projection, &projection_b],
+                )
+                .expect("dispatch resident embedding fan-out after loader drop");
+            assert_eq!(fanout.len(), 2);
+            for (branch, actual) in fanout.into_iter().enumerate() {
+                for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                    let tolerance = 3.0e-4_f32.max(expected.abs() * 5.0e-5);
+                    assert!(
+                        (expected - actual).abs() <= tolerance,
+                        "embedding fan-out branch {branch} token {token} row {row}: expected {expected}, got {actual}"
+                    );
+                }
             }
         }
     }
