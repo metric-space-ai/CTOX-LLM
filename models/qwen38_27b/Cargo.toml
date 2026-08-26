@@ -181,6 +181,11 @@ path = "src/bin/cuda_target_token_verify.rs"
 required-features = ["cuda"]
 
 [[bin]]
+name = "qwen38-cuda-model-prefill-verify"
+path = "src/bin/cuda_model_prefill_verify.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "qwen38-cuda-executor-verify"
 path = "src/bin/cuda_executor_verify.rs"
 required-features = ["cuda"]

@@ -606,7 +606,14 @@ unit-test integration; complete-model SM86 numerical, memory, and latency
 evidence remains required before promotion.
 `PreparedCudaProjectionGraph` binds the ordinary fan-out, attention-gate, and
 SwiGLU forms to its single admitted activation/output arena. The complete
-645-step executor transaction and one-barrier failure policy remain open.
+target-only 645-step executor transaction is now exposed through a dedicated
+full-model verifier:
+
+```text
+cargo run --release --features cuda --bin qwen38-cuda-model-prefill-verify -- \
+  --artifact <release.ctoxq> --module <qwen38-sm86.fatbin> \
+  --device <worker-visible-device> --token-ids <comma-delimited-token-ids>
+```
 
 The direct causal paged-GQA prefill candidate maps one warp to each
 `(query_token, query_head)` pair and scans exactly that position's logical
