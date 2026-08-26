@@ -284,9 +284,9 @@ GatedDelta recurrence, and MTP state, computes the target LM head only for the
 last prompt token, and exposes one cancellation/commit barrier per bounded
 chunk. Batched activation/output workspaces are separate from resident matrix
 owners, so enabling a 512-token chunk does not duplicate model weights. The
-standalone MMQ verifier exercises this same graph-facing path; complete
-batched RMSNorm/token-mixer kernels and executor replacement of the current
-sequential prefill loop are still open.
+standalone MMQ verifier exercises this same graph-facing path and the shared
+two-buffer batched RMSNorm workspace. Complete causal token-mixer scans and
+executor replacement of the current sequential prefill loop are still open.
 
 An isolated mixed-Q2/Q4 split-KV attention candidate now covers the five
 causal tail queries used by MTP4 verification. Sixteen KV segments expose

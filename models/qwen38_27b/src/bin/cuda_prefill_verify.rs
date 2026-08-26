@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use ctox_qwen38_27b::backend::cpu::CpuBackend;
-use ctox_qwen38_27b::backend::cuda_runtime::CudaCandidateRuntime;
+use ctox_qwen38_27b::backend::cuda_runtime::{CudaCandidateRuntime, CudaRmsNormConfig};
 use ctox_qwen38_27b::backend::{Activation, Backend, FusedMatVec, ScaleSlice};
 use ctox_qwen38_27b::format::{QuantSegment, TensorDType};
 use ctox_qwen38_27b::quant::{A8Block64, Q2Block64, Q4Block64, BLOCK_LEN};
@@ -61,6 +61,7 @@ struct Report<'a> {
     cpu_oracle_executed: bool,
     resident_bytes: usize,
     resident_graph_workspace_bytes: usize,
+    resident_norm_workspace_bytes: usize,
     baseline_mean_batch_milliseconds: f64,
     mmq_mean_batch_milliseconds: f64,
     mmq_speedup: f64,
@@ -73,6 +74,7 @@ struct Report<'a> {
     baseline_mmq_maximum_relative_delta: f32,
     mmq_graph_maximum_absolute_delta: f32,
     mmq_graph_maximum_relative_delta: f32,
+    norm_workspace_maximum_absolute_delta: f32,
     note: &'static str,
 }
 
@@ -201,6 +203,37 @@ fn main() -> anyhow::Result<()> {
         .resident_bytes()
         .checked_add(graph_output.resident_bytes())
         .context("CUDA graph workspace residency overflows")?;
+    let norm_weight = f16_bytes(
+        &(0..args.columns)
+            .map(|column| 0.01 * (column % 7) as f32)
+            .collect::<Vec<_>>(),
+    );
+    let norm = runtime.prepare_qwen_rms_norm_f16(
+        CudaRmsNormConfig {
+            rows: args.batch_rows,
+            columns: args.columns,
+            epsilon: 1.0e-6,
+        },
+        &norm_weight,
+    )?;
+    let norm_baseline = runtime.verifier_read_f32(
+        runtime.dispatch_qwen_rms_norm_f16_device(&norm, graph_input.device_view()?)?,
+    )?;
+    let norm_workspace =
+        runtime.prepare_batched_rms_norm_workspace(args.batch_rows, args.columns)?;
+    let norm_graph =
+        runtime.verifier_read_f32(runtime.dispatch_batched_qwen_rms_norm_f16_device(
+            &norm,
+            &norm_workspace,
+            graph_input.device_view()?,
+            args.batch_rows,
+        )?)?;
+    let (norm_workspace_maximum_absolute_delta, _) = compare(
+        &norm_baseline,
+        &norm_graph,
+        args.absolute_tolerance,
+        args.relative_tolerance,
+    )?;
     for _ in 0..args.warmup {
         std::hint::black_box(runtime.dispatch_batched_a8_matmul(&prepared)?);
         std::hint::black_box(runtime.dispatch_batched_a8_mmq(&prepared)?);
@@ -238,6 +271,7 @@ fn main() -> anyhow::Result<()> {
             cpu_oracle_executed: !args.skip_cpu_oracle,
             resident_bytes: prepared.resident_bytes(),
             resident_graph_workspace_bytes,
+            resident_norm_workspace_bytes: norm_workspace.transient_bytes(),
             baseline_mean_batch_milliseconds: baseline_mean_batch_seconds * 1_000.0,
             mmq_mean_batch_milliseconds: mmq_mean_batch_seconds * 1_000.0,
             mmq_speedup: baseline_mean_batch_seconds / mmq_mean_batch_seconds,
@@ -250,6 +284,7 @@ fn main() -> anyhow::Result<()> {
             baseline_mmq_maximum_relative_delta,
             mmq_graph_maximum_absolute_delta,
             mmq_graph_maximum_relative_delta,
+            norm_workspace_maximum_absolute_delta,
             note: "Verifier-only comparison of the 2-D dp4a baseline, standalone SM86 MMQ tile, and the device-resident graph workspace path. The graph path shares immutable projection weights and keeps activation/output transients separate. Production promotion still requires complete layer-major chunk scheduling, recurrent/attention scans, representative Qwen shapes, and stable roofline evidence.",
         })?
     );

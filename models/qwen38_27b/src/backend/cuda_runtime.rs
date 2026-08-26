@@ -742,6 +742,19 @@ pub struct PreparedCudaResidualRmsNorm {
     transient_bytes: usize,
 }
 
+/// Two reusable f32 buffers for layer-major prefill normalization. Norm
+/// weights remain in their resident per-layer owners; this workspace is
+/// overwritten as the schedule advances and therefore scales with chunk size
+/// only once rather than once per layer.
+pub struct PreparedCudaBatchedRmsNormWorkspace {
+    context: Rc<CudaContextInner>,
+    batch_capacity: u32,
+    columns: u32,
+    residual_output: DeviceBuffer,
+    normalized_output: DeviceBuffer,
+    transient_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CudaPartialRopeConfig {
     pub heads: usize,
@@ -2668,6 +2681,158 @@ impl CudaCandidateRuntime {
         Ok((
             prepared.residual_output.f32_view(0, expected)?,
             prepared.normalized_output.f32_view(0, expected)?,
+        ))
+    }
+
+    /// Allocates the two normalization buffers shared by every layer while a
+    /// bounded prompt chunk advances through the layer-major schedule.
+    pub fn prepare_batched_rms_norm_workspace(
+        &self,
+        batch_capacity: usize,
+        columns: usize,
+    ) -> Result<PreparedCudaBatchedRmsNormWorkspace> {
+        let batch_capacity = validate_a8_batch_capacity(batch_capacity)?;
+        if columns == 0
+            || !columns.is_multiple_of(WARP_SIZE as usize)
+            || u32::try_from(columns).is_err()
+        {
+            return Err(EngineError::Shape(
+                "CUDA batched RMSNorm workspace requires positive u32 32-aligned columns".into(),
+            ));
+        }
+        let value_bytes = (batch_capacity as usize)
+            .checked_mul(columns)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA batched RMSNorm bytes overflow".into())
+            })?;
+        self.make_current()?;
+        let residual_output = DeviceBuffer::allocate(self, value_bytes)?;
+        let normalized_output = DeviceBuffer::allocate(self, value_bytes)?;
+        Ok(PreparedCudaBatchedRmsNormWorkspace {
+            context: Rc::clone(&self.inner),
+            batch_capacity,
+            columns: columns as u32,
+            transient_bytes: value_bytes * 2,
+            residual_output,
+            normalized_output,
+        })
+    }
+
+    /// Applies one resident layer norm weight to an active prompt-chunk
+    /// prefix. The prepared operator contributes only immutable weight and
+    /// epsilon; output storage comes from the shared workspace.
+    pub fn dispatch_batched_qwen_rms_norm_f16_device<'a>(
+        &self,
+        prepared: &PreparedCudaRmsNorm,
+        workspace: &'a PreparedCudaBatchedRmsNormWorkspace,
+        input: CudaDeviceF32View<'_>,
+        batch_rows: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let batch_rows = validate_batched_norm_inputs(
+            &self.inner,
+            &prepared.context,
+            workspace,
+            &[input],
+            prepared.config.columns,
+            batch_rows,
+        )?;
+        self.make_current()?;
+        let mut input_ptr = input.ptr()?;
+        let mut weight_ptr = prepared.weight.ptr();
+        let mut output_ptr = workspace.normalized_output.ptr();
+        let mut rows = batch_rows;
+        let mut columns = workspace.columns;
+        let mut epsilon = prepared.config.epsilon;
+        let mut params = [
+            (&mut input_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut weight_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rows as *mut u32).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut epsilon as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.qwen_rms_norm_f16_function,
+                    rows,
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "batched Qwen RMSNorm kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("batched Qwen RMSNorm context synchronization")?;
+        workspace.normalized_output(batch_rows as usize)
+    }
+
+    /// Fuses a batched residual edge with the following resident layer norm
+    /// using the same two shared chunk buffers.
+    pub fn dispatch_batched_residual_rms_norm_f16_device<'a>(
+        &self,
+        prepared: &PreparedCudaResidualRmsNorm,
+        workspace: &'a PreparedCudaBatchedRmsNormWorkspace,
+        residual: CudaDeviceF32View<'_>,
+        update: CudaDeviceF32View<'_>,
+        batch_rows: usize,
+    ) -> Result<(CudaDeviceF32View<'a>, CudaDeviceF32View<'a>)> {
+        let batch_rows = validate_batched_norm_inputs(
+            &self.inner,
+            &prepared.context,
+            workspace,
+            &[residual, update],
+            prepared.config.columns,
+            batch_rows,
+        )?;
+        self.make_current()?;
+        let mut residual_ptr = residual.ptr()?;
+        let mut update_ptr = update.ptr()?;
+        let mut weight_ptr = prepared.weight.ptr();
+        let mut residual_output_ptr = workspace.residual_output.ptr();
+        let mut normalized_output_ptr = workspace.normalized_output.ptr();
+        let mut rows = batch_rows;
+        let mut columns = workspace.columns;
+        let mut epsilon = prepared.config.epsilon;
+        let mut params = [
+            (&mut residual_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut update_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut weight_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut residual_output_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut normalized_output_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rows as *mut u32).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut epsilon as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.residual_rms_norm_f16_function,
+                    rows,
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "batched residual RMSNorm kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("batched residual RMSNorm context synchronization")?;
+        Ok((
+            workspace.residual_output(batch_rows as usize)?,
+            workspace.normalized_output(batch_rows as usize)?,
         ))
     }
 
@@ -6481,6 +6646,43 @@ impl PreparedCudaResidualRmsNorm {
     }
 }
 
+impl PreparedCudaBatchedRmsNormWorkspace {
+    pub fn batch_capacity(&self) -> usize {
+        self.batch_capacity as usize
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn residual_output(&self, batch_rows: usize) -> Result<CudaDeviceF32View<'_>> {
+        self.output_view(&self.residual_output, batch_rows)
+    }
+
+    pub fn normalized_output(&self, batch_rows: usize) -> Result<CudaDeviceF32View<'_>> {
+        self.output_view(&self.normalized_output, batch_rows)
+    }
+
+    fn output_view<'a>(
+        &'a self,
+        buffer: &'a DeviceBuffer,
+        batch_rows: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let batch_rows = validate_a8_batch_capacity(batch_rows)?;
+        if batch_rows > self.batch_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA batched RMSNorm requests {batch_rows} rows, capacity is {}",
+                self.batch_capacity
+            )));
+        }
+        buffer.f32_view(0, batch_rows as usize * self.columns())
+    }
+}
+
 impl PreparedCudaPartialRope {
     pub fn config(&self) -> CudaPartialRopeConfig {
         self.config
@@ -7118,6 +7320,43 @@ fn validate_a8_batch_capacity(batch_rows: usize) -> Result<u32> {
     Ok(batch_rows_u32)
 }
 
+fn validate_batched_norm_inputs(
+    runtime_context: &Rc<CudaContextInner>,
+    prepared_context: &Rc<CudaContextInner>,
+    workspace: &PreparedCudaBatchedRmsNormWorkspace,
+    inputs: &[CudaDeviceF32View<'_>],
+    columns: usize,
+    batch_rows: usize,
+) -> Result<u32> {
+    let batch_rows = validate_a8_batch_capacity(batch_rows)?;
+    if inputs.is_empty()
+        || !Rc::ptr_eq(runtime_context, prepared_context)
+        || !Rc::ptr_eq(runtime_context, &workspace.context)
+        || inputs
+            .iter()
+            .any(|input| !Rc::ptr_eq(runtime_context, input.context))
+    {
+        return Err(EngineError::InvalidState(
+            "batched CUDA RMSNorm dispatch crosses driver contexts".into(),
+        ));
+    }
+    if columns != workspace.columns as usize || batch_rows > workspace.batch_capacity {
+        return Err(EngineError::MemoryBudget(format!(
+            "CUDA batched RMSNorm {batch_rows}x{columns} exceeds workspace {}x{}",
+            workspace.batch_capacity, workspace.columns
+        )));
+    }
+    let expected = (batch_rows as usize)
+        .checked_mul(columns)
+        .ok_or_else(|| EngineError::Shape("CUDA batched RMSNorm shape overflows".into()))?;
+    if inputs.iter().any(|input| input.values() != expected) {
+        return Err(EngineError::Shape(format!(
+            "CUDA batched RMSNorm input does not have expected {expected} values"
+        )));
+    }
+    Ok(batch_rows)
+}
+
 fn embedding_row_location(
     layout: &CudaA8ProjectionLayout,
     rows: u32,
@@ -7682,6 +7921,7 @@ mod tests {
         assert_owned::<PreparedCudaBatchedA8Activation>();
         assert_owned::<PreparedCudaA8Projection>();
         assert_owned::<PreparedCudaBatchedA8Output>();
+        assert_owned::<PreparedCudaBatchedRmsNormWorkspace>();
         assert_owned::<PreparedCudaGatheredA8Projection>();
         assert_owned::<PreparedCudaArgmax>();
         assert_owned::<PreparedCudaRecoveredRow>();
