@@ -197,11 +197,12 @@ device-view contract, closing the tensor-transfer edges around this decode
 subgraph. The canonical head-wise query/gate layout now has an unpromoted fused
 deinterleave/Q-norm/RoPE candidate with a composite verifier; residual fusion
 and final scheduler assembly remain. Causal convolution and the FP16
-GatedDelta recurrence also accept producer-owned device views; compact Q/K
-head repetition plus decay/beta preprocessing remain open on the linear path.
-Its separate
-scalar-oracle verifier is queued on physical GPU 2 after the BF16 recovery
-pipeline; the production backend remains fail-closed until that evidence and
+GatedDelta recurrence also accept producer-owned device views. An exact-Qwen
+preparation candidate now repeats compact 16-head Q/K to 48 heads and applies
+the A/B-to-decay/beta transforms on device, then feeds those views directly
+into the recurrence. Its expanded scalar-oracle verifier is queued on physical
+GPU 2 after the BF16 recovery pipeline; the production backend remains
+fail-closed until that evidence and
 the complete projection/RoPE/attention/output graph wiring exist.
 
 The Metal linear-attention candidate set now also covers FP16 causal-

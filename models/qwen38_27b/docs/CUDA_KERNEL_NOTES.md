@@ -59,7 +59,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports thirteen explicitly unpromoted
+- The same verifier cubin additionally exports fifteen explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
@@ -68,11 +68,13 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
   - `ctox_q4_b64_a8_matvec_sm86`
   - `ctox_q2_b64_recovered_row_sm86`
   - `ctox_q4_b64_recovered_row_sm86`
+  - `ctox_qwen_gated_delta_prepare_f32_sm86`
   - `ctox_gated_delta_recurrent_f16_sm86`
   - `ctox_causal_conv_silu_f16_sm86`
   - `ctox_gated_rms_norm_f16_sm86`
   - `ctox_qwen_rms_norm_f16_sm86`
   - `ctox_partial_rope_f32_sm86`
+  - `ctox_qwen_query_gate_norm_rope_f32_sm86`
   - `ctox_pack_paged_kv_q4_f32_sm86`
   - `ctox_demote_paged_kv_q4_to_q2_sm86`
   - `ctox_paged_q2q4_gqa_decode_f32_sm86`
@@ -132,11 +134,14 @@ after the GatedDelta verifier; neither job may use GPU 0.
 
 The FP16 GatedDelta recurrence now has an equivalent device-view entry point
 for Q, K, V, log-decay, and beta, returning its device-resident output while
-retaining the state-poison/reset contract. Its verifier stages host fixtures in
-separate explicit verifier tensors and tests the production-facing pointer
-path; graph execution itself does not use those staging owners. Compact
-16-head Q/K repetition and raw A/B-to-decay/beta transforms still need fusion
-before the complete linear-attention layer is copy-free.
+retaining the state-poison/reset contract. A preceding exact-profile candidate
+consumes the convolution's compact `[Q:16x128, K:16x128, V:48x128]` view plus
+the two 48-value A/B projection views, repeats Q/K to the 48 recurrence heads,
+and computes `-exp(A_log) * softplus(A + dt_bias)` and `sigmoid(B)` entirely on
+device. Its verifier compares all four prepared outputs with the Rust oracle
+before feeding them directly into the recurrence; graph execution itself does
+not use verifier staging owners. Physical-GPU numerical evidence is still
+required before either candidate can be promoted.
 
 The general Qwen `(1 + weight)` RMSNorm candidate uses one 256-thread block
 per row and an eight-warp reduction, so hidden width 5,120 does not serialize
