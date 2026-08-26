@@ -101,6 +101,17 @@ Five verified batches contribute 593 unchanged final identities; the remaining
 subtraction preserves the complete 36-domain/15-language corpus contract rather
 than selecting a coding-only or English-only cache subset.
 
+The release activation selection in
+[`docs/ACTIVATION_CALIBRATION_V1.json`](docs/ACTIVATION_CALIBRATION_V1.json)
+binds 256 final-training identities and 917,704 tokens. It covers every one of
+the 36 primary domains, 15 language strata, and 14 service modes, with explicit
+coding, agentic/tool-calling, ordinary chat, mathematics, and genuine 32K/128K
+quotas. Three over-96K examples are isolated in token-bounded batches. The
+previous 167-sample activation artifact overlaps only 15 final-training
+identities and six primary domains, so it is superseded as a release assignment
+basis. Six immutable all-506-matrix collection batches are queued on GPU1+2;
+the final sensitivity result remains open until all six verifier reports pass.
+
 The signed, backend-neutral release and memory-admission schema is implemented
 in `src/release.rs` and documented in
 [`docs/RELEASE_MANIFEST_V2.md`](docs/RELEASE_MANIFEST_V2.md). It binds one

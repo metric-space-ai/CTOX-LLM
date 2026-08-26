@@ -1,0 +1,151 @@
+{
+  "format": "ctox.qwen38.activation-calibration.v1",
+  "status": "selection_complete_statistics_queued",
+  "selection": {
+    "samples": 256,
+    "sequence_tokens": 917704,
+    "maximum_sequence_tokens": 130883,
+    "materialized_bytes": 2814666,
+    "materialized_sha256": "c5c5d527e293afd21328f702e48ef700f05d18fbdecc0e7ebae31d690c5f0b81",
+    "release_train_sha256": "79d156969ae8846e8befd2406ae9837feb1c32cfc3e278338c3a533254471b4b",
+    "domain_tags_sha256": "ae4ca2a70692fdd0d7c61f108af0ca1b8609a60d1ca05548ddbd89d166488bfc",
+    "service_tags_sha256": "b7255b240c67fe8dc44b2ca09c3e9146501bed68ed1f44436abed316c5521b18",
+    "cache_plan_sha256": [
+      "608773c7a3b9eae16b89e4612f810d0682e8b8f0e20895fe2e49dfcd4a887473",
+      "252fafe6c57e2164206ec8f5124e0b78c446098bc6b510891e24489f0326c550"
+    ],
+    "rubric_sha256": {
+      "domain": "9adffaac115b24b99f97f53352c0f2cff5362512f4e93c49306149bf3e3762c3",
+      "language": "22ce547a7a5588a9ccf4dd737663229a4d924655dc4fcf9b2acfa857b683fd49",
+      "service": "36ba442f8863cf04e37cb7955a378e8af973a9b8f85df4729c28cf92b00c3f28"
+    }
+  },
+  "batch_plan": {
+    "format": "ctox.activation-batch-plan.v1",
+    "sha256": "0f37caf989c0d65289498dc2924229a79a4bbd88de4798f8a1ee530c2f581209",
+    "batches": 6,
+    "max_samples": 192,
+    "max_batch_tokens": 196608,
+    "max_sequence_tokens": 131072,
+    "samples": 256,
+    "sequence_tokens": 917704
+  },
+  "coverage": {
+    "all_requirements_met": true,
+    "categories": {
+      "agentic": 40,
+      "chat": 124,
+      "code": 40,
+      "long_context": 12,
+      "math": 40
+    },
+    "length_bands": {
+      "up_to_4k": 223,
+      "4k_16k": 18,
+      "16k_32k": 8,
+      "32k_64k": 4,
+      "over_96k": 3
+    },
+    "languages": {
+      "arb": 9,
+      "de": 15,
+      "de-en-mixed": 22,
+      "en": 105,
+      "fra": 9,
+      "hin": 8,
+      "ita": 9,
+      "jpn": 10,
+      "kor": 9,
+      "nld": 9,
+      "pol": 9,
+      "por": 11,
+      "rus": 10,
+      "spa": 9,
+      "zho": 12
+    },
+    "primary_domains": {
+      "agentic_tools_workflows": 41,
+      "agriculture_food_systems": 5,
+      "biology_biotechnology": 4,
+      "business_operations_management": 5,
+      "chemistry_materials": 4,
+      "creative_arts_literature": 5,
+      "cybersecurity_privacy": 4,
+      "data_analysis_statistics_structured": 9,
+      "design_architecture": 4,
+      "earth_climate_environment": 4,
+      "economics_accounting_finance": 4,
+      "education_learning": 5,
+      "electrical_hardware_engineering": 5,
+      "everyday_practical": 6,
+      "food_home_travel_lifestyle": 5,
+      "general_knowledge_explanation": 11,
+      "geography_geopolitics": 6,
+      "history_archaeology": 6,
+      "interpersonal_communication": 4,
+      "law_regulation_administration": 6,
+      "mathematics_logic": 8,
+      "mechanical_civil_manufacturing": 5,
+      "media_journalism_entertainment": 4,
+      "medicine_health": 5,
+      "philosophy_ethics_religion": 6,
+      "physics_astronomy": 4,
+      "politics_civics_institutions": 16,
+      "psychology_sociology": 5,
+      "research_search_factchecking": 4,
+      "safety_uncertainty": 5,
+      "software_development": 19,
+      "sports_fitness_recreation": 8,
+      "systems_cloud_databases": 4,
+      "translation_localization_linguistics": 7,
+      "transport_logistics": 7,
+      "writing_editing_summarization": 6
+    },
+    "service_modes": {
+      "analysis_comparison_synthesis": 172,
+      "coding_debugging": 100,
+      "creative_generation": 112,
+      "explanation_question_answering": 197,
+      "extraction_classification_transformation": 163,
+      "long_context_retrieval": 124,
+      "mathematical_reasoning": 146,
+      "multi_turn_dialogue": 170,
+      "planning_decision_support": 186,
+      "research_evidence_factchecking": 187,
+      "safety_uncertainty_calibration": 183,
+      "structured_output_constraints": 113,
+      "tool_calling_agentic": 179,
+      "writing_editing_summarization": 122
+    }
+  },
+  "minimums": {
+    "per_primary_domain": 4,
+    "per_language": 6,
+    "per_service_mode": 12,
+    "category": {
+      "agentic": 40,
+      "chat": 64,
+      "code": 40,
+      "long_context": 12,
+      "math": 40
+    },
+    "length_bands": {
+      "4k_16k": 16,
+      "16k_32k": 8,
+      "32k_64k": 4,
+      "over_96k": 3
+    }
+  },
+  "superseded_activation_basis": {
+    "artifact": "multilingual-agentic-longcontext-167-all506-v2.safetensors",
+    "overlap_with_final_train": 15,
+    "covered_primary_domains": 6,
+    "reason": "insufficient final-cohort, domain, and multilingual coverage for a release Q2/Q4 decision"
+  },
+  "next": [
+    "collect and independently verify all six all-506-matrix activation batches",
+    "merge with exact token-count weighting",
+    "recompute Q2/Q4 sensitivity and the <=7.8-GiB assignment",
+    "fit recovery scales and begin end-to-end recovery"
+  ]
+}

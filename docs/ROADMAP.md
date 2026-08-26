@@ -320,8 +320,9 @@ The immediate execution batch is:
 2. produce its exact teacher-cache size and token-aware batch plan, then run and
    verify each missing BF16/MTP batch;
 3. assemble and rehash the full 2,328-record teacher cache set;
-4. recompute all-506-matrix activation statistics and the Q2/Q4 assignment on
-   the final cohort under the 7.8-GiB package ceiling;
+4. collect and verify the frozen 256-sample, 917,704-token activation cohort
+   across all 36 domains, 15 languages, and 14 service modes, then recompute
+   the all-506-matrix Q2/Q4 assignment under the 7.8-GiB package ceiling;
 5. replace `train_recovery.py`'s layer-only utility with a complete packed
    fixed-qcode student trainer consuming KL, CE, hidden, activation, and MTP
    losses, while retaining the bounded layer utility as an initializer tool;
