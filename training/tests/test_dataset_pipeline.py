@@ -33,7 +33,9 @@ from build_quant_plan import (  # noqa: E402
 from cache_teacher import (  # noqa: E402
     mtp_target_positions,
     position_sets,
+    recover_unindexed_tail,
     resume_prefix,
+    save_sample_atomic,
     validate_local_model_provenance,
 )
 from classify_domains import (  # noqa: E402
@@ -498,6 +500,123 @@ class DatasetPipelineTests(unittest.TestCase):
             (cache / "unindexed.safetensors").write_bytes(b"bad")
             with self.assertRaisesRegex(ValueError, "unindexed"):
                 resume_prefix(cache, source, 0, 3)
+
+    def test_teacher_cache_recovers_exactly_one_fsynced_canonical_tail(self) -> None:
+        class FakeSafeTensor:
+            def __init__(self, path: Path) -> None:
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def metadata(self) -> dict[str, str]:
+                return json.loads(self.path.read_text())
+
+            def keys(self) -> list[str]:
+                return ["topk_logits"]
+
+        def fake_safe_open(path: Path, **_kwargs) -> FakeSafeTensor:
+            return FakeSafeTensor(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "id": sample_id,
+                            "prompt_sha256": f"sha-{sample_id}",
+                        }
+                    )
+                    + "\n"
+                    for sample_id in ("a", "b")
+                )
+            )
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "index.jsonl").write_text(
+                json.dumps({"id": "a", "file": "a.safetensors"}) + "\n"
+            )
+            (cache / "a.safetensors").write_bytes(b"indexed")
+            (cache / "b.safetensors").write_text(
+                json.dumps(
+                    {
+                        "sample_id": "b",
+                        "source_payload_sha256": "sha-b",
+                        "sequence_tokens": "32",
+                        "logit_target_count": "8",
+                        "hidden_target_count": "2",
+                        "mtp_target_count": "4",
+                        "mtp_hidden_target_count": "1",
+                    }
+                )
+            )
+            self.assertEqual(
+                recover_unindexed_tail(cache, source, 0, 2, fake_safe_open),
+                1,
+            )
+            entries = [
+                json.loads(line)
+                for line in (cache / "index.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual([entry["id"] for entry in entries], ["a", "b"])
+            self.assertEqual(entries[-1]["source_line"], 2)
+            self.assertEqual(entries[-1]["mtp_targets"], 4)
+            self.assertEqual(
+                recover_unindexed_tail(cache, source, 0, 2, fake_safe_open),
+                0,
+            )
+
+    def test_teacher_cache_recovery_rejects_temporary_or_noncanonical_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            source.write_text(
+                json.dumps({"id": "a", "prompt_sha256": "sha-a"}) + "\n"
+            )
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "index.jsonl").write_text("")
+            temporary = cache / ".a.safetensors.tmp"
+            temporary.write_bytes(b"partial")
+            with self.assertRaisesRegex(ValueError, "temporary"):
+                recover_unindexed_tail(cache, source, 0, 1, lambda *_a, **_k: None)
+            temporary.unlink()
+            (cache / "wrong.safetensors").write_bytes(b"complete")
+            with self.assertRaisesRegex(ValueError, "next source sample"):
+                recover_unindexed_tail(cache, source, 0, 1, lambda *_a, **_k: None)
+
+    def test_teacher_cache_sample_save_is_atomic_and_refuses_overwrite(self) -> None:
+        writes: list[tuple[Path, dict[str, str]]] = []
+
+        def fake_save_file(_tensors, path: Path, metadata: dict[str, str]) -> None:
+            writes.append((path, metadata))
+            path.write_bytes(b"complete")
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            save_sample_atomic(
+                fake_save_file,
+                {"tensor": object()},
+                output,
+                "a.safetensors",
+                {"sample_id": "a"},
+            )
+            self.assertEqual((output / "a.safetensors").read_bytes(), b"complete")
+            self.assertFalse((output / ".a.safetensors.tmp").exists())
+            self.assertEqual(writes[0][0].name, ".a.safetensors.tmp")
+            with self.assertRaisesRegex(ValueError, "overwrite"):
+                save_sample_atomic(
+                    fake_save_file,
+                    {},
+                    output,
+                    "a.safetensors",
+                    {"sample_id": "a"},
+                )
 
     def test_domain_classifier_preserves_hard_capability_signals(self) -> None:
         record = {

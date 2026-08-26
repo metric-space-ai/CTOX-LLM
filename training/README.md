@@ -207,7 +207,12 @@ cache or symlink from changing where an admitted run reads and writes.
 An inspected OOM prefix can be continued only with the explicit
 `--resume-incomplete` path. `cache_teacher.py --resume` requires the existing
 index to be a non-empty exact prefix of the same source slice, rejects missing
-or unindexed artifacts, keeps all semantic teacher/cache settings fixed, and
+artifacts, and accepts at most one unindexed artifact only when it is the next
+canonical source sample and its sealed safetensors metadata and payload are
+valid. Sample files are fsynced under a temporary name, atomically renamed, and
+the corresponding index line is flushed and fsynced before the next sample.
+Incomplete temporary files, multiple tail files, or any noncanonical tail are
+hard failures. Resume keeps all semantic teacher/cache settings fixed and
 records differing memory/device layouts as runtime profiles. The normal path
 continues to reject every pre-existing output directory, and full content
 verification still runs after the resumed suffix completes.

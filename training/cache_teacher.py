@@ -248,6 +248,117 @@ def resume_prefix(
     return run, entries
 
 
+def recover_unindexed_tail(
+    output: Path,
+    input_path: Path,
+    start_sample: int,
+    selected_samples: int,
+    safe_open: Any,
+) -> int:
+    """Commit one complete artifact left between rename and index fsync.
+
+    The sample file is written and fsynced before its index line. A power loss
+    in that narrow interval can therefore leave exactly the next canonical
+    artifact unindexed. Anything else remains an inspection failure.
+    """
+
+    temporary_files = sorted(output.glob(".*.safetensors.tmp"))
+    if temporary_files:
+        raise ValueError(
+            f"resume cache contains incomplete temporary artifact {temporary_files[0].name}"
+        )
+    index_path = output / "index.jsonl"
+    entries = [
+        json.loads(line)
+        for line in index_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    indexed_files = {str(entry["file"]) for entry in entries}
+    actual_files = {path.name for path in output.glob("*.safetensors")}
+    extra = actual_files - indexed_files
+    if not extra:
+        return 0
+    if len(extra) != 1 or indexed_files - actual_files:
+        raise ValueError("resume cache contains unsafe unindexed or missing artifacts")
+    source_rows = [
+        (line_number, json.loads(line))
+        for line_number, line in enumerate(
+            input_path.read_text(encoding="utf-8").splitlines(), 1
+        )
+        if line.strip()
+    ][start_sample : start_sample + selected_samples]
+    if len(entries) >= len(source_rows):
+        raise ValueError("resume cache extra artifact lies beyond selected samples")
+    source_line, record = source_rows[len(entries)]
+    sample_id = str(record["id"])
+    filename = f"{sample_id}.safetensors"
+    if extra != {filename}:
+        raise ValueError("resume cache unindexed artifact is not the next source sample")
+    artifact = output / filename
+    with safe_open(artifact, framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
+        required = {
+            "sample_id": sample_id,
+            "source_payload_sha256": str(record["prompt_sha256"]),
+        }
+        for key, expected in required.items():
+            if metadata.get(key) != expected:
+                raise ValueError(f"resume tail metadata {key} differs for {filename}")
+        if not handle.keys():
+            raise ValueError(f"resume tail artifact {filename} is empty")
+        entry = {
+            "id": sample_id,
+            "file": filename,
+            "tokens": int(metadata["sequence_tokens"]),
+            "logit_targets": int(metadata["logit_target_count"]),
+            "hidden_targets": int(metadata["hidden_target_count"]),
+            "mtp_targets": int(metadata.get("mtp_target_count", 0)),
+            "mtp_hidden_targets": int(metadata.get("mtp_hidden_target_count", 0)),
+            "source_line": source_line,
+            "source_payload_sha256": str(record["prompt_sha256"]),
+        }
+    descriptor = os.open(artifact, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    with index_path.open("a", encoding="utf-8") as index:
+        index.write(json.dumps(entry, sort_keys=True) + "\n")
+        index.flush()
+        os.fsync(index.fileno())
+    directory = os.open(output, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return 1
+
+
+def save_sample_atomic(
+    save_file: Any,
+    tensors: dict[str, Any],
+    output: Path,
+    filename: str,
+    metadata: dict[str, str],
+) -> None:
+    destination = output / filename
+    temporary = output / f".{filename}.tmp"
+    if destination.exists() or temporary.exists():
+        raise ValueError(f"refusing to overwrite teacher artifact {filename}")
+    save_file(tensors, temporary, metadata=metadata)
+    descriptor = os.open(temporary, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, destination)
+    directory = os.open(output, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def cache(
     args: argparse.Namespace,
     torch: Any,
@@ -280,6 +391,13 @@ def cache(
     existing_entries: list[dict[str, Any]] = []
     if args.resume:
         try:
+            recover_unindexed_tail(
+                args.output,
+                args.input,
+                args.start_sample,
+                selected_samples,
+                safe_open,
+            )
             existing_run, existing_entries = resume_prefix(
                 args.output, args.input, args.start_sample, selected_samples
             )
@@ -644,10 +762,12 @@ def cache(
                         f"positions, expected {len(hidden_position_list)}"
                     )
             filename = f"{sample_id}.safetensors"
-            save_file(
+            save_sample_atomic(
+                save_file,
                 tensors,
-                args.output / filename,
-                metadata={
+                args.output,
+                filename,
+                {
                     "sample_id": sample_id,
                     "teacher_model": args.model,
                     "teacher_revision": str(resolved_revision),
@@ -681,6 +801,8 @@ def cache(
                 )
                 + "\n"
             )
+            index.flush()
+            os.fsync(index.fileno())
             del (
                 selected_final_chunks,
                 selected_final_hidden,
