@@ -31,7 +31,17 @@ An unsupported protocol version is rejected before method dispatch. Invalid
 JSON receives request ID zero because no trustworthy caller identity could be
 decoded.
 
-The current server binary implements negotiation and bring-up health/model
-responses. All inference/control methods deliberately return
-`engine_not_ready` until it owns a complete promoted `Engine<ModelExecutor>`.
-The protocol contract being present is not evidence that generation works.
+`EngineServer<E>` is the reusable adapter around any admitted
+`Engine<ModelExecutor>`. It implements health, models, capabilities, identity
+checked load acknowledgement, warmup, token-ID prefill/decode, ordered MTP
+prefix streaming, cancellation, session reset, and unload. Active operations
+own distinct cancellation tokens, and the Unix listener handles connections
+concurrently so a cancel request does not wait behind the inference call. The
+adapter emits empty token text deliberately; detokenization belongs to the
+still-open Responses frontend binding.
+
+The current `qwen38-server` binary remains the artifact-inspection bring-up
+owner and returns `engine_not_ready`: it is not wired to `EngineServer` until a
+complete backend passes promotion and a signed release exists. Thus the wire
+adapter is implemented, but its presence is not evidence that a production
+executor is ready.

@@ -110,6 +110,13 @@ partial-prefix replay/commit transitions. It remains a scalar verifier rather
 than a production executor. CUDA, Metal, CPU SIMD token mixers, and Snapdragon
 still need optimized full graph implementations before production admission.
 
+`EngineServer<E>` now maps this exact lifecycle onto the v1 wire contract. It
+does not own alternate sampling or model state: the server mutex owns one
+`Engine<E>`, streams accepted MTP tokens before the target bonus/fallback,
+allows cancellation from a separate connection, and reports unload residue
+through the engine health contract. The Responses text renderer/detokenizer and
+the final promoted executor construction in the server binary remain open.
+
 [`WIRE_PROTOCOL_V1.md`](WIRE_PROTOCOL_V1.md) maps this lifecycle onto versioned
 JSON Lines. It carries distinct request, operation, and session identities so
 streaming and cancellation do not collapse into an ambiguous single RPC.
