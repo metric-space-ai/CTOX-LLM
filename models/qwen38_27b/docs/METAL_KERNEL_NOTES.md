@@ -88,6 +88,15 @@ homogeneous segment in a single command encoder. Weight, row-scale, bias, and
 output bindings advance by checked offsets; the logical codes remain in their
 original tensor and the input correction is shared across all segments.
 
+The restricted MTP LM head now has dedicated gathered Q2/Q4 candidates.
+Canonical token IDs remain strictly increasing and are grouped by their
+manifest row segment without changing output order. Each segment receives
+local row IDs while its original weight and `s_out` ranges remain offsets into
+the shared CTOXQ mapping; `s_in` and the final hidden vector are shared across
+the complete batch. Only the ID list and requested scalar logits are transient.
+Every draft is still verified by the complete target distribution in the Rust
+engine, so gathered evaluation cannot change target semantics.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -119,6 +128,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   a checksummed CTOXQ-v2 container with Q2 and Q4 row groups, validates its
   exact manifest coverage, dispatches both groups from one no-copy buffer, and
   matches every row against the mixed CPU oracle.
+- `mixed_gathered_lm_head_batches_canonical_rows_from_one_mapping` evaluates
+  sparse non-contiguous rows across both Q2 and Q4 segments, rejects unsorted
+  or out-of-range IDs, survives loader ownership being dropped, supports an
+  in-place input update, and matches the full mixed CPU projection.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.

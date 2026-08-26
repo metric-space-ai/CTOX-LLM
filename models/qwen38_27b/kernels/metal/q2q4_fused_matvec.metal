@@ -170,6 +170,119 @@ inline void fused_q4_rows(device const uchar* weights,
     finish_rows(partial, s_out, bias, output, params, first_row, simd_lane);
 }
 
+inline void finish_gathered_rows(thread float* partial,
+                                 device const uint* row_ids,
+                                 device const half* s_out,
+                                 device const float* bias,
+                                 device float* output,
+                                 constant FusedMatVecParams& params,
+                                 uint first_request,
+                                 uint simd_lane) {
+    for (uint row_offset = 0; row_offset < ROWS_PER_SIMDGROUP; ++row_offset) {
+        uint request = first_request + row_offset;
+        if (request >= params.rows) {
+            continue;
+        }
+        uint row = row_ids[request];
+        float total = simd_sum(partial[row_offset]);
+        if (simd_lane == 0u) {
+            total += params.has_bias != 0u ? bias[row] : 0.0f;
+            total *= params.has_s_out != 0u ? float(s_out[row]) : 1.0f;
+            output[request] = apply_activation(total, params.activation);
+        }
+    }
+}
+
+inline void gathered_q2_rows(device const uchar* weights,
+                             device const float* input,
+                             device const half* s_in,
+                             device const half* s_out,
+                             device const float* bias,
+                             device const uint* row_ids,
+                             device float* output,
+                             constant FusedMatVecParams& params,
+                             uint first_request,
+                             uint simd_lane) {
+    float partial[ROWS_PER_SIMDGROUP] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (simd_lane < 16u) {
+        for (uint block = 0; block < params.blocks_per_row; ++block) {
+            uint column = block * Q2Q4_BLOCK_LEN + simd_lane * 4u;
+            float4 x(input[column], input[column + 1u],
+                     input[column + 2u], input[column + 3u]);
+            if (params.has_s_in != 0u) {
+                x *= float4(float(s_in[column]), float(s_in[column + 1u]),
+                            float(s_in[column + 2u]), float(s_in[column + 3u]));
+            }
+            for (uint row_offset = 0; row_offset < ROWS_PER_SIMDGROUP; ++row_offset) {
+                uint request = first_request + row_offset;
+                if (request >= params.rows) {
+                    continue;
+                }
+                uint row = row_ids[request];
+                device const uchar* block_base = weights
+                    + ulong(row) * params.blocks_per_row * Q2_BLOCK_BYTES
+                    + ulong(block) * Q2_BLOCK_BYTES;
+                float scale = read_scale(block_base);
+                uint packed = uint(block_base[2u + simd_lane]);
+                float4 normalized(q2_normalized(packed & 0x3u),
+                                  q2_normalized((packed >> 2u) & 0x3u),
+                                  q2_normalized((packed >> 4u) & 0x3u),
+                                  q2_normalized((packed >> 6u) & 0x3u));
+                partial[row_offset] += scale * dot(normalized, x);
+            }
+        }
+    }
+    finish_gathered_rows(partial, row_ids, s_out, bias, output, params,
+                         first_request, simd_lane);
+}
+
+inline void gathered_q4_rows(device const uchar* weights,
+                             device const float* input,
+                             device const half* s_in,
+                             device const half* s_out,
+                             device const float* bias,
+                             device const uint* row_ids,
+                             device float* output,
+                             constant FusedMatVecParams& params,
+                             uint first_request,
+                             uint simd_lane) {
+    float partial[ROWS_PER_SIMDGROUP] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint block = 0; block < params.blocks_per_row; ++block) {
+        uint column_start = block * Q2Q4_BLOCK_LEN;
+        uint column0 = column_start + simd_lane;
+        uint column1 = column0 + 32u;
+        float x0 = input[column0];
+        float x1 = input[column1];
+        if (params.has_s_in != 0u) {
+            x0 *= float(s_in[column0]);
+            x1 *= float(s_in[column1]);
+        }
+        for (uint row_offset = 0; row_offset < ROWS_PER_SIMDGROUP; ++row_offset) {
+            uint request = first_request + row_offset;
+            if (request >= params.rows) {
+                continue;
+            }
+            uint row = row_ids[request];
+            device const uchar* block_base = weights
+                + ulong(row) * params.blocks_per_row * Q4_BLOCK_BYTES
+                + ulong(block) * Q4_BLOCK_BYTES;
+            float scale = read_scale(block_base);
+            device const uchar* codes = block_base + 2;
+            uint byte_index = simd_lane >> 1u;
+            uint shift = (simd_lane & 0x1u) << 2u;
+            uint packed0 = uint(codes[byte_index]);
+            uint packed1 = uint(codes[byte_index + 16u]);
+            uint code0 = (packed0 >> shift) & 0xfu;
+            uint code1 = (packed1 >> shift) & 0xfu;
+            float normalized0 = (float(code0) - 7.5f) * (1.0f / 7.5f);
+            float normalized1 = (float(code1) - 7.5f) * (1.0f / 7.5f);
+            partial[row_offset] += scale * (normalized0 * x0 + normalized1 * x1);
+        }
+    }
+    finish_gathered_rows(partial, row_ids, s_out, bias, output, params,
+                         first_request, simd_lane);
+}
+
 // Q2_B64 fused matvec candidate entry point.
 kernel void q2_b64_fused_matvec(
     device const uchar* weights [[buffer(0)]],
@@ -212,4 +325,48 @@ kernel void q4_b64_fused_matvec(
     }
     fused_q4_rows(weights, input, s_in, s_out, bias, output, params,
                   first_row, simd_lane);
+}
+
+kernel void q2_b64_gathered_matvec(
+    device const uchar* weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const half* s_in [[buffer(2)]],
+    device const half* s_out [[buffer(3)]],
+    device const float* bias [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant FusedMatVecParams& params [[buffer(6)]],
+    device const uint* row_ids [[buffer(7)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lanes_per_group [[threads_per_threadgroup]]) {
+    uint simd_groups = (lanes_per_group + 31u) / 32u;
+    uint first_request = (group_id * simd_groups + simd_group) * ROWS_PER_SIMDGROUP;
+    if (first_request >= params.rows) {
+        return;
+    }
+    gathered_q2_rows(weights, input, s_in, s_out, bias, row_ids, output,
+                     params, first_request, simd_lane);
+}
+
+kernel void q4_b64_gathered_matvec(
+    device const uchar* weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const half* s_in [[buffer(2)]],
+    device const half* s_out [[buffer(3)]],
+    device const float* bias [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant FusedMatVecParams& params [[buffer(6)]],
+    device const uint* row_ids [[buffer(7)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lanes_per_group [[threads_per_threadgroup]]) {
+    uint simd_groups = (lanes_per_group + 31u) / 32u;
+    uint first_request = (group_id * simd_groups + simd_group) * ROWS_PER_SIMDGROUP;
+    if (first_request >= params.rows) {
+        return;
+    }
+    gathered_q4_rows(weights, input, s_in, s_out, bias, row_ids, output,
+                     params, first_request, simd_lane);
 }

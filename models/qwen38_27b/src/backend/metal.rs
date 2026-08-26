@@ -19,6 +19,8 @@ pub struct MetalBackend;
 pub const Q2_KERNEL_NAME: &str = "q2_b64_fused_matvec";
 /// Metal CSL entry point for the Q4_B64 candidate kernel.
 pub const Q4_KERNEL_NAME: &str = "q4_b64_fused_matvec";
+pub const Q2_GATHERED_KERNEL_NAME: &str = "q2_b64_gathered_matvec";
+pub const Q4_GATHERED_KERNEL_NAME: &str = "q4_b64_gathered_matvec";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -47,6 +49,7 @@ impl MetalBufferAbi {
     pub const BIAS: u32 = 4;
     pub const OUTPUT: u32 = 5;
     pub const PARAMS: u32 = 6;
+    pub const ROW_IDS: u32 = 7;
 }
 
 /// Activation codes consumed by `apply_activation` in the MSL source.
@@ -499,6 +502,7 @@ mod tests {
             MetalBufferAbi::BIAS,
             MetalBufferAbi::OUTPUT,
             MetalBufferAbi::PARAMS,
+            MetalBufferAbi::ROW_IDS,
         ];
         for (index, binding) in bindings.iter().enumerate() {
             assert_eq!(*binding, index as u32);
@@ -518,6 +522,8 @@ mod tests {
         assert_ne!(Q2_KERNEL_NAME, Q4_KERNEL_NAME);
         assert!(Q2_KERNEL_NAME.starts_with("q2_b64"));
         assert!(Q4_KERNEL_NAME.starts_with("q4_b64"));
+        assert!(Q2_GATHERED_KERNEL_NAME.starts_with("q2_b64"));
+        assert!(Q4_GATHERED_KERNEL_NAME.starts_with("q4_b64"));
     }
 
     #[test]
@@ -731,7 +737,12 @@ mod tests {
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = crate_root.join(KERNEL_SOURCE_PATH);
         let text = std::fs::read_to_string(&source).expect("kernel source must be vendored");
-        for name in [Q2_KERNEL_NAME, Q4_KERNEL_NAME] {
+        for name in [
+            Q2_KERNEL_NAME,
+            Q4_KERNEL_NAME,
+            Q2_GATHERED_KERNEL_NAME,
+            Q4_GATHERED_KERNEL_NAME,
+        ] {
             assert!(
                 text.contains(&format!("kernel void {name}")),
                 "MSL source must define {name}"

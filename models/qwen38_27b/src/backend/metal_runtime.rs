@@ -17,11 +17,12 @@ use sha2::{Digest, Sha256};
 
 use super::metal::{
     validate_mixed_operation, validate_operation, MetalBufferAbi, MetalFusedMatVecParams,
-    MAX_SIMDGROUPS_PER_THREADGROUP, Q2_KERNEL_NAME, Q4_KERNEL_NAME,
+    MAX_SIMDGROUPS_PER_THREADGROUP, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
+    Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
 };
-use super::{FusedMatVec, ScaleSlice};
+use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
-use crate::loader::ModelArtifact;
+use crate::loader::{ModelArtifact, RecoveredMatrixView};
 use crate::{EngineError, Result};
 
 const KERNEL_SOURCE: &str = include_str!("../../kernels/metal/q2q4_fused_matvec.metal");
@@ -40,6 +41,8 @@ pub struct MetalCandidateRuntime {
     queue: CommandQueue,
     q2_pipeline: ComputePipelineState,
     q4_pipeline: ComputePipelineState,
+    q2_gathered_pipeline: ComputePipelineState,
+    q4_gathered_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -129,6 +132,33 @@ struct MappedMetalDispatch {
     s_out_offset: u64,
     bias_offset: u64,
     output_offset: u64,
+    params_buffer: Buffer,
+}
+
+/// Batched arbitrary-row projection used by the restricted MTP LM head.
+/// Quant codes and both recovery scales remain in the shared CTOXQ mapping;
+/// only canonical row IDs, one input vector, and requested scalar logits are
+/// transient Metal buffers.
+pub struct PreparedMappedMetalGatheredMatVec {
+    columns: usize,
+    requested_rows: usize,
+    s_in_offset: u64,
+    mapping: MappedMetalArtifact,
+    input_buffer: Buffer,
+    bias_buffer: Buffer,
+    output_buffer: Buffer,
+    dispatches: Vec<MappedMetalGatherDispatch>,
+    transient_bytes: usize,
+}
+
+struct MappedMetalGatherDispatch {
+    dtype: TensorDType,
+    requested_rows: usize,
+    thread_width: usize,
+    weights_offset: u64,
+    s_out_offset: u64,
+    output_offset: u64,
+    row_ids_buffer: Buffer,
     params_buffer: Buffer,
 }
 
@@ -277,6 +307,36 @@ impl PreparedMappedMetalMatVec {
     }
 }
 
+impl PreparedMappedMetalGatheredMatVec {
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn requested_rows(&self) -> usize {
+        self.requested_rows
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.mapping.copied_model_bytes()
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        validate_metal_input(input, self.columns)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                self.input_buffer.contents().cast::<f32>(),
+                input.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -303,6 +363,20 @@ impl MetalCandidateRuntime {
             .map_err(|message| {
                 EngineError::InvalidState(format!("Metal Q4 function lookup failed: {message}"))
             })?;
+        let q2_gathered_function = library
+            .get_function(Q2_GATHERED_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q2 gathered function lookup failed: {message}"
+                ))
+            })?;
+        let q4_gathered_function = library
+            .get_function(Q4_GATHERED_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 gathered function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -313,12 +387,28 @@ impl MetalCandidateRuntime {
             .map_err(|message| {
                 EngineError::InvalidState(format!("Metal Q4 pipeline creation failed: {message}"))
             })?;
+        let q2_gathered_pipeline = device
+            .new_compute_pipeline_state_with_function(&q2_gathered_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q2 gathered pipeline creation failed: {message}"
+                ))
+            })?;
+        let q4_gathered_pipeline = device
+            .new_compute_pipeline_state_with_function(&q4_gathered_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 gathered pipeline creation failed: {message}"
+                ))
+            })?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
             queue,
             q2_pipeline,
             q4_pipeline,
+            q2_gathered_pipeline,
+            q4_gathered_pipeline,
         })
     }
 
@@ -481,6 +571,179 @@ impl MetalCandidateRuntime {
             input_buffer,
             bias_buffer,
             output_buffer,
+            transient_bytes,
+        })
+    }
+
+    /// Prepare a single batched restricted-LM-head projection. Canonical row
+    /// IDs must be sorted and unique, matching the signed draft-vocabulary
+    /// contract. Mixed Q2/Q4 row groups become separate dispatches in one
+    /// command encoder while output order remains canonical ID order.
+    pub fn prepare_mapped_gathered_matvec(
+        &self,
+        mapping: &MappedMetalArtifact,
+        matrix: RecoveredMatrixView<'_>,
+        input: &[f32],
+        row_ids: &[u32],
+    ) -> Result<PreparedMappedMetalGatheredMatVec> {
+        if row_ids.is_empty()
+            || row_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || row_ids
+                .iter()
+                .any(|row| usize::try_from(*row).map_or(true, |row| row >= matrix.matrix.rows))
+        {
+            return Err(EngineError::InvalidArtifact(
+                "Metal gathered row IDs must be non-empty, canonical, and in range".into(),
+            ));
+        }
+        let operation = matrix.operation(input, Activation::Identity)?;
+        let contracts: Vec<(TensorDType, usize, usize, usize, MetalFusedMatVecParams)> =
+            if operation.dtype == TensorDType::MixedQ2Q4B64 {
+                validate_mixed_operation(&operation)?
+                    .into_iter()
+                    .map(|segment| {
+                        let row_count = segment.params.rows as usize;
+                        (
+                            segment.layout.dtype,
+                            segment.row_start,
+                            segment.row_start + row_count,
+                            segment.weight_offset,
+                            segment.params,
+                        )
+                    })
+                    .collect()
+            } else {
+                let (layout, params) = validate_operation(&operation)?;
+                vec![(layout.dtype, 0, operation.rows, 0, params)]
+            };
+        let s_in = match operation.s_in {
+            Some(ScaleSlice::F16Le(bytes)) => bytes,
+            _ => {
+                return Err(EngineError::InvalidArtifact(
+                    "Metal gathered projection requires artifact-backed FP16 s_in".into(),
+                ))
+            }
+        };
+        let s_out = match operation.s_out {
+            Some(ScaleSlice::F16Le(bytes)) => bytes,
+            _ => {
+                return Err(EngineError::InvalidArtifact(
+                    "Metal gathered projection requires artifact-backed FP16 s_out".into(),
+                ))
+            }
+        };
+        let weights_base = mapping.byte_offset(operation.weights, "gathered weights")?;
+        let s_in_offset = mapping.byte_offset(s_in, "gathered s_in")?;
+        let s_out_base = mapping.byte_offset(s_out, "gathered s_out")?;
+        let input_buffer = buffer_with_data(&self.device, as_bytes(input));
+        let bias_buffer = buffer_with_data(&self.device, as_bytes(&[0.0_f32]));
+        let output_bytes = row_ids
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("Metal gathered output bytes overflow".into()))?;
+        let output_buffer = self
+            .device
+            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let mut dispatches = Vec::new();
+        let mut selected_rows = 0_usize;
+        for (dtype, row_start, row_end, weight_offset, mut params) in contracts {
+            let request_start = row_ids.partition_point(|row| (*row as usize) < row_start);
+            let request_end = row_ids.partition_point(|row| (*row as usize) < row_end);
+            if request_start == request_end {
+                continue;
+            }
+            let local_ids: Vec<u32> = row_ids[request_start..request_end]
+                .iter()
+                .map(|row| {
+                    row.checked_sub(u32::try_from(row_start).map_err(|_| {
+                        EngineError::Shape("Metal gathered segment row exceeds u32".into())
+                    })?)
+                    .ok_or_else(|| {
+                        EngineError::InvalidArtifact(
+                            "Metal gathered row precedes its segment".into(),
+                        )
+                    })
+                })
+                .collect::<Result<_>>()?;
+            params.rows = u32::try_from(local_ids.len()).map_err(|_| {
+                EngineError::Shape("Metal gathered request count exceeds u32".into())
+            })?;
+            params.has_bias = 0;
+            params.activation = 0;
+            let pipeline = match dtype {
+                TensorDType::Q2B64 => &self.q2_gathered_pipeline,
+                TensorDType::Q4B64 => &self.q4_gathered_pipeline,
+                _ => unreachable!("Metal gathered segment is Q2/Q4"),
+            };
+            let weights_offset = weights_base
+                .checked_add(u64::try_from(weight_offset).map_err(|_| {
+                    EngineError::Shape("Metal gathered weight offset exceeds u64".into())
+                })?)
+                .ok_or_else(|| {
+                    EngineError::Shape("Metal gathered weight binding overflows u64".into())
+                })?;
+            let s_out_offset = s_out_base
+                .checked_add(
+                    u64::try_from(row_start)
+                        .map_err(|_| {
+                            EngineError::Shape("Metal gathered row start exceeds u64".into())
+                        })?
+                        .checked_mul(2)
+                        .ok_or_else(|| {
+                            EngineError::Shape("Metal gathered s_out offset overflows".into())
+                        })?,
+                )
+                .ok_or_else(|| {
+                    EngineError::Shape("Metal gathered s_out binding overflows".into())
+                })?;
+            let output_offset = u64::try_from(request_start)
+                .map_err(|_| EngineError::Shape("Metal gathered output index exceeds u64".into()))?
+                .checked_mul(std::mem::size_of::<f32>() as u64)
+                .ok_or_else(|| {
+                    EngineError::Shape("Metal gathered output offset overflows".into())
+                })?;
+            selected_rows = selected_rows
+                .checked_add(local_ids.len())
+                .ok_or_else(|| EngineError::Shape("Metal gathered row count overflows".into()))?;
+            dispatches.push(MappedMetalGatherDispatch {
+                dtype,
+                requested_rows: local_ids.len(),
+                thread_width: dispatch_width(pipeline, DEFAULT_SIMDGROUPS)?,
+                weights_offset,
+                s_out_offset,
+                output_offset,
+                row_ids_buffer: buffer_with_data(&self.device, as_bytes(&local_ids)),
+                params_buffer: buffer_with_data(&self.device, &params.encode()),
+            });
+        }
+        if selected_rows != row_ids.len() || dispatches.is_empty() {
+            return Err(EngineError::InvalidArtifact(
+                "Metal gathered row groups do not cover every requested ID".into(),
+            ));
+        }
+        let parameter_bytes = dispatches
+            .len()
+            .checked_mul(MetalFusedMatVecParams::BYTE_LEN)
+            .ok_or_else(|| EngineError::Shape("Metal gathered parameter bytes overflow".into()))?;
+        let row_id_bytes = row_ids
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| EngineError::Shape("Metal gathered ID bytes overflow".into()))?;
+        let transient_bytes = size_of_val(input)
+            .checked_add(std::mem::size_of::<f32>())
+            .and_then(|total| total.checked_add(output_bytes))
+            .and_then(|total| total.checked_add(row_id_bytes))
+            .and_then(|total| total.checked_add(parameter_bytes))
+            .ok_or_else(|| EngineError::Shape("Metal gathered transient bytes overflow".into()))?;
+        Ok(PreparedMappedMetalGatheredMatVec {
+            columns: operation.columns,
+            requested_rows: row_ids.len(),
+            s_in_offset,
+            mapping: mapping.clone(),
+            input_buffer,
+            bias_buffer,
+            output_buffer,
+            dispatches,
             transient_bytes,
         })
     }
@@ -840,6 +1103,95 @@ impl MetalCandidateRuntime {
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
                 "Metal mmap projection produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    pub fn dispatch_mapped_gathered(
+        &self,
+        prepared: &PreparedMappedMetalGatheredMatVec,
+    ) -> Result<Vec<f32>> {
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-gathered-lm-head-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_buffer(
+            MetalBufferAbi::INPUT as u64,
+            Some(&prepared.input_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::S_IN as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.s_in_offset,
+        );
+        encoder.set_buffer(MetalBufferAbi::BIAS as u64, Some(&prepared.bias_buffer), 0);
+        for dispatch in &prepared.dispatches {
+            let pipeline = match dispatch.dtype {
+                TensorDType::Q2B64 => &self.q2_gathered_pipeline,
+                TensorDType::Q4B64 => &self.q4_gathered_pipeline,
+                _ => unreachable!("Metal gathered dispatch is Q2/Q4"),
+            };
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(
+                MetalBufferAbi::WEIGHTS as u64,
+                Some(&prepared.mapping.inner.buffer),
+                dispatch.weights_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::S_OUT as u64,
+                Some(&prepared.mapping.inner.buffer),
+                dispatch.s_out_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::OUTPUT as u64,
+                Some(&prepared.output_buffer),
+                dispatch.output_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::PARAMS as u64,
+                Some(&dispatch.params_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::ROW_IDS as u64,
+                Some(&dispatch.row_ids_buffer),
+                0,
+            );
+            let grid = MTLSize {
+                width: dispatch
+                    .requested_rows
+                    .div_ceil((dispatch.thread_width / 32) * ROWS_PER_SIMDGROUP)
+                    as u64,
+                height: 1,
+                depth: 1,
+            };
+            let threads = MTLSize {
+                width: dispatch.thread_width as u64,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_thread_groups(grid, threads);
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal gathered command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(
+                prepared.output_buffer.contents().cast::<f32>(),
+                prepared.requested_rows,
+            )
+            .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal gathered projection produced a non-finite output".into(),
             ));
         }
         Ok(output)
@@ -1572,5 +1924,80 @@ mod tests {
                 "mixed row {row}: expected {expected}, got {actual}"
             );
         }
+    }
+
+    #[test]
+    fn mixed_gathered_lm_head_batches_canonical_rows_from_one_mapping() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let rows_q2 = 3;
+        let rows_q4 = 5;
+        let columns = 3 * BLOCK_LEN;
+        let directory = tempdir().expect("temporary gathered artifact directory");
+        let path = directory.path().join("gathered.ctoxq");
+        write_mixed_fixture(&path, rows_q2, rows_q4, columns);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open gathered mmap fixture");
+        let input: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.027).sin())
+            .collect();
+        let matrix = artifact
+            .recovered_matrix("matrix.weight")
+            .expect("resolve gathered recovered matrix");
+        let operation = matrix
+            .operation(&input, Activation::Identity)
+            .expect("construct gathered oracle operation");
+        let full = cpu
+            .fused_matvec(&operation)
+            .expect("full mixed scalar oracle");
+        let row_ids = [0_u32, 2, 3, 6, 7];
+        let expected: Vec<f32> = row_ids.iter().map(|row| full[*row as usize]).collect();
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import gathered mmap without copy");
+        let prepared = runtime
+            .prepare_mapped_gathered_matvec(&mapping, matrix, &input, &row_ids)
+            .expect("prepare gathered LM head");
+        assert_eq!(prepared.columns(), columns);
+        assert_eq!(prepared.requested_rows(), row_ids.len());
+        assert_eq!(prepared.dispatches.len(), 2);
+        assert_eq!(prepared.dispatches[0].dtype, TensorDType::Q2B64);
+        assert_eq!(prepared.dispatches[0].requested_rows, 2);
+        assert_eq!(prepared.dispatches[1].dtype, TensorDType::Q4B64);
+        assert_eq!(prepared.dispatches[1].requested_rows, 3);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert_eq!(
+            prepared.transient_bytes(),
+            size_of_val(input.as_slice())
+                + std::mem::size_of::<f32>()
+                + row_ids.len() * std::mem::size_of::<f32>()
+                + row_ids.len() * std::mem::size_of::<u32>()
+                + 2 * MetalFusedMatVecParams::BYTE_LEN
+        );
+        assert!(runtime
+            .prepare_mapped_gathered_matvec(&mapping, matrix, &input, &[2, 1])
+            .is_err());
+        assert!(runtime
+            .prepare_mapped_gathered_matvec(&mapping, matrix, &input, &[8])
+            .is_err());
+        drop(mapping);
+        drop(artifact);
+        let actual = runtime
+            .dispatch_mapped_gathered(&prepared)
+            .expect("dispatch gathered LM head after loader drop");
+        for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+            let tolerance = 2.0e-4_f32.max(expected.abs() * 3.0e-5);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "gathered row {row}: expected {expected}, got {actual}"
+            );
+        }
+        prepared
+            .write_input(&vec![0.0; columns])
+            .expect("update gathered input");
+        let zero = runtime
+            .dispatch_mapped_gathered(&prepared)
+            .expect("dispatch zero gathered input");
+        assert!(zero.iter().all(|value| value.abs() <= f32::EPSILON));
     }
 }
