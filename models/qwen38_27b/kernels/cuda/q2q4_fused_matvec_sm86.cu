@@ -529,3 +529,51 @@ void ctox_gated_rms_norm_f16_sm86(
             * __half2float(weight[column]) * silu_gate;
     }
 }
+
+// General Qwen residual RMSNorm. One 256-thread block owns one row and
+// reduces arbitrary 32-aligned widths (notably hidden_size=5120). The FP16
+// learned weight is widened only in registers and uses Qwen's (1 + weight)
+// convention.
+// ref: ggml/src/ggml-cuda/norm.cu:48-183
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_qwen_rms_norm_f16_sm86(
+    const float* __restrict__ input,
+    const __half* __restrict__ weight,
+    float* __restrict__ output,
+    unsigned rows,
+    unsigned columns,
+    float epsilon) {
+    const unsigned row = blockIdx.x;
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned warp = threadIdx.x / kWarpSize;
+    if (row >= rows || columns == 0u || (columns & 31u) != 0u) {
+        return;
+    }
+    const unsigned row_offset = row * columns;
+    float sum_squares = 0.0f;
+    for (unsigned column = threadIdx.x; column < columns; column += blockDim.x) {
+        const float item = input[row_offset + column];
+        sum_squares = fmaf(item, item, sum_squares);
+    }
+    sum_squares = warp_sum(sum_squares);
+    __shared__ float warp_sums[8];
+    __shared__ float inverse;
+    if (lane == 0u) {
+        warp_sums[warp] = sum_squares;
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        sum_squares = lane < 8u ? warp_sums[lane] : 0.0f;
+        sum_squares = warp_sum(sum_squares);
+        if (lane == 0u) {
+            inverse = rsqrtf(sum_squares
+                * (1.0f / static_cast<float>(columns)) + epsilon);
+        }
+    }
+    __syncthreads();
+    for (unsigned column = threadIdx.x; column < columns; column += blockDim.x) {
+        const unsigned index = row_offset + column;
+        output[index] = input[index] * inverse
+            * (1.0f + __half2float(weight[column]));
+    }
+}

@@ -4,9 +4,11 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use ctox_qwen38_27b::backend::cuda_runtime::{
-    CudaCandidateRuntime, CudaCausalConvConfig, CudaGatedRmsNormConfig,
+    CudaCandidateRuntime, CudaCausalConvConfig, CudaGatedRmsNormConfig, CudaRmsNormConfig,
 };
-use ctox_qwen38_27b::reference::{causal_conv_silu_update_f16_state, rms_norm_gated};
+use ctox_qwen38_27b::reference::{
+    causal_conv_silu_update_f16_state, rms_norm_1p_weight, rms_norm_gated,
+};
 use half::f16;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -43,10 +45,16 @@ struct Report<'a> {
     gated_norm_columns: usize,
     gated_norm_model_bytes: usize,
     gated_norm_transient_bytes: usize,
+    qwen_norm_rows: usize,
+    qwen_norm_columns: usize,
+    qwen_norm_model_bytes: usize,
+    qwen_norm_transient_bytes: usize,
     maximum_convolution_absolute_error: f32,
     maximum_convolution_relative_error: f32,
     maximum_gated_norm_absolute_error: f32,
     maximum_gated_norm_relative_error: f32,
+    maximum_qwen_norm_absolute_error: f32,
+    maximum_qwen_norm_relative_error: f32,
     state_matches_oracle_exactly: bool,
     reset_zero_state_verified: bool,
     driver_free_bytes_before_prepare: usize,
@@ -166,20 +174,62 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    let qwen_norm_config = CudaRmsNormConfig {
+        rows: 2,
+        columns: 5_120,
+        epsilon: 1.0e-6,
+    };
+    let (qwen_norm_weight, qwen_norm_weight_bytes) =
+        f16_fixture((0..qwen_norm_config.columns).map(|index| -0.15 + (index % 29) as f32 * 0.009));
+    let qwen_norm = runtime.prepare_qwen_rms_norm_f16(qwen_norm_config, &qwen_norm_weight_bytes)?;
+    let qwen_norm_input: Vec<f32> = (0..qwen_norm_config.rows * qwen_norm_config.columns)
+        .map(|index| ((index + 13) as f32 * 0.007).sin() * 0.9)
+        .collect();
+    let expected_qwen_norm = rms_norm_1p_weight(
+        &qwen_norm_input,
+        qwen_norm_config.rows,
+        qwen_norm_config.columns,
+        &qwen_norm_weight,
+        qwen_norm_config.epsilon,
+    )?;
+    qwen_norm.write_input(&qwen_norm_input)?;
+    let actual_qwen_norm = runtime.dispatch_qwen_rms_norm_f16(&qwen_norm)?;
+    let mut maximum_qwen_norm_absolute_error = 0.0_f32;
+    let mut maximum_qwen_norm_relative_error = 0.0_f32;
+    track_error(
+        &expected_qwen_norm,
+        &actual_qwen_norm,
+        &mut maximum_qwen_norm_absolute_error,
+        &mut maximum_qwen_norm_relative_error,
+    );
+    for (index, (expected, actual)) in expected_qwen_norm.iter().zip(&actual_qwen_norm).enumerate()
+    {
+        anyhow::ensure!(
+            (expected - actual).abs()
+                <= args.absolute_tolerance + args.relative_tolerance * expected.abs(),
+            "Qwen RMSNorm output {index}: expected {expected}, got {actual}"
+        );
+    }
+
     let convolution_model_bytes = conv.model_bytes();
     let convolution_state_bytes = conv.resident_state_bytes();
     let convolution_transient_bytes = conv.transient_bytes();
     let gated_norm_model_bytes = norm.model_bytes();
     let gated_norm_transient_bytes = norm.transient_bytes();
+    let qwen_norm_model_bytes = qwen_norm.model_bytes();
+    let qwen_norm_transient_bytes = qwen_norm.transient_bytes();
     drop(conv);
     drop(norm);
+    drop(qwen_norm);
     let (free_after_drop, _) = runtime.memory_info()?;
     let observed_reclaimed_bytes = free_after_drop.saturating_sub(free_after_prepare);
     let requested_bytes = convolution_model_bytes
         + convolution_state_bytes
         + convolution_transient_bytes
         + gated_norm_model_bytes
-        + gated_norm_transient_bytes;
+        + gated_norm_transient_bytes
+        + qwen_norm_model_bytes
+        + qwen_norm_transient_bytes;
     anyhow::ensure!(
         observed_reclaimed_bytes >= requested_bytes,
         "dropping CUDA linear-op objects did not reclaim requested buffers"
@@ -207,10 +257,16 @@ fn main() -> anyhow::Result<()> {
             gated_norm_columns: norm_config.columns,
             gated_norm_model_bytes,
             gated_norm_transient_bytes,
+            qwen_norm_rows: qwen_norm_config.rows,
+            qwen_norm_columns: qwen_norm_config.columns,
+            qwen_norm_model_bytes,
+            qwen_norm_transient_bytes,
             maximum_convolution_absolute_error,
             maximum_convolution_relative_error,
             maximum_gated_norm_absolute_error,
             maximum_gated_norm_relative_error,
+            maximum_qwen_norm_absolute_error,
+            maximum_qwen_norm_relative_error,
             state_matches_oracle_exactly,
             reset_zero_state_verified,
             driver_free_bytes_before_prepare: free_before_prepare,

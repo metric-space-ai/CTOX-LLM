@@ -241,6 +241,7 @@ pub const GATED_DELTA_F16_PARAM_BYTES: u32 = 72;
 // ref: ggml/src/ggml-cuda/norm.cu:1-148
 pub const CAUSAL_CONV_F16_SYMBOL: &str = "ctox_causal_conv_silu_f16_sm86";
 pub const GATED_RMS_NORM_F16_SYMBOL: &str = "ctox_gated_rms_norm_f16_sm86";
+pub const QWEN_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_rms_norm_f16_sm86";
 pub const LINEAR_CONV_CHANNELS: usize = 10_240;
 pub const LINEAR_CONV_KERNEL_WIDTH: usize = 4;
 pub const LINEAR_CONV_STATE_BYTES: usize = LINEAR_CONV_CHANNELS * LINEAR_CONV_KERNEL_WIDTH * 2;
@@ -319,6 +320,40 @@ pub const GATED_RMS_NORM_F16_PARAMS: &[KernelParam] = &[
     },
 ];
 pub const GATED_RMS_NORM_F16_PARAM_BYTES: u32 = 44;
+
+pub const QWEN_RMS_NORM_F16_PARAMS: &[KernelParam] = &[
+    KernelParam {
+        name: "input",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 0,
+    },
+    KernelParam {
+        name: "weight",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 8,
+    },
+    KernelParam {
+        name: "output",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 16,
+    },
+    KernelParam {
+        name: "rows",
+        size_bytes: 4,
+        offset_bytes: 24,
+    },
+    KernelParam {
+        name: "columns",
+        size_bytes: 4,
+        offset_bytes: 28,
+    },
+    KernelParam {
+        name: "epsilon",
+        size_bytes: 4,
+        offset_bytes: 32,
+    },
+];
+pub const QWEN_RMS_NORM_F16_PARAM_BYTES: u32 = 36;
 
 /// Module-level ABI contract for the SM86 kernel image: the compute
 /// capability the cubin must target and every kernel it must export.
@@ -816,7 +851,13 @@ mod tests {
         assert_eq!(CAUSAL_CONV_F16_PARAM_BYTES, 40);
         assert_eq!(GATED_RMS_NORM_F16_PARAMS.len(), 7);
         assert_eq!(GATED_RMS_NORM_F16_PARAM_BYTES, 44);
-        for symbol in [CAUSAL_CONV_F16_SYMBOL, GATED_RMS_NORM_F16_SYMBOL] {
+        assert_eq!(QWEN_RMS_NORM_F16_PARAMS.len(), 6);
+        assert_eq!(QWEN_RMS_NORM_F16_PARAM_BYTES, 36);
+        for symbol in [
+            CAUSAL_CONV_F16_SYMBOL,
+            GATED_RMS_NORM_F16_SYMBOL,
+            QWEN_RMS_NORM_F16_SYMBOL,
+        ] {
             assert!(!SM86_MODULE_ABI
                 .kernels
                 .iter()

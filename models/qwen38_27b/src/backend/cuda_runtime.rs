@@ -22,7 +22,7 @@ use super::cuda::{
     GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
     LINEAR_CONV_STATE_BYTES, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
     Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
-    Q4_B64_RECOVERED_ROW_SYMBOL,
+    Q4_B64_RECOVERED_ROW_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -171,6 +171,7 @@ struct CudaContextInner {
     gated_delta_f16_function: CuFunction,
     causal_conv_f16_function: CuFunction,
     gated_rms_norm_f16_function: CuFunction,
+    qwen_rms_norm_f16_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
 }
@@ -363,6 +364,23 @@ pub struct PreparedCudaGatedRmsNorm {
     transient_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CudaRmsNormConfig {
+    pub rows: usize,
+    pub columns: usize,
+    pub epsilon: f32,
+}
+
+pub struct PreparedCudaRmsNorm {
+    context: Rc<CudaContextInner>,
+    config: CudaRmsNormConfig,
+    input: DeviceBuffer,
+    weight: DeviceBuffer,
+    output: DeviceBuffer,
+    model_bytes: usize,
+    transient_bytes: usize,
+}
+
 impl CudaCandidateRuntime {
     /// Creates a private driver context on one exact device and loads the
     /// caller-supplied cubin. Only compute capability 8.6 is accepted.
@@ -548,6 +566,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let qwen_rms_norm_f16_function =
+            match resolve_function(&driver, module, QWEN_RMS_NORM_F16_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         Ok(Self {
             inner: Rc::new(CudaContextInner {
                 driver,
@@ -563,6 +592,7 @@ impl CudaCandidateRuntime {
                 gated_delta_f16_function,
                 causal_conv_f16_function,
                 gated_rms_norm_f16_function,
+                qwen_rms_norm_f16_function,
                 device_name,
                 compute_capability,
             }),
@@ -938,6 +968,105 @@ impl CudaCandidateRuntime {
         if result.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
                 "CUDA gated RMSNorm produced a non-finite output".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn prepare_qwen_rms_norm_f16(
+        &self,
+        config: CudaRmsNormConfig,
+        weight_f16_le: &[u8],
+    ) -> Result<PreparedCudaRmsNorm> {
+        if config.rows == 0
+            || config.columns == 0
+            || !config.columns.is_multiple_of(WARP_SIZE as usize)
+            || !config.epsilon.is_finite()
+            || config.epsilon <= 0.0
+            || u32::try_from(config.rows).is_err()
+            || u32::try_from(config.columns).is_err()
+        {
+            return Err(EngineError::Shape(
+                "CUDA Qwen RMSNorm requires positive u32 geometry, 32-aligned columns, and positive epsilon"
+                    .into(),
+            ));
+        }
+        let weight_bytes = config
+            .columns
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA RMSNorm weight overflows".into()))?;
+        validate_f16_buffer(weight_f16_le, weight_bytes, "Qwen RMSNorm weight")?;
+        let values = config
+            .rows
+            .checked_mul(config.columns)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA RMSNorm shape overflows".into()))?;
+        let value_bytes = values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA RMSNorm values overflow".into()))?;
+        let input = DeviceBuffer::allocate(self, value_bytes)?;
+        let weight = DeviceBuffer::from_bytes(self, weight_f16_le)?;
+        let output = DeviceBuffer::allocate(self, value_bytes)?;
+        input.zero()?;
+        output.zero()?;
+        Ok(PreparedCudaRmsNorm {
+            context: Rc::clone(&self.inner),
+            config,
+            input,
+            weight,
+            output,
+            model_bytes: weight_f16_le.len(),
+            transient_bytes: value_bytes * 2,
+        })
+    }
+
+    pub fn dispatch_qwen_rms_norm_f16(&self, prepared: &PreparedCudaRmsNorm) -> Result<Vec<f32>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA Qwen RMSNorm belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        let mut input = prepared.input.ptr();
+        let mut weight = prepared.weight.ptr();
+        let mut output = prepared.output.ptr();
+        let mut rows = prepared.config.rows as u32;
+        let mut columns = prepared.config.columns as u32;
+        let mut epsilon = prepared.config.epsilon;
+        let mut params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut weight as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rows as *mut u32).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut epsilon as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.qwen_rms_norm_f16_function,
+                    rows,
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "Qwen RMSNorm kernel launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "Qwen RMSNorm context synchronization",
+            )?;
+        }
+        let mut result = vec![0.0_f32; prepared.config.rows * prepared.config.columns];
+        prepared.output.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA Qwen RMSNorm produced a non-finite output".into(),
             ));
         }
         Ok(result)
@@ -2032,6 +2161,30 @@ impl PreparedCudaGatedRmsNorm {
         }
         self.input.write(as_bytes(input))?;
         self.gate.write(as_bytes(gate))
+    }
+}
+
+impl PreparedCudaRmsNorm {
+    pub fn config(&self) -> CudaRmsNormConfig {
+        self.config
+    }
+
+    pub fn model_bytes(&self) -> usize {
+        self.model_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        let expected = self.config.rows * self.config.columns;
+        if input.len() != expected || input.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::Shape(
+                "CUDA Qwen RMSNorm input has invalid length or values".into(),
+            ));
+        }
+        self.input.write(as_bytes(input))
     }
 }
 

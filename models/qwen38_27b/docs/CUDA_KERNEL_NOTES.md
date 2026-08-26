@@ -57,7 +57,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports eight explicitly unpromoted
+- The same verifier cubin additionally exports nine explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
@@ -69,6 +69,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
   - `ctox_gated_delta_recurrent_f16_sm86`
   - `ctox_causal_conv_silu_f16_sm86`
   - `ctox_gated_rms_norm_f16_sm86`
+  - `ctox_qwen_rms_norm_f16_sm86`
   These symbols are intentionally excluded from the production module ABI
   until their quality and complete-graph gates pass.
 - One launch fuses dequant, dot product, `s_in`, `s_out`, bias, and
@@ -107,7 +108,7 @@ one thread owns one value column. Decay and update stores round immediately to
 FP16, matching the Rust and Metal oracle. CUDA 12.6 compiled the candidate for
 SM86 with 24 registers, 40 bytes shared memory, and zero stack/spill bytes
 (current unified cubin SHA-256
-`e581a5341f52a160364243f6767f9a3bdfb302065f994e445846be901c60fb24`).
+`558d1dba104506b68cfd7a12a6528264e97045f170650c9319eed710a29f5b22`).
 The numerical verifier is built for a later physical-GPU-2 run after the
 teacher/evaluation/activation pipeline releases GPU 1+2; GPU 0 remains
 reserved for Greppy. No numerical or performance promotion is claimed yet.
@@ -121,6 +122,14 @@ stack and spill bytes for both. `qwen38-cuda-linear-ops-verify` checks six
 stateful convolution steps, exact FP16 history, reset, gated-norm output, and
 buffer reclamation against the Rust oracles. Its physical-GPU-2 run is chained
 after the GatedDelta verifier; neither job may use GPU 0.
+
+The general Qwen `(1 + weight)` RMSNorm candidate uses one 256-thread block
+per row and an eight-warp reduction, so hidden width 5,120 does not serialize
+through a single warp. It accepts positive 32-aligned widths, keeps its learned
+weight FP16, and has no f32 weight expansion. SM86 compilation uses 16
+registers, 36 bytes shared memory, and zero stack/spill bytes. The same chained
+linear-op verifier now includes a two-row 5,120-wide oracle comparison and
+accounts for its model/transient buffers in the unload proof.
 
 The first GPU3 run is recorded in
 `benchmarks/cuda/sm86-q2q4-fused-matvec-20260826.json`. It proved both formats
