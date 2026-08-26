@@ -11,10 +11,11 @@ from cache_teacher import transformer_layers
 from fanout_recovery import tie_fanout_s_in, validate_parameter_aliases
 from mtp_teacher import forward_mtp_activations
 from packed_student_model import install_packed_base_model, install_packed_mtp_model
-from recovery_io import atomic_json, durable_replace
+from recovery_io import durable_replace
 from recovery_modules import (
     compose_recovery_losses,
     normalized_hidden_loss,
+    normalized_hidden_loss_contribution,
     streamed_sparse_target_losses,
 )
 
@@ -197,23 +198,27 @@ class PackedStudentRuntime:
         self,
         main_model: Any,
         mtp_model: Any,
+        base_cache_type: Any,
         mtp_cache_type: Any,
         hidden_layers: list[int],
         top_k: int,
         logit_chunk: int,
         torch: Any,
         device: Any,
+        gradient_checkpointing: bool,
     ) -> None:
         if not hidden_layers or logit_chunk <= 0 or top_k <= 0:
             raise ValueError("packed student runtime contract is incomplete")
         self.main_model = main_model
         self.mtp_model = mtp_model
+        self.base_cache_type = base_cache_type
         self.mtp_cache_type = mtp_cache_type
         self.hidden_layers = hidden_layers
         self.top_k = top_k
         self.logit_chunk = logit_chunk
         self.torch = torch
         self.device = device
+        self.gradient_checkpointing = gradient_checkpointing
         self.base_model, self.layers = transformer_layers(main_model)
         if any(layer < 0 or layer >= len(self.layers) for layer in hidden_layers):
             raise ValueError("recovery hidden layer index is outside the student graph")
@@ -322,6 +327,221 @@ class PackedStudentRuntime:
         }
         return compose_recovery_losses(losses, weights), losses
 
+    @staticmethod
+    def _chunk_positions(positions: Any, start: int, stop: int) -> tuple[Any, Any]:
+        mask = (positions >= start) & (positions < stop)
+        indices = mask.nonzero(as_tuple=False).flatten()
+        return indices, positions.index_select(0, indices) - start
+
+    @staticmethod
+    def _detach_cache(cache: Any) -> None:
+        """Truncate autograd history while preserving exact causal state."""
+
+        for layer in cache.layers:
+            for attribute in ("keys", "values"):
+                value = getattr(layer, attribute, None)
+                if value is not None:
+                    setattr(layer, attribute, value.detach())
+            for attribute in ("conv_states", "recurrent_states"):
+                states = getattr(layer, attribute, None)
+                if states is None:
+                    continue
+                for index, value in tuple(states.items()):
+                    if value is not None:
+                        states[index] = value.detach()
+
+    def loss_chunks(
+        self,
+        teacher: dict[str, Any],
+        chunk_tokens: int,
+        weights: dict[str, float] | None = None,
+    ) -> Any:
+        """Yield exact loss contributions for stateful truncated-BPTT prefill.
+
+        The caller must backpropagate each yielded objective before requesting
+        the next item.  Resuming the generator detaches only the causal cache
+        tensors, so every chunk trains all fixed-qcode corrections it executes
+        while KV and GatedDelta state remain numerically continuous.
+        """
+
+        torch = self.torch
+        validate_teacher_tensors(teacher, self.hidden_layers, self.top_k, True)
+        if chunk_tokens <= 0:
+            raise ValueError("recovery prefill chunk size must be positive")
+        if self.gradient_checkpointing:
+            raise ValueError(
+                "stateful recovery chunking cannot be combined with gradient checkpointing"
+            )
+        input_ids = teacher["input_ids"].to(self.device, dtype=torch.long)
+        attention_mask = teacher["attention_mask"].to(self.device, dtype=torch.long)
+        sequence = int(input_ids.shape[1])
+        if chunk_tokens >= sequence:
+            yield self.losses(teacher, weights)
+            return
+
+        position_names = (
+            "logit_positions",
+            "hidden_positions",
+            "mtp_positions",
+            "mtp_hidden_positions",
+        )
+        positions = {
+            name: teacher[name].to(dtype=torch.long)
+            for name in position_names
+        }
+        totals = {name: int(value.numel()) for name, value in positions.items()}
+        hidden_signal = {
+            layer: teacher[f"hidden_{layer}"].float().square().sum()
+            for layer in self.hidden_layers
+        }
+        mtp_hidden_signal = teacher["mtp_hidden"].float().square().sum()
+        base_cache = self.base_cache_type(config=self.main_model.config)
+        mtp_cache = self.mtp_cache_type(config=self.mtp_model.config)
+
+        for chunk_start in range(0, sequence, chunk_tokens):
+            chunk_stop = min(sequence, chunk_start + chunk_tokens)
+            hidden_indices, local_hidden_positions = self._chunk_positions(
+                positions["hidden_positions"], chunk_start, chunk_stop
+            )
+            captured: dict[int, Any] = {}
+            hooks = []
+            if hidden_indices.numel():
+                for layer_index in self.hidden_layers:
+
+                    def capture(
+                        _module: Any,
+                        _inputs: Any,
+                        output: Any,
+                        index: int = layer_index,
+                        sink: dict[int, Any] = captured,
+                    ) -> None:
+                        values = output[0] if isinstance(output, tuple) else output
+                        sink[index] = values.index_select(
+                            1, local_hidden_positions.to(values.device)
+                        )
+
+                    hooks.append(self.layers[layer_index].register_forward_hook(capture))
+            try:
+                output = self.base_model(
+                    input_ids=input_ids[:, chunk_start:chunk_stop],
+                    attention_mask=attention_mask[:, :chunk_stop],
+                    past_key_values=base_cache,
+                    use_cache=True,
+                    return_dict=True,
+                )
+            finally:
+                for hook in hooks:
+                    hook.remove()
+            if hidden_indices.numel() and set(captured) != set(self.hidden_layers):
+                raise RuntimeError("chunked student did not capture every hidden layer")
+            final_hidden = output.last_hidden_state
+            zero = final_hidden.float().sum() * 0.0
+            losses = {
+                name: zero
+                for name in ("kl", "ce", "hidden", "mtp_kl", "mtp_ce", "mtp_hidden")
+            }
+
+            logit_indices, local_logit_positions = self._chunk_positions(
+                positions["logit_positions"], chunk_start, chunk_stop
+            )
+            if logit_indices.numel():
+                selected_final = final_hidden.index_select(
+                    1, local_logit_positions.to(final_hidden.device)
+                )
+                global_logit_positions = positions["logit_positions"].index_select(
+                    0, logit_indices
+                ).to(self.device)
+                kl, ce = streamed_sparse_target_losses(
+                    self.main_model.lm_head,
+                    selected_final,
+                    teacher["topk_indices"].index_select(1, logit_indices).to(self.device),
+                    teacher["topk_logprobs"].index_select(1, logit_indices).to(self.device),
+                    teacher["residual_probability"].index_select(1, logit_indices).to(self.device),
+                    input_ids,
+                    global_logit_positions,
+                    1,
+                    self.logit_chunk,
+                )
+                fraction = int(logit_indices.numel()) / totals["logit_positions"]
+                losses["kl"] = kl * fraction
+                losses["ce"] = ce * fraction
+
+            if hidden_indices.numel():
+                losses["hidden"] = torch.stack(
+                    [
+                        normalized_hidden_loss_contribution(
+                            captured[layer],
+                            teacher[f"hidden_{layer}"]
+                            .index_select(1, hidden_indices)
+                            .to(self.device),
+                            hidden_signal[layer],
+                            totals["hidden_positions"],
+                        )
+                        for layer in self.hidden_layers
+                    ]
+                ).mean()
+
+            mtp_hidden_stop = min(chunk_stop, sequence - 1)
+            mtp_output = None
+            if chunk_start < mtp_hidden_stop:
+                mtp_length = mtp_hidden_stop - chunk_start
+                mtp_output = forward_mtp_activations(
+                    self.mtp_model,
+                    input_ids[:, chunk_start + 1 : mtp_hidden_stop + 1],
+                    final_hidden[:, :mtp_length, :],
+                    torch.arange(
+                        chunk_start + 1,
+                        mtp_hidden_stop + 1,
+                        device=self.device,
+                        dtype=torch.long,
+                    ).unsqueeze(0),
+                    mtp_cache,
+                )
+                mtp_indices, local_mtp_positions = self._chunk_positions(
+                    positions["mtp_positions"], chunk_start, mtp_hidden_stop
+                )
+                if mtp_indices.numel():
+                    selected_mtp = mtp_output.index_select(
+                        1, local_mtp_positions.to(mtp_output.device)
+                    )
+                    global_mtp_positions = positions["mtp_positions"].index_select(
+                        0, mtp_indices
+                    ).to(self.device)
+                    mtp_kl, mtp_ce = streamed_sparse_target_losses(
+                        self.main_model.lm_head,
+                        selected_mtp,
+                        teacher["mtp_topk_indices"].index_select(1, mtp_indices).to(self.device),
+                        teacher["mtp_topk_logprobs"].index_select(1, mtp_indices).to(self.device),
+                        teacher["mtp_residual_probability"]
+                        .index_select(1, mtp_indices)
+                        .to(self.device),
+                        input_ids,
+                        global_mtp_positions,
+                        2,
+                        self.logit_chunk,
+                    )
+                    fraction = int(mtp_indices.numel()) / totals["mtp_positions"]
+                    losses["mtp_kl"] = mtp_kl * fraction
+                    losses["mtp_ce"] = mtp_ce * fraction
+
+                mtp_hidden_indices, local_mtp_hidden_positions = self._chunk_positions(
+                    positions["mtp_hidden_positions"], chunk_start, mtp_hidden_stop
+                )
+                if mtp_hidden_indices.numel():
+                    losses["mtp_hidden"] = normalized_hidden_loss_contribution(
+                        mtp_output.index_select(
+                            1, local_mtp_hidden_positions.to(mtp_output.device)
+                        ),
+                        teacher["mtp_hidden"].index_select(1, mtp_hidden_indices).to(self.device),
+                        mtp_hidden_signal,
+                        totals["mtp_hidden_positions"],
+                    )
+
+            yield compose_recovery_losses(losses, weights), losses
+            del output, final_hidden, captured, losses, mtp_output
+            self._detach_cache(base_cache)
+            self._detach_cache(mtp_cache)
+
 
 def build_packed_student(
     model_source: str,
@@ -339,7 +559,7 @@ def build_packed_student(
 ) -> tuple[PackedStudentRuntime, dict[str, Any], dict[str, Any], dict[str, Any]]:
     from accelerate import init_empty_weights
     from transformers import AutoConfig, AutoModelForCausalLM
-    from transformers.cache_utils import MtpCache
+    from transformers.cache_utils import DynamicCache, MtpCache
 
     local = Path(model_source).is_dir()
     config = AutoConfig.from_pretrained(
@@ -381,12 +601,14 @@ def build_packed_student(
     runtime = PackedStudentRuntime(
         model,
         mtp_model,
+        DynamicCache,
         MtpCache,
         hidden_layers,
         top_k,
         logit_chunk,
         torch,
         device,
+        gradient_checkpointing,
     )
     return runtime, base_evidence, mtp_evidence, fanout_evidence
 

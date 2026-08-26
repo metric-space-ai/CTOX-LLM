@@ -266,6 +266,18 @@ set, duplicates fail, and the sorted identity set is part of the immutable run
 contract. This cannot be combined with positional `--sample-limit`; release
 training continues to omit both selectors and therefore consumes the complete
 cache set.
+`train_recovery.py --prefill-chunk-tokens N` is the release path for sequences
+larger than the device's safe activation window. It performs stateful causal
+prefill through the same Transformers cache types pinned by teacher generation,
+backpropagates each chunk before continuing, then detaches only KV,
+causal-convolution, and recurrent cache history. Numerical state is preserved,
+but autograd memory is bounded to one chunk (truncated BPTT). Base/MTP KL, CE,
+and hidden reconstruction contributions use their full-sequence target counts;
+hidden reconstruction additionally uses the full teacher signal denominator.
+Their sum is therefore the same objective as the monolithic path for the
+recorded sparse targets. Gradient checkpointing is rejected with stateful
+chunking because Transformers disables or mutates cache semantics in that
+combination. The chunk size is part of the immutable run contract.
 `ctox_artifact.py` provides the corresponding offline Python reader for the
 native Rust container. It validates the 64-byte header, version, endianness,
 manifest bounds, alignment, Q2/Q4 or mixed-row byte formulas, non-overlapping

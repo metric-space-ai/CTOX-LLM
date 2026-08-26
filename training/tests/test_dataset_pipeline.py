@@ -97,8 +97,9 @@ try:  # Optional local training dependency; exercised in the pinned GPU venv.
     import torch  # noqa: E402
     from end_to_end_recovery import unique_scale_parameters  # noqa: E402
     from recovery_modules import (  # noqa: E402
-        normalized_hidden_loss,
         end_to_end_recovery_loss,
+        normalized_hidden_loss,
+        normalized_hidden_loss_contribution,
         sparse_teacher_kl,
         streamed_sparse_target_losses,
         supervised_mtp_token_loss,
@@ -1835,6 +1836,35 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertLess(
             float(supervised_mtp_token_loss(mtp_logits, input_ids, torch.tensor([0]))),
             1e-6,
+        )
+
+    def test_chunked_hidden_contributions_match_full_loss_and_gradient(self) -> None:
+        if torch is None:
+            self.skipTest("torch is not installed in the host-only test environment")
+        torch.manual_seed(38)
+        teacher = torch.randn(1, 7, 5)
+        full_student = torch.randn(1, 7, 5, requires_grad=True)
+        full_loss = normalized_hidden_loss(full_student, teacher)
+        full_loss.backward()
+        expected_gradient = full_student.grad.clone()
+
+        chunked_student = full_student.detach().clone().requires_grad_(True)
+        teacher_square_sum = teacher.float().square().sum()
+        contributions = []
+        for start, stop in ((0, 3), (3, 5), (5, 7)):
+            contribution = normalized_hidden_loss_contribution(
+                chunked_student[:, start:stop],
+                teacher[:, start:stop],
+                teacher_square_sum,
+                total_vectors=7,
+            )
+            contribution.backward()
+            contributions.append(contribution.detach())
+        self.assertTrue(
+            torch.allclose(torch.stack(contributions).sum(), full_loss.detach(), atol=1e-6)
+        )
+        self.assertTrue(
+            torch.allclose(chunked_student.grad, expected_gradient, atol=1e-6)
         )
 
     def test_end_to_end_recovery_objective_includes_every_base_and_mtp_family(

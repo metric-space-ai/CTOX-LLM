@@ -162,6 +162,38 @@ def normalized_hidden_loss(student: Tensor, teacher: Tensor) -> Tensor:
     return normalized_mse + 0.1 * cosine
 
 
+def normalized_hidden_loss_contribution(
+    student: Tensor,
+    teacher: Tensor,
+    teacher_square_sum: Tensor,
+    total_vectors: int,
+) -> Tensor:
+    """One chunk's exact contribution to the full normalized hidden loss.
+
+    Long-context recovery backpropagates one stateful prefill chunk at a time.
+    Using the ordinary per-chunk mean would give short final chunks and sparse
+    marker chunks disproportionate weight.  The caller therefore supplies the
+    full teacher signal and vector count; summing every returned contribution
+    is algebraically identical to :func:`normalized_hidden_loss` over the
+    concatenated sequence, including its cosine term.
+    """
+
+    if student.shape != teacher.shape or student.ndim < 2:
+        raise ValueError("student and teacher hidden shapes differ")
+    vectors = int(student.numel() // student.shape[-1])
+    if vectors <= 0 or total_vectors < vectors:
+        raise ValueError("hidden contribution has an invalid global vector count")
+    student_f32 = student.float()
+    teacher_f32 = teacher.float()
+    signal = teacher_square_sum.to(student_f32.device, dtype=torch.float32).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    normalized_mse = (student_f32 - teacher_f32).square().sum() / signal
+    cosine_sum = F.cosine_similarity(student_f32, teacher_f32, dim=-1).sum()
+    cosine = (student_f32.new_tensor(float(vectors)) - cosine_sum) / total_vectors
+    return normalized_mse + 0.1 * cosine
+
+
 def streamed_sparse_target_losses(
     project: object,
     student_hidden: Tensor,

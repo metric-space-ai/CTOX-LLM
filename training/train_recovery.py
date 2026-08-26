@@ -111,9 +111,17 @@ def validate_arguments(args: argparse.Namespace) -> None:
         raise ValueError(
             "learning, accumulation, clipping, chunk, and checkpoint values must be positive"
         )
-    if args.scale_regularization < 0 or args.max_sequence_tokens < 0:
+    if (
+        args.scale_regularization < 0
+        or args.max_sequence_tokens < 0
+        or args.prefill_chunk_tokens < 0
+    ):
         raise ValueError(
-            "regularization and maximum sequence length must be non-negative"
+            "regularization, maximum sequence length, and prefill chunk size must be non-negative"
+        )
+    if args.prefill_chunk_tokens and args.gradient_checkpointing:
+        raise ValueError(
+            "--prefill-chunk-tokens and --gradient-checkpointing are mutually exclusive"
         )
     if args.max_optimizer_steps is not None and args.max_optimizer_steps <= 0:
         raise ValueError("--max-optimizer-steps must be positive")
@@ -157,6 +165,15 @@ def main() -> None:
         help="train only the exact verified cache identity; repeatable",
     )
     parser.add_argument("--max-sequence-tokens", type=int, default=0)
+    parser.add_argument(
+        "--prefill-chunk-tokens",
+        type=int,
+        default=0,
+        help=(
+            "stateful truncated-BPTT chunk size for long-context recovery; "
+            "zero keeps the monolithic correctness path"
+        ),
+    )
     parser.add_argument("--oversize-policy", choices=("fail", "skip"), default="fail")
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--gradient-accumulation", type=int, default=1)
@@ -271,6 +288,7 @@ def main() -> None:
                 "sample_limit": args.sample_limit,
                 "sample_ids": sorted(args.sample_ids) if args.sample_ids else None,
                 "max_sequence_tokens": args.max_sequence_tokens,
+                "prefill_chunk_tokens": args.prefill_chunk_tokens,
                 "oversize_policy": args.oversize_policy,
                 "learning_rate": args.learning_rate,
                 "gradient_accumulation": args.gradient_accumulation,
@@ -406,14 +424,44 @@ def main() -> None:
                                 {"epoch": epoch, "next_position": position + 1}
                             )
                             continue
-                        total, losses = runtime.losses(teacher, loss_weights)
                         regularization = scale_regularization(parameters, torch)
-                        objective = total + args.scale_regularization * regularization
-                        if not bool(torch.isfinite(objective)):
-                            raise RuntimeError(
-                                f"non-finite recovery loss for {descriptor['id']}"
+                        chunked = (
+                            args.prefill_chunk_tokens > 0
+                            and sequence_tokens > args.prefill_chunk_tokens
+                        )
+                        loss_steps = (
+                            runtime.loss_chunks(
+                                teacher,
+                                args.prefill_chunk_tokens,
+                                loss_weights,
                             )
-                        (objective / args.gradient_accumulation).backward()
+                            if chunked
+                            else (runtime.losses(teacher, loss_weights),)
+                        )
+                        sample_metrics: dict[str, float] = {}
+                        objective_value = 0.0
+                        chunks_seen = 0
+                        for chunks_seen, (total, losses) in enumerate(loss_steps, 1):
+                            objective = total
+                            if chunks_seen == 1:
+                                objective = objective + (
+                                    args.scale_regularization * regularization
+                                )
+                            if not bool(torch.isfinite(objective)):
+                                raise RuntimeError(
+                                    f"non-finite recovery loss for {descriptor['id']}"
+                                )
+                            (objective / args.gradient_accumulation).backward()
+                            objective_value += float(objective.detach().float().cpu())
+                            for name, value in losses.items():
+                                sample_metrics[name] = sample_metrics.get(name, 0.0) + float(
+                                    value.detach().float().cpu()
+                                )
+                            del total, losses, objective
+                        if chunks_seen == 0:
+                            raise RuntimeError(
+                                f"recovery produced no loss chunks for {descriptor['id']}"
+                            )
                         accumulated += 1
                         last_trained = (
                             position + 1,
@@ -422,16 +470,12 @@ def main() -> None:
                         )
                         cursor["samples_seen"] += 1
                         cursor.update({"epoch": epoch, "next_position": position + 1})
-                        item_metrics = {
-                            name: float(value.detach().float().cpu())
-                            for name, value in losses.items()
-                        }
-                        item_metrics["objective"] = float(
-                            objective.detach().float().cpu()
-                        )
+                        item_metrics = sample_metrics
+                        item_metrics["objective"] = objective_value
                         item_metrics["regularization"] = float(
                             regularization.detach().float().cpu()
                         )
+                        item_metrics["prefill_chunks"] = float(chunks_seen)
                         recent_metrics.append(item_metrics)
                         if len(recent_metrics) > 100:
                             recent_metrics.pop(0)
@@ -444,7 +488,7 @@ def main() -> None:
                             )
                             if bounded_stop:
                                 break
-                        del teacher, total, losses, objective, regularization
+                        del teacher, regularization, loss_steps, sample_metrics
                     if bounded_stop:
                         break
                     if accumulated:
