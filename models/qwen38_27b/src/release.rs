@@ -13,6 +13,10 @@ use crate::config::{Qwen38Config, MODEL_ID};
 use crate::format::RecoveryMode;
 use crate::loader::ModelArtifact;
 use crate::memory::{LinearStateDType, SpeculativeStateStrategy};
+use crate::tokenizer::{
+    Qwen38Tokenizer, CHAT_TEMPLATE_SHA256, END_OF_TEXT_ID, IM_END_ID, IM_START_ID, THINK_END_ID,
+    THINK_START_ID, TOKENIZER_SHA256,
+};
 use crate::{EngineError, Result};
 
 pub const RELEASE_FORMAT: &str = "ctox.model-release.v2";
@@ -378,6 +382,35 @@ impl MemoryProfile {
 }
 
 impl ReleaseManifest {
+    pub fn load_tokenizer(&self, release_root: &Path) -> Result<Qwen38Tokenizer> {
+        self.validate()?;
+        let tokenizer_file = self.tokenizer_file("tokenizer.json")?;
+        let chat_template_file = self.tokenizer_file("chat_template.jinja")?;
+        let tokenizer_bytes = tokenizer_file.read_verified(release_root)?;
+        let chat_template_bytes = chat_template_file.read_verified(release_root)?;
+        Qwen38Tokenizer::from_release_bytes(
+            tokenizer_bytes,
+            chat_template_bytes,
+            &tokenizer_file.sha256,
+            &self.tokenizer.chat_template_sha256,
+        )
+    }
+
+    fn tokenizer_file(&self, name: &str) -> Result<&ReleaseFile> {
+        let mut matches = self.tokenizer.files.iter().filter(|file| {
+            Path::new(&file.relative_path)
+                .file_name()
+                .is_some_and(|file_name| file_name == name)
+        });
+        let file = matches.next().ok_or_else(|| {
+            EngineError::InvalidArtifact(format!("tokenizer release has no {name}"))
+        })?;
+        if matches.next().is_some() {
+            return invalid(format!("tokenizer release has multiple {name} files"));
+        }
+        Ok(file)
+    }
+
     pub fn load_mtp_draft_token_ids(&self, release_root: &Path) -> Result<Vec<u32>> {
         self.validate()?;
         let identity = &self.model.mtp.draft_vocabulary;
@@ -552,7 +585,7 @@ impl ReleaseManifest {
             return invalid("MTP draft vocabulary identity is invalid");
         }
         if !valid_sha256(&self.tokenizer.tokenizer_root_sha256)
-            || !valid_sha256(&self.tokenizer.chat_template_sha256)
+            || self.tokenizer.chat_template_sha256 != CHAT_TEMPLATE_SHA256
             || self.tokenizer.reasoning_format.is_empty()
             || self.tokenizer.tool_call_format.is_empty()
             || self.tokenizer.special_tokens.is_empty()
@@ -571,6 +604,22 @@ impl ReleaseManifest {
                 return invalid("special token names and ids must be unique and non-empty");
             }
         }
+        for (name, id, text) in [
+            ("end_of_text", END_OF_TEXT_ID, "<|endoftext|>"),
+            ("im_start", IM_START_ID, "<|im_start|>"),
+            ("im_end", IM_END_ID, "<|im_end|>"),
+            ("think_start", THINK_START_ID, "<think>"),
+            ("think_end", THINK_END_ID, "</think>"),
+        ] {
+            if !self
+                .tokenizer
+                .special_tokens
+                .iter()
+                .any(|token| token.name == name && token.id == id && token.text == text)
+            {
+                return invalid(format!("required Qwen special token {name} differs"));
+            }
+        }
         let mut file_paths = HashSet::new();
         file_paths.insert(&draft_vocabulary.token_ids.relative_path);
         for file in &self.tokenizer.files {
@@ -578,6 +627,14 @@ impl ReleaseManifest {
             if !file_paths.insert(&file.relative_path) {
                 return invalid("release file paths must be globally unique");
             }
+        }
+        let tokenizer_file = self.tokenizer_file("tokenizer.json")?;
+        let chat_template_file = self.tokenizer_file("chat_template.jinja")?;
+        if tokenizer_file.sha256 != TOKENIZER_SHA256
+            || chat_template_file.sha256 != CHAT_TEMPLATE_SHA256
+            || chat_template_file.sha256 != self.tokenizer.chat_template_sha256
+        {
+            return invalid("tokenizer or chat-template file differs from the pinned model");
         }
 
         let mut package_ids = HashSet::new();
@@ -769,6 +826,20 @@ mod tests {
         }
     }
 
+    fn pinned_file(path: &str, bytes: u64, sha256: &str) -> ReleaseFile {
+        ReleaseFile {
+            relative_path: path.into(),
+            bytes,
+            sha256: sha256.into(),
+            chunks: vec![FileChunk {
+                index: 0,
+                offset: 0,
+                length: bytes,
+                sha256: sha256.into(),
+            }],
+        }
+    }
+
     fn manifest() -> ReleaseManifest {
         let pack = BackendPack {
             pack_id: "text-cuda-sm86".into(),
@@ -829,15 +900,40 @@ mod tests {
             },
             tokenizer: TokenizerContract {
                 tokenizer_root_sha256: digest('2'),
-                chat_template_sha256: digest('3'),
+                chat_template_sha256: CHAT_TEMPLATE_SHA256.into(),
                 reasoning_format: "qwen38_reasoning_v1".into(),
                 tool_call_format: "qwen38_tool_call_v1".into(),
-                special_tokens: vec![SpecialToken {
-                    name: "eos".into(),
-                    id: 1,
-                    text: "<eos>".into(),
-                }],
-                files: vec![file("tokenizer/tokenizer.json", 1024, '4')],
+                special_tokens: vec![
+                    SpecialToken {
+                        name: "end_of_text".into(),
+                        id: END_OF_TEXT_ID,
+                        text: "<|endoftext|>".into(),
+                    },
+                    SpecialToken {
+                        name: "im_start".into(),
+                        id: IM_START_ID,
+                        text: "<|im_start|>".into(),
+                    },
+                    SpecialToken {
+                        name: "im_end".into(),
+                        id: IM_END_ID,
+                        text: "<|im_end|>".into(),
+                    },
+                    SpecialToken {
+                        name: "think_start".into(),
+                        id: THINK_START_ID,
+                        text: "<think>".into(),
+                    },
+                    SpecialToken {
+                        name: "think_end".into(),
+                        id: THINK_END_ID,
+                        text: "</think>".into(),
+                    },
+                ],
+                files: vec![
+                    pinned_file("tokenizer/tokenizer.json", 12_809_320, TOKENIZER_SHA256),
+                    pinned_file("tokenizer/chat_template.jinja", 8_952, CHAT_TEMPLATE_SHA256),
+                ],
             },
             packages: vec![ReleasePackage {
                 package_id: "text-mtp".into(),
@@ -967,6 +1063,40 @@ mod tests {
         let mut changed = decoded;
         changed.tokenizer.chat_template_sha256 = digest('5');
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn release_requires_the_pinned_tokenizer_assets_and_special_tokens() {
+        let mut wrong_tokenizer = manifest();
+        let file = wrong_tokenizer
+            .tokenizer
+            .files
+            .iter_mut()
+            .find(|file| file.relative_path.ends_with("tokenizer.json"))
+            .unwrap();
+        file.sha256 = digest('7');
+        file.chunks[0].sha256 = digest('7');
+        wrong_tokenizer.seal_unsigned().unwrap();
+        assert!(wrong_tokenizer.validate().is_err());
+
+        let mut missing_template = manifest();
+        missing_template
+            .tokenizer
+            .files
+            .retain(|file| !file.relative_path.ends_with("chat_template.jinja"));
+        missing_template.seal_unsigned().unwrap();
+        assert!(missing_template.validate().is_err());
+
+        let mut wrong_special_token = manifest();
+        wrong_special_token
+            .tokenizer
+            .special_tokens
+            .iter_mut()
+            .find(|token| token.name == "think_end")
+            .unwrap()
+            .id -= 1;
+        wrong_special_token.seal_unsigned().unwrap();
+        assert!(wrong_special_token.validate().is_err());
     }
 
     #[test]

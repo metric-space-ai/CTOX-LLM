@@ -33,6 +33,12 @@ fails closed on coding, domain, language, or overall coverage gaps.
 At engine load, the signed relative path is resolved below the installation
 root; symlink escape, byte-size drift, whole-file digest drift, chunk drift,
 non-increasing IDs, and out-of-vocabulary IDs all fail before backend loading.
+The tokenizer contract additionally requires exactly one `tokenizer.json` and
+one `chat_template.jinja` with the immutable Qwen3.8-27B hashes, plus the exact
+end-of-text, message-boundary, and thinking token IDs. `load_tokenizer` reads
+both through the same byte/chunk verifier and constructs the Rust tokenizer
+from those verified bytes; an alternate tokenizer cannot be selected through
+a backend pack.
 The validator rejects backend requantization, more than one resident full-model
 copy, a retained full CPU copy, unsafe paths, chunk gaps, duplicate IDs,
 unprofiled packs, or a calculated peak above the declared hard limit.

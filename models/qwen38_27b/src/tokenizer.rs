@@ -43,13 +43,29 @@ impl Qwen38Tokenizer {
         require_sha256(expected_tokenizer_sha256, "tokenizer")?;
         require_sha256(expected_chat_template_sha256, "chat template")?;
         let encoded = fs::read(tokenizer_path)?;
+        let chat_template = fs::read(chat_template_path)?;
+        Self::from_release_bytes(
+            encoded,
+            chat_template,
+            expected_tokenizer_sha256,
+            expected_chat_template_sha256,
+        )
+    }
+
+    pub fn from_release_bytes(
+        encoded: Vec<u8>,
+        chat_template: Vec<u8>,
+        expected_tokenizer_sha256: &str,
+        expected_chat_template_sha256: &str,
+    ) -> Result<Self> {
+        require_sha256(expected_tokenizer_sha256, "tokenizer")?;
+        require_sha256(expected_chat_template_sha256, "chat template")?;
         let sha256 = format!("{:x}", Sha256::digest(&encoded));
         if sha256 != expected_tokenizer_sha256 || sha256 != TOKENIZER_SHA256 {
             return Err(EngineError::InvalidArtifact(format!(
                 "tokenizer SHA-256 differs: expected {expected_tokenizer_sha256}, pinned {TOKENIZER_SHA256}, observed {sha256}"
             )));
         }
-        let chat_template = fs::read(chat_template_path)?;
         let chat_template_sha256 = format!("{:x}", Sha256::digest(&chat_template));
         if chat_template_sha256 != expected_chat_template_sha256
             || chat_template_sha256 != CHAT_TEMPLATE_SHA256
