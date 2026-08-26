@@ -24,8 +24,8 @@ use crate::backend::cuda_runtime::{
     PreparedCudaRmsNorm,
 };
 use crate::backend::cuda_schedule::{
-    CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaNormBinding, CudaPrefillOperation,
-    CudaPrefillSchedule, CudaPrefillStep,
+    CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaNormBinding, CudaPrefillChunk,
+    CudaPrefillOperation, CudaPrefillSchedule, CudaPrefillStep,
 };
 use crate::backend::{Activation, ScaleSlice};
 use crate::config::LayerKind;
@@ -95,6 +95,19 @@ pub struct CudaPrefillBindingPlan {
     steps: Vec<CudaBoundPrefillStep>,
     max_chunk_tokens: usize,
     projection_workspace: CudaPrefillProjectionWorkspacePlan,
+}
+
+/// Fail-closed progress tracker for one bound prefill chunk.
+///
+/// A caller may commit the returned token position only after advancing every
+/// bound operation, including the sole final chunk barrier. This object does
+/// not execute kernels itself; it prevents the production executor from
+/// silently skipping, duplicating, or reordering a model-specific dispatch.
+#[derive(Debug)]
+pub struct CudaPrefillExecutionCursor<'a> {
+    plan: &'a CudaPrefillBindingPlan,
+    chunk: CudaPrefillChunk,
+    next_step: usize,
 }
 
 /// Exact bytes for the shared full-attention prefill scratch admitted with a
@@ -604,6 +617,48 @@ impl CudaPrefillBindingPlan {
         self.projection_workspace
     }
 
+    pub fn execution_cursor(
+        &self,
+        chunk: CudaPrefillChunk,
+        committed_tokens: usize,
+        admitted_context: usize,
+    ) -> Result<CudaPrefillExecutionCursor<'_>> {
+        if chunk.token_count == 0 || chunk.token_count > self.max_chunk_tokens {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA prefill chunk has {} tokens, capacity is {}",
+                chunk.token_count, self.max_chunk_tokens
+            )));
+        }
+        if chunk.start_position != committed_tokens {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA prefill chunk starts at {}, but {} tokens are committed",
+                chunk.start_position, committed_tokens
+            )));
+        }
+        let end_position = chunk
+            .start_position
+            .checked_add(chunk.token_count)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA prefill chunk end overflows".into()))?;
+        if end_position > admitted_context {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA prefill chunk ends at {end_position}, admitted context is {admitted_context}"
+            )));
+        }
+        if self.steps.last().is_none_or(|step| {
+            step.operation != CudaPrefillOperation::ChunkBarrier
+                || step.schedule_index + 1 != self.steps.len()
+        }) {
+            return Err(EngineError::InvalidState(
+                "CUDA prefill binding has no sole final chunk barrier".into(),
+            ));
+        }
+        Ok(CudaPrefillExecutionCursor {
+            plan: self,
+            chunk,
+            next_step: 0,
+        })
+    }
+
     pub fn resource_count(&self, expected: fn(&CudaPreparedResource) -> bool) -> usize {
         self.steps
             .iter()
@@ -629,6 +684,57 @@ impl CudaPrefillBindingPlan {
             .flat_map(|step| step.resources.iter().cloned())
             .collect();
         validate_complete_resource_ownership("prefill", &resources, projections, config)
+    }
+}
+
+impl<'a> CudaPrefillExecutionCursor<'a> {
+    pub fn chunk(&self) -> CudaPrefillChunk {
+        self.chunk
+    }
+
+    pub fn next_step(&self) -> Option<&'a CudaBoundPrefillStep> {
+        self.plan.steps.get(self.next_step)
+    }
+
+    /// Record one successfully dispatched operation. The caller must pass the
+    /// identity of the operation it actually launched, after the CUDA driver
+    /// accepted that launch.
+    pub fn advance(
+        &mut self,
+        schedule_index: usize,
+        layer: Option<usize>,
+        operation: CudaPrefillOperation,
+    ) -> Result<()> {
+        let expected = self.next_step().ok_or_else(|| {
+            EngineError::InvalidState("CUDA prefill chunk is already complete".into())
+        })?;
+        if expected.schedule_index != schedule_index
+            || expected.layer != layer
+            || expected.operation != operation
+        {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA prefill expected step {} {:?} layer {:?}, received step {schedule_index} {operation:?} layer {layer:?}",
+                expected.schedule_index, expected.operation, expected.layer
+            )));
+        }
+        self.next_step += 1;
+        Ok(())
+    }
+
+    /// Return the new committed token position only after all 645 operations
+    /// and the final host-visible barrier have completed in order.
+    pub fn finish(self) -> Result<usize> {
+        if self.next_step != self.plan.steps.len() {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA prefill chunk completed {} of {} bound steps",
+                self.next_step,
+                self.plan.steps.len()
+            )));
+        }
+        self.chunk
+            .start_position
+            .checked_add(self.chunk.token_count)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA prefill commit overflows".into()))
     }
 }
 
@@ -3526,6 +3632,70 @@ mod tests {
             }),
             130
         );
+    }
+
+    #[test]
+    fn prefill_execution_cursor_commits_only_after_all_bound_steps() {
+        let config = Qwen38Config::default();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let schedule = CudaPrefillSchedule::qwen38(&config, 512).unwrap();
+        let bindings = CudaPrefillBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
+        let chunk = CudaPrefillChunk {
+            start_position: 512,
+            token_count: 137,
+        };
+        let mut cursor = bindings.execution_cursor(chunk, 512, 131_072).unwrap();
+        assert_eq!(cursor.chunk(), chunk);
+        while let Some(step) = cursor.next_step() {
+            let (schedule_index, layer, operation) =
+                (step.schedule_index, step.layer, step.operation);
+            cursor.advance(schedule_index, layer, operation).unwrap();
+        }
+        assert_eq!(cursor.finish().unwrap(), 649);
+    }
+
+    #[test]
+    fn prefill_execution_cursor_rejects_wrong_order_and_partial_commit() {
+        let config = Qwen38Config::default();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let schedule = CudaPrefillSchedule::qwen38(&config, 512).unwrap();
+        let bindings = CudaPrefillBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
+        let chunk = CudaPrefillChunk {
+            start_position: 0,
+            token_count: 512,
+        };
+        let mut cursor = bindings.execution_cursor(chunk, 0, 512).unwrap();
+        let first = cursor.next_step().unwrap();
+        assert!(cursor
+            .advance(first.schedule_index + 1, first.layer, first.operation)
+            .is_err());
+        assert_eq!(cursor.next_step().unwrap().schedule_index, 0);
+        cursor
+            .advance(first.schedule_index, first.layer, first.operation)
+            .unwrap();
+        assert!(cursor.finish().is_err());
+
+        assert!(bindings.execution_cursor(chunk, 1, 512).is_err());
+        assert!(bindings
+            .execution_cursor(
+                CudaPrefillChunk {
+                    start_position: 0,
+                    token_count: 513,
+                },
+                0,
+                1_024,
+            )
+            .is_err());
+        assert!(bindings
+            .execution_cursor(
+                CudaPrefillChunk {
+                    start_position: 500,
+                    token_count: 20,
+                },
+                500,
+                512,
+            )
+            .is_err());
     }
 
     #[test]

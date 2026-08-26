@@ -109,8 +109,15 @@ coding, agentic/tool-calling, ordinary chat, mathematics, and genuine 32K/128K
 quotas. Three over-96K examples are isolated in token-bounded batches. The
 previous 167-sample activation artifact overlaps only 15 final-training
 identities and six primary domains, so it is superseded as a release assignment
-basis. Six immutable all-506-matrix collection batches are queued on GPU1+2;
-the final sensitivity result remains open until all six verifier reports pass.
+basis. All six immutable all-506-matrix collection batches ran on GPU1+2 and
+their verifier reports passed. The frozen result in
+[`docs/ACTIVATION_CALIBRATION_RESULT_V1.json`](docs/ACTIVATION_CALIBRATION_RESULT_V1.json)
+uses the complete 256-sample/917,704-token basis to assign 381 full-Q2, 123
+full-Q4, and two mixed matrices. Embedding keeps 857 of 970 row groups at Q2;
+the measured LM-head error keeps all 970 row groups at Q4. Six iterations of
+fixed-code channel-scale fitting reduce the global activation-weighted error by
+48.27%, and the fully checksummed text+MTP pack is 8,373,658,112 bytes. This is
+the release-corpus initializer, not the final KL/CE/hidden/MTP-trained model.
 
 The signed, backend-neutral release and memory-admission schema is implemented
 in `src/release.rs` and documented in
@@ -306,8 +313,11 @@ fit four conflict-free output slots plus one maximum-width A8 encoding slot:
 that arena because prefill consumes only its final prompt row. The graph now
 allocates this arena once and binds compact offset views to the MMQ dispatcher;
 a mixed-Q2/Q4 A4500 run using a workspace twice as wide as the active matrix is
-bit-identical to the established MMQ graph path. Executor schedule wiring and
-complete-graph hardware verification remain open. The
+bit-identical to the established MMQ graph path. A fail-closed execution cursor
+now admits a chunk only at the exact committed position and releases its new
+commit position only after all 645 bound operations and the final barrier have
+completed in order. Kernel dispatch wiring and complete-graph hardware
+verification remain open. The
 standalone MMQ verifier exercises this same graph-facing path and the shared
 two-buffer batched RMSNorm workspace. The first causal-convolution scan now
 matches sequential CUDA output and final FP16 state bit-for-bit across a

@@ -1,0 +1,98 @@
+{
+  "format": "ctox.qwen38.activation-calibration-result.v1",
+  "date": "2026-08-26",
+  "status": "release_corpus_channel_scale_initializer",
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "activation_corpus": {
+    "samples": 256,
+    "observed_tokens": 917704,
+    "observed_quantized_matrices": 506,
+    "unobserved_quantized_matrices": 0,
+    "tensor_fields_per_batch": 1515,
+    "merged_artifact": "release-activation-calibration-256-merged-v1.safetensors",
+    "merged_artifact_bytes": 31916608,
+    "merged_artifact_sha256": "afa7813028613464d4eaaf8db7d43e14277aaca725c079e441696b0daa46970d",
+    "batches": [
+      {"index": 0, "samples": 192, "tokens": 108427, "bytes": 31909832, "sha256": "f844f742e8a7c204a60bf6a5bb6cc940f5c6639030d7372c6a93c129634821f9", "status": "passed"},
+      {"index": 1, "samples": 16, "tokens": 92118, "bytes": 31897688, "sha256": "908390943e35771a37a19410becc9e53d1ee12eb4ab85c8787ff3fbf0f91f558", "status": "passed"},
+      {"index": 2, "samples": 2, "tokens": 163478, "bytes": 31896816, "sha256": "3c464e71325de7264459f39a91084f7f44af6505007806626671ae9166168db1", "status": "passed"},
+      {"index": 3, "samples": 5, "tokens": 164842, "bytes": 31897024, "sha256": "635810aafc9e87536b6f2dee49313db9b621d0b7ad465795d52a224c86ff8883", "status": "passed"},
+      {"index": 4, "samples": 15, "tokens": 193995, "bytes": 31897712, "sha256": "84e3aef8d3094e3d0f38d3446b784e2b5e75cc273f7363678f0b23059f11944a", "status": "passed"},
+      {"index": 5, "samples": 26, "tokens": 194844, "bytes": 31898472, "sha256": "85cdf6bc52e46f1c9d32fe90b42240f728aba5f86c3920ae828c429b142a6628", "status": "passed"}
+    ]
+  },
+  "sensitivity": {
+    "artifact": "release-activation-calibration-256-all506-v1.json",
+    "artifact_bytes": 1179429,
+    "artifact_sha256": "cf9a2f5e50d15b38e00e8122877a952f9df09de88246dbf3cd3b662090857bda",
+    "candidates": 506,
+    "selection_policy": "activation-weighted Q2-to-Q4 quality gain per added packed byte",
+    "embedding_q2_relative_error": 2.352015208346987,
+    "embedding_q4_relative_error": 0.06953543594932575,
+    "lm_head_q2_relative_error": 0.13784470322552383,
+    "lm_head_q4_relative_error": 0.005312044650574436
+  },
+  "assignment": {
+    "artifact": "release-activation-calibration-256-all506-v1.json",
+    "artifact_bytes": 391689,
+    "artifact_sha256": "622a514959acb90b981d14d695790c27ca249a2e93dc294633eacecede5290d5",
+    "full_q2_matrices": 381,
+    "full_q4_matrices": 123,
+    "mixed_matrices": 2,
+    "embedding_row_groups": 970,
+    "embedding_q2_row_groups": 857,
+    "embedding_q4_row_groups": 113,
+    "lm_head_row_groups": 970,
+    "lm_head_q2_row_groups": 0,
+    "lm_head_q4_row_groups": 970,
+    "all_q2_base_bytes": 7704421376,
+    "resident_weights_bytes": 8373052416,
+    "resident_limit_bytes": 8373089075,
+    "resident_headroom_bytes": 36659
+  },
+  "channel_scale_fit": {
+    "algorithm": "activation-weighted-positive-alternating-least-squares",
+    "logical_qcodes": "fixed",
+    "iterations": 6,
+    "fitted_matrices": 506,
+    "non_improved_matrices": 0,
+    "mean_matrix_error_ratio": 0.5942112350137139,
+    "minimum_matrix_error_ratio": 0.05310477844378569,
+    "maximum_matrix_error_ratio": 0.9859950152237147,
+    "global_weighted_error_ratio": 0.5173179527201489,
+    "global_weighted_error_reduction": 0.4826820472798511,
+    "artifact": "release-activation-calibration-256-all506-scale-fit-v1.safetensors",
+    "artifact_bytes": 15982432,
+    "artifact_sha256": "c6cd06556af4811f51f28111c1935504087cfddd31f35b5325ad74fd9bdf0562",
+    "report_sha256": "1ce2eadc77d9b27261a681ab40ffee487f968b1d3c6ae680b73b657cc16d9f67"
+  },
+  "packed_checkpoint": {
+    "artifact": "release-activation-calibration-256-all506-scale-fit-v1.ctoxq",
+    "artifact_bytes": 8373658112,
+    "artifact_gib": 7.798576831817627,
+    "artifact_sha256": "6ee2bb2dd5802d69847c878715e678c4da43191ee276ca749e6691458e41bd27",
+    "package_limit_bytes": 8375186227,
+    "package_headroom_bytes": 1528115,
+    "tensors": 1878,
+    "target": "canonical-b64",
+    "mtp": "resident",
+    "vision": "separate"
+  },
+  "verification": {
+    "checksum_policy": "all_tensors",
+    "rust_tensor_contract": "passed",
+    "recovery_provenance": "passed",
+    "fixed_logical_qcodes": true,
+    "calculated_fold_128k_total_bytes": 10311869440,
+    "calculated_fold_128k_total_gib": 9.603676795959473,
+    "fold_target_bytes": 10415295693,
+    "fold_hard_limit_bytes": 10737418240
+  },
+  "limitations": [
+    "This is the release-corpus Q2/Q4 assignment and deterministic channel-scale initializer, not the end-to-end recovered release checkpoint.",
+    "Logit-KL, cross-entropy, selected hidden-state, activation-reconstruction, and explicit MTP recovery training are still pending on the complete teacher cache.",
+    "The quality and 128K retrieval gates have not run against the held-out 642-sample cohort.",
+    "The Fold memory value is a calculated whole-process plan, not measured Android PSS or accelerator residency."
+  ]
+}
