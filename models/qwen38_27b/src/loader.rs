@@ -7,10 +7,11 @@ use memmap2::{Mmap, MmapOptions};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
+use crate::fanout::{qwen38_fanout_groups, FanoutGroup, QWEN38_FANOUT_POLICY};
 use crate::format::{
     FileHeader, ModelManifest, QuantSegment, TensorDType, TensorEntry, HEADER_BYTES,
 };
-use crate::{EngineError, Result};
+use crate::{EngineError, Qwen38Config, Result};
 use half::f16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +288,7 @@ impl ModelArtifact {
             manifest_sha256,
             tensor_indices,
         };
+        artifact.verify_recovery_fanout()?;
         if checksum_policy == ChecksumPolicy::AllTensors {
             artifact.verify_checksums()?;
         }
@@ -299,6 +301,20 @@ impl ModelArtifact {
 
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+
+    /// A bound shared-A8 policy is accepted only when every mmap-backed FP16
+    /// input correction in each frozen fan-out group is byte-identical.
+    pub fn verify_recovery_fanout(&self) -> Result<()> {
+        let Some(recovery) = &self.manifest.recovery else {
+            return Ok(());
+        };
+        if recovery.fanout_s_in_policy.as_deref() != Some(QWEN38_FANOUT_POLICY) {
+            return Ok(());
+        }
+        verify_fanout_scale_bytes(&qwen38_fanout_groups(&Qwen38Config::default()), |name| {
+            self.tensor_bytes(name)
+        })
     }
 
     pub fn file_bytes(&self) -> u64 {
@@ -393,6 +409,28 @@ impl ModelArtifact {
         }
         Ok(())
     }
+}
+
+fn verify_fanout_scale_bytes<'a, F>(groups: &[FanoutGroup], mut resolve: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<&'a [u8]>,
+{
+    for group in groups {
+        let mut names = group.scale_names.iter();
+        let first_name = names.next().ok_or_else(|| {
+            EngineError::InvalidArtifact("recovery fan-out group is empty".into())
+        })?;
+        let reference = resolve(first_name)?;
+        for name in names {
+            if resolve(name)? != reference {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "recovery fan-out scales differ at {}",
+                    group.prefix
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -504,6 +542,22 @@ mod tests {
         assert!(view.as_recovery_scales().is_err());
         let nonfinite = f32::NAN.to_le_bytes();
         assert!(FloatTensorView::F32Le(&nonfinite).value(0).is_err());
+    }
+
+    #[test]
+    fn fanout_scale_verifier_rejects_one_different_byte() {
+        let groups = [FanoutGroup {
+            kind: "test",
+            prefix: "layer.attn".into(),
+            scale_names: vec!["q.s_in".into(), "k.s_in".into(), "v.s_in".into()],
+        }];
+        let equal = [1_u8, 2, 3, 4];
+        let different = [1_u8, 2, 3, 5];
+        assert!(verify_fanout_scale_bytes(&groups, |_name| Ok(&equal)).is_ok());
+        assert!(verify_fanout_scale_bytes(&groups, |name| {
+            Ok(if name == "v.s_in" { &different } else { &equal })
+        })
+        .is_err());
     }
 
     #[test]

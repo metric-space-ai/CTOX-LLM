@@ -74,3 +74,8 @@ required-features = ["cuda"]
 name = "qwen38-cuda-row-bench"
 path = "src/bin/cuda_row_bench.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "qwen38-cuda-fanout-bench"
+path = "src/bin/cuda_fanout_bench.rs"
+required-features = ["cuda"]

@@ -100,11 +100,17 @@ quantizes each 64-value activation block to signed int8 with one f32 scale,
 and runs half-warp-per-row Q2/Q4 `dp4a` matvecs. The logical Q2/Q4 weight codes
 are unchanged; there is no backend-specific weight requantization, and A8
 buffers are transient rather than serialized model state. The current prepared
-object retains that activation only for one projection. Repeated benchmark
-dispatches reuse the same matrix; they do not yet prove cross-matrix Q/K/V or
-gate/up sharing. Such sharing is legal only for a checkpoint carrying the
-`qwen38_fanout_s_in_v1` contract, whose participating FP16 `s_in` tensors are
-byte-identical, and still requires a dedicated shared-activation dispatcher.
+object retains that activation only for one projection. A separate
+shared-activation dispatcher now owns one corrected input, one transient A8
+code/scale pair, and matrix-local Q2/Q4 projections. It refuses a projection
+unless the column count, CUDA context, and SHA-256 identity of the exact packed
+FP16 `s_in` bytes match. The loader independently checks all 130 frozen Qwen
+fan-out groups (373 logical `s_in` tensors) when the checkpoint carries the
+`qwen38_fanout_s_in_v1` contract. The host contract, Rust/Python group digest,
+compile path, and negative identity test are validated; the exact Q/K/V-shaped
+GPU verifier has not run yet because GPU 0 is reserved for Greppy and the BF16
+teacher occupies GPU 1+2. No performance evidence is claimed for this new
+dispatcher until that verifier runs on a released device.
 Canonical `MixedQ2Q4B64` tensors use the same transient activation across all
 manifest row groups. The host validates exact contiguous row/byte coverage,
 uploads the original mixed payload once, offsets device pointers into each

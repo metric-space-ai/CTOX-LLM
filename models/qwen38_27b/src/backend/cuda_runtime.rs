@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::slice;
 
 use libloading::Library;
+use sha2::{Digest, Sha256};
 
 use super::cuda::{
     validate_mixed_operation, validate_operation, validate_recovered_row, CudaMixedRowSegment,
@@ -206,6 +207,47 @@ pub struct PreparedCudaMixedA8MatVec {
     output: DeviceBuffer,
     q8_codes: DeviceBuffer,
     q8_scales: DeviceBuffer,
+    resident_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct A8CorrectionIdentity {
+    columns: u32,
+    s_in_sha256: [u8; 32],
+}
+
+/// One corrected input and transient A8 encoding shared by an exact Qwen
+/// fan-out group. It owns no matrix weights or output buffers.
+pub struct PreparedCudaA8Activation {
+    context: Rc<CudaContextInner>,
+    columns: u32,
+    correction_identity: A8CorrectionIdentity,
+    input: DeviceBuffer,
+    s_in: Option<DeviceBuffer>,
+    q8_codes: DeviceBuffer,
+    q8_scales: DeviceBuffer,
+    resident_bytes: usize,
+}
+
+enum CudaA8ProjectionLayout {
+    Pure(TensorDType),
+    Mixed(Vec<CudaMixedRowSegment>),
+}
+
+/// Matrix-local state for a projection that consumes a separately owned,
+/// identity-checked [`PreparedCudaA8Activation`].
+pub struct PreparedCudaA8Projection {
+    context: Rc<CudaContextInner>,
+    dtype: TensorDType,
+    rows: u32,
+    columns: u32,
+    activation: u32,
+    correction_identity: A8CorrectionIdentity,
+    layout: CudaA8ProjectionLayout,
+    weights: DeviceBuffer,
+    s_out: Option<DeviceBuffer>,
+    bias: Option<DeviceBuffer>,
+    output: DeviceBuffer,
     resident_bytes: usize,
 }
 
@@ -647,9 +689,93 @@ impl CudaCandidateRuntime {
         })
     }
 
+    /// Prepares one corrected activation independently of its fan-out
+    /// projections. The exact packed FP16 `s_in` bytes form part of the
+    /// identity checked by every consuming projection.
+    pub fn prepare_shared_a8_activation(
+        &self,
+        operation: &FusedMatVec<'_>,
+    ) -> Result<PreparedCudaA8Activation> {
+        validate_a8_projection_layout(operation)?;
+        let correction_identity = a8_correction_identity(operation.columns, operation.s_in)?;
+        self.make_current()?;
+        let input = DeviceBuffer::from_bytes(self, as_bytes(operation.input))?;
+        let s_in = optional_scale_buffer(self, operation.s_in)?;
+        let q8_codes = DeviceBuffer::allocate(self, operation.columns)?;
+        let q8_scales = DeviceBuffer::allocate(self, a8_scale_bytes(operation.columns)?)?;
+        let resident_bytes = input
+            .len()
+            .checked_add(s_in.as_ref().map_or(0, DeviceBuffer::len))
+            .and_then(|total| total.checked_add(q8_codes.len()))
+            .and_then(|total| total.checked_add(q8_scales.len()))
+            .ok_or_else(|| {
+                EngineError::Shape("shared CUDA A8 activation byte count overflows".into())
+            })?;
+        Ok(PreparedCudaA8Activation {
+            context: Rc::clone(&self.inner),
+            columns: operation.columns as u32,
+            correction_identity,
+            input,
+            s_in,
+            q8_codes,
+            q8_scales,
+            resident_bytes,
+        })
+    }
+
+    /// Prepares matrix-local state without duplicating the input, `s_in`, or
+    /// A8 buffers. Dispatch still fails closed unless its activation carries
+    /// the byte-identical correction identity.
+    pub fn prepare_shared_a8_projection(
+        &self,
+        operation: &FusedMatVec<'_>,
+    ) -> Result<PreparedCudaA8Projection> {
+        let layout = validate_a8_projection_layout(operation)?;
+        let correction_identity = a8_correction_identity(operation.columns, operation.s_in)?;
+        self.make_current()?;
+        let weights = DeviceBuffer::from_bytes(self, operation.weights)?;
+        let s_out = optional_scale_buffer(self, operation.s_out)?;
+        let bias = operation
+            .bias
+            .map(|values| DeviceBuffer::from_bytes(self, as_bytes(values)))
+            .transpose()?;
+        let output_bytes = operation
+            .rows
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::Shape("shared CUDA A8 projection output size overflows".into())
+            })?;
+        let output = DeviceBuffer::allocate(self, output_bytes)?;
+        let resident_bytes = weights
+            .len()
+            .checked_add(s_out.as_ref().map_or(0, DeviceBuffer::len))
+            .and_then(|total| total.checked_add(bias.as_ref().map_or(0, DeviceBuffer::len)))
+            .and_then(|total| total.checked_add(output.len()))
+            .ok_or_else(|| {
+                EngineError::Shape("shared CUDA A8 projection byte count overflows".into())
+            })?;
+        Ok(PreparedCudaA8Projection {
+            context: Rc::clone(&self.inner),
+            dtype: operation.dtype,
+            rows: operation.rows as u32,
+            columns: operation.columns as u32,
+            activation: match operation.activation {
+                Activation::Identity => 0,
+                Activation::Silu => 1,
+            },
+            correction_identity,
+            layout,
+            weights,
+            s_out,
+            bias,
+            output,
+            resident_bytes,
+        })
+    }
+
     /// Quantizes the corrected activation once into symmetric Q8_B64 blocks.
-    /// Callers may share this result across projections that consume the same
-    /// input, such as Q/K/V or gate/up matrices.
+    /// This legacy prepared object remains matrix-local. Use
+    /// [`Self::prepare_shared_a8_activation`] for an actual fan-out.
     pub fn quantize_prepared_a8(&self, prepared: &PreparedCudaA8MatVec) -> Result<()> {
         if !Rc::ptr_eq(&self.inner, &prepared.base.context) {
             return Err(EngineError::InvalidState(
@@ -678,6 +804,151 @@ impl CudaCandidateRuntime {
             prepared.q8_scales.ptr(),
             prepared.columns,
         )
+    }
+
+    pub fn quantize_shared_a8_activation(&self, prepared: &PreparedCudaA8Activation) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared shared CUDA A8 activation belongs to another context".into(),
+            ));
+        }
+        self.launch_a8_quantization(
+            prepared.input.ptr(),
+            prepared.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            prepared.q8_codes.ptr(),
+            prepared.q8_scales.ptr(),
+            prepared.columns,
+        )
+    }
+
+    /// Quantizes one corrected activation, launches every byte-identity-bound
+    /// projection, synchronizes once, and returns outputs in caller order.
+    pub fn dispatch_shared_a8_fanout(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        projections: &[&PreparedCudaA8Projection],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.validate_shared_a8_fanout(activation, projections, 1)?;
+        self.quantize_shared_a8_activation(activation)?;
+        self.dispatch_prepared_shared_a8_fanout_repeated(activation, projections, 1)
+    }
+
+    /// Verifier/roofline variant that replays the complete fan-out without
+    /// requantizing. Production decode uses one dispatch per projection.
+    pub fn dispatch_prepared_shared_a8_fanout_repeated(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        projections: &[&PreparedCudaA8Projection],
+        dispatches: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.validate_shared_a8_fanout(activation, projections, dispatches)?;
+        self.make_current()?;
+        for _ in 0..dispatches {
+            for projection in projections {
+                self.launch_shared_a8_projection(activation, projection)?;
+            }
+        }
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "shared A8 fan-out context synchronization",
+            )?;
+        }
+        projections
+            .iter()
+            .map(|projection| {
+                let mut output = vec![0.0_f32; projection.rows as usize];
+                projection.output.copy_to(as_bytes_mut(&mut output))?;
+                if output.iter().any(|value| !value.is_finite()) {
+                    return Err(EngineError::InvalidState(
+                        "shared CUDA A8 fan-out produced a non-finite output".into(),
+                    ));
+                }
+                Ok(output)
+            })
+            .collect()
+    }
+
+    fn validate_shared_a8_fanout(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        projections: &[&PreparedCudaA8Projection],
+        dispatches: usize,
+    ) -> Result<()> {
+        if dispatches == 0 || projections.is_empty() {
+            return Err(EngineError::Shape(
+                "shared CUDA A8 fan-out requires projections and positive dispatches".into(),
+            ));
+        }
+        if !Rc::ptr_eq(&self.inner, &activation.context) {
+            return Err(EngineError::InvalidState(
+                "prepared shared CUDA A8 activation belongs to another context".into(),
+            ));
+        }
+        for projection in projections {
+            if !Rc::ptr_eq(&self.inner, &projection.context) {
+                return Err(EngineError::InvalidState(
+                    "prepared shared CUDA A8 projection belongs to another context".into(),
+                ));
+            }
+            if projection.columns != activation.columns
+                || projection.correction_identity != activation.correction_identity
+            {
+                return Err(EngineError::InvalidArtifact(
+                    "shared CUDA A8 projection s_in identity differs".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn launch_shared_a8_projection(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        projection: &PreparedCudaA8Projection,
+    ) -> Result<()> {
+        match &projection.layout {
+            CudaA8ProjectionLayout::Pure(dtype) => self.launch_a8_projection(
+                *dtype,
+                projection.weights.ptr(),
+                activation.q8_codes.ptr(),
+                activation.q8_scales.ptr(),
+                projection.s_out.as_ref().map_or(0, DeviceBuffer::ptr),
+                projection.bias.as_ref().map_or(0, DeviceBuffer::ptr),
+                projection.output.ptr(),
+                projection.rows,
+                projection.columns,
+                projection.activation,
+            ),
+            CudaA8ProjectionLayout::Mixed(segments) => {
+                for segment in segments {
+                    let row_start = segment.row_start as usize;
+                    self.launch_a8_projection(
+                        segment.descriptor.dtype,
+                        device_ptr_offset(projection.weights.ptr(), segment.weight_offset)?,
+                        activation.q8_codes.ptr(),
+                        activation.q8_scales.ptr(),
+                        projection
+                            .s_out
+                            .as_ref()
+                            .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 2))
+                            .transpose()?
+                            .unwrap_or(0),
+                        projection
+                            .bias
+                            .as_ref()
+                            .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 4))
+                            .transpose()?
+                            .unwrap_or(0),
+                        device_ptr_offset(projection.output.ptr(), row_start * 4)?,
+                        segment.row_count,
+                        projection.columns,
+                        projection.activation,
+                    )?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn launch_a8_quantization(
@@ -1095,6 +1366,50 @@ impl PreparedCudaMixedA8MatVec {
     }
 }
 
+impl PreparedCudaA8Activation {
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        if input.len() != self.columns() {
+            return Err(EngineError::Shape(format!(
+                "shared CUDA A8 input has {} values, expected {}",
+                input.len(),
+                self.columns()
+            )));
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidArtifact(
+                "shared CUDA A8 input contains a non-finite value".into(),
+            ));
+        }
+        self.input.write(as_bytes(input))
+    }
+}
+
+impl PreparedCudaA8Projection {
+    pub fn dtype(&self) -> TensorDType {
+        self.dtype
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows as usize
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+}
+
 impl PreparedCudaRecoveredRow {
     pub fn dtype(&self) -> TensorDType {
         self.dtype
@@ -1293,6 +1608,58 @@ fn a8_scale_bytes(columns: usize) -> Result<usize> {
         .ok_or_else(|| EngineError::Shape("CUDA A8 scale size overflows usize".into()))
 }
 
+fn validate_a8_projection_layout(operation: &FusedMatVec<'_>) -> Result<CudaA8ProjectionLayout> {
+    match operation.dtype {
+        TensorDType::MixedQ2Q4B64 => {
+            validate_mixed_operation(operation).map(CudaA8ProjectionLayout::Mixed)
+        }
+        TensorDType::Q2B64 | TensorDType::Q4B64 => {
+            validate_operation(operation)?;
+            Ok(CudaA8ProjectionLayout::Pure(operation.dtype))
+        }
+        _ => Err(EngineError::UnsupportedDType(format!(
+            "CUDA A8 projection does not support {:?}",
+            operation.dtype
+        ))),
+    }
+}
+
+fn a8_correction_identity(
+    columns: usize,
+    s_in: Option<ScaleSlice<'_>>,
+) -> Result<A8CorrectionIdentity> {
+    let columns_u32 = u32::try_from(columns)
+        .map_err(|_| EngineError::Shape("CUDA A8 columns exceed u32".into()))?;
+    let mut digest = Sha256::new();
+    digest.update(b"ctox.cuda.a8-correction-identity.v1\0");
+    digest.update(columns_u32.to_le_bytes());
+    match s_in {
+        None => digest.update([0]),
+        Some(ScaleSlice::F16Le(bytes)) => {
+            let expected = columns
+                .checked_mul(2)
+                .ok_or_else(|| EngineError::Shape("CUDA A8 s_in size overflows".into()))?;
+            if bytes.len() != expected {
+                return Err(EngineError::Shape(format!(
+                    "CUDA A8 s_in has {} bytes, expected {expected}",
+                    bytes.len()
+                )));
+            }
+            digest.update([1]);
+            digest.update(bytes);
+        }
+        Some(ScaleSlice::F32(_)) => {
+            return Err(EngineError::UnsupportedDType(
+                "CUDA A8 correction identity requires packed FP16 s_in".into(),
+            ));
+        }
+    }
+    Ok(A8CorrectionIdentity {
+        columns: columns_u32,
+        s_in_sha256: digest.finalize().into(),
+    })
+}
+
 fn device_ptr_offset(base: CuDevicePtr, offset: usize) -> Result<CuDevicePtr> {
     let offset = u64::try_from(offset)
         .map_err(|_| EngineError::Shape("CUDA device pointer offset exceeds u64".into()))?;
@@ -1331,6 +1698,27 @@ mod tests {
     }
 
     #[test]
+    fn shared_a8_identity_requires_exact_packed_s_in_bytes() {
+        let one = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let two = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let mut first = one.repeat(64);
+        let second = first.clone();
+        let identity = a8_correction_identity(64, Some(ScaleSlice::F16Le(&first))).unwrap();
+        assert_eq!(
+            identity,
+            a8_correction_identity(64, Some(ScaleSlice::F16Le(&second))).unwrap()
+        );
+        first[..2].copy_from_slice(&two);
+        assert_ne!(
+            identity,
+            a8_correction_identity(64, Some(ScaleSlice::F16Le(&first))).unwrap()
+        );
+        assert_ne!(identity, a8_correction_identity(64, None).unwrap());
+        assert!(a8_correction_identity(64, Some(ScaleSlice::F32(&[1.0; 64]))).is_err());
+        assert!(a8_correction_identity(64, Some(ScaleSlice::F16Le(&second[..126]))).is_err());
+    }
+
+    #[test]
     fn checked_device_pointer_offsets_fail_closed() {
         assert_eq!(device_ptr_offset(1_024, 256).unwrap(), 1_280);
         assert!(device_ptr_offset(u64::MAX, 1).is_err());
@@ -1355,6 +1743,8 @@ mod tests {
         assert_owned::<PreparedCudaMatVec>();
         assert_owned::<PreparedCudaA8MatVec>();
         assert_owned::<PreparedCudaMixedA8MatVec>();
+        assert_owned::<PreparedCudaA8Activation>();
+        assert_owned::<PreparedCudaA8Projection>();
         assert_owned::<PreparedCudaRecoveredRow>();
     }
 }

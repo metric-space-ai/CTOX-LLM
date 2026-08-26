@@ -6,7 +6,12 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::fanout::{
+    fanout_group_sha256, qwen38_fanout_groups, INDEPENDENT_FANOUT_POLICY, QWEN38_FANOUT_GROUPS,
+    QWEN38_FANOUT_LOGICAL_S_IN, QWEN38_FANOUT_POLICY,
+};
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
+use crate::Qwen38Config;
 use crate::{EngineError, Result};
 
 pub const MAGIC: &[u8; 8] = b"CTOXQ2Q4";
@@ -90,6 +95,14 @@ pub struct RecoveryProvenance {
     pub activation_stats_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_s_in_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_group_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_group_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_logical_s_in_tensors: Option<u32>,
 }
 
 impl RecoveryProvenance {
@@ -105,6 +118,10 @@ impl RecoveryProvenance {
                     || self.artifact_sha256.is_some()
                     || self.activation_stats_sha256.is_some()
                     || self.report_sha256.is_some()
+                    || self.fanout_s_in_policy.is_some()
+                    || self.fanout_group_sha256.is_some()
+                    || self.fanout_group_count.is_some()
+                    || self.fanout_logical_s_in_tensors.is_some()
                 {
                     return Err(EngineError::InvalidArtifact(
                         "identity recovery provenance contains trained-scale fields".into(),
@@ -124,6 +141,57 @@ impl RecoveryProvenance {
                         "trained recovery provenance is incomplete or invalid".into(),
                     ));
                 }
+                self.validate_fanout()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_fanout(&self) -> Result<()> {
+        let fields = (
+            self.fanout_s_in_policy.as_deref(),
+            self.fanout_group_sha256.as_deref(),
+            self.fanout_group_count,
+            self.fanout_logical_s_in_tensors,
+        );
+        let (Some(policy), Some(group_sha256), Some(group_count), Some(logical_s_in)) = fields
+        else {
+            if fields == (None, None, None, None) {
+                return Ok(());
+            }
+            return Err(EngineError::InvalidArtifact(
+                "trained recovery fan-out provenance is partial".into(),
+            ));
+        };
+        if !valid_sha256(group_sha256) {
+            return Err(EngineError::InvalidArtifact(
+                "trained recovery fan-out digest is invalid".into(),
+            ));
+        }
+        match policy {
+            INDEPENDENT_FANOUT_POLICY => {
+                let empty_digest = format!("{:x}", Sha256::digest(b"[]"));
+                if group_count != 0 || logical_s_in != 0 || group_sha256 != empty_digest {
+                    return Err(EngineError::InvalidArtifact(
+                        "independent recovery declares fan-out groups".into(),
+                    ));
+                }
+            }
+            QWEN38_FANOUT_POLICY => {
+                let expected = fanout_group_sha256(&qwen38_fanout_groups(&Qwen38Config::default()));
+                if group_count as usize != QWEN38_FANOUT_GROUPS
+                    || logical_s_in as usize != QWEN38_FANOUT_LOGICAL_S_IN
+                    || group_sha256 != expected
+                {
+                    return Err(EngineError::InvalidArtifact(
+                        "Qwen recovery fan-out provenance differs from the frozen graph".into(),
+                    ));
+                }
+            }
+            other => {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "unsupported recovery fan-out policy {other}"
+                )));
             }
         }
         Ok(())
@@ -591,11 +659,42 @@ mod tests {
             artifact_sha256: Some("b".repeat(64)),
             activation_stats_sha256: Some("c".repeat(64)),
             report_sha256: Some("d".repeat(64)),
+            fanout_s_in_policy: None,
+            fanout_group_sha256: None,
+            fanout_group_count: None,
+            fanout_logical_s_in_tensors: None,
         });
         assert!(manifest
             .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
             .is_ok());
         manifest.recovery.as_mut().unwrap().report_sha256 = None;
+        assert!(manifest
+            .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
+            .is_err());
+    }
+
+    #[test]
+    fn trained_recovery_fanout_binds_frozen_group_digest() {
+        let mut manifest = mixed_manifest();
+        manifest.recovery = Some(RecoveryProvenance {
+            mode: RecoveryMode::Trained,
+            format: "ctox.recovery.channel-scales.v2".into(),
+            plan_sha256: "a".repeat(64),
+            fixed_logical_qcodes: true,
+            artifact_sha256: Some("b".repeat(64)),
+            activation_stats_sha256: Some("c".repeat(64)),
+            report_sha256: Some("d".repeat(64)),
+            fanout_s_in_policy: Some(QWEN38_FANOUT_POLICY.into()),
+            fanout_group_sha256: Some(fanout_group_sha256(&qwen38_fanout_groups(
+                &Qwen38Config::default(),
+            ))),
+            fanout_group_count: Some(QWEN38_FANOUT_GROUPS as u32),
+            fanout_logical_s_in_tensors: Some(QWEN38_FANOUT_LOGICAL_S_IN as u32),
+        });
+        assert!(manifest
+            .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
+            .is_ok());
+        manifest.recovery.as_mut().unwrap().fanout_group_count = Some(129);
         assert!(manifest
             .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
             .is_err());

@@ -908,6 +908,10 @@ mod tests {
                 artifact_sha256: Some(release.model.recovery_sha256.clone()),
                 activation_stats_sha256: Some(digest('b')),
                 report_sha256: Some(digest('c')),
+                fanout_s_in_policy: None,
+                fanout_group_sha256: None,
+                fanout_group_count: None,
+                fanout_logical_s_in_tensors: None,
             }),
             tensors: vec![TensorEntry {
                 name: "model.embed_tokens.weight".into(),

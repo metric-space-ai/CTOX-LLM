@@ -9,6 +9,7 @@ pub mod config;
 pub mod decoder;
 pub mod engine;
 pub mod error;
+pub mod fanout;
 pub mod format;
 pub mod graph;
 pub mod kv_cache;
