@@ -51,6 +51,8 @@ struct Report {
     draft_tokens: Vec<u32>,
     draft_rows_per_step: usize,
     all_drafts_restricted: bool,
+    gathered_full_mismatched_rows: usize,
+    gathered_full_maximum_absolute_error: f32,
     verified_draft_prefix: u32,
     accepted_drafts: u32,
     bonus_token: u32,
@@ -128,6 +130,13 @@ fn main() -> anyhow::Result<()> {
         "CUDA prefill unexpectedly returned speculative outputs"
     );
     let decode_input_token = greedy_token(&prefill.target_logits)?;
+    let gathered_verification = executor.verify_gathered_mtp(decode_input_token)?;
+    anyhow::ensure!(
+        gathered_verification.rows == mtp_draft_token_ids.len()
+            && gathered_verification.mismatched_rows == 0
+            && gathered_verification.maximum_absolute_error == 0.0,
+        "CUDA gathered MTP head differs from complete LM head: {gathered_verification:?}"
+    );
 
     let decode_started = Instant::now();
     let decoded = executor.decode(decode_input_token, true, &cancellation)?;
@@ -193,7 +202,7 @@ fn main() -> anyhow::Result<()> {
         "CUDA partial-prefix replay produced target/MTP counters {target_tokens_after_replay}/{mtp_tokens_after_replay}"
     );
     let submission_stats = executor.submission_stats()?;
-    let expected_submissions = 10 + u64::from(accepted_drafts) * 2;
+    let expected_submissions = 12 + u64::from(accepted_drafts) * 2;
     anyhow::ensure!(
         submission_stats.token_submission_attempts == expected_submissions
             && submission_stats.token_submission_commits == expected_submissions,
@@ -202,8 +211,8 @@ fn main() -> anyhow::Result<()> {
         submission_stats.token_submission_attempts,
     );
     anyhow::ensure!(
-        submission_stats.context_synchronizations == expected_submissions + 10,
-        "CUDA executor used {} context barriers, expected {} commits plus ten verifier readbacks",
+        submission_stats.context_synchronizations == expected_submissions + 12,
+        "CUDA executor used {} context barriers, expected {} commits plus twelve verifier readbacks",
         submission_stats.context_synchronizations,
         expected_submissions,
     );
@@ -238,6 +247,8 @@ fn main() -> anyhow::Result<()> {
             draft_tokens,
             draft_rows_per_step: mtp_draft_token_ids.len(),
             all_drafts_restricted: true,
+            gathered_full_mismatched_rows: gathered_verification.mismatched_rows,
+            gathered_full_maximum_absolute_error: gathered_verification.maximum_absolute_error,
             verified_draft_prefix,
             accepted_drafts,
             bonus_token,

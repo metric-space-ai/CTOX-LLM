@@ -25,6 +25,13 @@ use crate::{EngineError, Qwen38Config, Result};
 const MAXIMUM_CHAINED_MTP_DRAFTS: usize = 4;
 pub const CUDA_SM86_EXECUTOR_PROFILE: &str = "cuda-sm86-qwen38-verifier";
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CudaGatheredMtpVerification {
+    pub rows: usize,
+    pub mismatched_rows: usize,
+    pub maximum_absolute_error: f32,
+}
+
 #[derive(Debug)]
 struct PendingCudaSpeculativeBranch {
     candidate_tokens: Vec<u32>,
@@ -84,6 +91,10 @@ enum CudaWorkerCommand {
     },
     SessionTokenCounters {
         reply: SyncSender<Result<(usize, usize)>>,
+    },
+    VerifyGatheredMtp {
+        token: u32,
+        reply: SyncSender<Result<CudaGatheredMtpVerification>>,
     },
     Shutdown {
         reply: SyncSender<Result<()>>,
@@ -159,6 +170,64 @@ impl CudaModelExecutor {
         self.graph
             .as_ref()
             .map(|graph| (graph.target_tokens(), graph.mtp_tokens()))
+    }
+
+    /// Verifier-only proof that the compact draft projection returns the
+    /// bit-exact corresponding rows of the complete LM head for one identical
+    /// MTP state. Both branches are restored on device before returning.
+    pub fn verify_gathered_mtp(&mut self, token: u32) -> Result<CudaGatheredMtpVerification> {
+        self.validate_loaded_decode(&CancellationToken::default())?;
+        if token as usize >= TOKENIZER_VOCAB_SIZE {
+            return Err(EngineError::Shape(
+                "CUDA gathered-head verifier token exceeds vocabulary".into(),
+            ));
+        }
+        let runtime = self.runtime.as_ref().expect("validated CUDA runtime");
+        let graph = self.graph.as_mut().expect("validated CUDA graph");
+        let position = graph.target_tokens();
+
+        graph.begin_speculative_branch(runtime)?;
+        let full_result = (|| {
+            let view =
+                graph.dispatch_mtp_draft_device(runtime, &self.config, token as usize, position)?;
+            read_valid_logits(runtime, view)
+        })();
+        let full_restore = graph.restore_speculative_branch(runtime);
+        let full = match (full_result, full_restore) {
+            (Ok(full), Ok(())) => full,
+            (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+        };
+
+        graph.begin_speculative_branch(runtime)?;
+        let restricted_result = (|| {
+            let view = graph.dispatch_mtp_restricted_draft_device(
+                runtime,
+                &self.config,
+                token as usize,
+                position,
+            )?;
+            read_restricted_logits(runtime, view, self.mtp_draft_token_ids.len())
+        })();
+        let restricted_restore = graph.restore_speculative_branch(runtime);
+        let restricted = match (restricted_result, restricted_restore) {
+            (Ok(restricted), Ok(())) => restricted,
+            (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+        };
+
+        let mut mismatched_rows = 0_usize;
+        let mut maximum_absolute_error = 0.0_f32;
+        for (&token_id, &compact) in self.mtp_draft_token_ids.iter().zip(&restricted) {
+            let complete = full[token_id as usize];
+            if complete.to_bits() != compact.to_bits() {
+                mismatched_rows += 1;
+            }
+            maximum_absolute_error = maximum_absolute_error.max((complete - compact).abs());
+        }
+        Ok(CudaGatheredMtpVerification {
+            rows: restricted.len(),
+            mismatched_rows,
+            maximum_absolute_error,
+        })
     }
 }
 
@@ -240,6 +309,12 @@ impl ThreadedCudaModelExecutor {
     pub fn session_token_counters(&self) -> Result<(usize, usize)> {
         self.request("session token counters", |reply| {
             CudaWorkerCommand::SessionTokenCounters { reply }
+        })
+    }
+
+    pub fn verify_gathered_mtp(&self, token: u32) -> Result<CudaGatheredMtpVerification> {
+        self.request("gathered MTP verification", |reply| {
+            CudaWorkerCommand::VerifyGatheredMtp { token, reply }
         })
     }
 
@@ -343,6 +418,9 @@ fn run_cuda_worker(mut executor: CudaModelExecutor, receiver: mpsc::Receiver<Cud
                     .session_token_counters()
                     .ok_or_else(|| EngineError::InvalidState("CUDA graph is not loaded".into()));
                 let _ = reply.send(result);
+            }
+            CudaWorkerCommand::VerifyGatheredMtp { token, reply } => {
+                let _ = reply.send(executor.verify_gathered_mtp(token));
             }
             CudaWorkerCommand::Shutdown { reply } => {
                 let reset = executor.reset_session();

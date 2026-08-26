@@ -353,7 +353,10 @@ reordering compact logits. The gathered object owns 160,000 bytes of row IDs
 and 160,000 bytes of logits; the complete LM head remains independently
 available for mandatory target verification. Draft readback is therefore
 bounded to 40,000 logits rather than the full head. Device sampling, production
-quality, and roofline promotion remain open.
+quality, and roofline promotion remain open. The hardware lifecycle verifier
+checkpoints the identical MTP state, executes the complete head, restores it,
+executes the gathered head, and requires every compact logit to be bit-exact
+with its global full-head row before continuing to MTP4 verification.
 
 The Unix-socket service cannot move the private driver context among its
 connection threads. `ThreadedCudaModelExecutor` therefore creates the
