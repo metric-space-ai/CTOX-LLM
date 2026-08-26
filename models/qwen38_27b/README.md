@@ -278,7 +278,12 @@ owns this deliberately thread-affine CUDA executor on one dedicated worker;
 the socket threads exchange typed commands and never move driver objects.
 
 Chunked CUDA prefill now also has a layer-major 645-step schedule contract and
-single-copy graph workspace primitives. The schedule batches every large
+an exact resident-resource binding plan. Before execution is enabled, that
+plan resolves the complete prompt program to the same 505 projections, 262
+shared activation owners, 48 linear mixers, 17 full-attention states, and 134
+norm operators used by decode; reordered residual producers or missing MTP
+resources fail closed. Single-copy graph workspace primitives remain separate
+from that immutable ownership contract. The schedule batches every large
 Q2/Q4 projection, retains causal device scans for paged GQA, convolution,
 GatedDelta recurrence, and MTP state, computes the target LM head only for the
 last prompt token, and exposes one cancellation/commit barrier per bounded
