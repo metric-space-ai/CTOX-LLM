@@ -65,6 +65,7 @@ from mtp_teacher import mtp_checkpoint_weight_name, mtp_parameter_mapping  # noq
 from optimize_q4_budget import initial_selections, layout_bytes, mixed_tensor_bytes  # noqa: E402
 from plan_teacher_cache import sample_tensor_bytes  # noqa: E402
 from plan_teacher_batches import batches as plan_teacher_batches  # noqa: E402
+from plan_activation_batches import activation_batches  # noqa: E402
 from prompt_format import normalize_content, normalize_messages, normalize_tool_call  # noqa: E402
 from filter_recovery_cohort import filter_records  # noqa: E402
 from generate_long_context import generated_record  # noqa: E402
@@ -284,6 +285,45 @@ class DatasetPipelineTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "disagree"):
                 load_token_counts([first, second], {"a", "b"})
+
+    def test_activation_batches_are_contiguous_and_token_bounded(self) -> None:
+        records = [{"id": sample_id} for sample_id in "abcde"]
+        token_counts = {"a": 20, "b": 30, "c": 60, "d": 10, "e": 10}
+        planned = activation_batches(records, token_counts, 3, 70, 64)
+        self.assertEqual(
+            planned,
+            [
+                {
+                    "batch_index": 0,
+                    "start_sample": 0,
+                    "samples": 2,
+                    "sequence_tokens": 50,
+                    "maximum_sample_tokens": 30,
+                    "first_id": "a",
+                    "last_id": "b",
+                },
+                {
+                    "batch_index": 1,
+                    "start_sample": 2,
+                    "samples": 2,
+                    "sequence_tokens": 70,
+                    "maximum_sample_tokens": 60,
+                    "first_id": "c",
+                    "last_id": "d",
+                },
+                {
+                    "batch_index": 2,
+                    "start_sample": 4,
+                    "samples": 1,
+                    "sequence_tokens": 10,
+                    "maximum_sample_tokens": 10,
+                    "first_id": "e",
+                    "last_id": "e",
+                },
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "sequence limit"):
+            activation_batches(records, token_counts, 3, 70, 59)
 
     def test_teacher_cache_batch_group_binds_plan_and_contiguous_verifications(
         self,
