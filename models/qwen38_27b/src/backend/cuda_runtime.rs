@@ -24,7 +24,7 @@ use super::cuda::{
     PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES, PAGED_GQA_PARAMS_BYTES,
     PAGED_Q2Q4_GQA_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
     Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
-    Q4_B64_RECOVERED_ROW_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
+    Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -177,6 +177,7 @@ struct CudaContextInner {
     gated_rms_norm_f16_function: CuFunction,
     qwen_rms_norm_f16_function: CuFunction,
     partial_rope_f32_function: CuFunction,
+    query_gate_norm_rope_f32_function: CuFunction,
     pack_paged_kv_q4_f32_function: CuFunction,
     demote_paged_kv_q4_to_q2_function: CuFunction,
     paged_q2q4_gqa_f32_function: CuFunction,
@@ -462,6 +463,37 @@ pub struct PreparedCudaPartialRope {
     transient_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CudaQueryGateConfig {
+    pub heads: usize,
+    pub head_dim: usize,
+    pub rotary_dim: usize,
+    pub theta: f32,
+    pub epsilon: f32,
+}
+
+impl CudaQueryGateConfig {
+    pub const QWEN38_27B: Self = Self {
+        heads: 24,
+        head_dim: 256,
+        rotary_dim: 64,
+        theta: 10_000_000.0,
+        epsilon: 1.0e-6,
+    };
+}
+
+pub struct PreparedCudaQueryGate {
+    context: Rc<CudaContextInner>,
+    config: CudaQueryGateConfig,
+    q_norm_weight: DeviceBuffer,
+    cosine: DeviceBuffer,
+    sine: DeviceBuffer,
+    query: DeviceBuffer,
+    gate: DeviceBuffer,
+    model_bytes: usize,
+    transient_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaPagedGqaConfig {
     pub query_heads: usize,
@@ -715,6 +747,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let query_gate_norm_rope_f32_function =
+            match resolve_function(&driver, module, QUERY_GATE_NORM_ROPE_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let pack_paged_kv_q4_f32_function =
             match resolve_function(&driver, module, PACK_PAGED_KV_Q4_F32_SYMBOL) {
                 Ok(function) => function,
@@ -765,6 +808,7 @@ impl CudaCandidateRuntime {
                 gated_rms_norm_f16_function,
                 qwen_rms_norm_f16_function,
                 partial_rope_f32_function,
+                query_gate_norm_rope_f32_function,
                 pack_paged_kv_q4_f32_function,
                 demote_paged_kv_q4_to_q2_function,
                 paged_q2q4_gqa_f32_function,
@@ -1485,6 +1529,135 @@ impl CudaCandidateRuntime {
             )?;
         }
         Ok(())
+    }
+
+    pub fn prepare_query_gate_norm_rope_f32(
+        &self,
+        config: CudaQueryGateConfig,
+        q_norm_weight_f16_le: &[u8],
+    ) -> Result<PreparedCudaQueryGate> {
+        if config.heads != 24
+            || config.head_dim != 256
+            || config.rotary_dim != 64
+            || !config.theta.is_finite()
+            || config.theta <= 0.0
+            || !config.epsilon.is_finite()
+            || config.epsilon <= 0.0
+        {
+            return Err(EngineError::Shape(
+                "CUDA query/gate fusion requires the exact Qwen3.8-27B 24x256/64 profile".into(),
+            ));
+        }
+        let weight_bytes = config
+            .head_dim
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA Q norm weight overflows".into()))?;
+        validate_f16_buffer(
+            q_norm_weight_f16_le,
+            weight_bytes,
+            "query/gate Q norm weight",
+        )?;
+        let output_values = config
+            .heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA query/gate width overflows".into()))?;
+        let output_bytes = output_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA query/gate output overflows".into()))?;
+        let table_bytes = (config.rotary_dim / 2)
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA query/gate table overflows".into()))?;
+        let q_norm_weight = DeviceBuffer::from_bytes(self, q_norm_weight_f16_le)?;
+        let cosine = DeviceBuffer::allocate(self, table_bytes)?;
+        let sine = DeviceBuffer::allocate(self, table_bytes)?;
+        let query = DeviceBuffer::allocate(self, output_bytes)?;
+        let gate = DeviceBuffer::allocate(self, output_bytes)?;
+        query.zero()?;
+        gate.zero()?;
+        let prepared = PreparedCudaQueryGate {
+            context: Rc::clone(&self.inner),
+            config,
+            q_norm_weight,
+            cosine,
+            sine,
+            query,
+            gate,
+            model_bytes: weight_bytes,
+            transient_bytes: output_bytes * 2 + table_bytes * 2,
+        };
+        prepared.write_position(0)?;
+        Ok(prepared)
+    }
+
+    pub fn dispatch_query_gate_norm_rope_device<'a>(
+        &self,
+        prepared: &'a PreparedCudaQueryGate,
+        query_gate: CudaDeviceF32View<'_>,
+    ) -> Result<(CudaDeviceF32View<'a>, CudaDeviceF32View<'a>)> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, query_gate.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA query/gate device input belongs to another context".into(),
+            ));
+        }
+        let output_values = prepared.config.heads * prepared.config.head_dim;
+        let expected_input = output_values * 2;
+        if query_gate.values() != expected_input {
+            return Err(EngineError::Shape(format!(
+                "CUDA query/gate device input has {} values, expected {expected_input}",
+                query_gate.values()
+            )));
+        }
+        self.make_current()?;
+        let mut query_gate_ptr = query_gate.ptr()?;
+        let mut q_norm_weight = prepared.q_norm_weight.ptr();
+        let mut cosine = prepared.cosine.ptr();
+        let mut sine = prepared.sine.ptr();
+        let mut query = prepared.query.ptr();
+        let mut gate = prepared.gate.ptr();
+        let mut heads = prepared.config.heads as u32;
+        let mut head_dim = prepared.config.head_dim as u32;
+        let mut rotary_dim = prepared.config.rotary_dim as u32;
+        let mut epsilon = prepared.config.epsilon;
+        let mut params = [
+            (&mut query_gate_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q_norm_weight as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut cosine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut sine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut query as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut gate as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut heads as *mut u32).cast::<c_void>(),
+            (&mut head_dim as *mut u32).cast::<c_void>(),
+            (&mut rotary_dim as *mut u32).cast::<c_void>(),
+            (&mut epsilon as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.query_gate_norm_rope_f32_function,
+                    heads,
+                    1,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "query/gate norm+RoPE kernel launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "query/gate norm+RoPE context synchronization",
+            )?;
+        }
+        Ok((
+            prepared.query.f32_view(0, output_values)?,
+            prepared.gate.f32_view(0, output_values)?,
+        ))
     }
 
     pub fn prepare_paged_q2q4_gqa(
@@ -3167,6 +3340,37 @@ impl PreparedCudaPartialRope {
     }
 }
 
+impl PreparedCudaQueryGate {
+    pub fn config(&self) -> CudaQueryGateConfig {
+        self.config
+    }
+
+    pub fn model_bytes(&self) -> usize {
+        self.model_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        let half_dim = self.config.rotary_dim / 2;
+        let mut cosine = Vec::with_capacity(half_dim);
+        let mut sine = Vec::with_capacity(half_dim);
+        for index in 0..half_dim {
+            let inverse_frequency = self
+                .config
+                .theta
+                .powf(-((2 * index) as f32) / self.config.rotary_dim as f32);
+            let angle = position as f32 * inverse_frequency;
+            cosine.push(angle.cos());
+            sine.push(angle.sin());
+        }
+        self.cosine.write(as_bytes(&cosine))?;
+        self.sine.write(as_bytes(&sine))
+    }
+}
+
 impl PreparedCudaPagedGqa {
     pub fn config(&self) -> CudaPagedGqaConfig {
         self.config
@@ -3667,6 +3871,7 @@ mod tests {
         assert_owned::<PreparedCudaA8Projection>();
         assert_owned::<PreparedCudaRecoveredRow>();
         assert_owned::<PreparedCudaPagedGqa>();
+        assert_owned::<PreparedCudaQueryGate>();
         assert_owned::<CudaVerifierF32Tensor>();
     }
 }

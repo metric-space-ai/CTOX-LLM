@@ -243,6 +243,7 @@ pub const CAUSAL_CONV_F16_SYMBOL: &str = "ctox_causal_conv_silu_f16_sm86";
 pub const GATED_RMS_NORM_F16_SYMBOL: &str = "ctox_gated_rms_norm_f16_sm86";
 pub const QWEN_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_rms_norm_f16_sm86";
 pub const PARTIAL_ROPE_F32_SYMBOL: &str = "ctox_partial_rope_f32_sm86";
+pub const QUERY_GATE_NORM_ROPE_F32_SYMBOL: &str = "ctox_qwen_query_gate_norm_rope_f32_sm86";
 pub const PACK_PAGED_KV_Q4_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_f32_sm86";
 pub const DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL: &str = "ctox_demote_paged_kv_q4_to_q2_sm86";
 pub const PAGED_Q2Q4_GQA_F32_SYMBOL: &str = "ctox_paged_q2q4_gqa_decode_f32_sm86";
@@ -392,6 +393,60 @@ pub const PARTIAL_ROPE_F32_PARAMS: &[KernelParam] = &[
     },
 ];
 pub const PARTIAL_ROPE_F32_PARAM_BYTES: u32 = 36;
+
+pub const QUERY_GATE_NORM_ROPE_F32_PARAMS: &[KernelParam] = &[
+    KernelParam {
+        name: "query_gate",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 0,
+    },
+    KernelParam {
+        name: "q_norm_weight",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 8,
+    },
+    KernelParam {
+        name: "cosine",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 16,
+    },
+    KernelParam {
+        name: "sine",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 24,
+    },
+    KernelParam {
+        name: "query",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 32,
+    },
+    KernelParam {
+        name: "gate",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 40,
+    },
+    KernelParam {
+        name: "heads",
+        size_bytes: 4,
+        offset_bytes: 48,
+    },
+    KernelParam {
+        name: "head_dim",
+        size_bytes: 4,
+        offset_bytes: 52,
+    },
+    KernelParam {
+        name: "rotary_dim",
+        size_bytes: 4,
+        offset_bytes: 56,
+    },
+    KernelParam {
+        name: "epsilon",
+        size_bytes: 4,
+        offset_bytes: 60,
+    },
+];
+pub const QUERY_GATE_NORM_ROPE_F32_PARAM_BYTES: u32 = 64;
 
 pub const PAGED_GQA_DESCRIPTOR_BYTES: usize = 16;
 pub const PAGED_GQA_PARAMS_BYTES: usize = 48;
@@ -997,6 +1052,8 @@ mod tests {
         assert_eq!(QWEN_RMS_NORM_F16_PARAM_BYTES, 36);
         assert_eq!(PARTIAL_ROPE_F32_PARAMS.len(), 6);
         assert_eq!(PARTIAL_ROPE_F32_PARAM_BYTES, 36);
+        assert_eq!(QUERY_GATE_NORM_ROPE_F32_PARAMS.len(), 10);
+        assert_eq!(QUERY_GATE_NORM_ROPE_F32_PARAM_BYTES, 64);
         assert_eq!(PAGED_GQA_DESCRIPTOR_BYTES, 16);
         assert_eq!(PAGED_GQA_PARAMS_BYTES, 48);
         assert_eq!(PACK_PAGED_KV_Q4_F32_PARAMS.len(), 8);
@@ -1013,6 +1070,7 @@ mod tests {
             GATED_RMS_NORM_F16_SYMBOL,
             QWEN_RMS_NORM_F16_SYMBOL,
             PARTIAL_ROPE_F32_SYMBOL,
+            QUERY_GATE_NORM_ROPE_F32_SYMBOL,
             PACK_PAGED_KV_Q4_F32_SYMBOL,
             DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
             PAGED_Q2Q4_GQA_F32_SYMBOL,

@@ -201,10 +201,14 @@ unless the column count, CUDA context, and SHA-256 identity of the exact packed
 FP16 `s_in` bytes match. Its device-view entry point consumes a producer-owned
 activation directly and returns borrowed projection-output views. K and V can
 feed the subsequent normalization/RoPE path directly. The canonical Q
-projection remains head-wise `[query, gate]` interleaved, so a verified fused
-deinterleave/normalization edge or an explicitly manifested deterministic
-physical row permutation is still required before Q and gate can feed the
-remaining device graph without a copy. The loader independently checks all 130 frozen Qwen
+projection remains head-wise `[query, gate]` interleaved. A new verifier-only
+kernel therefore fuses the exact per-head deinterleave, Qwen `(1 + weight)` Q
+normalization, and partial RoPE into contiguous query and gate device buffers.
+It consumes the Q projection's borrowed output directly; no backend-specific
+weight permutation or host copy is introduced. CUDA 12.6 reports 21 registers,
+36 bytes shared memory, and zero stack/spill bytes. Its composite numerical
+run remains queued, so this candidate is not yet promoted. The loader
+independently checks all 130 frozen Qwen
 fan-out groups (373 logical `s_in` tensors) when the checkpoint carries the
 `qwen38_fanout_s_in_v1` contract. The host contract, Rust/Python group digest,
 compile path, and negative identity test are validated; the exact Q/K/V-shaped

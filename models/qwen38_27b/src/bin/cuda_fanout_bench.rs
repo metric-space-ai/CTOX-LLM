@@ -5,10 +5,11 @@ use std::time::Instant;
 use anyhow::Context;
 use clap::Parser;
 use ctox_qwen38_27b::backend::cpu::CpuBackend;
-use ctox_qwen38_27b::backend::cuda_runtime::CudaCandidateRuntime;
+use ctox_qwen38_27b::backend::cuda_runtime::{CudaCandidateRuntime, CudaQueryGateConfig};
 use ctox_qwen38_27b::backend::{Activation, Backend, FusedMatVec, ScaleSlice};
 use ctox_qwen38_27b::format::TensorDType;
 use ctox_qwen38_27b::quant::{A8Block64, Q2Block64, Q4Block64, BLOCK_LEN};
+use ctox_qwen38_27b::reference::{apply_partial_rope, rms_norm_1p_weight};
 use half::f16;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -93,6 +94,10 @@ struct Report<'a> {
     requested_resident_bytes_saved: usize,
     verifier_device_input_bytes: usize,
     device_view_path_verified: bool,
+    query_gate_model_bytes: usize,
+    query_gate_transient_bytes: usize,
+    maximum_query_gate_fusion_absolute_error: f32,
+    gate_deinterleave_exact: bool,
     mismatched_s_in_rejected: bool,
     elapsed_milliseconds: f64,
     mean_fanout_pass_milliseconds: f64,
@@ -169,8 +174,59 @@ fn main() -> anyhow::Result<()> {
         verifier_device_input.device_view()?,
         &projection_refs,
     )?;
+    let query_gate_config = CudaQueryGateConfig::QWEN38_27B;
+    let q_norm_values = (0..query_gate_config.head_dim)
+        .map(|index| f16::from_f32(-0.1 + (index % 23) as f32 * 0.008).to_f32())
+        .collect::<Vec<_>>();
+    let query_gate =
+        runtime.prepare_query_gate_norm_rope_f32(query_gate_config, &f16_bytes(&q_norm_values))?;
+    query_gate.write_position(131_071)?;
+    let (actual_query_view, actual_gate_view) =
+        runtime.dispatch_query_gate_norm_rope_device(&query_gate, cuda_output_views[0])?;
+    let actual_query = runtime.verifier_read_f32(actual_query_view)?;
+    let actual_gate = runtime.verifier_read_f32(actual_gate_view)?;
+    let raw_query_gate = runtime.verifier_read_f32(cuda_output_views[0])?;
+    let mut expected_query =
+        Vec::with_capacity(query_gate_config.heads * query_gate_config.head_dim);
+    let mut expected_gate =
+        Vec::with_capacity(query_gate_config.heads * query_gate_config.head_dim);
+    for head in raw_query_gate.chunks_exact(query_gate_config.head_dim * 2) {
+        expected_query.extend_from_slice(&head[..query_gate_config.head_dim]);
+        expected_gate.extend_from_slice(&head[query_gate_config.head_dim..]);
+    }
+    expected_query = rms_norm_1p_weight(
+        &expected_query,
+        query_gate_config.heads,
+        query_gate_config.head_dim,
+        &q_norm_values,
+        query_gate_config.epsilon,
+    )?;
+    let mut unused_key = vec![0.0_f32; query_gate_config.head_dim];
+    apply_partial_rope(
+        &mut expected_query,
+        &mut unused_key,
+        query_gate_config.heads,
+        1,
+        query_gate_config.head_dim,
+        query_gate_config.rotary_dim,
+        131_071,
+        query_gate_config.theta,
+    )?;
+    let maximum_query_gate_fusion_absolute_error = expected_query
+        .iter()
+        .zip(&actual_query)
+        .map(|(expected, actual)| (expected - actual).abs())
+        .fold(0.0_f32, f32::max);
+    anyhow::ensure!(
+        maximum_query_gate_fusion_absolute_error <= 5.0e-5,
+        "query/gate norm+RoPE fusion differs from the Rust oracle"
+    );
+    let gate_deinterleave_exact = expected_gate == actual_gate;
+    anyhow::ensure!(gate_deinterleave_exact, "query gate deinterleave differs");
+
     let cuda_outputs = cuda_output_views
-        .into_iter()
+        .iter()
+        .copied()
         .map(|output| runtime.verifier_read_f32(output))
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -265,6 +321,10 @@ fn main() -> anyhow::Result<()> {
                 .saturating_sub(shared_requested_resident_bytes),
             verifier_device_input_bytes: verifier_device_input.resident_bytes(),
             device_view_path_verified: true,
+            query_gate_model_bytes: query_gate.model_bytes(),
+            query_gate_transient_bytes: query_gate.transient_bytes(),
+            maximum_query_gate_fusion_absolute_error,
+            gate_deinterleave_exact,
             mismatched_s_in_rejected,
             elapsed_milliseconds: elapsed * 1_000.0,
             mean_fanout_pass_milliseconds: elapsed * 1_000.0 / total_fanout_passes as f64,
@@ -275,7 +335,7 @@ fn main() -> anyhow::Result<()> {
             projections,
             absolute_tolerance: args.absolute_tolerance,
             relative_tolerance: args.relative_tolerance,
-            note: "One packed-FP16 s_in identity and one transient A8 buffer feed Q4 Q plus Q2 K/V. Numerical verification feeds that fan-out through a producer-owned CUDA device view and reads outputs only through the explicit verifier API. Timed intervals retain the resident verifier input and include output copies plus host dispatch; packed-byte GB/s is not hardware-counter roofline evidence.",
+            note: "One packed-FP16 s_in identity and one transient A8 buffer feed Q4 Q plus Q2 K/V. Numerical verification feeds that fan-out through a producer-owned CUDA device view, then fuses the canonical per-head query/gate deinterleave, Q norm, and partial RoPE without a host edge. Readback is explicit verifier-only. Timed intervals retain the resident verifier input and include output copies plus host dispatch; packed-byte GB/s is not hardware-counter roofline evidence.",
         })?
     );
     Ok(())
