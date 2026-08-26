@@ -114,8 +114,9 @@ struct MappedMetalArtifactInner {
 }
 
 /// Reusable projection whose immutable weights and recovery scales are
-/// offsets into one shared no-copy CTOXQ mapping. Only input, bias, output,
-/// and the small parameter block allocate separate Metal storage.
+/// offsets into one shared no-copy CTOXQ mapping. A standalone projection owns
+/// an input buffer; a graph projection consumes an upstream device buffer and
+/// allocates only bias, output, and small parameter blocks.
 pub struct PreparedMappedMetalMatVec {
     dtype: TensorDType,
     rows: usize,
@@ -123,7 +124,7 @@ pub struct PreparedMappedMetalMatVec {
     s_in_offset: u64,
     dispatches: Vec<MappedMetalDispatch>,
     mapping: MappedMetalArtifact,
-    input_buffer: Buffer,
+    input_buffer: Option<Buffer>,
     bias_buffer: Buffer,
     output_buffer: Buffer,
     transient_bytes: usize,
@@ -332,10 +333,15 @@ impl PreparedMappedMetalMatVec {
 
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
         validate_metal_input(input, self.columns)?;
+        let input_buffer = self.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal projection consumes an upstream graph buffer and has no host input".into(),
+            )
+        })?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 input.as_ptr(),
-                self.input_buffer.contents().cast::<f32>(),
+                input_buffer.contents().cast::<f32>(),
                 input.len(),
             );
         }
@@ -590,7 +596,17 @@ impl MetalCandidateRuntime {
         mapping: &MappedMetalArtifact,
         operation: &FusedMatVec<'_>,
     ) -> Result<PreparedMappedMetalMatVec> {
-        self.prepare_mapped_fused_matvec_with_simdgroups(mapping, operation, DEFAULT_SIMDGROUPS)
+        self.prepare_mapped_fused_matvec_internal(mapping, operation, DEFAULT_SIMDGROUPS, true)
+    }
+
+    /// Prepare a projection whose input will be supplied by an upstream Metal
+    /// graph buffer. No duplicate activation buffer is allocated.
+    pub fn prepare_mapped_fused_matvec_external_input(
+        &self,
+        mapping: &MappedMetalArtifact,
+        operation: &FusedMatVec<'_>,
+    ) -> Result<PreparedMappedMetalMatVec> {
+        self.prepare_mapped_fused_matvec_internal(mapping, operation, DEFAULT_SIMDGROUPS, false)
     }
 
     pub fn prepare_mapped_fused_matvec_with_simdgroups(
@@ -598,6 +614,16 @@ impl MetalCandidateRuntime {
         mapping: &MappedMetalArtifact,
         operation: &FusedMatVec<'_>,
         simdgroups: usize,
+    ) -> Result<PreparedMappedMetalMatVec> {
+        self.prepare_mapped_fused_matvec_internal(mapping, operation, simdgroups, true)
+    }
+
+    fn prepare_mapped_fused_matvec_internal(
+        &self,
+        mapping: &MappedMetalArtifact,
+        operation: &FusedMatVec<'_>,
+        simdgroups: usize,
+        own_input: bool,
     ) -> Result<PreparedMappedMetalMatVec> {
         let segment_contracts: Vec<(TensorDType, usize, usize, MetalFusedMatVecParams)> =
             if operation.dtype == TensorDType::MixedQ2Q4B64 {
@@ -635,7 +661,8 @@ impl MetalCandidateRuntime {
         let weights_base = mapping.byte_offset(operation.weights, "weights")?;
         let s_in_offset = mapping.byte_offset(s_in, "s_in")?;
         let s_out_base = mapping.byte_offset(s_out, "s_out")?;
-        let input_buffer = buffer_with_data(&self.device, as_bytes(operation.input));
+        let input_buffer =
+            own_input.then(|| buffer_with_data(&self.device, as_bytes(operation.input)));
         let dummy_bias = [0.0_f32];
         let bias = operation.bias.unwrap_or(&dummy_bias);
         let bias_buffer = buffer_with_data(&self.device, as_bytes(bias));
@@ -695,7 +722,12 @@ impl MetalCandidateRuntime {
         let parameter_bytes = MetalFusedMatVecParams::BYTE_LEN
             .checked_mul(dispatches.len())
             .ok_or_else(|| EngineError::Shape("Metal parameter bytes overflow usize".into()))?;
-        let transient_bytes = size_of_val(operation.input)
+        let input_bytes = if own_input {
+            size_of_val(operation.input)
+        } else {
+            0
+        };
+        let transient_bytes = input_bytes
             .checked_add(size_of_val(bias))
             .and_then(|total| total.checked_add(output_bytes))
             .and_then(|total| total.checked_add(parameter_bytes))
@@ -1314,14 +1346,15 @@ impl MetalCandidateRuntime {
     }
 
     pub fn dispatch_mapped(&self, prepared: &PreparedMappedMetalMatVec) -> Result<Vec<f32>> {
+        let input_buffer = prepared.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal external-input projection requires an upstream graph dispatch".into(),
+            )
+        })?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-q2q4-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_buffer(
-            MetalBufferAbi::INPUT as u64,
-            Some(&prepared.input_buffer),
-            0,
-        );
+        encoder.set_buffer(MetalBufferAbi::INPUT as u64, Some(input_buffer), 0);
         encoder.set_buffer(
             MetalBufferAbi::S_IN as u64,
             Some(&prepared.mapping.inner.buffer),
@@ -1657,6 +1690,146 @@ impl MetalCandidateRuntime {
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
                 "Metal RMSNorm produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
+    /// projection in a single command encoder. The projection consumes the
+    /// RMSNorm output buffer directly and therefore owns no second activation
+    /// allocation and performs no host readback between operations.
+    pub fn dispatch_mapped_rms_norm_then_projection(
+        &self,
+        norm: &PreparedMappedMetalRmsNorm,
+        projection: &PreparedMappedMetalMatVec,
+    ) -> Result<Vec<f32>> {
+        if norm.rows != 1 || norm.columns != projection.columns {
+            return Err(EngineError::Shape(format!(
+                "Metal norm/projection chain has norm {}x{} and projection width {}",
+                norm.rows, norm.columns, projection.columns
+            )));
+        }
+        if projection.input_buffer.is_some() {
+            return Err(EngineError::InvalidState(
+                "Metal norm/projection chain requires an external-input projection".into(),
+            ));
+        }
+        if !Rc::ptr_eq(&norm.mapping.inner, &projection.mapping.inner) {
+            return Err(EngineError::InvalidState(
+                "Metal norm and projection do not share one artifact mapping".into(),
+            ));
+        }
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-rmsnorm-projection-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.rms_norm_1p_pipeline);
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::INPUT as u64,
+            Some(&norm.input_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::WEIGHT as u64,
+            Some(&norm.mapping.inner.buffer),
+            norm.weight_offset,
+        );
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::OUTPUT as u64,
+            Some(&norm.output_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::PARAMS as u64,
+            Some(&norm.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        encoder.set_buffer(MetalBufferAbi::INPUT as u64, Some(&norm.output_buffer), 0);
+        encoder.set_buffer(
+            MetalBufferAbi::S_IN as u64,
+            Some(&projection.mapping.inner.buffer),
+            projection.s_in_offset,
+        );
+        for dispatch in &projection.dispatches {
+            let pipeline = match dispatch.dtype {
+                TensorDType::Q2B64 => &self.q2_pipeline,
+                TensorDType::Q4B64 => &self.q4_pipeline,
+                _ => unreachable!("mapped Metal dispatch is Q2/Q4"),
+            };
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(
+                MetalBufferAbi::WEIGHTS as u64,
+                Some(&projection.mapping.inner.buffer),
+                dispatch.weights_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::S_OUT as u64,
+                Some(&projection.mapping.inner.buffer),
+                dispatch.s_out_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::BIAS as u64,
+                Some(&projection.bias_buffer),
+                dispatch.bias_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::OUTPUT as u64,
+                Some(&projection.output_buffer),
+                dispatch.output_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::PARAMS as u64,
+                Some(&dispatch.params_buffer),
+                0,
+            );
+            let grid = MTLSize {
+                width: dispatch
+                    .rows
+                    .div_ceil((dispatch.thread_width / 32) * ROWS_PER_SIMDGROUP)
+                    as u64,
+                height: 1,
+                depth: 1,
+            };
+            let threads = MTLSize {
+                width: dispatch.thread_width as u64,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_thread_groups(grid, threads);
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal norm/projection command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(
+                projection.output_buffer.contents().cast::<f32>(),
+                projection.rows,
+            )
+            .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal norm/projection chain produced a non-finite output".into(),
             ));
         }
         Ok(output)
@@ -2608,6 +2781,87 @@ mod tests {
         let zero = runtime
             .dispatch_mapped_rms_norm_1p(&prepared)
             .expect("dispatch zero RMSNorm input");
+        assert!(zero.iter().all(|value| value.abs() <= f32::EPSILON));
+    }
+
+    #[test]
+    fn mapped_rms_norm_feeds_mixed_projection_without_host_intermediate() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let rows_q2 = 3;
+        let rows_q4 = 5;
+        let columns = 3 * BLOCK_LEN;
+        let epsilon = 1.0e-6;
+        let directory = tempdir().expect("temporary chained artifact directory");
+        let path = directory.path().join("norm-projection.ctoxq");
+        write_mixed_fixture(&path, rows_q2, rows_q4, columns);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open chained mmap fixture");
+        let matrix = artifact
+            .recovered_matrix("matrix.weight")
+            .expect("resolve chained recovered matrix");
+        let norm_weight = artifact
+            .float_tensor("matrix.weight.s_in")
+            .expect("resolve chained norm weight");
+        let norm_weight_f32 = norm_weight
+            .to_f32_vec()
+            .expect("widen chained norm oracle weight");
+        let input: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.023).cos() * 0.6 - 0.05)
+            .collect();
+        let normalized =
+            crate::reference::rms_norm_1p_weight(&input, 1, columns, &norm_weight_f32, epsilon)
+                .expect("chained RMSNorm oracle");
+        let expected_operation = matrix
+            .operation(&normalized, Activation::Identity)
+            .expect("construct chained projection oracle");
+        let expected = cpu
+            .fused_matvec(&expected_operation)
+            .expect("execute chained projection oracle");
+        let placeholder_operation = matrix
+            .operation(&input, Activation::Identity)
+            .expect("construct external-input projection contract");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import chained mmap without copy");
+        let norm = runtime
+            .prepare_mapped_rms_norm_1p(&mapping, norm_weight, &input, 1, columns, epsilon)
+            .expect("prepare chained RMSNorm");
+        let owned_projection = runtime
+            .prepare_mapped_fused_matvec(&mapping, &placeholder_operation)
+            .expect("prepare owned-input comparison projection");
+        let projection = runtime
+            .prepare_mapped_fused_matvec_external_input(&mapping, &placeholder_operation)
+            .expect("prepare external-input projection");
+        assert_eq!(norm.copied_model_bytes(), 0);
+        assert_eq!(projection.copied_model_bytes(), 0);
+        assert_eq!(
+            owned_projection.transient_bytes() - projection.transient_bytes(),
+            size_of_val(input.as_slice())
+        );
+        assert!(projection.write_input(&input).is_err());
+        assert!(runtime.dispatch_mapped(&projection).is_err());
+        assert!(runtime
+            .dispatch_mapped_rms_norm_then_projection(&norm, &owned_projection)
+            .is_err());
+        drop(owned_projection);
+        drop(mapping);
+        drop(artifact);
+        let actual = runtime
+            .dispatch_mapped_rms_norm_then_projection(&norm, &projection)
+            .expect("dispatch chained norm/projection after loader drop");
+        for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+            let tolerance = 3.0e-4_f32.max(expected.abs() * 5.0e-5);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "chained projection row {row}: expected {expected}, got {actual}"
+            );
+        }
+        norm.write_input(&vec![0.0; columns])
+            .expect("update chained norm input");
+        let zero = runtime
+            .dispatch_mapped_rms_norm_then_projection(&norm, &projection)
+            .expect("dispatch zero chained input");
         assert!(zero.iter().all(|value| value.abs() <= f32::EPSILON));
     }
 }

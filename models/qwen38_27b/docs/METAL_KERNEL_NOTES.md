@@ -112,6 +112,11 @@ convention rather than Llama's direct-weight convention. One simdgroup owns a
 complete row, reduces the f32 sum of squares without threadgroup scratch, and
 writes corrected columns using an mmap-backed FP16 weight. Reusable f32
 input/output buffers cover single-token decode and multi-row prefill.
+An external-input projection mode omits its own activation allocation. The
+composed verifier encodes decode RMSNorm first and then binds that exact output
+buffer as the mixed Q2/Q4 projection input in the same command encoder. Direct
+dispatch of such a projection fails closed because only an explicit upstream
+graph operation can supply its input.
 
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
@@ -156,6 +161,11 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   multi-row Qwen RMSNorm after dropping loader ownership, rejects copied
   same-valued weights and invalid epsilon, supports an in-place input update,
   and matches the exact scalar `(1 + weight)` equation.
+- `mapped_rms_norm_feeds_mixed_projection_without_host_intermediate` verifies
+  the two-operation device chain against scalar norm plus mixed-matrix
+  oracles, proves the external-input projection saves exactly one activation
+  vector, rejects incorrect standalone use, and updates only the upstream norm
+  input for a second zero-output dispatch.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.

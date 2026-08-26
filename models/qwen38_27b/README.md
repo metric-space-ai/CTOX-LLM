@@ -173,6 +173,9 @@ the same mapping; only the resulting hidden vector is transient.
 Qwen `(1 + weight)` RMSNorm is also a direct Metal candidate: its FP16 weight
 stays mapping-backed, while reusable f32 input/output graph buffers support
 both one-row decode and multi-row prefill.
+Decode RMSNorm and a following mixed Q2/Q4 projection can now be encoded in
+one command encoder: the projection reads the norm output directly and omits
+its otherwise duplicated activation allocation.
 Complete-graph residency and unload measurements on the 7.8-GiB artifact are
 still required before this changes backend promotion state.
 
