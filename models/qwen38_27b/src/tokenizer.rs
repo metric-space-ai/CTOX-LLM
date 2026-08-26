@@ -127,6 +127,46 @@ impl Qwen38Tokenizer {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct IncrementalDecoder {
+    token_ids: Vec<u32>,
+    committed: String,
+}
+
+impl IncrementalDecoder {
+    pub fn push(&mut self, tokenizer: &Qwen38Tokenizer, token_id: u32) -> Result<Option<String>> {
+        self.token_ids.push(token_id);
+        let decoded = tokenizer.decode(&self.token_ids, false)?;
+        if !decoded.starts_with(&self.committed) {
+            return Err(EngineError::InvalidArtifact(
+                "incremental tokenizer output is not monotonic".into(),
+            ));
+        }
+        if decoded.ends_with('\u{fffd}') {
+            return Ok(None);
+        }
+        let delta = decoded[self.committed.len()..].to_owned();
+        self.committed = decoded;
+        Ok(Some(delta))
+    }
+
+    pub fn finish(&mut self, tokenizer: &Qwen38Tokenizer) -> Result<String> {
+        let decoded = tokenizer.decode(&self.token_ids, false)?;
+        if !decoded.starts_with(&self.committed) {
+            return Err(EngineError::InvalidArtifact(
+                "final tokenizer output is not monotonic".into(),
+            ));
+        }
+        let delta = decoded[self.committed.len()..].to_owned();
+        self.committed = decoded;
+        Ok(delta)
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.token_ids.len()
+    }
+}
+
 fn tokenizer_error(error: impl std::fmt::Display) -> EngineError {
     EngineError::InvalidArtifact(format!("Qwen tokenizer failed: {error}"))
 }
@@ -182,7 +222,8 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     #[default]
     XHigh,
@@ -504,5 +545,12 @@ mod tests {
             &ChatTemplateOptions::default(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn tokenizer_and_incremental_decoder_are_thread_transferable() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Qwen38Tokenizer>();
+        assert_send_sync::<IncrementalDecoder>();
     }
 }

@@ -38,6 +38,7 @@
       "assistant reasoning history",
       "tool declaration, call, response, and final answer"
     ],
+    "incremental_decode": "all six multilingual direct cases reconstruct exactly under token-by-token streaming, buffering incomplete UTF-8 suffixes",
     "reference": "Transformers AutoTokenizer loaded offline from the byte-verified BF16 source",
     "comparison": "rendered UTF-8 SHA-256 and little-endian u32 token-ID SHA-256",
     "result": "all Rust outputs exactly match the pinned Python reference"

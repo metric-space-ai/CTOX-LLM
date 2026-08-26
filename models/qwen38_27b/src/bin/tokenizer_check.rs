@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use ctox_qwen38_27b::tokenizer::{
-    render_chat, ChatMessage, ChatRole, ChatTemplateOptions, Qwen38Tokenizer, ReasoningEffort,
-    ToolCall, CHAT_TEMPLATE_SHA256, TOKENIZER_SHA256,
+    render_chat, ChatMessage, ChatRole, ChatTemplateOptions, IncrementalDecoder, Qwen38Tokenizer,
+    ReasoningEffort, ToolCall, CHAT_TEMPLATE_SHA256, TOKENIZER_SHA256,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -47,6 +47,17 @@ fn main() -> anyhow::Result<()> {
         if tokenizer.decode(&observed, false)? != *text {
             anyhow::bail!("tokenizer round trip differs for {text:?}");
         }
+        let mut decoder = IncrementalDecoder::default();
+        let mut streamed = String::new();
+        for token_id in &observed {
+            if let Some(delta) = decoder.push(&tokenizer, *token_id)? {
+                streamed.push_str(&delta);
+            }
+        }
+        streamed.push_str(&decoder.finish(&tokenizer)?);
+        if decoder.token_count() != observed.len() || streamed != *text {
+            anyhow::bail!("incremental tokenizer round trip differs for {text:?}");
+        }
     }
 
     let user = [ChatMessage::text(ChatRole::User, "Hallo Welt!")];
@@ -84,6 +95,7 @@ fn main() -> anyhow::Result<()> {
             "tokenizer_sha256": tokenizer.sha256(),
             "chat_template_sha256": tokenizer.chat_template_sha256(),
             "multilingual_text_cases": text_cases.len(),
+            "incremental_text_cases": text_cases.len(),
             "chat_cases": 5,
             "xhigh_rendered_bytes": rendered.len(),
         }))?

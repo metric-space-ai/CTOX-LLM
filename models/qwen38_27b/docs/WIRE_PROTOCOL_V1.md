@@ -37,8 +37,7 @@ checked load acknowledgement, warmup, token-ID prefill/decode, ordered MTP
 prefix streaming, cancellation, session reset, and unload. Active operations
 own distinct cancellation tokens, and the Unix listener handles connections
 concurrently so a cancel request does not wait behind the inference call. The
-adapter emits empty token text deliberately; detokenization belongs to the
-still-open Responses frontend binding.
+low-level token-ID methods emit empty token text deliberately.
 
 The transport calls the streaming service hook with a write-and-flush sink.
 The default implementation emits an ordinary response vector, while a
@@ -46,8 +45,20 @@ Responses generation owner can override the hook and publish each token before
 the following decode begins. This prevents a superficially streaming API that
 buffers a complete generation in memory.
 
+The Responses streaming override is bound to the pinned tokenizer and Qwen
+template. It accepts plain text or ordered system/developer, user, assistant,
+and tool history; text content arrays; OpenAI-shaped tool calls and tool
+definitions; reasoning effort; thinking enablement; deterministic seed; and
+optional verified MTP. Vision content fails closed because it belongs to the
+separate vision package. The request ID is also the operation/session ID, so a
+second connection cancels the stream using that value. Generation is currently
+greedy, matching the exact MTP verifier contract. Incremental ByteLevel decode
+buffers incomplete UTF-8 suffixes and emits each token exactly once; a
+completion record follows `stop`, length, or cancellation. Normal completion
+resets the session before the server accepts another generation.
+
 The current `qwen38-server` binary remains the artifact-inspection bring-up
 owner and returns `engine_not_ready`: it is not wired to `EngineServer` until a
 complete backend passes promotion and a signed release exists. Thus the wire
-adapter is implemented, but its presence is not evidence that a production
-executor is ready.
+adapter and Responses frontend are implemented, but their presence is not
+evidence that a production executor is ready.

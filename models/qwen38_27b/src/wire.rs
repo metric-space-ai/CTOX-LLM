@@ -9,6 +9,7 @@ use crate::engine::{
     SessionStatus,
 };
 use crate::sampler::SamplerConfig;
+use crate::tokenizer::ReasoningEffort;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -113,9 +114,17 @@ pub struct CreateResponse {
     pub model: String,
     pub input: Value,
     #[serde(default)]
+    pub tools: Vec<Value>,
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    #[serde(default)]
+    pub mtp_enabled: bool,
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +279,29 @@ mod tests {
                 supported: PROTOCOL_VERSION,
             })
         );
+    }
+
+    #[test]
+    fn responses_request_defaults_are_explicit_and_backward_compatible() {
+        let request: WireRequest = serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "request_id": 27,
+            "method": "responses_create",
+            "params": {
+                "model": "Qwen/Qwen3.8-27B",
+                "input": "Hallo"
+            }
+        }))
+        .unwrap();
+        let Request::ResponsesCreate(request) = request.request else {
+            panic!("expected Responses request");
+        };
+        assert!(request.tools.is_empty());
+        assert_eq!(request.max_output_tokens, None);
+        assert_eq!(request.seed, None);
+        assert!(!request.mtp_enabled);
+        assert_eq!(request.enable_thinking, None);
+        assert_eq!(request.reasoning_effort, None);
     }
 
     #[test]

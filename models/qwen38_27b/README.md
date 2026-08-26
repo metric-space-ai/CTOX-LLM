@@ -126,7 +126,9 @@ Transformers reference on multilingual text, reasoning modes, assistant
 history, and a complete tool-call round trip. Exact hashes and Golden evidence
 are recorded in
 [`docs/TOKENIZER_VERIFICATION_V1.json`](docs/TOKENIZER_VERIFICATION_V1.json).
-Wiring this frontend to the promoted server executor remains open.
+The concurrent `EngineServer` now owns this frontend for unbuffered multilingual
+Responses/tool streaming; constructing it in the public binary remains gated
+on a promoted production executor and signed release.
 
 The embeddable Rust lifecycle is implemented in `src/engine.rs` and documented
 in [`docs/ENGINE_ABI_V1.md`](docs/ENGINE_ABI_V1.md). It provides signed loading,
@@ -186,5 +188,7 @@ the same logical Q2/Q4 cache into CUDA, Metal, and Snapdragon Vulkan kernels.
 
 [`docs/WIRE_PROTOCOL_V1.md`](docs/WIRE_PROTOCOL_V1.md) defines the matching
 versioned Unix-socket/named-pipe control and token-stream contract. The bring-up
-server negotiates and reports health but remains fail-closed with
-`engine_not_ready` for inference until a complete executor is installed.
+binary negotiates and reports health but remains fail-closed with
+`engine_not_ready` until a complete executor is installed. The reusable server
+adapter already implements token-ID and Responses generation, cancellation,
+MTP token ordering, reset, and unload around that future executor.
