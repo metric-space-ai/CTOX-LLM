@@ -40,6 +40,12 @@ concurrently so a cancel request does not wait behind the inference call. The
 adapter emits empty token text deliberately; detokenization belongs to the
 still-open Responses frontend binding.
 
+The transport calls the streaming service hook with a write-and-flush sink.
+The default implementation emits an ordinary response vector, while a
+Responses generation owner can override the hook and publish each token before
+the following decode begins. This prevents a superficially streaming API that
+buffers a complete generation in memory.
+
 The current `qwen38-server` binary remains the artifact-inspection bring-up
 owner and returns `engine_not_ready`: it is not wired to `EngineServer` until a
 complete backend passes promotion and a signed release exists. Thus the wire

@@ -16,6 +16,17 @@ use std::sync::Mutex;
 
 pub trait WireService {
     fn respond(&self, envelope: WireRequest) -> Vec<WireResponse>;
+
+    fn respond_stream(
+        &self,
+        envelope: WireRequest,
+        emit: &mut dyn FnMut(WireResponse) -> Result<()>,
+    ) -> Result<()> {
+        for response in self.respond(envelope) {
+            emit(response)?;
+        }
+        Ok(())
+    }
 }
 
 pub struct ServerState {
@@ -574,15 +585,16 @@ pub fn run_unix<S: WireService + Sync>(socket: impl AsRef<Path>, state: &S) -> R
         let reader = BufReader::new(reader_stream);
         for line in reader.lines() {
             let line = line?;
-            let responses = match serde_json::from_str::<WireRequest>(&line) {
-                Ok(request) => state.respond(request),
-                Err(error) => vec![WireResponse::error(0, "invalid_request", error.to_string())],
-            };
-            for response in responses {
+            let mut emit = |response: WireResponse| -> Result<()> {
                 serde_json::to_writer(&mut stream, &response)?;
                 stream.write_all(b"\n")?;
-            }
-            stream.flush()?;
+                stream.flush()?;
+                Ok(())
+            };
+            match serde_json::from_str::<WireRequest>(&line) {
+                Ok(request) => state.respond_stream(request, &mut emit)?,
+                Err(error) => emit(WireResponse::error(0, "invalid_request", error.to_string()))?,
+            };
         }
         Ok(())
     }
