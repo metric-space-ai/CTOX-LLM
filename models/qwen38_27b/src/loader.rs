@@ -321,6 +321,14 @@ impl ModelArtifact {
         self.mmap.len() as u64
     }
 
+    /// Complete immutable file mapping for platform backends that can import
+    /// host virtual memory directly. The returned bytes remain owned by every
+    /// clone of this artifact; callers must retain one clone for as long as an
+    /// accelerator buffer references the mapping.
+    pub(crate) fn mapped_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
+
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
         Ok(self.tensor(name)?.bytes)
     }

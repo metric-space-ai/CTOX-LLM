@@ -159,6 +159,13 @@ normalizes the selected-token embedding and prior target final hidden, applies
 head. It remains a correctness executor: production paged-Q2/Q4 KV, fused
 token-mixer kernels, chunked prefill, and optimized backend integration remain.
 
+Metal now has a verified no-copy CTOXQ ownership primitive: one shared Metal
+buffer wraps the complete immutable file mapping, while projections bind
+weights and packed recovery scales by validated offsets. The fixture survives
+the original loader handles being dropped and reports zero copied model bytes.
+Complete-graph residency and unload measurements on the 7.8-GiB artifact are
+still required before this changes backend promotion state.
+
 `CpuCorrectnessExecutor` connects that target graph to the stable embeddable
 `ModelExecutor` lifecycle: shared-`Arc<Mmap>` load, warmup, sequential prefill,
 incremental decode, cancellation, reset, allocation reporting, and zero-residue

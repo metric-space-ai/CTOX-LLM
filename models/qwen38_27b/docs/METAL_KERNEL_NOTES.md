@@ -68,6 +68,20 @@ rejects a mismatched projection before encoding. The existing MSL kernels
 still multiply `input * s_in` inside each projection; this change proves shared
 ownership and scheduling, not a pre-corrected or A8 Metal compute path.
 
+`MappedMetalArtifact` now imports the complete immutable CTOXQ file mapping as
+one `newBufferWithBytesNoCopy` shared-memory buffer. Prepared projections bind
+their weight, `s_in`, and `s_out` tensors as validated byte offsets into that
+single mapping; slices with identical contents but a different address are
+rejected. The owner retains an `Arc<Mmap>` through a cloned `ModelArtifact`
+until after the Metal buffer is released, so dropping the loader's original
+artifact cannot leave a dangling GPU mapping. Per-projection allocations are
+limited to input, optional bias, output, and a 32-byte parameter block. The
+same-device test dispatches after dropping both original mapping handles,
+matches the scalar recovered-Q4 oracle, reports zero copied model bytes, and
+updates only the existing input buffer for a second dispatch. This proves the
+no-copy ownership primitive; the complete 506-matrix graph still needs a
+single shared mapping, measured allocator high-watermark, and unload evidence.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -90,6 +104,11 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   executes mixed Q2/Q4 projections in one command buffer, matches both scalar
   oracles, saves exactly one duplicated input/scale allocation for two
   projections, accepts in-place input updates, and rejects another `s_in`.
+- `mmap_artifact_is_shared_without_copy_and_outlives_original_owner` imports a
+  deliberately non-page-multiple CTOXQ fixture as one no-copy Metal buffer,
+  binds quant codes and both recovery scales by offset, survives the original
+  mmap owners being dropped, matches the scalar oracle, and rejects copied
+  same-valued tensor slices.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
@@ -111,9 +130,9 @@ dequantization array before this source was accepted.
 
 ## Not yet done (promotion blockers)
 
-- The verifier still copies weights from fixture memory into Metal buffers. It
-  is not evidence for zero-copy CTOXQ mappings, complete resident model tensor
-  ownership, allocator high-watermark, or complete unload.
+- The no-copy CTOXQ import is verified on a small real container, but complete
+  resident model tensor ownership, allocator high-watermark, and complete
+  unload have not yet been measured on the 7.8-GiB artifact.
 - Exploratory 17408x5120 FFN measurements with eight dispatches per command
   reached roughly 26.55 GB/s for Q2 (four simdgroups/threadgroup) and
   43.95 GB/s for Q4 (two simdgroups/threadgroup). The earlier CTOX M5 hardware

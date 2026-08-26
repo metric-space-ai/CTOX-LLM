@@ -6,6 +6,7 @@
 
 use std::ffi::c_void;
 use std::mem::size_of_val;
+use std::rc::Rc;
 use std::slice;
 
 use metal_driver::{
@@ -20,6 +21,7 @@ use super::metal::{
 };
 use super::{FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
+use crate::loader::ModelArtifact;
 use crate::{EngineError, Result};
 
 const KERNEL_SOURCE: &str = include_str!("../../kernels/metal/q2q4_fused_matvec.metal");
@@ -86,6 +88,40 @@ pub struct PreparedMetalProjection {
     output_buffer: Buffer,
     params_buffer: Buffer,
     resident_bytes: usize,
+}
+
+/// One shared Metal view over the complete immutable CTOXQ file mapping.
+///
+/// `new_buffer_with_bytes_no_copy` does not retain the Rust mmap owner. The
+/// owner is therefore the final field of the inner object: Metal releases the
+/// buffer before the `ModelArtifact` clone can unmap its address range.
+#[derive(Clone)]
+pub struct MappedMetalArtifact {
+    inner: Rc<MappedMetalArtifactInner>,
+}
+
+struct MappedMetalArtifactInner {
+    buffer: Buffer,
+    artifact: ModelArtifact,
+}
+
+/// Reusable projection whose immutable weights and recovery scales are
+/// offsets into one shared no-copy CTOXQ mapping. Only input, bias, output,
+/// and the small parameter block allocate separate Metal storage.
+pub struct PreparedMappedMetalMatVec {
+    dtype: TensorDType,
+    rows: usize,
+    columns: usize,
+    thread_width: usize,
+    weights_offset: u64,
+    s_in_offset: u64,
+    s_out_offset: u64,
+    mapping: MappedMetalArtifact,
+    input_buffer: Buffer,
+    bias_buffer: Buffer,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    transient_bytes: usize,
 }
 
 impl PreparedMetalMatVec {
@@ -163,6 +199,76 @@ impl PreparedMetalProjection {
     }
 }
 
+impl MappedMetalArtifact {
+    /// Logical file bytes shared by every projection. This is one mmap-backed
+    /// residency, not an additional copied model allocation.
+    pub fn mapped_file_bytes(&self) -> u64 {
+        self.inner.artifact.file_bytes()
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        0
+    }
+
+    fn byte_offset(&self, bytes: &[u8], label: &str) -> Result<u64> {
+        let mapped = self.inner.artifact.mapped_bytes();
+        let base = mapped.as_ptr() as usize;
+        let start = (bytes.as_ptr() as usize).checked_sub(base).ok_or_else(|| {
+            EngineError::InvalidArtifact(format!(
+                "Metal {label} does not originate from the admitted CTOXQ mapping"
+            ))
+        })?;
+        let end = start.checked_add(bytes.len()).ok_or_else(|| {
+            EngineError::Shape(format!("Metal {label} mapped range overflows usize"))
+        })?;
+        if bytes.is_empty() || end > mapped.len() {
+            return Err(EngineError::InvalidArtifact(format!(
+                "Metal {label} lies outside the admitted CTOXQ mapping"
+            )));
+        }
+        u64::try_from(start)
+            .map_err(|_| EngineError::Shape(format!("Metal {label} offset exceeds u64")))
+    }
+}
+
+impl PreparedMappedMetalMatVec {
+    pub fn dtype(&self) -> TensorDType {
+        self.dtype
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn mapped_file_bytes(&self) -> u64 {
+        self.mapping.mapped_file_bytes()
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.mapping.copied_model_bytes()
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        validate_metal_input(input, self.columns)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                self.input_buffer.contents().cast::<f32>(),
+                input.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -210,6 +316,111 @@ impl MetalCandidateRuntime {
 
     pub fn device_name(&self) -> &str {
         self.device.name()
+    }
+
+    /// Import the complete immutable CTOXQ mmap once through Metal shared
+    /// virtual memory. The returned owner must be reused by every prepared
+    /// model projection so loading never creates a second full weight copy.
+    pub fn map_artifact_no_copy(&self, artifact: &ModelArtifact) -> Result<MappedMetalArtifact> {
+        let mapped = artifact.mapped_bytes();
+        if mapped.is_empty() {
+            return Err(EngineError::InvalidArtifact(
+                "cannot map an empty CTOXQ artifact into Metal".into(),
+            ));
+        }
+        let length = u64::try_from(mapped.len())
+            .map_err(|_| EngineError::Shape("Metal artifact length exceeds u64".into()))?;
+        let buffer = self.device.new_buffer_with_bytes_no_copy(
+            mapped.as_ptr().cast::<c_void>(),
+            length,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        Ok(MappedMetalArtifact {
+            inner: Rc::new(MappedMetalArtifactInner {
+                buffer,
+                artifact: artifact.clone(),
+            }),
+        })
+    }
+
+    /// Prepare a projection without copying its quantized payload or packed
+    /// FP16 recovery scales. The operation must have been resolved from the
+    /// exact artifact represented by `mapping`; arbitrary same-valued slices
+    /// are rejected by address-range validation.
+    pub fn prepare_mapped_fused_matvec(
+        &self,
+        mapping: &MappedMetalArtifact,
+        operation: &FusedMatVec<'_>,
+    ) -> Result<PreparedMappedMetalMatVec> {
+        self.prepare_mapped_fused_matvec_with_simdgroups(mapping, operation, DEFAULT_SIMDGROUPS)
+    }
+
+    pub fn prepare_mapped_fused_matvec_with_simdgroups(
+        &self,
+        mapping: &MappedMetalArtifact,
+        operation: &FusedMatVec<'_>,
+        simdgroups: usize,
+    ) -> Result<PreparedMappedMetalMatVec> {
+        let (layout, params) = validate_operation(operation)?;
+        let pipeline = match layout.dtype {
+            TensorDType::Q2B64 => &self.q2_pipeline,
+            TensorDType::Q4B64 => &self.q4_pipeline,
+            _ => unreachable!("Metal validation accepts only Q2/Q4"),
+        };
+        let thread_width = dispatch_width(pipeline, simdgroups)?;
+        let s_in = match operation.s_in {
+            Some(ScaleSlice::F16Le(bytes)) => bytes,
+            _ => {
+                return Err(EngineError::InvalidArtifact(
+                    "mapped Metal projection requires artifact-backed FP16 s_in".into(),
+                ))
+            }
+        };
+        let s_out = match operation.s_out {
+            Some(ScaleSlice::F16Le(bytes)) => bytes,
+            _ => {
+                return Err(EngineError::InvalidArtifact(
+                    "mapped Metal projection requires artifact-backed FP16 s_out".into(),
+                ))
+            }
+        };
+        let weights_offset = mapping.byte_offset(operation.weights, "weights")?;
+        let s_in_offset = mapping.byte_offset(s_in, "s_in")?;
+        let s_out_offset = mapping.byte_offset(s_out, "s_out")?;
+        let input_buffer = buffer_with_data(&self.device, as_bytes(operation.input));
+        let dummy_bias = [0.0_f32];
+        let bias = operation.bias.unwrap_or(&dummy_bias);
+        let bias_buffer = buffer_with_data(&self.device, as_bytes(bias));
+        let output_bytes = operation
+            .rows
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("Metal output byte size overflows".into()))?;
+        let output_buffer = self
+            .device
+            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let params = params.encode();
+        let params_buffer = buffer_with_data(&self.device, &params);
+        let transient_bytes = size_of_val(operation.input)
+            .checked_add(size_of_val(bias))
+            .and_then(|total| total.checked_add(output_bytes))
+            .and_then(|total| total.checked_add(params.len()))
+            .ok_or_else(|| EngineError::Shape("Metal transient byte count overflows".into()))?;
+        Ok(PreparedMappedMetalMatVec {
+            dtype: layout.dtype,
+            rows: operation.rows,
+            columns: operation.columns,
+            thread_width,
+            weights_offset,
+            s_in_offset,
+            s_out_offset,
+            mapping: mapping.clone(),
+            input_buffer,
+            bias_buffer,
+            output_buffer,
+            params_buffer,
+            transient_bytes,
+        })
     }
 
     /// Executes the candidate kernel with its exact CTOXQ FP16 recovery-scale
@@ -487,6 +698,85 @@ impl MetalCandidateRuntime {
         self.dispatch_prepared_repeated(prepared, 1)
     }
 
+    pub fn dispatch_mapped(&self, prepared: &PreparedMappedMetalMatVec) -> Result<Vec<f32>> {
+        let pipeline = match prepared.dtype {
+            TensorDType::Q2B64 => &self.q2_pipeline,
+            TensorDType::Q4B64 => &self.q4_pipeline,
+            _ => unreachable!("prepared mapped Metal operation is Q2/Q4"),
+        };
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-q2q4-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(
+            MetalBufferAbi::WEIGHTS as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.weights_offset,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::INPUT as u64,
+            Some(&prepared.input_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::S_IN as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.s_in_offset,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::S_OUT as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.s_out_offset,
+        );
+        encoder.set_buffer(MetalBufferAbi::BIAS as u64, Some(&prepared.bias_buffer), 0);
+        encoder.set_buffer(
+            MetalBufferAbi::OUTPUT as u64,
+            Some(&prepared.output_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        let grid = MTLSize {
+            width: prepared
+                .rows
+                .div_ceil((prepared.thread_width / 32) * ROWS_PER_SIMDGROUP)
+                as u64,
+            height: 1,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width: prepared.thread_width as u64,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(grid, threads);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal mmap command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(
+                prepared.output_buffer.contents().cast::<f32>(),
+                prepared.rows,
+            )
+            .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal mmap projection produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
     /// Records the same resident operation repeatedly into one command
     /// encoder and pays commit/wait only once. This is a benchmark/graph
     /// construction primitive; a production decoder will record distinct
@@ -690,8 +980,11 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::backend::{Activation, Backend};
+    use crate::format::{ArtifactBuilder, PackedTensor, DEFAULT_ALIGNMENT};
+    use crate::loader::{ChecksumPolicy, ModelArtifact};
     use crate::quant::{Q2Block64, Q4Block64, BLOCK_LEN};
     use half::f16;
+    use tempfile::tempdir;
 
     fn f16_bytes(values: &[f32]) -> Vec<u8> {
         values
@@ -931,5 +1224,112 @@ mod tests {
             .expect("second resident dispatch");
         assert!(second.iter().all(|value| value.abs() <= f32::EPSILON));
         assert!(prepared.write_input(&[0.0; 3]).is_err());
+    }
+
+    #[test]
+    fn mmap_artifact_is_shared_without_copy_and_outlives_original_owner() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let rows = 7;
+        let columns = 3 * BLOCK_LEN;
+        let weights = packed_weights(TensorDType::Q4B64, rows, columns);
+        let s_in = f16_bytes(&vec![1.125; columns]);
+        let s_out = f16_bytes(&vec![0.875; rows]);
+        let directory = tempdir().expect("temporary artifact directory");
+        let path = directory.path().join("mapped.ctoxq");
+        ArtifactBuilder {
+            model: "test/qwen38".into(),
+            revision: "0123456789abcdef".into(),
+            target: "canonical-b64".into(),
+            alignment: DEFAULT_ALIGNMENT,
+            tensors: vec![
+                PackedTensor {
+                    name: "matrix.weight".into(),
+                    dtype: TensorDType::Q4B64,
+                    shape: vec![rows as u64, columns as u64],
+                    bytes: weights,
+                },
+                PackedTensor {
+                    name: "matrix.weight.s_in".into(),
+                    dtype: TensorDType::F16,
+                    shape: vec![columns as u64],
+                    bytes: s_in,
+                },
+                PackedTensor {
+                    name: "matrix.weight.s_out".into(),
+                    dtype: TensorDType::F16,
+                    shape: vec![rows as u64],
+                    bytes: s_out,
+                },
+            ],
+        }
+        .write_new(&path)
+        .expect("write mmap fixture");
+        let artifact =
+            ModelArtifact::open(&path, ChecksumPolicy::AllTensors).expect("open mmap fixture");
+        let input: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.023).sin())
+            .collect();
+        let matrix = artifact
+            .recovered_matrix("matrix.weight")
+            .expect("resolve recovered fixture matrix");
+        let operation = matrix
+            .operation(&input, Activation::Silu)
+            .expect("construct mmap operation");
+        let expected = cpu.fused_matvec(&operation).expect("scalar mmap oracle");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import mmap without copy");
+        let prepared = runtime
+            .prepare_mapped_fused_matvec(&mapping, &operation)
+            .expect("prepare mmap projection");
+        assert_eq!(prepared.dtype(), TensorDType::Q4B64);
+        assert_eq!(prepared.rows(), rows);
+        assert_eq!(prepared.columns(), columns);
+        assert_eq!(prepared.mapped_file_bytes(), artifact.file_bytes());
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert_eq!(
+            prepared.transient_bytes(),
+            size_of_val(input.as_slice())
+                + size_of_val(&[0.0_f32])
+                + rows * std::mem::size_of::<f32>()
+                + 32
+        );
+        drop(mapping);
+        drop(artifact);
+        let actual = runtime
+            .dispatch_mapped(&prepared)
+            .expect("dispatch after original artifact owner drops");
+        for (expected, actual) in expected.iter().zip(actual) {
+            let tolerance = 2.0e-4_f32.max(expected.abs() * 3.0e-5);
+            assert!((expected - actual).abs() <= tolerance);
+        }
+
+        prepared
+            .write_input(&vec![0.0; columns])
+            .expect("update mmap projection input");
+        let zero = runtime
+            .dispatch_mapped(&prepared)
+            .expect("dispatch mmap projection again");
+        assert!(zero.iter().all(|value| value.abs() <= f32::EPSILON));
+
+        let copied_weights = packed_weights(TensorDType::Q4B64, rows, columns);
+        let copied_s_in = f16_bytes(&vec![1.125; columns]);
+        let copied_s_out = f16_bytes(&vec![0.875; rows]);
+        let copied_operation = FusedMatVec {
+            dtype: TensorDType::Q4B64,
+            weights: &copied_weights,
+            segments: &[],
+            rows,
+            columns,
+            input: &input,
+            s_in: Some(ScaleSlice::F16Le(&copied_s_in)),
+            s_out: Some(ScaleSlice::F16Le(&copied_s_out)),
+            bias: None,
+            activation: Activation::Identity,
+        };
+        assert!(runtime
+            .prepare_mapped_fused_matvec(&prepared.mapping, &copied_operation)
+            .is_err());
     }
 }
