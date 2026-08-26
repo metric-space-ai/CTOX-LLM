@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from select_activation_calibration import write_bytes_atomic
 from teacher_cache_dataset import VerifiedTeacherCache
 
 
@@ -170,13 +171,10 @@ def main() -> None:
         )
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         raise SystemExit(str(error)) from error
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = args.output.with_name(f".{args.output.name}.tmp")
-    temporary.write_text(
-        json.dumps(document, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    write_bytes_atomic(
+        args.output,
+        (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8"),
     )
-    temporary.replace(args.output)
 
 
 if __name__ == "__main__":
