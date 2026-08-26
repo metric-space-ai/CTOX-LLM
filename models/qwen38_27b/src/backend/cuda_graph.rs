@@ -1794,6 +1794,74 @@ pub struct PreparedCudaFullAttentionLayer {
 }
 
 impl PreparedCudaFullAttentionLayer {
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        key: &str,
+        q_norm_weight_f16_le: &[u8],
+        k_norm_weight_f16_le: &[u8],
+        maximum_context_tokens: usize,
+    ) -> Result<Self> {
+        if config != &Qwen38Config::default() {
+            return Err(EngineError::Shape(
+                "CUDA full-attention preparation requires the frozen Qwen3.8-27B topology".into(),
+            ));
+        }
+        let query_gate = runtime.prepare_query_gate_norm_rope_f32(
+            CudaQueryGateConfig::QWEN38_27B,
+            q_norm_weight_f16_le,
+        )?;
+        let key_norm = runtime.prepare_qwen_rms_norm_f16(
+            CudaRmsNormConfig {
+                rows: config.num_key_value_heads,
+                columns: config.head_dim,
+                epsilon: config.rms_norm_epsilon,
+            },
+            k_norm_weight_f16_le,
+        )?;
+        let key_rope = runtime.prepare_partial_rope_f32(CudaPartialRopeConfig {
+            heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            rotary_dim: config.rotary_dim,
+            theta: config.rope_theta,
+        })?;
+        let kv = runtime.prepare_paged_q2q4_gqa(CudaPagedGqaConfig {
+            query_heads: config.num_attention_heads,
+            key_value_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            maximum_tokens: maximum_context_tokens,
+            page_tokens: DEFAULT_KV_PAGE_TOKENS,
+            sink_tokens: DEFAULT_KV_SINK_TOKENS,
+            recent_tokens: DEFAULT_KV_RECENT_TOKENS,
+        })?;
+        let model_bytes = sum_usize(
+            [query_gate.model_bytes(), key_norm.model_bytes()],
+            "CUDA full-attention model bytes",
+        )?;
+        let graph_bytes = sum_usize(
+            [
+                query_gate.transient_bytes(),
+                key_norm.transient_bytes(),
+                key_rope.transient_bytes(),
+                kv.transient_bytes(),
+            ],
+            "CUDA full-attention graph bytes",
+        )?;
+        let session_bytes = u64::try_from(kv.packed_device_bytes())
+            .map_err(|_| EngineError::MemoryBudget("CUDA packed KV bytes exceed u64".into()))?;
+        Ok(Self {
+            key: key.to_owned(),
+            query_gate,
+            key_norm,
+            key_rope,
+            kv,
+            model_bytes,
+            graph_bytes,
+            session_bytes,
+        })
+    }
+
     pub fn key(&self) -> &str {
         &self.key
     }
@@ -1865,6 +1933,75 @@ impl PreparedCudaFullAttentionLayer {
         let key = runtime.dispatch_partial_rope_f32_device(key_rope, key)?;
         let attention =
             runtime.append_and_dispatch_paged_q2q4_gqa_device(kv, query, key, value_input)?;
+        Ok((attention, gate))
+    }
+
+    /// Advances one complete token-major prompt chunk through Qwen's exact
+    /// full-attention frontend and canonical mixed Q2/Q4 KV cache. All output
+    /// storage is borrowed from the one graph-owned prefill pool.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_prefill_device<'a>(
+        &mut self,
+        runtime: &CudaCandidateRuntime,
+        key_norm_workspace: &'a PreparedCudaBatchedRmsNormWorkspace,
+        rope_workspace: &'a PreparedCudaBatchedRopeWorkspace,
+        query_gate_output: &'a PreparedCudaBatchedQueryGateOutput,
+        attention_output: &'a PreparedCudaPagedGqaPrefillOutput,
+        query_gate_input: CudaDeviceF32View<'_>,
+        key_input: CudaDeviceF32View<'_>,
+        value_input: CudaDeviceF32View<'_>,
+        start_position: usize,
+        tokens: usize,
+    ) -> Result<(CudaDeviceF32View<'a>, CudaDeviceF32View<'a>)> {
+        if self.kv.tokens() != start_position {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA full-attention prefill starts at {start_position}, but its KV cache has {} tokens",
+                self.kv.tokens()
+            )));
+        }
+        let Self {
+            query_gate,
+            key_norm,
+            kv,
+            ..
+        } = self;
+        runtime.write_batched_rope_positions(rope_workspace, start_position as u64, tokens)?;
+        let (query, gate) = runtime.dispatch_batched_query_gate_norm_rope_with_table_device(
+            query_gate,
+            rope_workspace,
+            query_gate_output,
+            query_gate_input,
+            tokens,
+        )?;
+        let config = Qwen38Config::default();
+        let key_rows = tokens
+            .checked_mul(config.num_key_value_heads)
+            .ok_or_else(|| EngineError::Shape("CUDA batched key rows overflow".into()))?;
+        let key = runtime.dispatch_batched_qwen_rms_norm_f16_device(
+            key_norm,
+            key_norm_workspace,
+            key_input,
+            key_rows,
+        )?;
+        let key = runtime.dispatch_batched_partial_rope_with_table_f32_device(
+            rope_workspace,
+            CudaPartialRopeConfig {
+                heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                rotary_dim: config.rotary_dim,
+                theta: config.rope_theta,
+            },
+            key,
+            tokens,
+        )?;
+        let attention = runtime.append_and_dispatch_paged_q2q4_gqa_prefill_device(
+            kv,
+            attention_output,
+            query,
+            key,
+            value_input,
+            tokens,
+        )?;
         Ok((attention, gate))
     }
 }
@@ -2042,9 +2179,9 @@ impl PreparedCudaLinearMixerLayer {
     /// never stages the recurrent tensors through host memory.
     ///
     /// This is deliberately a launch-only layer primitive: the enclosing
-    /// graph submission owns the single chunk commit barrier and the one
-    /// graph-wide rollback checkpoint. Standalone callers must reset the
-    /// layer after an error because either recurrent state may have advanced.
+    /// graph submission owns the single chunk commit barrier and fail-closed
+    /// reset policy. Standalone callers must reset the layer after an error
+    /// because either recurrent state may have advanced.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_prefill_device<'a>(
         &mut self,
@@ -3377,58 +3514,14 @@ fn prepare_full_attention(
     prefix: &str,
     maximum_context_tokens: usize,
 ) -> Result<PreparedCudaFullAttentionLayer> {
-    let query_gate = runtime.prepare_query_gate_norm_rope_f32(
-        CudaQueryGateConfig::QWEN38_27B,
+    PreparedCudaFullAttentionLayer::prepare(
+        runtime,
+        config,
+        key,
         artifact_f16(artifact, &format!("{prefix}.q_norm.weight"))?,
-    )?;
-    let key_norm = runtime.prepare_qwen_rms_norm_f16(
-        CudaRmsNormConfig {
-            rows: config.num_key_value_heads,
-            columns: config.head_dim,
-            epsilon: config.rms_norm_epsilon,
-        },
         artifact_f16(artifact, &format!("{prefix}.k_norm.weight"))?,
-    )?;
-    let key_rope = runtime.prepare_partial_rope_f32(CudaPartialRopeConfig {
-        heads: config.num_key_value_heads,
-        head_dim: config.head_dim,
-        rotary_dim: config.rotary_dim,
-        theta: config.rope_theta,
-    })?;
-    let kv = runtime.prepare_paged_q2q4_gqa(CudaPagedGqaConfig {
-        query_heads: config.num_attention_heads,
-        key_value_heads: config.num_key_value_heads,
-        head_dim: config.head_dim,
-        maximum_tokens: maximum_context_tokens,
-        page_tokens: DEFAULT_KV_PAGE_TOKENS,
-        sink_tokens: DEFAULT_KV_SINK_TOKENS,
-        recent_tokens: DEFAULT_KV_RECENT_TOKENS,
-    })?;
-    let model_bytes = sum_usize(
-        [query_gate.model_bytes(), key_norm.model_bytes()],
-        "CUDA full-attention model bytes",
-    )?;
-    let graph_bytes = sum_usize(
-        [
-            query_gate.transient_bytes(),
-            key_norm.transient_bytes(),
-            key_rope.transient_bytes(),
-            kv.transient_bytes(),
-        ],
-        "CUDA full-attention graph bytes",
-    )?;
-    let session_bytes = u64::try_from(kv.packed_device_bytes())
-        .map_err(|_| EngineError::MemoryBudget("CUDA packed KV bytes exceed u64".into()))?;
-    Ok(PreparedCudaFullAttentionLayer {
-        key: key.to_owned(),
-        query_gate,
-        key_norm,
-        key_rope,
-        kv,
-        model_bytes,
-        graph_bytes,
-        session_bytes,
-    })
+        maximum_context_tokens,
+    )
 }
 
 fn artifact_f16<'a>(artifact: &'a ModelArtifact, name: &str) -> Result<&'a [u8]> {

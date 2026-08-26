@@ -131,6 +131,11 @@ path = "src/bin/cuda_linear_prefill_verify.rs"
 required-features = ["cuda"]
 
 [[bin]]
+name = "qwen38-cuda-attention-prefill-verify"
+path = "src/bin/cuda_attention_prefill_verify.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "qwen38-cuda-batched-rope-verify"
 path = "src/bin/cuda_batched_rope_verify.rs"
 required-features = ["cuda"]

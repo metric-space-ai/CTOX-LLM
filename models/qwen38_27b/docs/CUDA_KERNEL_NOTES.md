@@ -547,7 +547,7 @@ shared workspace into one allocation-free device chain: causal-convolution
 scan, fused GatedDelta input preparation, recurrent GatedDelta scan, and
 batched gated RMSNorm. The layer primitive deliberately does not install an
 intermediate commit barrier; the enclosing graph-wide chunk submission will
-own the sole barrier and rollback checkpoint. On an RTX A4500, the full
+own the sole barrier and fail-closed reset policy. On an RTX A4500, the full
 512-token-capacity run produced 3,145,728 output values bit-identical to 512
 ordinary CUDA decode steps. Both the final FP16 convolution history and the
 final FP16 GatedDelta state were also bit-identical. Its four shared chunk
@@ -559,6 +559,26 @@ Evidence is recorded in
 `benchmarks/cuda/sm86-linear-prefill-512-20260826.json`. Projection fanout,
 the graph-wide transaction, all 645 scheduled steps, and controlled roofline
 evidence remain open before production promotion.
+
+`PreparedCudaFullAttentionLayer::dispatch_prefill_device` now composes the
+other stateful layer family from the same shared pool: one device RoPE table,
+batched query/gate deinterleave plus Q-norm/RoPE, batched K-norm/RoPE,
+canonical paged K/V packing, and causal paged GQA. The first 512-token run
+exposed a cache-timing error that short fixtures could not see: demoting all
+stale pages before computing the entire chunk changed early queries by up to
+`0.1217`. The corrected path executes page-bounded segments and isolates at
+most the single token at each Q4-to-Q2 demotion boundary. It therefore retains
+the token-wise precision timeline without a host loop over tokens.
+
+On the corrected RTX A4500 run, 3,145,728 attention values differed from 512
+ordinary CUDA steps by at most `1.19e-7`; all gate values were bit-identical.
+The final cache precision map also matched exactly at 128 Q2 and 384 Q4
+tokens. All 81,788,928 verifier-observed bytes were reclaimed after drop. The
+unified cubin SHA-256 remained
+`0c6545a72ef3a76e6ac81e875977a29844d2307f9c97151536e767d8602c3b27`;
+evidence is in
+`benchmarks/cuda/sm86-attention-prefill-512-20260826.json`. The attention
+gate/output projection, graph-wide commit, and complete schedule remain open.
 
 The direct causal paged-GQA prefill candidate maps one warp to each
 `(query_token, query_head)` pair and scans exactly that position's logical

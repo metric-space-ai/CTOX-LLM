@@ -4565,6 +4565,17 @@ impl CudaCandidateRuntime {
         values: CudaDeviceF32View<'_>,
         token_count: usize,
     ) -> Result<usize> {
+        self.append_paged_q2q4_kv_batch_device_inner(prepared, keys, values, token_count, true)
+    }
+
+    fn append_paged_q2q4_kv_batch_device_inner(
+        &self,
+        prepared: &mut PreparedCudaPagedGqa,
+        keys: CudaDeviceF32View<'_>,
+        values: CudaDeviceF32View<'_>,
+        token_count: usize,
+        demote_after_page: bool,
+    ) -> Result<usize> {
         validate_a8_batch_capacity(token_count)?;
         if !Rc::ptr_eq(&self.inner, &prepared.context)
             || !Rc::ptr_eq(&self.inner, keys.context)
@@ -4676,7 +4687,9 @@ impl CudaCandidateRuntime {
                 prepared.tokens += page_tokens;
                 input_token += page_tokens;
                 page_launches += 1;
-                self.demote_stale_paged_q2q4_pages(prepared)?;
+                if demote_after_page {
+                    self.demote_stale_paged_q2q4_pages(prepared)?;
+                }
             }
             self.write_paged_q2q4_metadata(prepared)?;
             Ok(page_launches)
@@ -4891,6 +4904,24 @@ impl CudaCandidateRuntime {
         query: CudaDeviceF32View<'_>,
         query_tokens: usize,
     ) -> Result<CudaDeviceF32View<'a>> {
+        self.dispatch_paged_q2q4_gqa_prefill_segment_device(
+            prepared,
+            output,
+            query,
+            0,
+            query_tokens,
+        )?;
+        output.device_output(query_tokens)
+    }
+
+    fn dispatch_paged_q2q4_gqa_prefill_segment_device(
+        &self,
+        prepared: &PreparedCudaPagedGqa,
+        output: &PreparedCudaPagedGqaPrefillOutput,
+        query: CudaDeviceF32View<'_>,
+        output_token_offset: usize,
+        query_tokens: usize,
+    ) -> Result<()> {
         let query_tokens = validate_a8_batch_capacity(query_tokens)?;
         if !Rc::ptr_eq(&self.inner, &prepared.context)
             || !Rc::ptr_eq(&self.inner, &output.context)
@@ -4907,7 +4938,9 @@ impl CudaCandidateRuntime {
         }
         if output.query_heads != prepared.config.query_heads as u32
             || output.head_dim != prepared.config.head_dim as u32
-            || query_tokens > output.token_capacity
+            || output_token_offset
+                .checked_add(query_tokens as usize)
+                .is_none_or(|end| end > output.token_capacity as usize)
             || query_tokens as usize > prepared.tokens
         {
             return Err(EngineError::MemoryBudget(format!(
@@ -4931,7 +4964,16 @@ impl CudaCandidateRuntime {
         let mut q2_pages_ptr = prepared.q2_pages.ptr();
         let mut q4_pages_ptr = prepared.q4_pages.ptr();
         let mut descriptors_ptr = prepared.descriptors.ptr();
-        let mut output_ptr = output.output.ptr();
+        let output_value_offset = output_token_offset
+            .checked_mul(prepared.config.query_heads)
+            .and_then(|values| values.checked_mul(prepared.config.head_dim))
+            .ok_or_else(|| EngineError::Shape("CUDA paged-GQA output offset overflows".into()))?;
+        let output_byte_offset = output_value_offset
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::Shape("CUDA paged-GQA output byte offset overflows".into())
+            })?;
+        let mut output_ptr = device_ptr_offset(output.output.ptr(), output_byte_offset)?;
         let mut params_ptr = prepared.params.ptr();
         let mut query_token_count = query_tokens;
         let mut params = [
@@ -4965,7 +5007,131 @@ impl CudaCandidateRuntime {
             )?;
         }
         self.synchronize_after_launch("paged Q2/Q4 GQA prefill context synchronization")?;
-        output.device_output(query_tokens as usize)
+        Ok(())
+    }
+
+    /// Appends and attends one prompt chunk in page-bounded segments. A page
+    /// that becomes stale at a boundary remains Q4 through the queries that
+    /// precede that boundary and is demoted only afterwards. This preserves
+    /// token-wise cache precision semantics without a host loop over tokens.
+    pub fn append_and_dispatch_paged_q2q4_gqa_prefill_device<'a>(
+        &self,
+        prepared: &mut PreparedCudaPagedGqa,
+        output: &'a PreparedCudaPagedGqaPrefillOutput,
+        query: CudaDeviceF32View<'_>,
+        keys: CudaDeviceF32View<'_>,
+        values: CudaDeviceF32View<'_>,
+        token_count: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let token_count = validate_a8_batch_capacity(token_count)? as usize;
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &output.context)
+            || !Rc::ptr_eq(&self.inner, query.context)
+            || !Rc::ptr_eq(&self.inner, keys.context)
+            || !Rc::ptr_eq(&self.inner, values.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA page-segmented prefill crosses driver contexts".into(),
+            ));
+        }
+        if prepared.poisoned || prepared.speculative_checkpoint.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA page-segmented prefill requires healthy non-speculative state".into(),
+            ));
+        }
+        if token_count > output.token_capacity as usize {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA page-segmented prefill requests {token_count} tokens, output capacity is {}",
+                output.token_capacity
+            )));
+        }
+        let query_width = prepared
+            .config
+            .query_heads
+            .checked_mul(prepared.config.head_dim)
+            .ok_or_else(|| EngineError::Shape("CUDA prefill query width overflows".into()))?;
+        let query_values = token_count
+            .checked_mul(query_width)
+            .ok_or_else(|| EngineError::Shape("CUDA prefill query shape overflows".into()))?;
+        let component_values = token_count
+            .checked_mul(prepared.component_values)
+            .ok_or_else(|| EngineError::Shape("CUDA prefill K/V shape overflows".into()))?;
+        if query.values() != query_values
+            || keys.values() != component_values
+            || values.values() != component_values
+        {
+            return Err(EngineError::Shape(format!(
+                "CUDA page-segmented prefill has Q/K/V {}/{}/{}, expected {query_values}/{component_values}/{component_values}",
+                query.values(),
+                keys.values(),
+                values.values()
+            )));
+        }
+        let final_tokens = prepared.tokens.checked_add(token_count).ok_or_else(|| {
+            EngineError::MemoryBudget("CUDA prefill token count overflows".into())
+        })?;
+        if final_tokens > prepared.config.maximum_tokens {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA page-segmented prefill reaches {final_tokens} tokens, capacity is {}",
+                prepared.config.maximum_tokens
+            )));
+        }
+
+        let result = (|| {
+            let mut processed = 0_usize;
+            while processed < token_count {
+                let (segment_tokens, demote_before_attention) = paged_prefill_segment(
+                    prepared.tokens,
+                    token_count - processed,
+                    &prepared.pages,
+                    prepared.config.page_tokens,
+                    prepared.config.sink_tokens,
+                    prepared.config.recent_tokens,
+                )?;
+                let segment_query = query.slice(
+                    processed
+                        .checked_mul(query_width)
+                        .ok_or_else(|| EngineError::Shape("CUDA query offset overflows".into()))?,
+                    segment_tokens.checked_mul(query_width).ok_or_else(|| {
+                        EngineError::Shape("CUDA query segment shape overflows".into())
+                    })?,
+                )?;
+                let kv_offset = processed
+                    .checked_mul(prepared.component_values)
+                    .ok_or_else(|| EngineError::Shape("CUDA K/V offset overflows".into()))?;
+                let kv_values = segment_tokens
+                    .checked_mul(prepared.component_values)
+                    .ok_or_else(|| EngineError::Shape("CUDA K/V segment shape overflows".into()))?;
+                let segment_keys = keys.slice(kv_offset, kv_values)?;
+                let segment_values = values.slice(kv_offset, kv_values)?;
+                self.append_paged_q2q4_kv_batch_device_inner(
+                    prepared,
+                    segment_keys,
+                    segment_values,
+                    segment_tokens,
+                    demote_before_attention,
+                )?;
+                self.dispatch_paged_q2q4_gqa_prefill_segment_device(
+                    prepared,
+                    output,
+                    segment_query,
+                    processed,
+                    segment_tokens,
+                )?;
+                if !demote_before_attention {
+                    self.demote_stale_paged_q2q4_pages(prepared)?;
+                    self.write_paged_q2q4_metadata(prepared)?;
+                }
+                processed += segment_tokens;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            prepared.poisoned = true;
+            return Err(error);
+        }
+        debug_assert_eq!(prepared.tokens, final_tokens);
+        output.device_output(token_count)
     }
 
     /// Seeds a verifier cache from finite f32 K/V rows without running the
@@ -9292,6 +9458,39 @@ fn validate_a8_batch_capacity(batch_rows: usize) -> Result<u32> {
     Ok(batch_rows_u32)
 }
 
+fn paged_prefill_segment(
+    committed_tokens: usize,
+    remaining_tokens: usize,
+    pages: &[CudaPagedKvPage],
+    page_tokens: usize,
+    sink_tokens: usize,
+    recent_tokens: usize,
+) -> Result<(usize, bool)> {
+    if remaining_tokens == 0 || page_tokens == 0 {
+        return Err(EngineError::Shape(
+            "CUDA prefill segment requires remaining tokens and page capacity".into(),
+        ));
+    }
+    let token_in_page = committed_tokens % page_tokens;
+    let page_segment_tokens = remaining_tokens.min(page_tokens - token_in_page);
+    let page_segment_end = committed_tokens
+        .checked_add(page_segment_tokens)
+        .ok_or_else(|| EngineError::Shape("CUDA page segment end overflows".into()))?;
+    let future_recent_start = page_segment_end.saturating_sub(recent_tokens);
+    let demotion_at_page_segment_end = pages.iter().any(|page| {
+        page.precision == KvPrecision::Q4
+            && page.first_token >= sink_tokens
+            && page.first_token + page.tokens <= future_recent_start
+    });
+    // Decode demotes immediately before the boundary token's attention. Keep
+    // the preceding page prefix batched, then isolate at most that one token.
+    if demotion_at_page_segment_end && page_segment_tokens > 1 {
+        Ok((page_segment_tokens - 1, false))
+    } else {
+        Ok((page_segment_tokens, demotion_at_page_segment_end))
+    }
+}
+
 fn validate_batched_norm_inputs(
     runtime_context: &Rc<CudaContextInner>,
     prepared_context: &Rc<CudaContextInner>,
@@ -9881,6 +10080,37 @@ mod tests {
         );
         assert!(validate_a8_batch_capacity(0).is_err());
         assert!(validate_a8_batch_capacity(CUDA_GRID_Y_MAX as usize + 1).is_err());
+    }
+
+    #[test]
+    fn paged_prefill_isolates_only_the_q2_demotion_boundary_token() {
+        let mut pages = (0..3)
+            .map(|index| CudaPagedKvPage {
+                precision: KvPrecision::Q4,
+                physical_slot: index,
+                tokens: 128,
+                first_token: index * 128,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paged_prefill_segment(384, 128, &pages, 128, 128, 256).unwrap(),
+            (127, false)
+        );
+        pages.push(CudaPagedKvPage {
+            precision: KvPrecision::Q4,
+            physical_slot: 3,
+            tokens: 127,
+            first_token: 384,
+        });
+        assert_eq!(
+            paged_prefill_segment(511, 1, &pages, 128, 128, 256).unwrap(),
+            (1, true)
+        );
+        assert_eq!(
+            paged_prefill_segment(0, 512, &[], 128, 128, 256).unwrap(),
+            (128, false)
+        );
+        assert!(paged_prefill_segment(0, 0, &[], 128, 128, 256).is_err());
     }
 
     #[test]
