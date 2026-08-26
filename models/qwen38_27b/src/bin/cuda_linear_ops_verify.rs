@@ -51,6 +51,8 @@ struct Report<'a> {
     gated_norm_model_bytes: usize,
     gated_norm_transient_bytes: usize,
     gated_norm_device_view_staging_bytes: usize,
+    gated_norm_batch_transient_bytes: usize,
+    gated_norm_batch_device_view_staging_bytes: usize,
     qwen_norm_rows: usize,
     qwen_norm_columns: usize,
     qwen_norm_model_bytes: usize,
@@ -67,6 +69,8 @@ struct Report<'a> {
     convolution_scan_matches_sequential_state_exactly: bool,
     maximum_gated_norm_absolute_error: f32,
     maximum_gated_norm_relative_error: f32,
+    maximum_batched_gated_norm_absolute_error: f32,
+    maximum_batched_gated_norm_relative_error: f32,
     maximum_qwen_norm_absolute_error: f32,
     maximum_qwen_norm_relative_error: f32,
     maximum_residual_norm_absolute_error: f32,
@@ -237,6 +241,62 @@ fn main() -> anyhow::Result<()> {
             "gated RMSNorm output {index}: expected {expected}, got {actual}"
         );
     }
+    let batch_values = args
+        .tokens
+        .checked_mul(norm_config.rows)
+        .and_then(|rows| rows.checked_mul(norm_config.columns))
+        .context("batched gated RMSNorm shape overflows")?;
+    let batched_norm_input: Vec<f32> = (0..batch_values)
+        .map(|index| ((index + 29) as f32 * 0.009).sin() * 0.7)
+        .collect();
+    let batched_norm_gate: Vec<f32> = (0..batch_values)
+        .map(|index| ((index + 37) as f32 * 0.015).cos() * 0.75)
+        .collect();
+    let token_values = norm_config.rows * norm_config.columns;
+    let mut expected_batched_norm = Vec::with_capacity(batch_values);
+    for (input, gate) in batched_norm_input
+        .chunks_exact(token_values)
+        .zip(batched_norm_gate.chunks_exact(token_values))
+    {
+        expected_batched_norm.extend(rms_norm_gated(
+            input,
+            gate,
+            norm_config.rows,
+            norm_config.columns,
+            &norm_weight,
+            norm_config.epsilon,
+        )?);
+    }
+    let batched_norm_output =
+        runtime.prepare_batched_gated_rms_norm_output(norm_config, args.tokens)?;
+    let batched_norm_input_staging = runtime.prepare_verifier_f32_tensor(&batched_norm_input)?;
+    let batched_norm_gate_staging = runtime.prepare_verifier_f32_tensor(&batched_norm_gate)?;
+    let actual_batched_norm =
+        runtime.verifier_read_f32(runtime.dispatch_batched_gated_rms_norm_f16_device(
+            &norm,
+            &batched_norm_output,
+            batched_norm_input_staging.device_view()?,
+            batched_norm_gate_staging.device_view()?,
+            args.tokens,
+        )?)?;
+    let mut maximum_batched_gated_norm_absolute_error = 0.0_f32;
+    let mut maximum_batched_gated_norm_relative_error = 0.0_f32;
+    track_error(
+        &expected_batched_norm,
+        &actual_batched_norm,
+        &mut maximum_batched_gated_norm_absolute_error,
+        &mut maximum_batched_gated_norm_relative_error,
+    );
+    anyhow::ensure!(
+        expected_batched_norm
+            .iter()
+            .zip(&actual_batched_norm)
+            .all(|(expected, actual)| {
+                (expected - actual).abs()
+                    <= args.absolute_tolerance + args.relative_tolerance * expected.abs()
+            }),
+        "batched gated RMSNorm exceeds tolerance"
+    );
 
     let qwen_norm_config = CudaRmsNormConfig {
         rows: 2,
@@ -412,6 +472,9 @@ fn main() -> anyhow::Result<()> {
     let gated_norm_transient_bytes = norm.transient_bytes();
     let gated_norm_device_view_staging_bytes =
         norm_input_staging.resident_bytes() + norm_gate_staging.resident_bytes();
+    let gated_norm_batch_transient_bytes = batched_norm_output.transient_bytes();
+    let gated_norm_batch_device_view_staging_bytes =
+        batched_norm_input_staging.resident_bytes() + batched_norm_gate_staging.resident_bytes();
     let qwen_norm_model_bytes = qwen_norm.model_bytes();
     let qwen_norm_transient_bytes = qwen_norm.transient_bytes();
     let qwen_norm_device_view_staging_bytes = qwen_norm_input_staging.resident_bytes();
@@ -431,6 +494,9 @@ fn main() -> anyhow::Result<()> {
     drop(norm);
     drop(norm_input_staging);
     drop(norm_gate_staging);
+    drop(batched_norm_output);
+    drop(batched_norm_input_staging);
+    drop(batched_norm_gate_staging);
     drop(qwen_norm);
     drop(qwen_norm_input_staging);
     drop(residual_norm);
@@ -452,6 +518,8 @@ fn main() -> anyhow::Result<()> {
         + gated_norm_model_bytes
         + gated_norm_transient_bytes
         + gated_norm_device_view_staging_bytes
+        + gated_norm_batch_transient_bytes
+        + gated_norm_batch_device_view_staging_bytes
         + qwen_norm_model_bytes
         + qwen_norm_transient_bytes
         + qwen_norm_device_view_staging_bytes
@@ -492,6 +560,8 @@ fn main() -> anyhow::Result<()> {
             gated_norm_model_bytes,
             gated_norm_transient_bytes,
             gated_norm_device_view_staging_bytes,
+            gated_norm_batch_transient_bytes,
+            gated_norm_batch_device_view_staging_bytes,
             qwen_norm_rows: qwen_norm_config.rows,
             qwen_norm_columns: qwen_norm_config.columns,
             qwen_norm_model_bytes,
@@ -508,6 +578,8 @@ fn main() -> anyhow::Result<()> {
             convolution_scan_matches_sequential_state_exactly,
             maximum_gated_norm_absolute_error,
             maximum_gated_norm_relative_error,
+            maximum_batched_gated_norm_absolute_error,
+            maximum_batched_gated_norm_relative_error,
             maximum_qwen_norm_absolute_error,
             maximum_qwen_norm_relative_error,
             maximum_residual_norm_absolute_error,

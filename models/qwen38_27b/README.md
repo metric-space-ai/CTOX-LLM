@@ -286,9 +286,15 @@ resources fail closed. The loaded graph now owns exactly one reusable
 63,045,632-byte full-attention workspace pool for a 512-token chunk: hidden
 and K normalization, shared RoPE tables, Query/Gate output, and causal GQA
 output. Its planned and allocated byte counts must agree exactly, and the pool
-does not scale with the 16 target attention layers plus MTP. Projection and
-linear-attention chunk arenas remain separate from that immutable ownership
-contract. The schedule batches every large
+does not scale with the 16 target attention layers plus MTP. Projection
+workspaces remain separate from that immutable ownership contract. The graph
+now also owns one reusable 84,082,688-byte linear-attention pool for the same
+512-token chunk: causal-convolution output, prepared GatedDelta Q/K/V/decay/
+beta inputs, recurrent output, and batched gated-RMSNorm output. Those buffers
+are shared by all 48 linear-attention layers rather than multiplied by layer
+count, and planned versus allocated bytes fail closed. The three graph-owned
+prefill pools therefore total 230,096,896 bytes before executor-specific
+scratch. The schedule batches every large
 Q2/Q4 projection, retains causal device scans for paged GQA, convolution,
 GatedDelta recurrence, and MTP state, computes the target LM head only for the
 last prompt token, and exposes one cancellation/commit barrier per bounded
@@ -300,8 +306,8 @@ fit four conflict-free output slots plus one maximum-width A8 encoding slot:
 that arena because prefill consumes only its final prompt row. The graph now
 allocates this arena once and binds compact offset views to the MMQ dispatcher;
 a mixed-Q2/Q4 A4500 run using a workspace twice as wide as the active matrix is
-bit-identical to the established MMQ graph path. Executor schedule wiring
-remains open. The
+bit-identical to the established MMQ graph path. Executor schedule wiring and
+complete-graph hardware verification remain open. The
 standalone MMQ verifier exercises this same graph-facing path and the shared
 two-buffer batched RMSNorm workspace. The first causal-convolution scan now
 matches sequential CUDA output and final FP16 state bit-for-bit across a

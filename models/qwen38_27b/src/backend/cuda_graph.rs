@@ -14,12 +14,14 @@ use crate::backend::cuda_runtime::{
     CudaGatedRmsNormConfig, CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig,
     CudaRmsNormConfig, PreparedCudaA8Activation, PreparedCudaA8Projection,
     PreparedCudaBatchedA8OutputArena, PreparedCudaBatchedA8Workspace,
-    PreparedCudaBatchedQueryGateOutput, PreparedCudaBatchedRmsNormWorkspace,
-    PreparedCudaBatchedRopeWorkspace, PreparedCudaCausalConv, PreparedCudaEmbedding,
-    PreparedCudaF32Checkpoint, PreparedCudaF32Concat, PreparedCudaGatedDelta,
-    PreparedCudaGatedDeltaInputs, PreparedCudaGatedRmsNorm, PreparedCudaGatheredA8Projection,
-    PreparedCudaPagedGqa, PreparedCudaPagedGqaPrefillOutput, PreparedCudaPartialRope,
-    PreparedCudaQueryGate, PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
+    PreparedCudaBatchedGatedRmsNormOutput, PreparedCudaBatchedQueryGateOutput,
+    PreparedCudaBatchedRmsNormWorkspace, PreparedCudaBatchedRopeWorkspace, PreparedCudaCausalConv,
+    PreparedCudaCausalConvScanOutput, PreparedCudaEmbedding, PreparedCudaF32Checkpoint,
+    PreparedCudaF32Concat, PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs,
+    PreparedCudaGatedDeltaScanInputs, PreparedCudaGatedDeltaScanOutput, PreparedCudaGatedRmsNorm,
+    PreparedCudaGatheredA8Projection, PreparedCudaPagedGqa, PreparedCudaPagedGqaPrefillOutput,
+    PreparedCudaPartialRope, PreparedCudaQueryGate, PreparedCudaResidualRmsNorm,
+    PreparedCudaRmsNorm,
 };
 use crate::backend::cuda_schedule::{
     CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaNormBinding, CudaPrefillOperation,
@@ -122,6 +124,92 @@ pub struct CudaPrefillProjectionWorkspacePlan {
     pub activation_scale_bytes: u64,
     pub output_arena_bytes: u64,
     pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaPrefillLinearWorkspaceBudget {
+    pub causal_conv_output_bytes: u64,
+    pub gated_delta_input_bytes: u64,
+    pub gated_delta_output_bytes: u64,
+    pub gated_rms_norm_output_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl CudaPrefillLinearWorkspaceBudget {
+    pub fn qwen38(config: &Qwen38Config, max_chunk_tokens: usize) -> Result<Self> {
+        if max_chunk_tokens == 0 || max_chunk_tokens > 65_535 {
+            return Err(EngineError::MemoryBudget(
+                "CUDA linear workspace chunk capacity must be in 1..=65535".into(),
+            ));
+        }
+        let chunk = u64::try_from(max_chunk_tokens)
+            .map_err(|_| EngineError::MemoryBudget("CUDA prefill chunk exceeds u64".into()))?;
+        let key_width = config
+            .linear_num_key_heads
+            .checked_mul(config.linear_key_head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA linear key width overflows".into()))?;
+        let value_width = config
+            .linear_num_value_heads
+            .checked_mul(config.linear_value_head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA linear value width overflows".into()))?;
+        let convolution_width = key_width
+            .checked_mul(2)
+            .and_then(|width| width.checked_add(value_width))
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA convolution width overflows".into()))?;
+        let heads = u64::try_from(config.linear_num_value_heads)
+            .map_err(|_| EngineError::MemoryBudget("CUDA linear heads exceed u64".into()))?;
+        let key_dim = u64::try_from(config.linear_key_head_dim)
+            .map_err(|_| EngineError::MemoryBudget("CUDA linear key dim exceeds u64".into()))?;
+        let value_dim = u64::try_from(config.linear_value_head_dim)
+            .map_err(|_| EngineError::MemoryBudget("CUDA linear value dim exceeds u64".into()))?;
+        let f32_bytes =
+            u64::try_from(std::mem::size_of::<f32>()).expect("f32 byte count always fits u64");
+        let causal_conv_output_bytes = checked_product(
+            &[
+                chunk,
+                u64::try_from(convolution_width).map_err(|_| {
+                    EngineError::MemoryBudget("CUDA convolution width exceeds u64".into())
+                })?,
+                f32_bytes,
+            ],
+            "CUDA convolution scan output bytes",
+        )?;
+        let gated_delta_input_values = checked_add(
+            checked_product(&[heads, key_dim, 2], "CUDA gated-delta Q/K values")?,
+            checked_add(
+                checked_product(&[heads, value_dim], "CUDA gated-delta V values")?,
+                checked_product(&[heads, 2], "CUDA gated-delta scalar values")?,
+                "CUDA gated-delta V/scalar values",
+            )?,
+            "CUDA gated-delta input values",
+        )?;
+        let gated_delta_input_bytes = checked_product(
+            &[chunk, gated_delta_input_values, f32_bytes],
+            "CUDA gated-delta input bytes",
+        )?;
+        let gated_delta_output_bytes = checked_product(
+            &[chunk, heads, value_dim, f32_bytes],
+            "CUDA gated-delta output bytes",
+        )?;
+        let gated_rms_norm_output_bytes = gated_delta_output_bytes;
+        let total_bytes = [
+            causal_conv_output_bytes,
+            gated_delta_input_bytes,
+            gated_delta_output_bytes,
+            gated_rms_norm_output_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, value| {
+            checked_add(total, value, "CUDA linear workspace bytes")
+        })?;
+        Ok(Self {
+            causal_conv_output_bytes,
+            gated_delta_input_bytes,
+            gated_delta_output_bytes,
+            gated_rms_norm_output_bytes,
+            total_bytes,
+        })
+    }
 }
 
 impl CudaPrefillProjectionWorkspacePlan {
@@ -1330,6 +1418,7 @@ pub struct PreparedCudaPrefillWorkspaces {
     max_chunk_tokens: usize,
     budget: CudaPrefillWorkspaceBudget,
     projection_budget: CudaPrefillProjectionWorkspacePlan,
+    linear_budget: CudaPrefillLinearWorkspaceBudget,
     hidden_norm: PreparedCudaBatchedRmsNormWorkspace,
     key_norm: PreparedCudaBatchedRmsNormWorkspace,
     rope: PreparedCudaBatchedRopeWorkspace,
@@ -1337,6 +1426,10 @@ pub struct PreparedCudaPrefillWorkspaces {
     paged_gqa_output: PreparedCudaPagedGqaPrefillOutput,
     projection_activation: PreparedCudaBatchedA8Workspace,
     projection_outputs: PreparedCudaBatchedA8OutputArena,
+    causal_conv_output: PreparedCudaCausalConvScanOutput,
+    gated_delta_inputs: PreparedCudaGatedDeltaScanInputs,
+    gated_delta_output: PreparedCudaGatedDeltaScanOutput,
+    gated_rms_norm_output: PreparedCudaBatchedGatedRmsNormOutput,
 }
 
 impl PreparedCudaPrefillWorkspaces {
@@ -1348,6 +1441,7 @@ impl PreparedCudaPrefillWorkspaces {
         projection_budget: CudaPrefillProjectionWorkspacePlan,
     ) -> Result<Self> {
         let budget = CudaPrefillWorkspaceBudget::qwen38(config, max_chunk_tokens)?;
+        let linear_budget = CudaPrefillLinearWorkspaceBudget::qwen38(config, max_chunk_tokens)?;
         if projection_budget.max_chunk_tokens != max_chunk_tokens {
             return Err(EngineError::InvalidState(
                 "CUDA attention/projection workspace chunk capacities differ".into(),
@@ -1386,6 +1480,15 @@ impl PreparedCudaPrefillWorkspaces {
             max_chunk_tokens,
             projection_budget.output_slot_rows,
         )?;
+        let causal_conv_output = runtime
+            .prepare_causal_conv_scan_output(CudaCausalConvConfig::QWEN38_27B, max_chunk_tokens)?;
+        let gated_delta_inputs = runtime.prepare_gated_delta_scan_inputs(max_chunk_tokens)?;
+        let gated_delta_output = runtime
+            .prepare_gated_delta_scan_output(CudaGatedDeltaConfig::QWEN38_27B, max_chunk_tokens)?;
+        let gated_rms_norm_output = runtime.prepare_batched_gated_rms_norm_output(
+            CudaGatedRmsNormConfig::QWEN38_27B,
+            max_chunk_tokens,
+        )?;
         let actual = [
             hidden_norm.transient_bytes(),
             key_norm.transient_bytes(),
@@ -1394,6 +1497,10 @@ impl PreparedCudaPrefillWorkspaces {
             paged_gqa_output.transient_bytes(),
             projection_activation.transient_bytes(),
             projection_outputs.transient_bytes(),
+            causal_conv_output.transient_bytes(),
+            gated_delta_inputs.transient_bytes(),
+            gated_delta_output.transient_bytes(),
+            gated_rms_norm_output.transient_bytes(),
         ]
         .into_iter()
         .try_fold(0_u64, |total, bytes| {
@@ -1403,8 +1510,12 @@ impl PreparedCudaPrefillWorkspaces {
             checked_add(total, bytes, "CUDA prefill workspace allocation")
         })?;
         let planned = checked_add(
-            budget.total_bytes,
-            projection_budget.total_bytes,
+            checked_add(
+                budget.total_bytes,
+                projection_budget.total_bytes,
+                "CUDA attention/projection workspace bytes",
+            )?,
+            linear_budget.total_bytes,
             "CUDA complete prefill workspace bytes",
         )?;
         if actual != planned {
@@ -1416,6 +1527,7 @@ impl PreparedCudaPrefillWorkspaces {
             max_chunk_tokens,
             budget,
             projection_budget,
+            linear_budget,
             hidden_norm,
             key_norm,
             rope,
@@ -1423,6 +1535,10 @@ impl PreparedCudaPrefillWorkspaces {
             paged_gqa_output,
             projection_activation,
             projection_outputs,
+            causal_conv_output,
+            gated_delta_inputs,
+            gated_delta_output,
+            gated_rms_norm_output,
         })
     }
 
@@ -1438,8 +1554,14 @@ impl PreparedCudaPrefillWorkspaces {
         self.projection_budget
     }
 
+    pub fn linear_budget(&self) -> CudaPrefillLinearWorkspaceBudget {
+        self.linear_budget
+    }
+
     pub fn transient_bytes(&self) -> u64 {
-        self.budget.total_bytes + self.projection_budget.total_bytes
+        self.budget.total_bytes
+            + self.projection_budget.total_bytes
+            + self.linear_budget.total_bytes
     }
 
     pub fn hidden_norm(&self) -> &PreparedCudaBatchedRmsNormWorkspace {
@@ -1468,6 +1590,22 @@ impl PreparedCudaPrefillWorkspaces {
 
     pub fn projection_outputs(&self) -> &PreparedCudaBatchedA8OutputArena {
         &self.projection_outputs
+    }
+
+    pub fn causal_conv_output(&self) -> &PreparedCudaCausalConvScanOutput {
+        &self.causal_conv_output
+    }
+
+    pub fn gated_delta_inputs(&self) -> &PreparedCudaGatedDeltaScanInputs {
+        &self.gated_delta_inputs
+    }
+
+    pub fn gated_delta_output(&self) -> &PreparedCudaGatedDeltaScanOutput {
+        &self.gated_delta_output
+    }
+
+    pub fn gated_rms_norm_output(&self) -> &PreparedCudaBatchedGatedRmsNormOutput {
+        &self.gated_rms_norm_output
     }
 }
 
@@ -3219,6 +3357,25 @@ mod tests {
         assert_eq!(
             full.chunk_projection_count,
             projections.projection_count() - 1
+        );
+    }
+
+    #[test]
+    fn frozen_linear_prefill_workspace_is_shared_across_all_forty_eight_layers() {
+        let config = Qwen38Config::default();
+        let budget = CudaPrefillLinearWorkspaceBudget::qwen38(&config, 512).unwrap();
+        assert_eq!(budget.causal_conv_output_bytes, 20_971_520);
+        assert_eq!(budget.gated_delta_input_bytes, 37_945_344);
+        assert_eq!(budget.gated_delta_output_bytes, 12_582_912);
+        assert_eq!(budget.gated_rms_norm_output_bytes, 12_582_912);
+        assert_eq!(budget.total_bytes, 84_082_688);
+        let attention = CudaPrefillWorkspaceBudget::qwen38(&config, 512).unwrap();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let projection =
+            CudaPrefillProjectionWorkspacePlan::qwen38(&config, &projections, 512).unwrap();
+        assert_eq!(
+            budget.total_bytes + attention.total_bytes + projection.total_bytes,
+            230_096_896
         );
     }
 

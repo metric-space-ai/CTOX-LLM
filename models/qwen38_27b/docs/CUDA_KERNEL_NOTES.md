@@ -529,6 +529,18 @@ Evidence is recorded in
 lifecycle evidence only; complete-graph integration and controlled chunk-size
 latency remain open before promotion.
 
+The prepared graph now reserves the complete 512-token linear-attention
+workspace once rather than once per layer: 20,971,520 bytes for causal-
+convolution output, 37,945,344 bytes for prepared GatedDelta inputs,
+12,582,912 bytes for recurrent output, and 12,582,912 bytes for batched gated
+RMSNorm output. The exact total is 84,082,688 bytes and is shared across all 48
+linear-attention layers. Together with the 63,045,632-byte full-attention pool
+and 82,968,576-byte projection arena, fixed graph-owned chunk workspaces total
+230,096,896 bytes. Host planning and actual CUDA allocations must match
+exactly; this is an ownership/bounded-memory result, not yet complete-graph
+performance evidence. The batched gated-RMSNorm verifier is compiled into the
+linear-ops hardware harness, but its updated A4500 run remains required.
+
 The direct causal paged-GQA prefill candidate maps one warp to each
 `(query_token, query_head)` pair and scans exactly that position's logical
 prefix from the canonical mixed Q2/Q4 page descriptors. It requires only

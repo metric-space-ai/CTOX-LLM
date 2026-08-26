@@ -793,6 +793,17 @@ pub struct PreparedCudaGatedRmsNorm {
     transient_bytes: usize,
 }
 
+/// Token-major output for batched GatedDelta RMSNorm. The immutable FP16
+/// weight remains in [`PreparedCudaGatedRmsNorm`].
+pub struct PreparedCudaBatchedGatedRmsNormOutput {
+    context: Rc<CudaContextInner>,
+    token_capacity: u32,
+    heads: u32,
+    columns: u32,
+    output: DeviceBuffer,
+    transient_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CudaRmsNormConfig {
     pub rows: usize,
@@ -3023,6 +3034,35 @@ impl CudaCandidateRuntime {
         })
     }
 
+    pub fn prepare_batched_gated_rms_norm_output(
+        &self,
+        config: CudaGatedRmsNormConfig,
+        token_capacity: usize,
+    ) -> Result<PreparedCudaBatchedGatedRmsNormOutput> {
+        if config != CudaGatedRmsNormConfig::QWEN38_27B {
+            return Err(EngineError::Shape(
+                "CUDA batched gated RMSNorm requires the exact Qwen3.8-27B profile".into(),
+            ));
+        }
+        let token_capacity = validate_a8_batch_capacity(token_capacity)?;
+        let output_bytes = (token_capacity as usize)
+            .checked_mul(config.rows)
+            .and_then(|values| values.checked_mul(config.columns))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA batched gated RMSNorm output overflows".into())
+            })?;
+        self.make_current()?;
+        Ok(PreparedCudaBatchedGatedRmsNormOutput {
+            context: Rc::clone(&self.inner),
+            token_capacity,
+            heads: config.rows as u32,
+            columns: config.columns as u32,
+            output: DeviceBuffer::allocate(self, output_bytes)?,
+            transient_bytes: output_bytes,
+        })
+    }
+
     pub fn dispatch_gated_rms_norm_f16(
         &self,
         prepared: &PreparedCudaGatedRmsNorm,
@@ -3074,16 +3114,83 @@ impl CudaCandidateRuntime {
         prepared.output.f32_view(0, expected)
     }
 
+    pub fn dispatch_batched_gated_rms_norm_f16_device<'a>(
+        &self,
+        prepared: &PreparedCudaGatedRmsNorm,
+        output: &'a PreparedCudaBatchedGatedRmsNormOutput,
+        input: CudaDeviceF32View<'_>,
+        gate: CudaDeviceF32View<'_>,
+        token_count: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let token_count = validate_a8_batch_capacity(token_count)?;
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &output.context)
+            || !Rc::ptr_eq(&self.inner, input.context)
+            || !Rc::ptr_eq(&self.inner, gate.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA batched gated RMSNorm crosses driver contexts".into(),
+            ));
+        }
+        if output.heads != prepared.config.rows as u32
+            || output.columns != prepared.config.columns as u32
+            || token_count > output.token_capacity
+        {
+            return Err(EngineError::MemoryBudget(
+                "CUDA batched gated RMSNorm output does not admit the request".into(),
+            ));
+        }
+        let rows = (token_count as usize)
+            .checked_mul(prepared.config.rows)
+            .ok_or_else(|| EngineError::Shape("CUDA gated RMSNorm rows overflow".into()))?;
+        let expected = rows
+            .checked_mul(prepared.config.columns)
+            .ok_or_else(|| EngineError::Shape("CUDA gated RMSNorm values overflow".into()))?;
+        for (name, view) in [("input", input), ("gate", gate)] {
+            if view.values() != expected {
+                return Err(EngineError::Shape(format!(
+                    "CUDA batched gated RMSNorm {name} has {} values, expected {expected}",
+                    view.values()
+                )));
+            }
+        }
+        self.dispatch_gated_rms_norm_f16_buffers(
+            prepared,
+            input.ptr()?,
+            gate.ptr()?,
+            output.output.ptr(),
+            rows,
+        )?;
+        output.output.f32_view(0, expected)
+    }
+
     fn dispatch_gated_rms_norm_f16_inner(
+        &self,
+        prepared: &PreparedCudaGatedRmsNorm,
+        input: CuDevicePtr,
+        gate: CuDevicePtr,
+    ) -> Result<()> {
+        self.dispatch_gated_rms_norm_f16_buffers(
+            prepared,
+            input,
+            gate,
+            prepared.output.ptr(),
+            prepared.config.rows,
+        )
+    }
+
+    fn dispatch_gated_rms_norm_f16_buffers(
         &self,
         prepared: &PreparedCudaGatedRmsNorm,
         mut input: CuDevicePtr,
         mut gate: CuDevicePtr,
+        mut output: CuDevicePtr,
+        rows: usize,
     ) -> Result<()> {
         self.make_current()?;
         let mut weight = prepared.weight.ptr();
-        let mut output = prepared.output.ptr();
-        let mut rows = prepared.config.rows as u32;
+        let mut rows = u32::try_from(rows)
+            .map_err(|_| EngineError::Shape("CUDA gated RMSNorm rows exceed u32".into()))?;
         let mut columns = prepared.config.columns as u32;
         let mut epsilon = prepared.config.epsilon;
         let mut params = [
@@ -8190,6 +8297,30 @@ impl PreparedCudaGatedRmsNorm {
     }
 }
 
+impl PreparedCudaBatchedGatedRmsNormOutput {
+    pub fn token_capacity(&self) -> usize {
+        self.token_capacity as usize
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn device_output(&self, token_count: usize) -> Result<CudaDeviceF32View<'_>> {
+        let token_count = validate_a8_batch_capacity(token_count)?;
+        if token_count > self.token_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA batched gated RMSNorm requests {token_count} tokens, capacity is {}",
+                self.token_capacity
+            )));
+        }
+        self.output.f32_view(
+            0,
+            token_count as usize * self.heads as usize * self.columns as usize,
+        )
+    }
+}
+
 impl PreparedCudaRmsNorm {
     pub fn config(&self) -> CudaRmsNormConfig {
         self.config
@@ -9565,6 +9696,7 @@ mod tests {
         assert_owned::<PreparedCudaBatchedA8Output>();
         assert_owned::<PreparedCudaBatchedA8OutputArena>();
         assert_owned::<PreparedCudaBatchedRmsNormWorkspace>();
+        assert_owned::<PreparedCudaBatchedGatedRmsNormOutput>();
         assert_owned::<PreparedCudaCausalConvScanOutput>();
         assert_owned::<PreparedCudaGatedDeltaScanInputs>();
         assert_owned::<PreparedCudaGatedDeltaScanOutput>();
