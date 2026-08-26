@@ -167,7 +167,9 @@ Mixed Q2/Q4 matrices dispatch their original contiguous row groups through the
 same mapping and one command encoder, with no backend-specific repacking.
 The restricted MTP LM head also gathers arbitrary canonical token rows from
 that mapping in one batched Q2/Q4 command path instead of copying or expanding
-the vocabulary matrix.
+the vocabulary matrix. Embedding lookup resolves one pure or mixed Q2/Q4 row
+and decodes it with its packed FP16 `s_in`/`s_out` corrections directly from
+the same mapping; only the resulting hidden vector is transient.
 Complete-graph residency and unload measurements on the 7.8-GiB artifact are
 still required before this changes backend promotion state.
 

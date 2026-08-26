@@ -370,3 +370,56 @@ kernel void q4_b64_gathered_matvec(
     gathered_q4_rows(weights, input, s_in, s_out, bias, row_ids, output,
                      params, first_request, simd_lane);
 }
+
+// Decode one loader-resolved Q2 embedding row. One thread owns one packed
+// byte and writes four adjacent corrected hidden values. The weight row,
+// complete s_in vector, and one s_out half remain offsets into the shared
+// CTOXQ mmap; only the f32 hidden vector is a separate Metal buffer.
+kernel void q2_b64_recovered_row(
+    device const uchar* weights [[buffer(0)]],
+    device const half* s_in [[buffer(2)]],
+    device const half* s_out [[buffer(3)]],
+    device float* output [[buffer(5)]],
+    constant FusedMatVecParams& params [[buffer(6)]],
+    uint packed_index [[thread_position_in_grid]]) {
+    uint column = packed_index * 4u;
+    if (column >= params.columns) {
+        return;
+    }
+    uint block = column / Q2Q4_BLOCK_LEN;
+    uint byte_in_block = packed_index & 15u;
+    device const uchar* block_base = weights + ulong(block) * Q2_BLOCK_BYTES;
+    float scale = read_scale(block_base) * float(s_out[0]);
+    uint packed = uint(block_base[2u + byte_in_block]);
+    output[column] = scale * q2_normalized(packed & 0x3u) * float(s_in[column]);
+    output[column + 1u] = scale * q2_normalized((packed >> 2u) & 0x3u)
+        * float(s_in[column + 1u]);
+    output[column + 2u] = scale * q2_normalized((packed >> 4u) & 0x3u)
+        * float(s_in[column + 2u]);
+    output[column + 3u] = scale * q2_normalized((packed >> 6u) & 0x3u)
+        * float(s_in[column + 3u]);
+}
+
+// Decode one loader-resolved Q4 embedding row. One thread owns one packed
+// byte and writes two adjacent corrected hidden values.
+kernel void q4_b64_recovered_row(
+    device const uchar* weights [[buffer(0)]],
+    device const half* s_in [[buffer(2)]],
+    device const half* s_out [[buffer(3)]],
+    device float* output [[buffer(5)]],
+    constant FusedMatVecParams& params [[buffer(6)]],
+    uint packed_index [[thread_position_in_grid]]) {
+    uint column = packed_index * 2u;
+    if (column >= params.columns) {
+        return;
+    }
+    uint block = column / Q2Q4_BLOCK_LEN;
+    uint byte_in_block = packed_index & 31u;
+    device const uchar* block_base = weights + ulong(block) * Q4_BLOCK_BYTES;
+    float scale = read_scale(block_base) * float(s_out[0]);
+    uint packed = uint(block_base[2u + byte_in_block]);
+    float normalized0 = (float(packed & 0xfu) - 7.5f) * (1.0f / 7.5f);
+    float normalized1 = (float((packed >> 4u) & 0xfu) - 7.5f) * (1.0f / 7.5f);
+    output[column] = scale * normalized0 * float(s_in[column]);
+    output[column + 1u] = scale * normalized1 * float(s_in[column + 1u]);
+}

@@ -16,9 +16,10 @@ use metal_driver::{
 use sha2::{Digest, Sha256};
 
 use super::metal::{
-    validate_mixed_operation, validate_operation, MetalBufferAbi, MetalFusedMatVecParams,
-    MAX_SIMDGROUPS_PER_THREADGROUP, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
-    Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
+    validate_mixed_operation, validate_operation, validate_recovered_row, MetalBufferAbi,
+    MetalFusedMatVecParams, MAX_SIMDGROUPS_PER_THREADGROUP, Q2_GATHERED_KERNEL_NAME,
+    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
+    Q4_RECOVERED_ROW_KERNEL_NAME,
 };
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
@@ -43,6 +44,8 @@ pub struct MetalCandidateRuntime {
     q4_pipeline: ComputePipelineState,
     q2_gathered_pipeline: ComputePipelineState,
     q4_gathered_pipeline: ComputePipelineState,
+    q2_recovered_row_pipeline: ComputePipelineState,
+    q4_recovered_row_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -160,6 +163,23 @@ struct MappedMetalGatherDispatch {
     output_offset: u64,
     row_ids_buffer: Buffer,
     params_buffer: Buffer,
+}
+
+/// One recovered embedding row decoded directly from the shared CTOXQ mmap.
+/// The complete packed row and FP16 correction tensors are mapping offsets;
+/// only the resulting f32 hidden vector and 32-byte parameter block allocate
+/// transient Metal storage.
+pub struct PreparedMappedMetalRecoveredRow {
+    dtype: TensorDType,
+    columns: usize,
+    thread_width: usize,
+    mapping: MappedMetalArtifact,
+    weights_offset: u64,
+    s_in_offset: u64,
+    s_out_offset: u64,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    transient_bytes: usize,
 }
 
 impl PreparedMetalMatVec {
@@ -337,6 +357,24 @@ impl PreparedMappedMetalGatheredMatVec {
     }
 }
 
+impl PreparedMappedMetalRecoveredRow {
+    pub fn dtype(&self) -> TensorDType {
+        self.dtype
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.mapping.copied_model_bytes()
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -377,6 +415,20 @@ impl MetalCandidateRuntime {
                     "Metal Q4 gathered function lookup failed: {message}"
                 ))
             })?;
+        let q2_recovered_row_function = library
+            .get_function(Q2_RECOVERED_ROW_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q2 recovered-row function lookup failed: {message}"
+                ))
+            })?;
+        let q4_recovered_row_function = library
+            .get_function(Q4_RECOVERED_ROW_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 recovered-row function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -401,6 +453,20 @@ impl MetalCandidateRuntime {
                     "Metal Q4 gathered pipeline creation failed: {message}"
                 ))
             })?;
+        let q2_recovered_row_pipeline = device
+            .new_compute_pipeline_state_with_function(&q2_recovered_row_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q2 recovered-row pipeline creation failed: {message}"
+                ))
+            })?;
+        let q4_recovered_row_pipeline = device
+            .new_compute_pipeline_state_with_function(&q4_recovered_row_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 recovered-row pipeline creation failed: {message}"
+                ))
+            })?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -409,6 +475,8 @@ impl MetalCandidateRuntime {
             q4_pipeline,
             q2_gathered_pipeline,
             q4_gathered_pipeline,
+            q2_recovered_row_pipeline,
+            q4_recovered_row_pipeline,
         })
     }
 
@@ -744,6 +812,79 @@ impl MetalCandidateRuntime {
             bias_buffer,
             output_buffer,
             dispatches,
+            transient_bytes,
+        })
+    }
+
+    /// Prepare one embedding lookup from an exact recovered matrix row. The
+    /// selected pure or mixed Q2/Q4 row is resolved by the loader, then bound
+    /// as an offset into the same complete CTOXQ mapping used by projections.
+    pub fn prepare_mapped_recovered_row(
+        &self,
+        mapping: &MappedMetalArtifact,
+        matrix: RecoveredMatrixView<'_>,
+        row: usize,
+    ) -> Result<PreparedMappedMetalRecoveredRow> {
+        let operation = matrix.row_operation(row)?;
+        let layout = validate_recovered_row(&operation)?;
+        let ScaleSlice::F16Le(s_in) = operation.s_in else {
+            unreachable!("validated Metal recovered-row s_in is FP16")
+        };
+        let ScaleSlice::F16Le(s_out) = matrix.s_out.as_recovery_scales()? else {
+            unreachable!("loader recovery scales are FP16")
+        };
+        let weights_offset = mapping.byte_offset(operation.weights, "recovered-row weights")?;
+        let s_in_offset = mapping.byte_offset(s_in, "recovered-row s_in")?;
+        let s_out_base = mapping.byte_offset(s_out, "recovered-row s_out")?;
+        let s_out_offset = s_out_base
+            .checked_add(
+                u64::try_from(row)
+                    .map_err(|_| EngineError::Shape("Metal embedding row exceeds u64".into()))?
+                    .checked_mul(std::mem::size_of::<half::f16>() as u64)
+                    .ok_or_else(|| {
+                        EngineError::Shape("Metal embedding s_out index overflows".into())
+                    })?,
+            )
+            .ok_or_else(|| EngineError::Shape("Metal embedding s_out offset overflows".into()))?;
+        let pipeline = match layout.dtype {
+            TensorDType::Q2B64 => &self.q2_recovered_row_pipeline,
+            TensorDType::Q4B64 => &self.q4_recovered_row_pipeline,
+            _ => unreachable!("Metal recovered row is Q2 or Q4"),
+        };
+        let params = MetalFusedMatVecParams {
+            rows: 1,
+            columns: u32::try_from(operation.columns)
+                .map_err(|_| EngineError::Shape("Metal embedding width exceeds u32".into()))?,
+            blocks_per_row: u32::try_from(operation.columns / crate::quant::BLOCK_LEN).map_err(
+                |_| EngineError::Shape("Metal embedding block count exceeds u32".into()),
+            )?,
+            has_s_in: 1,
+            has_s_out: 1,
+            has_bias: 0,
+            activation: 0,
+            reserved0: 0,
+        };
+        let output_bytes = operation
+            .columns
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("Metal embedding output bytes overflow".into()))?;
+        let output_buffer = self
+            .device
+            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let params_buffer = buffer_with_data(&self.device, &params.encode());
+        let transient_bytes = output_bytes
+            .checked_add(MetalFusedMatVecParams::BYTE_LEN)
+            .ok_or_else(|| EngineError::Shape("Metal embedding transient bytes overflow".into()))?;
+        Ok(PreparedMappedMetalRecoveredRow {
+            dtype: layout.dtype,
+            columns: operation.columns,
+            thread_width: dispatch_width(pipeline, DEFAULT_SIMDGROUPS)?,
+            mapping: mapping.clone(),
+            weights_offset,
+            s_in_offset,
+            s_out_offset,
+            output_buffer,
+            params_buffer,
             transient_bytes,
         })
     }
@@ -1192,6 +1333,82 @@ impl MetalCandidateRuntime {
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
                 "Metal gathered projection produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    /// Decode one prepared embedding row directly from the no-copy artifact
+    /// mapping. No host implementation or alternate Metal kernel is used.
+    pub fn dispatch_mapped_recovered_row(
+        &self,
+        prepared: &PreparedMappedMetalRecoveredRow,
+    ) -> Result<Vec<f32>> {
+        let (pipeline, values_per_thread) = match prepared.dtype {
+            TensorDType::Q2B64 => (&self.q2_recovered_row_pipeline, 4_usize),
+            TensorDType::Q4B64 => (&self.q4_recovered_row_pipeline, 2_usize),
+            _ => unreachable!("prepared Metal recovered row is Q2 or Q4"),
+        };
+        let work_items = prepared.columns / values_per_thread;
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-recovered-embedding-row-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(
+            MetalBufferAbi::WEIGHTS as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.weights_offset,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::S_IN as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.s_in_offset,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::S_OUT as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.s_out_offset,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::OUTPUT as u64,
+            Some(&prepared.output_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        let grid = MTLSize {
+            width: work_items.div_ceil(prepared.thread_width) as u64,
+            height: 1,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width: prepared.thread_width as u64,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(grid, threads);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal recovered-row command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(
+                prepared.output_buffer.contents().cast::<f32>(),
+                prepared.columns,
+            )
+            .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal recovered embedding row produced a non-finite output".into(),
             ));
         }
         Ok(output)
@@ -1999,5 +2216,73 @@ mod tests {
             .dispatch_mapped_gathered(&prepared)
             .expect("dispatch zero gathered input");
         assert!(zero.iter().all(|value| value.abs() <= f32::EPSILON));
+    }
+
+    #[test]
+    fn mixed_embedding_rows_decode_from_one_mapping_without_model_copies() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let rows_q2 = 3;
+        let rows_q4 = 5;
+        let columns = 3 * BLOCK_LEN;
+        let directory = tempdir().expect("temporary embedding artifact directory");
+        let path = directory.path().join("embedding.ctoxq");
+        write_mixed_fixture(&path, rows_q2, rows_q4, columns);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open embedding mmap fixture");
+        let matrix = artifact
+            .recovered_matrix("matrix.weight")
+            .expect("resolve recovered embedding matrix");
+        let q2_row = 1;
+        let q4_row = rows_q2 + 2;
+        let expected_q2 = cpu
+            .recovered_row(&matrix.row_operation(q2_row).expect("resolve Q2 row"))
+            .expect("decode Q2 embedding oracle");
+        let expected_q4 = cpu
+            .recovered_row(&matrix.row_operation(q4_row).expect("resolve Q4 row"))
+            .expect("decode Q4 embedding oracle");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import embedding mmap without copy");
+        let prepared_q2 = runtime
+            .prepare_mapped_recovered_row(&mapping, matrix, q2_row)
+            .expect("prepare Q2 embedding row");
+        let prepared_q4 = runtime
+            .prepare_mapped_recovered_row(&mapping, matrix, q4_row)
+            .expect("prepare Q4 embedding row");
+        assert_eq!(prepared_q2.dtype(), TensorDType::Q2B64);
+        assert_eq!(prepared_q4.dtype(), TensorDType::Q4B64);
+        assert_eq!(prepared_q2.columns(), columns);
+        assert_eq!(prepared_q4.columns(), columns);
+        assert_eq!(prepared_q2.copied_model_bytes(), 0);
+        assert_eq!(prepared_q4.copied_model_bytes(), 0);
+        assert_eq!(
+            prepared_q2.transient_bytes(),
+            columns * std::mem::size_of::<f32>() + MetalFusedMatVecParams::BYTE_LEN
+        );
+        assert_eq!(prepared_q4.transient_bytes(), prepared_q2.transient_bytes());
+        assert!(runtime
+            .prepare_mapped_recovered_row(&mapping, matrix, rows_q2 + rows_q4)
+            .is_err());
+        drop(mapping);
+        drop(artifact);
+        let actual_q2 = runtime
+            .dispatch_mapped_recovered_row(&prepared_q2)
+            .expect("dispatch Q2 embedding after loader drop");
+        let actual_q4 = runtime
+            .dispatch_mapped_recovered_row(&prepared_q4)
+            .expect("dispatch Q4 embedding after loader drop");
+        for (dtype, expected, actual) in [
+            (TensorDType::Q2B64, expected_q2, actual_q2),
+            (TensorDType::Q4B64, expected_q4, actual_q4),
+        ] {
+            for (column, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 2.0e-5_f32.max(expected.abs() * 3.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "{dtype:?} embedding column {column}: expected {expected}, got {actual}"
+                );
+            }
+        }
     }
 }

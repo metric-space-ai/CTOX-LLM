@@ -32,7 +32,7 @@
     "metal": {
       "state": "candidate",
       "production_allowed": false,
-      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch", "resident_projection_reuse", "identity_bound_shared_fanout", "batched_command_encoding", "mmap_no_copy_artifact_import", "shared_artifact_buffer_offsets", "restricted_lm_head_gather"],
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch", "resident_projection_reuse", "identity_bound_shared_fanout", "batched_command_encoding", "mmap_no_copy_artifact_import", "shared_artifact_buffer_offsets", "recovered_embedding_row", "restricted_lm_head_gather"],
       "evidence": ["METAL_KERNEL_NOTES.md", "../benchmarks/metal/apple-m5-shared-fanout-20260826.json"],
       "promotion_blocker": "complete-graph no-copy ownership/high-watermark/unload evidence, complete graph kernels, controlled roofline/reference evidence, and full-model golden run"
     },

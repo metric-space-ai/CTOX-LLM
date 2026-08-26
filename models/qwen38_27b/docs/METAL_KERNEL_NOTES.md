@@ -20,6 +20,8 @@ usage, no scalar fallback.
 |---|---|---|
 | `q2_b64_fused_matvec` | Q2_B64 | 18 bytes: fp16-LE scale + 16 code bytes (4 x 2-bit values per byte) |
 | `q4_b64_fused_matvec` | Q4_B64 | 34 bytes: fp16-LE scale + 32 code bytes (2 x 4-bit values per byte) |
+| `q2_b64_recovered_row` | Q2_B64 embedding row | one packed byte/four corrected outputs per thread |
+| `q4_b64_recovered_row` | Q4_B64 embedding row | one packed byte/two corrected outputs per thread |
 
 64 values per block, row-major block order, codebook matching
 `src/quant.rs` (Q2: {-1, -1/3, 1/3, 1}; Q4: (code - 7.5) / 7.5). Q3 does not
@@ -97,6 +99,13 @@ the complete batch. Only the ID list and requested scalar logits are transient.
 Every draft is still verified by the complete target distribution in the Rust
 engine, so gathered evaluation cannot change target semantics.
 
+Embedding lookup uses two separate recovered-row entry points. The loader
+resolves the requested global row to its exact Q2 or Q4 manifest segment, and
+the runtime binds that packed row plus the complete `s_in` vector and one
+packed `s_out` half as offsets into the shared mapping. Q2 threads decode four
+adjacent columns and Q4 threads decode two; the only new allocation is the
+f32 hidden vector plus the fixed parameter block.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -132,6 +141,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   sparse non-contiguous rows across both Q2 and Q4 segments, rejects unsorted
   or out-of-range IDs, survives loader ownership being dropped, supports an
   in-place input update, and matches the full mixed CPU projection.
+- `mixed_embedding_rows_decode_from_one_mapping_without_model_copies` selects
+  one Q2 and one Q4 row from the same mixed container, drops all loader
+  handles, and matches the recovered CPU embedding oracle while reporting zero
+  copied model bytes.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
@@ -168,7 +181,7 @@ dequantization array before this source was accepted.
   evidence.
 - No controlled size/residue/thermal sweep or hardware-counter roofline
   evidence exists yet.
-- No full embedding, attention, GatedDeltaNet, MTP, sampling, or model-graph
-  Metal execution exists yet.
+- Recovered embedding rows exist as verifier candidates; no full attention,
+  GatedDeltaNet, MTP block, sampling, or model-graph Metal execution exists yet.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

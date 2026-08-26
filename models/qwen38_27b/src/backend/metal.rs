@@ -21,6 +21,8 @@ pub const Q2_KERNEL_NAME: &str = "q2_b64_fused_matvec";
 pub const Q4_KERNEL_NAME: &str = "q4_b64_fused_matvec";
 pub const Q2_GATHERED_KERNEL_NAME: &str = "q2_b64_gathered_matvec";
 pub const Q4_GATHERED_KERNEL_NAME: &str = "q4_b64_gathered_matvec";
+pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
+pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -239,6 +241,50 @@ pub fn validate_operation(
     Ok((layout, params))
 }
 
+/// Validate one loader-resolved embedding row without widening or copying its
+/// packed weights and recovery scales. The returned layout selects only the
+/// verifier candidate kernel; production dispatch remains fail-closed until
+/// the complete Metal promotion gates pass.
+pub(crate) fn validate_recovered_row(operation: &RecoveredRow<'_>) -> Result<MetalBlockLayout> {
+    let layout = block_layout(operation.dtype)?;
+    if operation.columns == 0 || !operation.columns.is_multiple_of(BLOCK_LEN) {
+        return Err(EngineError::Shape(
+            "Metal recovered-row columns must be non-zero and divisible by 64".into(),
+        ));
+    }
+    let ScaleSlice::F16Le(s_in) = operation.s_in else {
+        return Err(EngineError::UnsupportedDType(
+            "Metal recovered-row s_in must remain packed FP16".into(),
+        ));
+    };
+    let expected_s_in = operation
+        .columns
+        .checked_mul(std::mem::size_of::<half::f16>())
+        .ok_or_else(|| EngineError::Shape("Metal recovered-row s_in bytes overflow".into()))?;
+    if s_in.len() != expected_s_in {
+        return Err(EngineError::Shape(format!(
+            "Metal recovered-row s_in has {} bytes, expected {}",
+            s_in.len(),
+            expected_s_in
+        )));
+    }
+    if !operation.s_out.is_finite() {
+        return Err(EngineError::InvalidArtifact(
+            "Metal recovered-row s_out is non-finite".into(),
+        ));
+    }
+    let expected_weights = (operation.columns / BLOCK_LEN)
+        .checked_mul(layout.block_bytes)
+        .ok_or_else(|| EngineError::Shape("Metal recovered-row bytes overflow".into()))?;
+    if operation.weights.len() != expected_weights {
+        return Err(EngineError::Shape(format!(
+            "Metal recovered row has {} packed bytes, expected {expected_weights}",
+            operation.weights.len()
+        )));
+    }
+    Ok(layout)
+}
+
 /// Validate the exact manifest row groups of a mixed Q2/Q4 operation. Every
 /// returned dispatch covers one contiguous row and byte range exactly once.
 pub(crate) fn validate_mixed_operation(
@@ -403,7 +449,8 @@ impl Backend for MetalBackend {
         })
     }
 
-    fn recovered_row(&self, _operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
+    fn recovered_row(&self, operation: &RecoveredRow<'_>) -> Result<Vec<f32>> {
+        validate_recovered_row(operation)?;
         Err(EngineError::UnsupportedOperation {
             backend: "metal",
             operation: "Q2/Q4 recovered row gather",
@@ -524,6 +571,8 @@ mod tests {
         assert!(Q4_KERNEL_NAME.starts_with("q4_b64"));
         assert!(Q2_GATHERED_KERNEL_NAME.starts_with("q2_b64"));
         assert!(Q4_GATHERED_KERNEL_NAME.starts_with("q4_b64"));
+        assert!(Q2_RECOVERED_ROW_KERNEL_NAME.starts_with("q2_b64"));
+        assert!(Q4_RECOVERED_ROW_KERNEL_NAME.starts_with("q4_b64"));
     }
 
     #[test]
@@ -742,6 +791,8 @@ mod tests {
             Q4_KERNEL_NAME,
             Q2_GATHERED_KERNEL_NAME,
             Q4_GATHERED_KERNEL_NAME,
+            Q2_RECOVERED_ROW_KERNEL_NAME,
+            Q4_RECOVERED_ROW_KERNEL_NAME,
         ] {
             assert!(
                 text.contains(&format!("kernel void {name}")),
