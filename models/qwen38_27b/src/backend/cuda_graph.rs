@@ -13,10 +13,10 @@ use crate::backend::cuda_runtime::{
     CudaCandidateRuntime, CudaCausalConvConfig, CudaDeviceF32View, CudaGatedDeltaConfig,
     CudaGatedRmsNormConfig, CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig,
     CudaRmsNormConfig, PreparedCudaA8Activation, PreparedCudaA8Projection, PreparedCudaCausalConv,
-    PreparedCudaEmbedding, PreparedCudaF32Concat, PreparedCudaGatedDelta,
-    PreparedCudaGatedDeltaInputs, PreparedCudaGatedRmsNorm, PreparedCudaPagedGqa,
-    PreparedCudaPartialRope, PreparedCudaQueryGate, PreparedCudaResidualRmsNorm,
-    PreparedCudaRmsNorm,
+    PreparedCudaEmbedding, PreparedCudaF32Checkpoint, PreparedCudaF32Concat,
+    PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs, PreparedCudaGatedRmsNorm,
+    PreparedCudaPagedGqa, PreparedCudaPartialRope, PreparedCudaQueryGate,
+    PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
 };
 use crate::backend::cuda_schedule::{
     CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaNormBinding,
@@ -623,13 +623,22 @@ pub struct PreparedCudaProjectionGraph {
     full_attention: BTreeMap<String, PreparedCudaFullAttentionLayer>,
     norms: PreparedCudaNormGraph,
     mtp_concat: PreparedCudaF32Concat,
+    target_hidden_checkpoint: PreparedCudaF32Checkpoint,
     model_bytes: u64,
     graph_bytes: u64,
     session_bytes: u64,
+    speculative_checkpoint_bytes: u64,
     target_tokens: usize,
     poisoned: bool,
     mtp_tokens: usize,
     mtp_poisoned: bool,
+    speculative_base: Option<CudaSpeculativeBase>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CudaSpeculativeBase {
+    target_tokens: usize,
+    mtp_tokens: usize,
 }
 
 pub struct PreparedCudaNormGraph {
@@ -717,6 +726,18 @@ impl PreparedCudaFullAttentionLayer {
         self.kv.reset()
     }
 
+    fn begin_speculative(&mut self) -> Result<()> {
+        self.kv.begin_speculative()
+    }
+
+    fn restore_speculative(&mut self) -> Result<()> {
+        self.kv.restore_speculative()
+    }
+
+    fn commit_speculative(&mut self) -> Result<()> {
+        self.kv.commit_speculative()
+    }
+
     pub fn dispatch_device<'a>(
         &'a mut self,
         runtime: &CudaCandidateRuntime,
@@ -770,6 +791,25 @@ impl PreparedCudaLinearMixerLayer {
 
     pub fn session_bytes(&self) -> u64 {
         self.session_bytes
+    }
+
+    fn begin_speculative(&mut self) -> Result<()> {
+        self.convolution.begin_speculative()?;
+        if let Err(error) = self.recurrence.begin_speculative() {
+            self.convolution.commit_speculative()?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn restore_speculative(&mut self) -> Result<()> {
+        self.convolution.restore_speculative()?;
+        self.recurrence.restore_speculative()
+    }
+
+    fn commit_speculative(&mut self) -> Result<()> {
+        self.convolution.commit_speculative()?;
+        self.recurrence.commit_speculative()
     }
 
     pub fn convolution_mut(&mut self) -> &mut PreparedCudaCausalConv {
@@ -854,6 +894,7 @@ impl PreparedCudaProjectionGraph {
         let mut model_bytes = 0_u64;
         let mut graph_bytes = 0_u64;
         let mut session_bytes = 0_u64;
+        let mut speculative_checkpoint_bytes = 0_u64;
 
         let embedding_view = artifact.recovered_matrix(EMBEDDING_MATRIX)?;
         let embedding = runtime.prepare_embedding_recovered(embedding_view)?;
@@ -990,8 +1031,21 @@ impl PreparedCudaProjectionGraph {
                 [
                     convolution.resident_state_bytes(),
                     recurrence.resident_state_bytes(),
+                    convolution.speculative_checkpoint_bytes(),
+                    recurrence.speculative_checkpoint_bytes(),
                 ],
                 "CUDA linear mixer session bytes",
+            )?;
+            speculative_checkpoint_bytes = checked_add(
+                speculative_checkpoint_bytes,
+                sum_usize(
+                    [
+                        convolution.speculative_checkpoint_bytes(),
+                        recurrence.speculative_checkpoint_bytes(),
+                    ],
+                    "CUDA linear checkpoint bytes",
+                )?,
+                "CUDA speculative checkpoint bytes",
             )?;
             model_bytes = checked_add(model_bytes, mixer_model_bytes, "CUDA model bytes")?;
             graph_bytes = checked_add(graph_bytes, mixer_graph_bytes, "CUDA graph bytes")?;
@@ -1077,6 +1131,21 @@ impl PreparedCudaProjectionGraph {
                 .map_err(|_| EngineError::MemoryBudget("CUDA MTP concat exceeds u64".into()))?,
             "CUDA graph bytes",
         )?;
+        let target_hidden_checkpoint = runtime.prepare_f32_checkpoint(config.hidden_size)?;
+        session_bytes = checked_add(
+            session_bytes,
+            u64::try_from(target_hidden_checkpoint.resident_bytes()).map_err(|_| {
+                EngineError::MemoryBudget("CUDA target-hidden checkpoint exceeds u64".into())
+            })?,
+            "CUDA session bytes",
+        )?;
+        speculative_checkpoint_bytes = checked_add(
+            speculative_checkpoint_bytes,
+            u64::try_from(target_hidden_checkpoint.resident_bytes()).map_err(|_| {
+                EngineError::MemoryBudget("CUDA target-hidden checkpoint exceeds u64".into())
+            })?,
+            "CUDA speculative checkpoint bytes",
+        )?;
         let graph = Self {
             artifact: artifact.clone(),
             plan,
@@ -1088,13 +1157,16 @@ impl PreparedCudaProjectionGraph {
             full_attention,
             norms,
             mtp_concat,
+            target_hidden_checkpoint,
             model_bytes,
             graph_bytes,
             session_bytes,
+            speculative_checkpoint_bytes,
             target_tokens: 0,
             poisoned: false,
             mtp_tokens: 0,
             mtp_poisoned: false,
+            speculative_base: None,
         };
         graph.validate_bound_resources()?;
         Ok(graph)
@@ -1187,8 +1259,141 @@ impl PreparedCudaProjectionGraph {
         self.session_bytes
     }
 
+    pub fn speculative_checkpoint_bytes(&self) -> u64 {
+        self.speculative_checkpoint_bytes
+    }
+
     pub fn target_tokens(&self) -> usize {
         self.target_tokens
+    }
+
+    pub fn speculative_branch_active(&self) -> bool {
+        self.speculative_base.is_some()
+    }
+
+    /// Preserve exactly the mutable state required to verify a chained MTP
+    /// block. Linear recurrence/convolution state is copied once on device;
+    /// paged KV retains its boundary slot and snapshots metadata only. The
+    /// caller must either commit the complete branch or restore and replay the
+    /// causally accepted prefix.
+    pub fn begin_speculative_branch(&mut self, runtime: &CudaCandidateRuntime) -> Result<()> {
+        if self.poisoned || self.mtp_poisoned || self.speculative_base.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA speculative checkpoint requires a healthy graph without a pending branch"
+                    .into(),
+            ));
+        }
+        if self.target_tokens == 0 || self.target_tokens != self.mtp_tokens {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA speculative checkpoint requires aligned target/MTP state, observed {}/{}",
+                self.target_tokens, self.mtp_tokens
+            )));
+        }
+        let final_target_norm = format!(
+            "target:{}:post_ffn:final",
+            Qwen38Config::default().num_hidden_layers - 1
+        );
+        let final_hidden = self
+            .norms
+            .residual(&final_target_norm)?
+            .normalized_output()?;
+        runtime.snapshot_f32_device(&mut self.target_hidden_checkpoint, final_hidden)?;
+
+        let mut begun_mixers = Vec::new();
+        for (layer, mixer) in &mut self.linear_mixers {
+            if let Err(error) = mixer.begin_speculative() {
+                for begun in begun_mixers {
+                    self.linear_mixers
+                        .get_mut(&begun)
+                        .expect("recorded CUDA mixer")
+                        .commit_speculative()?;
+                }
+                self.target_hidden_checkpoint.commit()?;
+                return Err(error);
+            }
+            begun_mixers.push(*layer);
+        }
+
+        let mut begun_attention = Vec::new();
+        for (key, attention) in &mut self.full_attention {
+            if let Err(error) = attention.begin_speculative() {
+                for begun in begun_attention {
+                    self.full_attention
+                        .get_mut(&begun)
+                        .expect("recorded CUDA attention")
+                        .commit_speculative()?;
+                }
+                for mixer in self.linear_mixers.values_mut() {
+                    mixer.commit_speculative()?;
+                }
+                self.target_hidden_checkpoint.commit()?;
+                return Err(error);
+            }
+            begun_attention.push(key.clone());
+        }
+        self.speculative_base = Some(CudaSpeculativeBase {
+            target_tokens: self.target_tokens,
+            mtp_tokens: self.mtp_tokens,
+        });
+        Ok(())
+    }
+
+    /// Restore the pre-branch target/MTP state. The executor then replays only
+    /// the accepted causal prefix through the ordinary committed token path.
+    pub fn restore_speculative_branch(&mut self, runtime: &CudaCandidateRuntime) -> Result<()> {
+        let base = self.speculative_base.take().ok_or_else(|| {
+            EngineError::InvalidState("CUDA graph has no pending speculative branch".into())
+        })?;
+        let restored = (|| {
+            for mixer in self.linear_mixers.values_mut() {
+                mixer.restore_speculative()?;
+            }
+            for attention in self.full_attention.values_mut() {
+                attention.restore_speculative()?;
+            }
+            let final_target_norm = format!(
+                "target:{}:post_ffn:final",
+                Qwen38Config::default().num_hidden_layers - 1
+            );
+            let destination = self
+                .norms
+                .residual(&final_target_norm)?
+                .normalized_output()?;
+            runtime.restore_f32_device(&mut self.target_hidden_checkpoint, destination)
+        })();
+        if let Err(error) = restored {
+            self.poisoned = true;
+            self.mtp_poisoned = true;
+            return Err(error);
+        }
+        self.target_tokens = base.target_tokens;
+        self.mtp_tokens = base.mtp_tokens;
+        self.poisoned = false;
+        self.mtp_poisoned = false;
+        Ok(())
+    }
+
+    /// Keep a completely accepted speculative branch and discard only its
+    /// bounded replay checkpoint.
+    pub fn commit_speculative_branch(&mut self) -> Result<()> {
+        self.speculative_base.take().ok_or_else(|| {
+            EngineError::InvalidState("CUDA graph has no pending speculative branch".into())
+        })?;
+        let committed = (|| {
+            for mixer in self.linear_mixers.values_mut() {
+                mixer.commit_speculative()?;
+            }
+            for attention in self.full_attention.values_mut() {
+                attention.commit_speculative()?;
+            }
+            self.target_hidden_checkpoint.commit()
+        })();
+        if let Err(error) = committed {
+            self.poisoned = true;
+            self.mtp_poisoned = true;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn reset_session(&mut self) -> Result<()> {
@@ -1199,10 +1404,12 @@ impl PreparedCudaProjectionGraph {
         for attention in self.full_attention.values_mut() {
             attention.reset()?;
         }
+        self.target_hidden_checkpoint.clear()?;
         self.target_tokens = 0;
         self.poisoned = false;
         self.mtp_tokens = 0;
         self.mtp_poisoned = false;
+        self.speculative_base = None;
         Ok(())
     }
 

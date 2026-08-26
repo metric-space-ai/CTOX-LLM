@@ -275,6 +275,15 @@ pub struct PreparedCudaF32Concat {
     output: DeviceBuffer,
 }
 
+/// One bounded device-side snapshot used by replay-on-reject. The snapshot
+/// never crosses host memory and is valid for exactly one speculative branch.
+pub struct PreparedCudaF32Checkpoint {
+    context: Rc<CudaContextInner>,
+    values: usize,
+    snapshot: DeviceBuffer,
+    valid: bool,
+}
+
 /// Device-resident buffers for one pure Q2 or Q4 projection. Immutable model
 /// and recovery buffers remain allocated across repeated token dispatches.
 pub struct PreparedCudaMatVec {
@@ -421,10 +430,12 @@ pub struct PreparedCudaGatedDelta {
     log_decay: DeviceBuffer,
     beta: DeviceBuffer,
     state: DeviceBuffer,
+    checkpoint: DeviceBuffer,
     output: DeviceBuffer,
     resident_state_bytes: usize,
     transient_bytes: usize,
     poisoned: bool,
+    checkpoint_valid: bool,
 }
 
 /// Resident model parameters and reusable outputs for the Qwen-specific
@@ -467,11 +478,13 @@ pub struct PreparedCudaCausalConv {
     input: DeviceBuffer,
     weight: DeviceBuffer,
     state: DeviceBuffer,
+    checkpoint: DeviceBuffer,
     output: DeviceBuffer,
     model_bytes: usize,
     resident_state_bytes: usize,
     transient_bytes: usize,
     poisoned: bool,
+    checkpoint_valid: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -611,6 +624,14 @@ pub struct PreparedCudaPagedGqa {
     packed_device_bytes: usize,
     transient_bytes: usize,
     poisoned: bool,
+    speculative_checkpoint: Option<CudaPagedGqaCheckpoint>,
+}
+
+#[derive(Clone)]
+struct CudaPagedGqaCheckpoint {
+    tokens: usize,
+    pages: Vec<CudaPagedKvPage>,
+    free_q4_slots: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1071,6 +1092,73 @@ impl CudaCandidateRuntime {
         })
     }
 
+    pub fn prepare_f32_checkpoint(&self, values: usize) -> Result<PreparedCudaF32Checkpoint> {
+        let bytes = values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA checkpoint bytes overflow".into()))?;
+        if values == 0 {
+            return Err(EngineError::Shape(
+                "CUDA checkpoint must contain at least one value".into(),
+            ));
+        }
+        let snapshot = DeviceBuffer::allocate(self, bytes)?;
+        snapshot.zero()?;
+        Ok(PreparedCudaF32Checkpoint {
+            context: Rc::clone(&self.inner),
+            values,
+            snapshot,
+            valid: false,
+        })
+    }
+
+    pub fn snapshot_f32_device(
+        &self,
+        prepared: &mut PreparedCudaF32Checkpoint,
+        source: CudaDeviceF32View<'_>,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) || !Rc::ptr_eq(&self.inner, source.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA checkpoint source belongs to another context".into(),
+            ));
+        }
+        if prepared.valid || source.values() != prepared.values {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA checkpoint is already active or has {} values for a {}-value source",
+                prepared.values,
+                source.values()
+            )));
+        }
+        prepared
+            .snapshot
+            .copy_from_view(source, "target-hidden checkpoint copy")?;
+        prepared.valid = true;
+        Ok(())
+    }
+
+    pub fn restore_f32_device(
+        &self,
+        prepared: &mut PreparedCudaF32Checkpoint,
+        destination: CudaDeviceF32View<'_>,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, destination.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA checkpoint destination belongs to another context".into(),
+            ));
+        }
+        if !prepared.valid || destination.values() != prepared.values {
+            return Err(EngineError::InvalidState(
+                "CUDA checkpoint is absent or has the wrong destination width".into(),
+            ));
+        }
+        destination
+            .buffer
+            .copy_from_buffer(&prepared.snapshot, "target-hidden checkpoint restore")?;
+        prepared.valid = false;
+        Ok(())
+    }
+
     pub fn dispatch_f32_concat_device<'a>(
         &self,
         prepared: &'a PreparedCudaF32Concat,
@@ -1359,8 +1447,10 @@ impl CudaCandidateRuntime {
         let log_decay = DeviceBuffer::allocate(self, head_bytes)?;
         let beta = DeviceBuffer::allocate(self, head_bytes)?;
         let state = DeviceBuffer::allocate(self, GATED_DELTA_STATE_BYTES)?;
+        let checkpoint = DeviceBuffer::allocate(self, GATED_DELTA_STATE_BYTES)?;
         let output = DeviceBuffer::allocate(self, value_bytes)?;
         state.zero()?;
+        checkpoint.zero()?;
         output.zero()?;
         Ok(PreparedCudaGatedDelta {
             context: Rc::clone(&self.inner),
@@ -1371,10 +1461,12 @@ impl CudaCandidateRuntime {
             log_decay,
             beta,
             state,
+            checkpoint,
             output,
             resident_state_bytes: GATED_DELTA_STATE_BYTES,
             transient_bytes,
             poisoned: false,
+            checkpoint_valid: false,
         })
     }
 
@@ -1542,9 +1634,11 @@ impl CudaCandidateRuntime {
         let input = DeviceBuffer::allocate(self, value_bytes)?;
         let weight = DeviceBuffer::from_bytes(self, weight_f16_le)?;
         let state = DeviceBuffer::allocate(self, LINEAR_CONV_STATE_BYTES)?;
+        let checkpoint = DeviceBuffer::allocate(self, LINEAR_CONV_STATE_BYTES)?;
         let output = DeviceBuffer::allocate(self, value_bytes)?;
         input.zero()?;
         state.zero()?;
+        checkpoint.zero()?;
         output.zero()?;
         Ok(PreparedCudaCausalConv {
             context: Rc::clone(&self.inner),
@@ -1552,11 +1646,13 @@ impl CudaCandidateRuntime {
             input,
             weight,
             state,
+            checkpoint,
             output,
             model_bytes: weight_f16_le.len(),
             resident_state_bytes: LINEAR_CONV_STATE_BYTES,
             transient_bytes: value_bytes * 2,
             poisoned: false,
+            checkpoint_valid: false,
         })
     }
 
@@ -2406,6 +2502,7 @@ impl CudaCandidateRuntime {
             packed_device_bytes,
             transient_bytes,
             poisoned: false,
+            speculative_checkpoint: None,
         })
     }
 
@@ -2588,18 +2685,27 @@ impl CudaCandidateRuntime {
         let recent_start = prepared
             .tokens
             .saturating_sub(prepared.config.recent_tokens);
-        let demoted_pages = prepared
-            .pages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, page)| {
-                let end = page.first_token + page.tokens;
-                (page.precision == KvPrecision::Q4
-                    && page.first_token >= prepared.config.sink_tokens
-                    && end <= recent_start)
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
+        // A speculative block is at most four tokens and can cross at most one
+        // 64-token page boundary. Keep all pre-branch Q4 slots intact until
+        // commit/restore so metadata rollback never points at a demoted or
+        // reused physical page. The extra boundary slot is admitted by the
+        // memory plan; normal demotion resumes on the first committed replay.
+        let demoted_pages = if prepared.speculative_checkpoint.is_some() {
+            Vec::new()
+        } else {
+            prepared
+                .pages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, page)| {
+                    let end = page.first_token + page.tokens;
+                    (page.precision == KvPrecision::Q4
+                        && page.first_token >= prepared.config.sink_tokens
+                        && end <= recent_start)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>()
+        };
         for index in demoted_pages {
             let page = prepared.pages[index];
             let q4_offset = page
@@ -4189,6 +4295,46 @@ impl PreparedCudaGatedDelta {
         self.resident_state_bytes
     }
 
+    pub fn speculative_checkpoint_bytes(&self) -> usize {
+        self.checkpoint.len()
+    }
+
+    pub fn begin_speculative(&mut self) -> Result<()> {
+        if self.poisoned || self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "CUDA gated-delta checkpoint requires a healthy state without an active branch"
+                    .into(),
+            ));
+        }
+        self.checkpoint
+            .copy_from_buffer(&self.state, "gated-delta checkpoint copy")?;
+        self.checkpoint_valid = true;
+        Ok(())
+    }
+
+    pub fn restore_speculative(&mut self) -> Result<()> {
+        if !self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "CUDA gated-delta has no speculative checkpoint".into(),
+            ));
+        }
+        self.state
+            .copy_from_buffer(&self.checkpoint, "gated-delta checkpoint restore")?;
+        self.checkpoint_valid = false;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn commit_speculative(&mut self) -> Result<()> {
+        if !self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "CUDA gated-delta has no speculative checkpoint".into(),
+            ));
+        }
+        self.checkpoint_valid = false;
+        Ok(())
+    }
+
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
     }
@@ -4225,8 +4371,10 @@ impl PreparedCudaGatedDelta {
 
     pub fn reset(&mut self) -> Result<()> {
         self.state.zero()?;
+        self.checkpoint.zero()?;
         self.output.zero()?;
         self.poisoned = false;
+        self.checkpoint_valid = false;
         Ok(())
     }
 
@@ -4262,6 +4410,46 @@ impl PreparedCudaCausalConv {
         self.resident_state_bytes
     }
 
+    pub fn speculative_checkpoint_bytes(&self) -> usize {
+        self.checkpoint.len()
+    }
+
+    pub fn begin_speculative(&mut self) -> Result<()> {
+        if self.poisoned || self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "CUDA convolution checkpoint requires a healthy state without an active branch"
+                    .into(),
+            ));
+        }
+        self.checkpoint
+            .copy_from_buffer(&self.state, "convolution checkpoint copy")?;
+        self.checkpoint_valid = true;
+        Ok(())
+    }
+
+    pub fn restore_speculative(&mut self) -> Result<()> {
+        if !self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "CUDA convolution has no speculative checkpoint".into(),
+            ));
+        }
+        self.state
+            .copy_from_buffer(&self.checkpoint, "convolution checkpoint restore")?;
+        self.checkpoint_valid = false;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn commit_speculative(&mut self) -> Result<()> {
+        if !self.checkpoint_valid {
+            return Err(EngineError::InvalidState(
+                "CUDA convolution has no speculative checkpoint".into(),
+            ));
+        }
+        self.checkpoint_valid = false;
+        Ok(())
+    }
+
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
     }
@@ -4277,8 +4465,10 @@ impl PreparedCudaCausalConv {
 
     pub fn reset(&mut self) -> Result<()> {
         self.state.zero()?;
+        self.checkpoint.zero()?;
         self.output.zero()?;
         self.poisoned = false;
+        self.checkpoint_valid = false;
         Ok(())
     }
 
@@ -4486,6 +4676,46 @@ impl PreparedCudaPagedGqa {
             .sum()
     }
 
+    pub fn begin_speculative(&mut self) -> Result<()> {
+        if self.poisoned || self.speculative_checkpoint.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA paged GQA checkpoint requires a healthy state without an active branch"
+                    .into(),
+            ));
+        }
+        if self.free_q4_slots.is_empty() {
+            return Err(EngineError::MemoryBudget(
+                "CUDA paged GQA has no retained Q4 boundary slot for speculation".into(),
+            ));
+        }
+        self.speculative_checkpoint = Some(CudaPagedGqaCheckpoint {
+            tokens: self.tokens,
+            pages: self.pages.clone(),
+            free_q4_slots: self.free_q4_slots.clone(),
+        });
+        Ok(())
+    }
+
+    pub fn restore_speculative(&mut self) -> Result<()> {
+        let checkpoint = self.speculative_checkpoint.take().ok_or_else(|| {
+            EngineError::InvalidState("CUDA paged GQA has no speculative checkpoint".into())
+        })?;
+        self.tokens = checkpoint.tokens;
+        self.pages = checkpoint.pages;
+        self.free_q4_slots = checkpoint.free_q4_slots;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn commit_speculative(&mut self) -> Result<()> {
+        if self.speculative_checkpoint.take().is_none() {
+            return Err(EngineError::InvalidState(
+                "CUDA paged GQA has no speculative checkpoint".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         self.tokens = 0;
         self.pages.clear();
@@ -4499,6 +4729,7 @@ impl PreparedCudaPagedGqa {
         self.output.zero()?;
         self.params.zero()?;
         self.poisoned = false;
+        self.speculative_checkpoint = None;
         Ok(())
     }
 }
@@ -4539,6 +4770,32 @@ impl PreparedCudaF32Concat {
 
     pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
         self.output.f32_view(0, self.values())
+    }
+}
+
+impl PreparedCudaF32Checkpoint {
+    pub fn resident_bytes(&self) -> usize {
+        self.snapshot.len()
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    pub fn commit(&mut self) -> Result<()> {
+        if !self.valid {
+            return Err(EngineError::InvalidState(
+                "CUDA f32 checkpoint is not active".into(),
+            ));
+        }
+        self.valid = false;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.snapshot.zero()?;
+        self.valid = false;
+        Ok(())
     }
 }
 
@@ -4639,6 +4896,40 @@ impl DeviceBuffer {
             self.context.driver.check(
                 (self.context.driver.memcpy_dtoh)(bytes.as_mut_ptr().cast(), self.ptr, bytes.len()),
                 "device-to-host copy",
+            )
+        }
+    }
+
+    fn copy_from_buffer(&self, source: &Self, operation: &'static str) -> Result<()> {
+        if !Rc::ptr_eq(&self.context, &source.context) || self.len != source.len {
+            return Err(EngineError::InvalidState(
+                "CUDA device checkpoint buffers differ in context or length".into(),
+            ));
+        }
+        self.context.make_current()?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.memcpy_dtod)(self.ptr, source.ptr, self.len),
+                operation,
+            )
+        }
+    }
+
+    fn copy_from_view(&self, source: CudaDeviceF32View<'_>, operation: &'static str) -> Result<()> {
+        let source_bytes = source
+            .values()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("CUDA device view bytes overflow".into()))?;
+        if !Rc::ptr_eq(&self.context, source.context) || self.len != source_bytes {
+            return Err(EngineError::InvalidState(
+                "CUDA device checkpoint and source differ in context or length".into(),
+            ));
+        }
+        self.context.make_current()?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.memcpy_dtod)(self.ptr, source.ptr()?, self.len),
+                operation,
             )
         }
     }

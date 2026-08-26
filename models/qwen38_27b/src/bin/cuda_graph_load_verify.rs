@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use clap::Parser;
+use ctox_qwen38_27b::backend::cuda::{GATED_DELTA_STATE_BYTES, LINEAR_CONV_STATE_BYTES};
 use ctox_qwen38_27b::backend::cuda_graph::PreparedCudaProjectionGraph;
 use ctox_qwen38_27b::backend::cuda_runtime::CudaCandidateRuntime;
 use ctox_qwen38_27b::loader::{ChecksumPolicy, ModelArtifact};
@@ -45,6 +46,7 @@ struct Report<'a> {
     requested_model_bytes: u64,
     requested_graph_bytes: u64,
     requested_session_bytes: u64,
+    speculative_checkpoint_bytes: u64,
     requested_resident_bytes: u64,
     driver_total_bytes: usize,
     driver_free_bytes_before_prepare: usize,
@@ -85,6 +87,20 @@ fn main() -> anyhow::Result<()> {
     let requested_model_bytes = graph.model_bytes();
     let requested_graph_bytes = graph.graph_bytes();
     let requested_session_bytes = graph.session_bytes();
+    let speculative_checkpoint_bytes = graph.speculative_checkpoint_bytes();
+    let expected_speculative_checkpoint_bytes = u64::try_from(
+        Qwen38Config::default()
+            .linear_attention_layers()
+            .checked_mul(GATED_DELTA_STATE_BYTES + LINEAR_CONV_STATE_BYTES)
+            .and_then(|bytes| {
+                bytes.checked_add(Qwen38Config::default().hidden_size * std::mem::size_of::<f32>())
+            })
+            .context("CUDA speculative checkpoint size overflows")?,
+    )?;
+    anyhow::ensure!(
+        speculative_checkpoint_bytes == expected_speculative_checkpoint_bytes,
+        "CUDA graph reports {speculative_checkpoint_bytes} speculative checkpoint bytes, expected {expected_speculative_checkpoint_bytes}"
+    );
     let requested_resident_bytes = graph.resident_bytes()?;
     let (free_after_prepare, _) = runtime.memory_info()?;
     anyhow::ensure!(
@@ -125,6 +141,7 @@ fn main() -> anyhow::Result<()> {
             requested_model_bytes,
             requested_graph_bytes,
             requested_session_bytes,
+            speculative_checkpoint_bytes,
             requested_resident_bytes,
             driver_total_bytes: total,
             driver_free_bytes_before_prepare: free_before_prepare,
@@ -133,7 +150,7 @@ fn main() -> anyhow::Result<()> {
             observed_allocation_bytes: free_before_prepare.saturating_sub(free_after_prepare),
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
             checksum_and_prepare_milliseconds: elapsed_milliseconds,
-            note: "Full checksum, resident 248320-row embedding, all 505 remaining target/MTP projections, 48 linear-attention state groups, 17 packed Q2/Q4 KV states, all 134 decoder/MTP norm operators, and exact resource ownership for all 645 decode steps. This proves artifact binding/residency/unload only; decoder dispatch, logits, and roofline promotion remain separate gates.",
+            note: "Full checksum, resident 248320-row embedding, all 505 remaining target/MTP projections, 48 linear-attention state groups plus one bounded FP16 replay checkpoint, retained KV boundary capacity for 17 packed Q2/Q4 states, all 134 decoder/MTP norm operators, and exact resource ownership for all 645 decode steps. This proves artifact binding/residency/unload only; decoder dispatch, logits, and roofline promotion remain separate gates.",
         })?
     );
     Ok(())

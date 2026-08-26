@@ -321,12 +321,18 @@ with two driver device-to-device copies; no host tensor or backend-specific
 requantization is introduced. Operator-local barriers retain their standalone
 verifier semantics, but the complete graph suppresses them inside a
 transactional default-stream submission and synchronizes exactly once before
-committing each target or MTP state transition. The v2 SM86 verifier records
+committing each target or MTP state transition. The v3 SM86 verifier records
 attempts, commits, deferred operator barriers, and context synchronizations;
 its hardware run is pending, so this is not yet a production or roofline
 claim. A second complete target transition verifies the greedy MTP proposal
-and records acceptance or fallback explicitly. Multi-draft replay and
-production sampling remain unbound.
+and records acceptance or fallback explicitly. The graph additionally owns one
+device-side FP16 checkpoint for all 48 convolution/GatedDelta states and the
+last target hidden vector. While a branch is active, paged attention suppresses
+Q4 demotion and uses the admitted spare boundary slot, so restoring host-side
+page metadata never refers to overwritten state. The verifier restores that
+checkpoint and requires a repeated target transition to produce bit-identical
+logits. Chained MTP4 construction, accepted-prefix replay through the executor,
+and production sampling remain unbound.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not

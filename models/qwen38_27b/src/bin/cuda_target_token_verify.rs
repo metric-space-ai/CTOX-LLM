@@ -56,10 +56,16 @@ struct Report<'a> {
     verification_top_logits: Vec<RankedLogit>,
     target_verified_token: usize,
     mtp_draft_accepted: bool,
+    checkpoint_mtp_logits_f32le_sha256: String,
+    checkpoint_draft_token: usize,
+    speculative_target_logits_f32le_sha256: String,
+    replayed_target_logits_f32le_sha256: String,
+    speculative_restore_exact: bool,
     graph_prepare_milliseconds: f64,
     target_dispatch_milliseconds: f64,
     mtp_dispatch_milliseconds: f64,
     target_verify_milliseconds: f64,
+    checkpoint_replay_milliseconds: f64,
     token_submission_attempts: u64,
     token_submission_commits: u64,
     deferred_operator_synchronizations: u64,
@@ -146,6 +152,53 @@ fn main() -> anyhow::Result<()> {
         graph.target_tokens() == 2,
         "CUDA target verifier token did not commit"
     );
+
+    let checkpoint_started = Instant::now();
+    let checkpoint_mtp_view = graph.dispatch_mtp_draft_device(
+        &runtime,
+        &Qwen38Config::default(),
+        target_verified_token,
+        2,
+    )?;
+    let checkpoint_mtp_logits = runtime.verifier_read_f32_device(checkpoint_mtp_view)?;
+    let checkpoint_mtp_logits_f32le_sha256 = digest_logits(&checkpoint_mtp_logits);
+    let checkpoint_draft_token = rank_valid_logits(&checkpoint_mtp_logits)?[0].token_id;
+    anyhow::ensure!(
+        graph.target_tokens() == 2 && graph.mtp_tokens() == 2,
+        "CUDA checkpoint base is not target/MTP aligned"
+    );
+    graph.begin_speculative_branch(&runtime)?;
+    anyhow::ensure!(
+        graph.speculative_branch_active(),
+        "CUDA speculative checkpoint did not become active"
+    );
+    let speculative_view = graph.dispatch_target_token_device(
+        &runtime,
+        &Qwen38Config::default(),
+        target_verified_token,
+        2,
+    )?;
+    let speculative_logits = runtime.verifier_read_f32_device(speculative_view)?;
+    let speculative_target_logits_f32le_sha256 = digest_logits(&speculative_logits);
+    graph.restore_speculative_branch(&runtime)?;
+    anyhow::ensure!(
+        !graph.speculative_branch_active() && graph.target_tokens() == 2 && graph.mtp_tokens() == 2,
+        "CUDA speculative restore did not return to the checkpoint counters"
+    );
+    let replayed_view = graph.dispatch_target_token_device(
+        &runtime,
+        &Qwen38Config::default(),
+        target_verified_token,
+        2,
+    )?;
+    let replayed_logits = runtime.verifier_read_f32_device(replayed_view)?;
+    let replayed_target_logits_f32le_sha256 = digest_logits(&replayed_logits);
+    let speculative_restore_exact = speculative_logits == replayed_logits;
+    anyhow::ensure!(
+        speculative_restore_exact,
+        "CUDA replay after speculative restore changed target logits"
+    );
+    let checkpoint_replay_milliseconds = checkpoint_started.elapsed().as_secs_f64() * 1.0e3;
     graph.reset_session()?;
     anyhow::ensure!(
         graph.target_tokens() == 0,
@@ -161,19 +214,19 @@ fn main() -> anyhow::Result<()> {
     );
     let submission_stats = runtime.submission_stats();
     anyhow::ensure!(
-        submission_stats.token_submission_attempts == 3
-            && submission_stats.token_submission_commits == 3,
-        "CUDA target/MTP chain committed {}/{} token submissions, expected 3/3",
+        submission_stats.token_submission_attempts == 6
+            && submission_stats.token_submission_commits == 6,
+        "CUDA target/MTP chain committed {}/{} token submissions, expected 6/6",
         submission_stats.token_submission_commits,
         submission_stats.token_submission_attempts,
     );
     anyhow::ensure!(
-        submission_stats.context_synchronizations == 6,
-        "CUDA target/MTP chain used {} context barriers, expected three commits and three verifier readbacks",
+        submission_stats.context_synchronizations == 12,
+        "CUDA target/MTP chain used {} context barriers, expected six commits and six verifier readbacks",
         submission_stats.context_synchronizations,
     );
     anyhow::ensure!(
-        submission_stats.deferred_operator_synchronizations > 100,
+        submission_stats.deferred_operator_synchronizations > 200,
         "CUDA target/MTP chain deferred only {} operator barriers",
         submission_stats.deferred_operator_synchronizations,
     );
@@ -181,7 +234,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.cuda-sm86-target-token.v2",
+            format: "ctox.cuda-sm86-target-token.v3",
             status: "finite_logits_verifier_only_not_promoted",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -206,10 +259,16 @@ fn main() -> anyhow::Result<()> {
             verification_top_logits,
             target_verified_token,
             mtp_draft_accepted,
+            checkpoint_mtp_logits_f32le_sha256,
+            checkpoint_draft_token,
+            speculative_target_logits_f32le_sha256,
+            replayed_target_logits_f32le_sha256,
+            speculative_restore_exact,
             graph_prepare_milliseconds,
             target_dispatch_milliseconds,
             mtp_dispatch_milliseconds,
             target_verify_milliseconds,
+            checkpoint_replay_milliseconds,
             token_submission_attempts: submission_stats.token_submission_attempts,
             token_submission_commits: submission_stats.token_submission_commits,
             deferred_operator_synchronizations: submission_stats
@@ -218,7 +277,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_before_prepare: free_before_prepare,
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
-            note: "Executes embedding, all 64 target layers, final norm, LM head, target-selected-token MTP draft, a second complete target step that verifies the draft, reset, and unload through device views. Each target/MTP step has one commit barrier; logits cross the host only at explicit verifier boundaries. Draft rejection is a valid result and is reported, not hidden. Finite logits and exact unload are necessary but not sufficient: BF16/CPU logit comparison, production sampling/MTP4 replay, prefill, and roofline promotion remain open.",
+            note: "Executes embedding, all 64 target layers, final norm, LM head, target-selected-token MTP drafts, target verification, one device-side speculative checkpoint, restore, bit-exact target replay, reset, and unload. Each target/MTP step has one commit barrier; logits cross the host only at explicit verifier boundaries. Draft rejection is a valid result and is reported, not hidden. The checkpoint proves the bounded replay primitive, not the complete MTP4 executor: chained draft assembly, partial-prefix replay, production sampling, prefill, BF16/CPU comparison, and roofline promotion remain open.",
         })?
     );
     Ok(())
