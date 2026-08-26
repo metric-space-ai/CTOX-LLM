@@ -172,21 +172,22 @@ pub const SM86_MODULE_ABI: CudaModuleAbi = CudaModuleAbi {
     kernels: &[Q2_B64_FUSED_MATVEC, Q4_B64_FUSED_MATVEC],
 };
 
-/// Validates a pure Q2_B64/Q4_B64 operation before the verifier-only CUDA
-/// runtime allocates device memory. Mixed matrices are dispatched as their
-/// manifest-defined homogeneous row segments by the graph layer; they are
-/// never re-packed or silently widened here.
-pub fn validate_operation(operation: &FusedMatVec<'_>) -> Result<&'static CudaKernelAbi> {
-    let descriptor = SM86_MODULE_ABI.descriptor_for(operation.dtype)?;
+/// One validated launch over a homogeneous row range inside a canonical
+/// `MixedQ2Q4B64` payload. Offsets always refer to the existing packed tensor;
+/// validation never creates backend-specific weight codes or repacks bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CudaMixedRowSegment {
+    pub descriptor: &'static CudaKernelAbi,
+    pub row_start: u32,
+    pub row_count: u32,
+    pub weight_offset: usize,
+}
+
+fn validate_common_operation(operation: &FusedMatVec<'_>) -> Result<usize> {
     if operation.rows == 0 || operation.columns == 0 || !operation.columns.is_multiple_of(BLOCK_LEN)
     {
         return Err(EngineError::Shape(
             "CUDA fused matvec dimensions must be non-zero and columns divisible by 64".into(),
-        ));
-    }
-    if !operation.segments.is_empty() {
-        return Err(EngineError::InvalidArtifact(
-            "pure CUDA Q2/Q4 operation declares mixed row segments".into(),
         ));
     }
     if operation.input.len() != operation.columns {
@@ -194,18 +195,6 @@ pub fn validate_operation(operation: &FusedMatVec<'_>) -> Result<&'static CudaKe
             "input has {} values, expected {}",
             operation.input.len(),
             operation.columns
-        )));
-    }
-    let blocks_per_row = operation.columns / BLOCK_LEN;
-    let expected_weights = operation
-        .rows
-        .checked_mul(blocks_per_row)
-        .and_then(|blocks| blocks.checked_mul(descriptor.block_bytes))
-        .ok_or_else(|| EngineError::Shape("CUDA weight buffer size overflows usize".into()))?;
-    if operation.weights.len() != expected_weights {
-        return Err(EngineError::Shape(format!(
-            "weight buffer has {} bytes, expected {expected_weights}",
-            operation.weights.len()
         )));
     }
     for (name, scales, expected) in [
@@ -236,7 +225,120 @@ pub fn validate_operation(operation: &FusedMatVec<'_>) -> Result<&'static CudaKe
         .map_err(|_| EngineError::Shape("rows exceed CUDA u32 launch limit".into()))?;
     u32::try_from(operation.columns)
         .map_err(|_| EngineError::Shape("columns exceed CUDA u32 launch limit".into()))?;
+    Ok(operation.columns / BLOCK_LEN)
+}
+
+/// Validates a pure Q2_B64/Q4_B64 operation before the verifier-only CUDA
+/// runtime allocates device memory. Mixed matrices use the separate validated
+/// segment path below; neither path repacks or silently widens weights.
+pub fn validate_operation(operation: &FusedMatVec<'_>) -> Result<&'static CudaKernelAbi> {
+    let descriptor = SM86_MODULE_ABI.descriptor_for(operation.dtype)?;
+    let blocks_per_row = validate_common_operation(operation)?;
+    if !operation.segments.is_empty() {
+        return Err(EngineError::InvalidArtifact(
+            "pure CUDA Q2/Q4 operation declares mixed row segments".into(),
+        ));
+    }
+    let expected_weights = operation
+        .rows
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(descriptor.block_bytes))
+        .ok_or_else(|| EngineError::Shape("CUDA weight buffer size overflows usize".into()))?;
+    if operation.weights.len() != expected_weights {
+        return Err(EngineError::Shape(format!(
+            "weight buffer has {} bytes, expected {expected_weights}",
+            operation.weights.len()
+        )));
+    }
     Ok(descriptor)
+}
+
+/// Validates the exact manifest row groups of a mixed Q2/Q4 projection and
+/// returns launch metadata into the original packed tensor. The resulting
+/// segments cover every row and byte exactly once.
+pub(crate) fn validate_mixed_operation(
+    operation: &FusedMatVec<'_>,
+) -> Result<Vec<CudaMixedRowSegment>> {
+    if operation.dtype != TensorDType::MixedQ2Q4B64 {
+        return Err(EngineError::UnsupportedDType(format!(
+            "mixed CUDA validation requires MixedQ2Q4B64, got {:?}",
+            operation.dtype
+        )));
+    }
+    let blocks_per_row = validate_common_operation(operation)?;
+    if operation.segments.is_empty() {
+        return Err(EngineError::InvalidArtifact(
+            "mixed CUDA Q2/Q4 operation has no row segments".into(),
+        ));
+    }
+    let mut launches = Vec::with_capacity(operation.segments.len());
+    let mut expected_row = 0_usize;
+    let mut expected_offset = 0_usize;
+    for (expected_group, segment) in operation.segments.iter().enumerate() {
+        let group_index = usize::try_from(segment.group_index).map_err(|_| {
+            EngineError::InvalidArtifact("mixed CUDA group index overflows usize".into())
+        })?;
+        let row_start = usize::try_from(segment.row_start).map_err(|_| {
+            EngineError::InvalidArtifact("mixed CUDA row start overflows usize".into())
+        })?;
+        let row_end = usize::try_from(segment.row_end).map_err(|_| {
+            EngineError::InvalidArtifact("mixed CUDA row end overflows usize".into())
+        })?;
+        let offset = usize::try_from(segment.offset).map_err(|_| {
+            EngineError::InvalidArtifact("mixed CUDA segment offset overflows usize".into())
+        })?;
+        let length = usize::try_from(segment.length).map_err(|_| {
+            EngineError::InvalidArtifact("mixed CUDA segment length overflows usize".into())
+        })?;
+        if group_index != expected_group
+            || row_start != expected_row
+            || row_end <= row_start
+            || row_end > operation.rows
+            || offset != expected_offset
+        {
+            return Err(EngineError::InvalidArtifact(format!(
+                "mixed CUDA Q2/Q4 operation has non-contiguous segment {}",
+                segment.group_index
+            )));
+        }
+        let descriptor = SM86_MODULE_ABI.descriptor_for(segment.dtype).map_err(|_| {
+            EngineError::InvalidArtifact(format!(
+                "mixed CUDA segment {} has invalid dtype {:?}",
+                segment.group_index, segment.dtype
+            ))
+        })?;
+        let expected_length = row_end
+            .checked_sub(row_start)
+            .and_then(|rows| rows.checked_mul(blocks_per_row))
+            .and_then(|blocks| blocks.checked_mul(descriptor.block_bytes))
+            .ok_or_else(|| EngineError::Shape("mixed CUDA segment size overflows usize".into()))?;
+        if length != expected_length {
+            return Err(EngineError::InvalidArtifact(format!(
+                "mixed CUDA segment {} has {length} bytes, expected {expected_length}",
+                segment.group_index
+            )));
+        }
+        launches.push(CudaMixedRowSegment {
+            descriptor,
+            row_start: u32::try_from(row_start)
+                .map_err(|_| EngineError::Shape("mixed CUDA row start exceeds u32".into()))?,
+            row_count: u32::try_from(row_end - row_start)
+                .map_err(|_| EngineError::Shape("mixed CUDA row count exceeds u32".into()))?,
+            weight_offset: offset,
+        });
+        expected_row = row_end;
+        expected_offset = expected_offset
+            .checked_add(length)
+            .ok_or_else(|| EngineError::Shape("mixed CUDA weight size overflows usize".into()))?;
+    }
+    if expected_row != operation.rows || expected_offset != operation.weights.len() {
+        return Err(EngineError::Shape(format!(
+            "mixed CUDA segments cover {expected_row}/{} rows and {expected_offset}/{} bytes",
+            operation.rows,
+            operation.weights.len()
+        )));
+    }
+    Ok(launches)
 }
 
 impl CudaModuleAbi {
@@ -527,6 +629,92 @@ mod tests {
             let descriptor = validate_operation(&operation).unwrap();
             assert_eq!(descriptor.dtype, dtype);
         }
+    }
+
+    #[test]
+    fn mixed_validation_preserves_manifest_offsets_and_row_groups() {
+        let rows = 5;
+        let columns = 128;
+        let q2 = packed_weights(TensorDType::Q2B64, 3, columns);
+        let q4 = packed_weights(TensorDType::Q4B64, 2, columns);
+        let mut weights = q2.clone();
+        weights.extend_from_slice(&q4);
+        let segments = [
+            crate::format::QuantSegment {
+                group_index: 0,
+                row_start: 0,
+                row_end: 3,
+                dtype: TensorDType::Q2B64,
+                offset: 0,
+                length: q2.len() as u64,
+            },
+            crate::format::QuantSegment {
+                group_index: 1,
+                row_start: 3,
+                row_end: 5,
+                dtype: TensorDType::Q4B64,
+                offset: q2.len() as u64,
+                length: q4.len() as u64,
+            },
+        ];
+        let input = vec![0.25_f32; columns];
+        let s_in = f16_bytes(columns);
+        let s_out = f16_bytes(rows);
+        let bias = vec![0.0_f32; rows];
+        let operation = FusedMatVec {
+            dtype: TensorDType::MixedQ2Q4B64,
+            weights: &weights,
+            segments: &segments,
+            rows,
+            columns,
+            input: &input,
+            s_in: Some(ScaleSlice::F16Le(&s_in)),
+            s_out: Some(ScaleSlice::F16Le(&s_out)),
+            bias: Some(&bias),
+            activation: Activation::Silu,
+        };
+        let launches = validate_mixed_operation(&operation).unwrap();
+        assert_eq!(launches.len(), 2);
+        assert_eq!(launches[0].descriptor.dtype, TensorDType::Q2B64);
+        assert_eq!(launches[0].row_start, 0);
+        assert_eq!(launches[0].row_count, 3);
+        assert_eq!(launches[0].weight_offset, 0);
+        assert_eq!(launches[1].descriptor.dtype, TensorDType::Q4B64);
+        assert_eq!(launches[1].row_start, 3);
+        assert_eq!(launches[1].row_count, 2);
+        assert_eq!(launches[1].weight_offset, q2.len());
+    }
+
+    #[test]
+    fn mixed_validation_rejects_a_gap_before_device_allocation() {
+        let rows = 2;
+        let columns = 64;
+        let weights = packed_weights(TensorDType::Q2B64, rows, columns);
+        let segments = [crate::format::QuantSegment {
+            group_index: 0,
+            row_start: 1,
+            row_end: 2,
+            dtype: TensorDType::Q2B64,
+            offset: 0,
+            length: Q2_BLOCK_BYTES as u64,
+        }];
+        let input = vec![0.0_f32; columns];
+        let operation = FusedMatVec {
+            dtype: TensorDType::MixedQ2Q4B64,
+            weights: &weights,
+            segments: &segments,
+            rows,
+            columns,
+            input: &input,
+            s_in: None,
+            s_out: None,
+            bias: None,
+            activation: Activation::Identity,
+        };
+        assert!(matches!(
+            validate_mixed_operation(&operation),
+            Err(EngineError::InvalidArtifact(_))
+        ));
     }
 
     #[test]

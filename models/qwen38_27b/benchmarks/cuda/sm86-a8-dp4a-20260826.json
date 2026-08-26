@@ -21,6 +21,11 @@
     "spill_load_bytes": 0,
     "spill_store_bytes": 0
   },
+  "runtime_sources": {
+    "src/backend/cuda.rs": "15b9339eaa0d2ec9f37d8a432f1a02d700fed91546a45fa6145b5d7c6503263b",
+    "src/backend/cuda_runtime.rs": "e54a5e1fc6f9baebd79fd8ab8857a24257c81aa07e56cd57cb866ca916d717dc",
+    "src/bin/cuda_bench.rs": "1bd7d9305db926e7e2ddd88f97149ac9863e33076258b479e15cb5f78bfb3f32"
+  },
   "semantic_contract": {
     "logical_weight_codes": "unchanged_q2_b64_or_q4_b64",
     "activation": "transient_symmetric_a8_b64",
@@ -42,7 +47,9 @@
       "q2_kernel_maximum_absolute_error": 0.000008583069,
       "q2_a8_quality_delta_maximum_absolute": 0.013885021,
       "q4_kernel_maximum_absolute_error": 0.000008583069,
-      "q4_a8_quality_delta_maximum_absolute": 0.011193991
+      "q4_a8_quality_delta_maximum_absolute": 0.011193991,
+      "mixed_kernel_maximum_absolute_error": 0.0000076293945,
+      "mixed_a8_quality_delta_maximum_absolute": 0.013885021
     },
     "large_shape": {
       "rows": 5120,
@@ -50,7 +57,9 @@
       "q2_kernel_maximum_absolute_error": 0.000026226044,
       "q2_a8_quality_delta_maximum_absolute": 0.04283285,
       "q4_kernel_maximum_absolute_error": 0.00002503395,
-      "q4_a8_quality_delta_maximum_absolute": 0.03768587
+      "q4_a8_quality_delta_maximum_absolute": 0.03768587,
+      "mixed_kernel_maximum_absolute_error": 0.000026226044,
+      "mixed_a8_quality_delta_maximum_absolute": 0.04279113
     }
   },
   "amortized_measurements": [
@@ -87,6 +96,27 @@
       "range_packed_weight_gb_per_second": [387.2101159977398, 391.74974981873726],
       "mean_dispatch_milliseconds": [0.035614685, 0.035549225, 0.0356188075, 0.0359660025, 0.03588771],
       "median_mean_dispatch_milliseconds": 0.0356188075
+    },
+    {
+      "dtype": "mixed_q2_q4_b64",
+      "row_assignment": "first_2560_q2_then_2560_q4",
+      "rows": 5120,
+      "columns": 5120,
+      "warmup_syncs_per_replicate": 5,
+      "measured_syncs_per_replicate": 20,
+      "dispatches_per_sync": 20,
+      "segment_launches_per_dispatch": 2,
+      "activation_quantizations_per_sync": 1,
+      "inter_segment_copies": 0,
+      "inter_segment_synchronizations": 0,
+      "replicates": 5,
+      "packed_weight_bytes": 10649600,
+      "requested_resident_buffer_bytes": 10736960,
+      "packed_weight_gb_per_second": [284.3031471471543, 284.0010909784998, 285.39715946803454, 285.1428883930905, 283.1662633944003],
+      "median_packed_weight_gb_per_second": 284.3031471471543,
+      "range_packed_weight_gb_per_second": [283.1662633944003, 285.39715946803454],
+      "mean_dispatch_milliseconds": [0.0374586075, 0.0374984475, 0.0373150175, 0.0373482925, 0.037609],
+      "median_mean_dispatch_milliseconds": 0.0374586075
     }
   ],
   "single_projection_measurements": [
@@ -105,6 +135,16 @@
       "replicates": 5,
       "median_packed_weight_gb_per_second": 236.4392183095064,
       "median_mean_dispatch_milliseconds": 0.05890055
+    },
+    {
+      "dtype": "mixed_q2_q4_b64",
+      "row_assignment": "first_2560_q2_then_2560_q4",
+      "activation_quantizations_per_sync": 1,
+      "dispatches_per_sync": 1,
+      "segment_launches_per_dispatch": 2,
+      "replicates": 5,
+      "median_packed_weight_gb_per_second": 177.0093602408747,
+      "median_mean_dispatch_milliseconds": 0.06016405
     }
   ],
   "limitations": [
@@ -114,6 +154,7 @@
     "Requested resident bytes exclude CUDA context and allocator overhead.",
     "Packed-weight GB/s is an application-level ratio, not a sustainable-bandwidth roofline measurement.",
     "Repeated-dispatch measurements amortize one A8 activation quantization across 20 projections; the single-projection section does not.",
+    "The synthetic mixed fixture uses two contiguous 50/50 row groups; final sensitivity plans may contain more groups and require a separate launch-count study.",
     "A8 activation quality has not passed recovery, full-model logit, multilingual, coding, agentic, tool-calling, or long-context gates.",
     "The verifier candidate is not wired into the production Backend trait or complete model graph."
   ],

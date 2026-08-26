@@ -98,6 +98,10 @@ and runs half-warp-per-row Q2/Q4 `dp4a` matvecs. The logical Q2/Q4 weight codes
 are unchanged; there is no backend-specific weight requantization, and A8
 buffers are transient rather than serialized model state. One quantized
 activation may be shared across related projections such as Q/K/V or gate/up.
+Canonical `MixedQ2Q4B64` tensors use the same transient activation across all
+manifest row groups. The host validates exact contiguous row/byte coverage,
+uploads the original mixed payload once, offsets device pointers into each
+homogeneous group, and synchronizes only after every Q2/Q4 segment has run.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not
@@ -109,6 +113,9 @@ of 264.45 GB/s for Q2 and 390.98 GB/s for Q4 when one activation quantization
 was shared over 20 projections. With one quantization per single projection,
 the medians were 139.19 GB/s and 236.44 GB/s. These remain application-level
 packed-byte ratios under a concurrent teacher workload, not roofline claims.
+The 50/50 mixed 5120x5120 verifier reached a median 284.30 GB/s over five
+amortized replicates and 177.01 GB/s when one quantization served one complete
+mixed projection. Its maximum CUDA-vs-A8-oracle error was `2.63e-5`.
 
 The A8 path is therefore computationally validated but not promoted. Its
 quality must be measured after recovery on full-model logits and the held-out

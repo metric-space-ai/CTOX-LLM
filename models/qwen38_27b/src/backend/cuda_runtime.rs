@@ -14,8 +14,8 @@ use std::slice;
 use libloading::Library;
 
 use super::cuda::{
-    validate_operation, A8_QUANTIZE_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
-    Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
+    validate_mixed_operation, validate_operation, CudaMixedRowSegment, A8_QUANTIZE_SYMBOL,
+    Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
 };
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
@@ -174,6 +174,25 @@ pub struct PreparedCudaMatVec<'runtime> {
 /// become part of a backend-specific model artifact.
 pub struct PreparedCudaA8MatVec<'runtime> {
     base: PreparedCudaMatVec<'runtime>,
+    q8_codes: DeviceBuffer<'runtime>,
+    q8_scales: DeviceBuffer<'runtime>,
+    resident_bytes: usize,
+}
+
+/// One canonical mixed Q2/Q4 payload with shared transient A8 activation.
+/// Segment metadata points into `weights`; no segment is copied or repacked.
+pub struct PreparedCudaMixedA8MatVec<'runtime> {
+    runtime: &'runtime CudaCandidateRuntime,
+    rows: u32,
+    columns: u32,
+    activation: u32,
+    segments: Vec<CudaMixedRowSegment>,
+    weights: DeviceBuffer<'runtime>,
+    input: DeviceBuffer<'runtime>,
+    s_in: Option<DeviceBuffer<'runtime>>,
+    s_out: Option<DeviceBuffer<'runtime>>,
+    bias: Option<DeviceBuffer<'runtime>>,
+    output: DeviceBuffer<'runtime>,
     q8_codes: DeviceBuffer<'runtime>,
     q8_scales: DeviceBuffer<'runtime>,
     resident_bytes: usize,
@@ -407,6 +426,58 @@ impl CudaCandidateRuntime {
         })
     }
 
+    pub fn prepare_mixed_a8_fused_matvec<'runtime>(
+        &'runtime self,
+        operation: &FusedMatVec<'_>,
+    ) -> Result<PreparedCudaMixedA8MatVec<'runtime>> {
+        let segments = validate_mixed_operation(operation)?;
+        self.make_current()?;
+        let weights = DeviceBuffer::from_bytes(self, operation.weights)?;
+        let input = DeviceBuffer::from_bytes(self, as_bytes(operation.input))?;
+        let s_in = optional_scale_buffer(self, operation.s_in)?;
+        let s_out = optional_scale_buffer(self, operation.s_out)?;
+        let bias = operation
+            .bias
+            .map(|values| DeviceBuffer::from_bytes(self, as_bytes(values)))
+            .transpose()?;
+        let output_bytes = operation
+            .rows
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("mixed CUDA output size overflows usize".into()))?;
+        let output = DeviceBuffer::allocate(self, output_bytes)?;
+        let q8_codes = DeviceBuffer::allocate(self, operation.columns)?;
+        let q8_scales = DeviceBuffer::allocate(self, a8_scale_bytes(operation.columns)?)?;
+        let resident_bytes = weights
+            .len()
+            .checked_add(input.len())
+            .and_then(|total| total.checked_add(s_in.as_ref().map_or(0, DeviceBuffer::len)))
+            .and_then(|total| total.checked_add(s_out.as_ref().map_or(0, DeviceBuffer::len)))
+            .and_then(|total| total.checked_add(bias.as_ref().map_or(0, DeviceBuffer::len)))
+            .and_then(|total| total.checked_add(output.len()))
+            .and_then(|total| total.checked_add(q8_codes.len()))
+            .and_then(|total| total.checked_add(q8_scales.len()))
+            .ok_or_else(|| EngineError::Shape("mixed CUDA resident byte count overflows".into()))?;
+        Ok(PreparedCudaMixedA8MatVec {
+            runtime: self,
+            rows: operation.rows as u32,
+            columns: operation.columns as u32,
+            activation: match operation.activation {
+                Activation::Identity => 0,
+                Activation::Silu => 1,
+            },
+            segments,
+            weights,
+            input,
+            s_in,
+            s_out,
+            bias,
+            output,
+            q8_codes,
+            q8_scales,
+            resident_bytes,
+        })
+    }
+
     /// Quantizes the corrected activation once into symmetric Q8_B64 blocks.
     /// Callers may share this result across projections that consume the same
     /// input, such as Q/K/V or gate/up matrices.
@@ -416,12 +487,47 @@ impl CudaCandidateRuntime {
                 "prepared CUDA A8 operation belongs to another context".into(),
             ));
         }
+        self.launch_a8_quantization(
+            prepared.base.input.ptr(),
+            prepared.base.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            prepared.q8_codes.ptr(),
+            prepared.q8_scales.ptr(),
+            prepared.base.columns,
+        )
+    }
+
+    pub fn quantize_prepared_mixed_a8(
+        &self,
+        prepared: &PreparedCudaMixedA8MatVec<'_>,
+    ) -> Result<()> {
+        if !ptr::eq(self, prepared.runtime) {
+            return Err(EngineError::InvalidState(
+                "prepared mixed CUDA A8 operation belongs to another context".into(),
+            ));
+        }
+        self.launch_a8_quantization(
+            prepared.input.ptr(),
+            prepared.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            prepared.q8_codes.ptr(),
+            prepared.q8_scales.ptr(),
+            prepared.columns,
+        )
+    }
+
+    fn launch_a8_quantization(
+        &self,
+        input_ptr: CuDevicePtr,
+        s_in_ptr: CuDevicePtr,
+        q8_codes_ptr: CuDevicePtr,
+        q8_scales_ptr: CuDevicePtr,
+        column_count: u32,
+    ) -> Result<()> {
         self.make_current()?;
-        let mut input = prepared.base.input.ptr();
-        let mut s_in = prepared.base.s_in.as_ref().map_or(0, DeviceBuffer::ptr);
-        let mut q8_codes = prepared.q8_codes.ptr();
-        let mut q8_scales = prepared.q8_scales.ptr();
-        let mut columns = prepared.base.columns;
+        let mut input = input_ptr;
+        let mut s_in = s_in_ptr;
+        let mut q8_codes = q8_codes_ptr;
+        let mut q8_scales = q8_scales_ptr;
+        let mut columns = column_count;
         let mut params = [
             (&mut input as *mut CuDevicePtr).cast::<c_void>(),
             (&mut s_in as *mut CuDevicePtr).cast::<c_void>(),
@@ -433,7 +539,7 @@ impl CudaCandidateRuntime {
             self.driver.check(
                 (self.driver.launch_kernel)(
                     self.a8_quantize_function,
-                    prepared.base.columns.div_ceil(64),
+                    column_count.div_ceil(64),
                     1,
                     1,
                     64,
@@ -475,51 +581,19 @@ impl CudaCandidateRuntime {
             ));
         }
         self.make_current()?;
-        let function = match prepared.base.dtype {
-            TensorDType::Q2B64 => self.q2_a8_function,
-            TensorDType::Q4B64 => self.q4_a8_function,
-            _ => unreachable!("CUDA validation accepts only Q2/Q4"),
-        };
-        let grid_x = prepared.base.rows.div_ceil(A8_ROWS_PER_BLOCK);
         for _ in 0..dispatches {
-            let mut weights = prepared.base.weights.ptr();
-            let mut q8_codes = prepared.q8_codes.ptr();
-            let mut q8_scales = prepared.q8_scales.ptr();
-            let mut s_out = prepared.base.s_out.as_ref().map_or(0, DeviceBuffer::ptr);
-            let mut bias = prepared.base.bias.as_ref().map_or(0, DeviceBuffer::ptr);
-            let mut output = prepared.base.output.ptr();
-            let mut rows = prepared.base.rows;
-            let mut columns = prepared.base.columns;
-            let mut activation = prepared.base.activation;
-            let mut params = [
-                (&mut weights as *mut CuDevicePtr).cast::<c_void>(),
-                (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
-                (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
-                (&mut s_out as *mut CuDevicePtr).cast::<c_void>(),
-                (&mut bias as *mut CuDevicePtr).cast::<c_void>(),
-                (&mut output as *mut CuDevicePtr).cast::<c_void>(),
-                (&mut rows as *mut u32).cast::<c_void>(),
-                (&mut columns as *mut u32).cast::<c_void>(),
-                (&mut activation as *mut u32).cast::<c_void>(),
-            ];
-            unsafe {
-                self.driver.check(
-                    (self.driver.launch_kernel)(
-                        function,
-                        grid_x,
-                        1,
-                        1,
-                        THREADS_PER_BLOCK,
-                        1,
-                        1,
-                        0,
-                        ptr::null_mut(),
-                        params.as_mut_ptr(),
-                        ptr::null_mut(),
-                    ),
-                    "A8 dp4a matvec launch",
-                )?;
-            }
+            self.launch_a8_projection(
+                prepared.base.dtype,
+                prepared.base.weights.ptr(),
+                prepared.q8_codes.ptr(),
+                prepared.q8_scales.ptr(),
+                prepared.base.s_out.as_ref().map_or(0, DeviceBuffer::ptr),
+                prepared.base.bias.as_ref().map_or(0, DeviceBuffer::ptr),
+                prepared.base.output.ptr(),
+                prepared.base.rows,
+                prepared.base.columns,
+                prepared.base.activation,
+            )?;
         }
         unsafe {
             self.driver.check(
@@ -535,6 +609,139 @@ impl CudaCandidateRuntime {
             ));
         }
         Ok(output)
+    }
+
+    pub fn dispatch_mixed_a8_fused_matvec(
+        &self,
+        prepared: &PreparedCudaMixedA8MatVec<'_>,
+    ) -> Result<Vec<f32>> {
+        self.quantize_prepared_mixed_a8(prepared)?;
+        self.dispatch_prepared_mixed_a8_repeated(prepared, 1)
+    }
+
+    /// Dispatches every canonical mixed row segment without synchronizing or
+    /// copying between segments. One output tensor and one transient A8 input
+    /// remain resident for the complete mixed projection.
+    pub fn dispatch_prepared_mixed_a8_repeated(
+        &self,
+        prepared: &PreparedCudaMixedA8MatVec<'_>,
+        dispatches: usize,
+    ) -> Result<Vec<f32>> {
+        if dispatches == 0 {
+            return Err(EngineError::Shape(
+                "mixed CUDA A8 repeated dispatch count must be positive".into(),
+            ));
+        }
+        if !ptr::eq(self, prepared.runtime) {
+            return Err(EngineError::InvalidState(
+                "prepared mixed CUDA A8 operation belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        for _ in 0..dispatches {
+            for segment in &prepared.segments {
+                let row_start = segment.row_start as usize;
+                let weights = device_ptr_offset(prepared.weights.ptr(), segment.weight_offset)?;
+                let s_out = prepared
+                    .s_out
+                    .as_ref()
+                    .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 2))
+                    .transpose()?
+                    .unwrap_or(0);
+                let bias = prepared
+                    .bias
+                    .as_ref()
+                    .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 4))
+                    .transpose()?
+                    .unwrap_or(0);
+                let output = device_ptr_offset(prepared.output.ptr(), row_start * 4)?;
+                self.launch_a8_projection(
+                    segment.descriptor.dtype,
+                    weights,
+                    prepared.q8_codes.ptr(),
+                    prepared.q8_scales.ptr(),
+                    s_out,
+                    bias,
+                    output,
+                    segment.row_count,
+                    prepared.columns,
+                    prepared.activation,
+                )?;
+            }
+        }
+        unsafe {
+            self.driver.check(
+                (self.driver.ctx_synchronize)(),
+                "mixed A8 context synchronization",
+            )?;
+        }
+        let mut output = vec![0.0_f32; prepared.rows as usize];
+        prepared.output.copy_to(as_bytes_mut(&mut output))?;
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "mixed CUDA A8 candidate produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_a8_projection(
+        &self,
+        dtype: TensorDType,
+        weights_ptr: CuDevicePtr,
+        q8_codes_ptr: CuDevicePtr,
+        q8_scales_ptr: CuDevicePtr,
+        s_out_ptr: CuDevicePtr,
+        bias_ptr: CuDevicePtr,
+        output_ptr: CuDevicePtr,
+        row_count: u32,
+        column_count: u32,
+        activation_code: u32,
+    ) -> Result<()> {
+        let function = match dtype {
+            TensorDType::Q2B64 => self.q2_a8_function,
+            TensorDType::Q4B64 => self.q4_a8_function,
+            _ => unreachable!("validated CUDA A8 segment is Q2 or Q4"),
+        };
+        let mut weights = weights_ptr;
+        let mut q8_codes = q8_codes_ptr;
+        let mut q8_scales = q8_scales_ptr;
+        let mut s_out = s_out_ptr;
+        let mut bias = bias_ptr;
+        let mut output = output_ptr;
+        let mut rows = row_count;
+        let mut columns = column_count;
+        let mut activation = activation_code;
+        let mut params = [
+            (&mut weights as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_out as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut bias as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rows as *mut u32).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut activation as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.driver.check(
+                (self.driver.launch_kernel)(
+                    function,
+                    row_count.div_ceil(A8_ROWS_PER_BLOCK),
+                    1,
+                    1,
+                    THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "A8 dp4a matvec launch",
+            )
+        }
     }
 
     /// Launches a resident operation repeatedly and synchronizes once. This
@@ -680,6 +887,40 @@ impl PreparedCudaA8MatVec<'_> {
 
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
         self.base.write_input(input)
+    }
+}
+
+impl PreparedCudaMixedA8MatVec<'_> {
+    pub fn rows(&self) -> usize {
+        self.rows as usize
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        if input.len() != self.columns() {
+            return Err(EngineError::Shape(format!(
+                "mixed CUDA prepared input has {} values, expected {}",
+                input.len(),
+                self.columns()
+            )));
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidArtifact(
+                "mixed CUDA prepared input contains a non-finite value".into(),
+            ));
+        }
+        self.input.write(as_bytes(input))
     }
 }
 
@@ -863,6 +1104,13 @@ fn a8_scale_bytes(columns: usize) -> Result<usize> {
         .ok_or_else(|| EngineError::Shape("CUDA A8 scale size overflows usize".into()))
 }
 
+fn device_ptr_offset(base: CuDevicePtr, offset: usize) -> Result<CuDevicePtr> {
+    let offset = u64::try_from(offset)
+        .map_err(|_| EngineError::Shape("CUDA device pointer offset exceeds u64".into()))?;
+    base.checked_add(offset)
+        .ok_or_else(|| EngineError::Shape("CUDA device pointer offset overflows".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,6 +1139,12 @@ mod tests {
         assert_eq!(a8_scale_bytes(64).unwrap(), 4);
         assert_eq!(a8_scale_bytes(512).unwrap(), 32);
         assert_eq!(512 + a8_scale_bytes(512).unwrap(), 544);
+    }
+
+    #[test]
+    fn checked_device_pointer_offsets_fail_closed() {
+        assert_eq!(device_ptr_offset(1_024, 256).unwrap(), 1_280);
+        assert!(device_ptr_offset(u64::MAX, 1).is_err());
     }
 
     #[test]

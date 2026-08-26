@@ -6,10 +6,10 @@ use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use ctox_qwen38_27b::backend::cpu::CpuBackend;
 use ctox_qwen38_27b::backend::cuda_runtime::{
-    CudaCandidateRuntime, PreparedCudaA8MatVec, PreparedCudaMatVec,
+    CudaCandidateRuntime, PreparedCudaA8MatVec, PreparedCudaMatVec, PreparedCudaMixedA8MatVec,
 };
 use ctox_qwen38_27b::backend::{Activation, Backend, FusedMatVec, ScaleSlice};
-use ctox_qwen38_27b::format::TensorDType;
+use ctox_qwen38_27b::format::{QuantSegment, TensorDType};
 use ctox_qwen38_27b::quant::{A8Block64, Q2Block64, Q4Block64, BLOCK_LEN};
 use half::f16;
 use serde::Serialize;
@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 enum DTypeArg {
     Q2,
     Q4,
+    Mixed,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -89,6 +90,7 @@ struct Report<'a> {
 enum Prepared<'runtime> {
     Exact(PreparedCudaMatVec<'runtime>),
     A8(PreparedCudaA8MatVec<'runtime>),
+    MixedA8(PreparedCudaMixedA8MatVec<'runtime>),
 }
 
 impl Prepared<'_> {
@@ -96,6 +98,7 @@ impl Prepared<'_> {
         match self {
             Self::Exact(prepared) => prepared.resident_bytes(),
             Self::A8(prepared) => prepared.resident_bytes(),
+            Self::MixedA8(prepared) => prepared.resident_bytes(),
         }
     }
 }
@@ -122,8 +125,18 @@ fn main() -> anyhow::Result<()> {
     let dtype = match args.dtype {
         DTypeArg::Q2 => TensorDType::Q2B64,
         DTypeArg::Q4 => TensorDType::Q4B64,
+        DTypeArg::Mixed => TensorDType::MixedQ2Q4B64,
     };
-    let weights = packed_weights(dtype, args.rows, args.columns)?;
+    anyhow::ensure!(
+        !matches!(args.dtype, DTypeArg::Mixed) || args.rows >= 2,
+        "mixed benchmark requires at least two rows"
+    );
+    anyhow::ensure!(
+        !matches!(args.dtype, DTypeArg::Mixed)
+            || matches!(args.execution_path, ExecutionPathArg::A8Dp4a),
+        "mixed benchmark currently requires --execution-path a8-dp4a"
+    );
+    let (weights, segments) = packed_weights_and_segments(dtype, args.rows, args.columns)?;
     let input: Vec<f32> = (0..args.columns)
         .map(|index| (index as f32 * 0.031_25).cos())
         .collect();
@@ -143,7 +156,7 @@ fn main() -> anyhow::Result<()> {
     let operation = FusedMatVec {
         dtype,
         weights: &weights,
-        segments: &[],
+        segments: &segments,
         rows: args.rows,
         columns: args.columns,
         input: &input,
@@ -161,11 +174,15 @@ fn main() -> anyhow::Result<()> {
     let runtime = CudaCandidateRuntime::new(&module, args.device)?;
     let prepared = match args.execution_path {
         ExecutionPathArg::Exact => Prepared::Exact(runtime.prepare_fused_matvec(&operation)?),
+        ExecutionPathArg::A8Dp4a if dtype == TensorDType::MixedQ2Q4B64 => {
+            Prepared::MixedA8(runtime.prepare_mixed_a8_fused_matvec(&operation)?)
+        }
         ExecutionPathArg::A8Dp4a => Prepared::A8(runtime.prepare_a8_fused_matvec(&operation)?),
     };
     let cuda_output = match &prepared {
         Prepared::Exact(prepared) => runtime.dispatch_prepared(prepared)?,
         Prepared::A8(prepared) => runtime.dispatch_a8_fused_matvec(prepared)?,
+        Prepared::MixedA8(prepared) => runtime.dispatch_mixed_a8_fused_matvec(prepared)?,
     };
     let mut maximum_absolute_error = 0.0_f32;
     let mut maximum_relative_error = 0.0_f32;
@@ -196,6 +213,13 @@ fn main() -> anyhow::Result<()> {
                     runtime.dispatch_prepared_a8_repeated(prepared, args.dispatches_per_sync)?,
                 )
             }
+            Prepared::MixedA8(prepared) => {
+                runtime.quantize_prepared_mixed_a8(prepared)?;
+                std::hint::black_box(
+                    runtime
+                        .dispatch_prepared_mixed_a8_repeated(prepared, args.dispatches_per_sync)?,
+                )
+            }
         };
     }
     let started = Instant::now();
@@ -208,6 +232,13 @@ fn main() -> anyhow::Result<()> {
                 runtime.quantize_prepared_a8(prepared)?;
                 std::hint::black_box(
                     runtime.dispatch_prepared_a8_repeated(prepared, args.dispatches_per_sync)?,
+                )
+            }
+            Prepared::MixedA8(prepared) => {
+                runtime.quantize_prepared_mixed_a8(prepared)?;
+                std::hint::black_box(
+                    runtime
+                        .dispatch_prepared_mixed_a8_repeated(prepared, args.dispatches_per_sync)?,
                 )
             }
         };
@@ -231,6 +262,7 @@ fn main() -> anyhow::Result<()> {
             dtype: match dtype {
                 TensorDType::Q2B64 => "q2_b64",
                 TensorDType::Q4B64 => "q4_b64",
+                TensorDType::MixedQ2Q4B64 => "mixed_q2_q4_b64",
                 _ => unreachable!(),
             },
             execution_path: match args.execution_path {
@@ -325,6 +357,42 @@ fn packed_weights(dtype: TensorDType, rows: usize, columns: usize) -> anyhow::Re
         }
     }
     Ok(weights)
+}
+
+fn packed_weights_and_segments(
+    dtype: TensorDType,
+    rows: usize,
+    columns: usize,
+) -> anyhow::Result<(Vec<u8>, Vec<QuantSegment>)> {
+    if dtype != TensorDType::MixedQ2Q4B64 {
+        return Ok((packed_weights(dtype, rows, columns)?, Vec::new()));
+    }
+    let q2_rows = rows.div_ceil(2);
+    let q4_rows = rows - q2_rows;
+    let q2 = packed_weights(TensorDType::Q2B64, q2_rows, columns)?;
+    let q4 = packed_weights(TensorDType::Q4B64, q4_rows, columns)?;
+    let mut weights = Vec::with_capacity(q2.len() + q4.len());
+    weights.extend_from_slice(&q2);
+    weights.extend_from_slice(&q4);
+    let segments = vec![
+        QuantSegment {
+            group_index: 0,
+            row_start: 0,
+            row_end: q2_rows as u64,
+            dtype: TensorDType::Q2B64,
+            offset: 0,
+            length: q2.len() as u64,
+        },
+        QuantSegment {
+            group_index: 1,
+            row_start: q2_rows as u64,
+            row_end: rows as u64,
+            dtype: TensorDType::Q4B64,
+            offset: q2.len() as u64,
+            length: q4.len() as u64,
+        },
+    ];
+    Ok((weights, segments))
 }
 
 fn f16_bytes(values: &[f32]) -> Vec<u8> {
