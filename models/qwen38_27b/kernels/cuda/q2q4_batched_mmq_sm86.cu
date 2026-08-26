@@ -79,7 +79,9 @@ constexpr unsigned kQ4BlockBytes = 34;
 constexpr unsigned kWarps = 8;
 constexpr unsigned kRowsPerWarp = 16;
 constexpr unsigned kRowsPerCta = kWarps * kRowsPerWarp;
-constexpr unsigned kTokensPerCta = 8;
+constexpr unsigned kMmaTokens = 8;
+constexpr unsigned kTokenTiles = 8;
+constexpr unsigned kTokensPerCta = kMmaTokens * kTokenTiles;
 
 static __device__ __forceinline__ float optional_f16(
     const __half* values, unsigned index) {
@@ -112,7 +114,7 @@ static __device__ __forceinline__ void batched_mmq_body(
     const unsigned blocks_per_row = columns / kBlockLen;
     constexpr unsigned block_bytes = q4 ? kQ4BlockBytes : kQ2BlockBytes;
     constexpr float scale_denominator = q4 ? (1.0f / 15.0f) : (1.0f / 3.0f);
-    float sums[ctox_mma::tile<16, 8>::ne] = {0.0f};
+    float sums[kTokenTiles][ctox_mma::tile<16, 8>::ne] = {};
 
     for (unsigned block = 0; block < blocks_per_row; ++block) {
         for (unsigned index = thread;
@@ -159,7 +161,7 @@ static __device__ __forceinline__ void batched_mmq_body(
 
         ctox_mma::tile<16, 8> weight_fragment;
         ctox_mma::tile<8, 8> activation_fragment;
-        ctox_mma::tile<16, 8> dot_fragment;
+        ctox_mma::tile<16, 8> dot_fragments[kTokenTiles];
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             const int packed_column_offset = half * 8;
@@ -169,59 +171,76 @@ static __device__ __forceinline__ void batched_mmq_body(
                              warp_values + packed_column_offset,
                              kBlockLen / sizeof(int));
 #pragma unroll
-            for (int element = 0; element < activation_fragment.ne; ++element) {
-                const int token = ctox_mma::tile<8, 8>::get_i(element);
-                const int packed_column = ctox_mma::tile<8, 8>::get_j(element);
-                const int* token_values = reinterpret_cast<const int*>(
-                    activation_tile + token * kBlockLen);
-                activation_fragment.x[element] =
-                    token_values[packed_column_offset + packed_column];
+            for (int token_tile = 0; token_tile < kTokenTiles; ++token_tile) {
+#pragma unroll
+                for (int element = 0; element < activation_fragment.ne; ++element) {
+                    const int token = token_tile * kMmaTokens
+                        + ctox_mma::tile<8, 8>::get_i(element);
+                    const int packed_column = ctox_mma::tile<8, 8>::get_j(element);
+                    const int* token_values = reinterpret_cast<const int*>(
+                        activation_tile + token * kBlockLen);
+                    activation_fragment.x[element] =
+                        token_values[packed_column_offset + packed_column];
+                }
+                ctox_mma::mma(dot_fragments[token_tile],
+                              weight_fragment,
+                              activation_fragment);
             }
-            ctox_mma::mma(dot_fragment, weight_fragment, activation_fragment);
         }
 
 #pragma unroll
-        for (int element = 0; element < dot_fragment.ne; ++element) {
-            const unsigned local_row = warp * kRowsPerWarp
-                + ctox_mma::tile<16, 8>::get_i(element);
-            const unsigned local_token = ctox_mma::tile<16, 8>::get_j(element);
-            const unsigned row = row_base + local_row;
-            const unsigned batch_row = batch_base + local_token;
-            if (row < rows && batch_row < batch_rows) {
-                const unsigned long long packed_offset =
-                    (static_cast<unsigned long long>(row) * blocks_per_row + block)
-                    * block_bytes;
-                const float weight_scale = __half2float(
-                    *reinterpret_cast<const __half*>(packed_weights + packed_offset));
-                const float input_scale = q8_scales[
-                    static_cast<unsigned long long>(batch_row) * blocks_per_row + block];
-                sums[element] = fmaf(
-                    static_cast<float>(dot_fragment.x[element]),
-                    weight_scale * input_scale * scale_denominator,
-                    sums[element]);
+#pragma unroll
+        for (int token_tile = 0; token_tile < kTokenTiles; ++token_tile) {
+#pragma unroll
+            for (int element = 0; element < dot_fragments[token_tile].ne; ++element) {
+                const unsigned local_row = warp * kRowsPerWarp
+                    + ctox_mma::tile<16, 8>::get_i(element);
+                const unsigned local_token = token_tile * kMmaTokens
+                    + ctox_mma::tile<16, 8>::get_j(element);
+                const unsigned row = row_base + local_row;
+                const unsigned batch_row = batch_base + local_token;
+                if (row < rows && batch_row < batch_rows) {
+                    const unsigned long long packed_offset =
+                        (static_cast<unsigned long long>(row) * blocks_per_row + block)
+                        * block_bytes;
+                    const float weight_scale = __half2float(
+                        *reinterpret_cast<const __half*>(packed_weights + packed_offset));
+                    const float input_scale = q8_scales[
+                        static_cast<unsigned long long>(batch_row) * blocks_per_row + block];
+                    sums[token_tile][element] = fmaf(
+                        static_cast<float>(dot_fragments[token_tile].x[element]),
+                        weight_scale * input_scale * scale_denominator,
+                        sums[token_tile][element]);
+                }
             }
         }
         __syncthreads();
     }
 
 #pragma unroll
-    for (int element = 0; element < ctox_mma::tile<16, 8>::ne; ++element) {
-        const unsigned local_row = warp * kRowsPerWarp
-            + ctox_mma::tile<16, 8>::get_i(element);
-        const unsigned local_token = ctox_mma::tile<16, 8>::get_j(element);
-        const unsigned row = row_base + local_row;
-        const unsigned batch_row = batch_base + local_token;
-        if (row < rows && batch_row < batch_rows) {
-            const float shifted = sums[element] + (bias == nullptr ? 0.0f : bias[row]);
-            output[static_cast<unsigned long long>(batch_row) * output_stride + row] =
-                activate(shifted * optional_f16(s_out, row), activation);
+#pragma unroll
+    for (int token_tile = 0; token_tile < kTokenTiles; ++token_tile) {
+#pragma unroll
+        for (int element = 0; element < ctox_mma::tile<16, 8>::ne; ++element) {
+            const unsigned local_row = warp * kRowsPerWarp
+                + ctox_mma::tile<16, 8>::get_i(element);
+            const unsigned local_token = token_tile * kMmaTokens
+                + ctox_mma::tile<16, 8>::get_j(element);
+            const unsigned row = row_base + local_row;
+            const unsigned batch_row = batch_base + local_token;
+            if (row < rows && batch_row < batch_rows) {
+                const float shifted = sums[token_tile][element]
+                    + (bias == nullptr ? 0.0f : bias[row]);
+                output[static_cast<unsigned long long>(batch_row) * output_stride + row] =
+                    activate(shifted * optional_f16(s_out, row), activation);
+            }
         }
     }
 }
 
 }  // namespace ctox_batched_mmq
 
-extern "C" __global__ __launch_bounds__(256, 2)
+extern "C" __global__ __launch_bounds__(256, 1)
 void ctox_q2_b64_a8_batched_mmq_sm86(
     const unsigned char* __restrict__ weights,
     const int8_t* __restrict__ q8_codes,
@@ -243,7 +262,7 @@ void ctox_q2_b64_a8_batched_mmq_sm86(
         batch_rows, output_stride, activation, weight_tile, activation_tile);
 }
 
-extern "C" __global__ __launch_bounds__(256, 2)
+extern "C" __global__ __launch_bounds__(256, 1)
 void ctox_q4_b64_a8_batched_mmq_sm86(
     const unsigned char* __restrict__ weights,
     const int8_t* __restrict__ q8_codes,

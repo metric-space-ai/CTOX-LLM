@@ -59,7 +59,7 @@ const WARP_SIZE: u32 = 32;
 const A8_ROWS_PER_BLOCK: u32 = (THREADS_PER_BLOCK / WARP_SIZE) * 2;
 const MMQ_THREADS_PER_BLOCK: u32 = 256;
 const MMQ_ROWS_PER_BLOCK: u32 = 128;
-const MMQ_BATCH_ROWS_PER_BLOCK: u32 = 8;
+const MMQ_BATCH_ROWS_PER_BLOCK: u32 = 64;
 const CUDA_GRID_Y_MAX: u32 = 65_535;
 
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
@@ -7066,12 +7066,12 @@ mod tests {
     }
 
     #[test]
-    fn mmq_launch_geometry_reuses_each_weight_tile_across_eight_tokens() {
+    fn mmq_launch_geometry_reuses_each_weight_tile_across_sixty_four_tokens() {
         assert_eq!(MMQ_THREADS_PER_BLOCK, 256);
         assert_eq!(MMQ_ROWS_PER_BLOCK, 128);
-        assert_eq!(MMQ_BATCH_ROWS_PER_BLOCK, 8);
+        assert_eq!(MMQ_BATCH_ROWS_PER_BLOCK, 64);
         assert_eq!(257_u32.div_ceil(MMQ_ROWS_PER_BLOCK), 3);
-        assert_eq!(17_u32.div_ceil(MMQ_BATCH_ROWS_PER_BLOCK), 3);
+        assert_eq!(65_u32.div_ceil(MMQ_BATCH_ROWS_PER_BLOCK), 2);
     }
 
     #[test]
