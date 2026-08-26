@@ -28,6 +28,8 @@ use super::metal::{
     Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
     RMS_NORM_GATED_KERNEL_NAME,
 };
+use super::metal_graph::{MetalDecodeBufferBinding, MetalDecodeWorkspacePlan};
+use super::metal_schedule::MetalBufferSlot;
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
 use crate::kv_cache::{KvPrecision, PagedKvCache};
@@ -112,6 +114,16 @@ pub struct PreparedMetalProjection {
     output_buffer: Buffer,
     params_buffer: Buffer,
     resident_bytes: usize,
+}
+
+/// One device allocation backing every transient single-token decode slot.
+///
+/// Slot offsets come from the schedule-derived alias plan; this owner never
+/// creates a projection-local activation buffer. Persistent model/state
+/// allocations remain separate graph resources.
+pub struct PreparedMetalDecodeWorkspace {
+    plan: MetalDecodeWorkspacePlan,
+    buffer: Buffer,
 }
 
 /// One shared Metal view over the complete immutable CTOXQ file mapping.
@@ -470,6 +482,61 @@ impl PreparedMetalActivation {
             );
         }
         Ok(())
+    }
+}
+
+impl PreparedMetalDecodeWorkspace {
+    pub fn total_bytes(&self) -> usize {
+        self.plan.total_bytes()
+    }
+
+    pub fn binding(&self, slot: MetalBufferSlot) -> Result<MetalDecodeBufferBinding> {
+        self.plan.binding(slot)
+    }
+
+    /// Returns the single shared buffer and the validated byte offset for a
+    /// slot. Encoders must bind the returned offset instead of allocating a
+    /// slot-local buffer.
+    pub fn buffer_and_offset(&self, slot: MetalBufferSlot) -> Result<(&Buffer, u64)> {
+        let binding = self.binding(slot)?;
+        let offset = u64::try_from(binding.offset)
+            .map_err(|_| EngineError::MemoryBudget("Metal slot offset exceeds u64".into()))?;
+        Ok((&self.buffer, offset))
+    }
+
+    /// Verifier-only host write into one exact slot. Complete graph execution
+    /// binds producer kernels directly and does not round-trip activations.
+    pub fn write_f32(&mut self, slot: MetalBufferSlot, values: &[f32]) -> Result<()> {
+        let binding = self.binding(slot)?;
+        if values.len() != binding.values {
+            return Err(EngineError::Shape(format!(
+                "Metal slot {slot:?} has {} values, write has {}",
+                binding.values,
+                values.len()
+            )));
+        }
+        write_buffer_range(
+            &self.buffer,
+            binding.offset,
+            as_bytes(values),
+            self.total_bytes(),
+        )
+    }
+
+    /// Verifier-only read of one exact slot from the shared allocation.
+    pub fn read_f32(&self, slot: MetalBufferSlot) -> Result<Vec<f32>> {
+        let binding = self.binding(slot)?;
+        let values = unsafe {
+            slice::from_raw_parts(
+                self.buffer
+                    .contents()
+                    .cast::<u8>()
+                    .add(binding.offset)
+                    .cast::<f32>(),
+                binding.values,
+            )
+        };
+        Ok(values.to_vec())
     }
 }
 
@@ -1201,6 +1268,19 @@ impl MetalCandidateRuntime {
 
     pub fn device_name(&self) -> &str {
         self.device.name()
+    }
+
+    /// Materializes the schedule-derived decode arena as exactly one shared
+    /// Metal allocation. The plan is immutable after construction, so every
+    /// later encoder observes the same slot offsets and alias decisions.
+    pub fn prepare_decode_workspace(
+        &self,
+        plan: &MetalDecodeWorkspacePlan,
+    ) -> Result<PreparedMetalDecodeWorkspace> {
+        Ok(PreparedMetalDecodeWorkspace {
+            plan: plan.clone(),
+            buffer: new_zeroed_buffer(&self.device, plan.total_bytes())?,
+        })
     }
 
     pub fn prepare_argmax_f32(&self, input: &[f32]) -> Result<PreparedMetalArgMax> {
@@ -4404,6 +4484,7 @@ fn zero_buffer(buffer: &Buffer, bytes: usize) {
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
+    use crate::backend::metal_schedule::MetalDecodeSchedule;
     use crate::backend::{Activation, Backend};
     use crate::format::{
         ArtifactBuilder, FileHeader, ModelManifest, PackedTensor, QuantSegment, TensorEntry,
@@ -4411,6 +4492,7 @@ mod tests {
     };
     use crate::loader::{ChecksumPolicy, ModelArtifact};
     use crate::quant::{Q2Block64, Q4Block64, BLOCK_LEN};
+    use crate::Qwen38Config;
     use half::f16;
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -4555,6 +4637,60 @@ mod tests {
         file.write_all(&s_out).expect("write s_out");
         file.sync_all().expect("sync mixed artifact");
         segments
+    }
+
+    #[test]
+    fn decode_workspace_materializes_one_shared_buffer_with_exact_views() {
+        let config = Qwen38Config::default();
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("decode workspace plan");
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let mut workspace = runtime
+            .prepare_decode_workspace(&plan)
+            .expect("allocate one decode arena");
+        assert_eq!(workspace.total_bytes(), 1_173_760);
+
+        let hidden = workspace
+            .binding(MetalBufferSlot::HiddenA)
+            .expect("hidden binding");
+        let logits = workspace
+            .binding(MetalBufferSlot::TargetLogits)
+            .expect("target-logit binding");
+        let (hidden_buffer, hidden_offset) = workspace
+            .buffer_and_offset(MetalBufferSlot::HiddenA)
+            .expect("hidden view");
+        let (logit_buffer, logit_offset) = workspace
+            .buffer_and_offset(MetalBufferSlot::TargetLogits)
+            .expect("target-logit view");
+        assert!(std::ptr::eq(hidden_buffer, logit_buffer));
+        assert_eq!(hidden_offset, hidden.offset as u64);
+        assert_eq!(logit_offset, logits.offset as u64);
+
+        let values: Vec<f32> = (0..hidden.values)
+            .map(|index| index as f32 * 0.125 - 3.0)
+            .collect();
+        workspace
+            .write_f32(MetalBufferSlot::HiddenA, &values)
+            .expect("write exact hidden view");
+        assert_eq!(
+            workspace
+                .read_f32(MetalBufferSlot::HiddenA)
+                .expect("read exact hidden view"),
+            values
+        );
+        assert!(workspace
+            .write_f32(MetalBufferSlot::HiddenA, &[0.0; 3])
+            .is_err());
+
+        drop(workspace);
+        assert_eq!(
+            runtime
+                .prepare_decode_workspace(&plan)
+                .expect("reallocate arena after drop")
+                .total_bytes(),
+            plan.total_bytes()
+        );
     }
 
     #[test]

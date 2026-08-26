@@ -43,8 +43,14 @@ independent buffers, saving 459,520 bytes. Byte aliasing is rejected whenever
 any live interval overlaps; target logits and MTP draft logits consequently
 remain distinct through the final commit. Persistent weights, packed KV,
 causal-convolution/recurrent state, and kernel parameter blocks are explicitly
-outside this transient plan. Device allocation and step-to-view binding remain
-executor work.
+outside this transient plan. `prepare_decode_workspace` materializes it as
+exactly one zeroed shared Metal buffer for the plan and exposes the same buffer
+with validated per-slot offsets. The Apple-device verifier writes and reads an
+exact slot, rejects a wrong-sized write, proves distinct slot views share the
+one buffer, then drops and recreates the arena. This is allocation/lifetime
+evidence for the decode arena, not yet a complete allocator high-watermark or
+zero-residue unload measurement; per-step encoder binding remains executor
+work.
 
 ## Entry points
 
@@ -369,8 +375,8 @@ dequantization array before this source was accepted.
   verifier candidates. GQA still
   duplicates its packed pages in a CPU correctness mirror; neither attention
   path has controlled performance evidence. The MTP block and sampling do not
-  exist yet. A deterministic shared decode-arena plan exists, but the actual
-  Metal buffer, per-step view binding, prefill arena, transactional state, and
-  complete model-graph execution remain unfinished.
+  exist yet. A deterministic shared decode arena and its single Metal buffer
+  exist, but per-step encoder binding, the prefill arena, transactional state,
+  and complete model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.
