@@ -32,3 +32,12 @@ Direct driver binding dependency:
   (https://github.com/gfx-rs/metal-rs), licensed MIT OR Apache-2.0, as a thin
   binding to Apple's Metal API. It is not an inference framework. Exact direct
   and transitive versions are pinned in `models/qwen38_27b/Cargo.lock`.
+
+Tokenizer dependency:
+
+- The Qwen model crate uses Hugging Face tokenizers 0.23.1
+  (https://github.com/huggingface/tokenizers), licensed Apache-2.0, to execute
+  the byte-verified model-specific BPE artifact. Default features are disabled;
+  the build enables the pure-Rust `fancy-regex` path and does not enable HTTP,
+  Oniguruma, progress reporting, or the C++ `esaxx_fast` feature. Exact direct
+  and transitive versions are pinned in `models/qwen38_27b/Cargo.lock`.

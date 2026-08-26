@@ -1,0 +1,50 @@
+{
+  "format": "ctox.qwen38.tokenizer-verification.v1",
+  "date": "2026-08-26",
+  "status": "passed",
+  "source": {
+    "repository": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "tokenizer_bytes": 12809320,
+    "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "chat_template_bytes": 8952,
+    "chat_template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+  },
+  "tokenizer": {
+    "model": "BPE",
+    "normalizer": "NFC",
+    "pretokenizer": "pinned Qwen regex plus ByteLevel",
+    "decoder": "ByteLevel",
+    "base_vocabulary": 248044,
+    "added_tokens": 33,
+    "total_token_ids": 248077,
+    "implementation": "src/tokenizer.rs",
+    "dependency": "tokenizers 0.23.1, Apache-2.0, default features disabled, pure-Rust fancy-regex enabled"
+  },
+  "goldens": {
+    "multilingual_direct_cases": 6,
+    "languages_and_modes": [
+      "English",
+      "German",
+      "Japanese",
+      "Arabic",
+      "Rust code",
+      "emoji plus NFC text"
+    ],
+    "chat_cases": [
+      "xhigh reasoning generation prompt",
+      "low reasoning plus system message",
+      "thinking disabled",
+      "assistant reasoning history",
+      "tool declaration, call, response, and final answer"
+    ],
+    "reference": "Transformers AutoTokenizer loaded offline from the byte-verified BF16 source",
+    "comparison": "rendered UTF-8 SHA-256 and little-endian u32 token-ID SHA-256",
+    "result": "all Rust outputs exactly match the pinned Python reference"
+  },
+  "command": "cargo run --bin qwen38-tokenizer-check -- --tokenizer TOKENIZER_JSON --chat-template CHAT_TEMPLATE_JINJA",
+  "limitations": [
+    "This is the text-only template path; vision content is a separate package.",
+    "The bring-up server is not yet wired to a promoted full-graph executor."
+  ]
+}

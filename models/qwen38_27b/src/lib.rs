@@ -22,6 +22,7 @@ pub mod roofline;
 pub mod sampler;
 pub mod server;
 pub mod tensor_contract;
+pub mod tokenizer;
 pub mod wire;
 
 #[cfg(feature = "android-jni")]
