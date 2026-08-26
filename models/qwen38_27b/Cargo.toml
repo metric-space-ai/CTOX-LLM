@@ -94,3 +94,8 @@ required-features = ["cuda"]
 name = "qwen38-cuda-fanout-bench"
 path = "src/bin/cuda_fanout_bench.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "qwen38-cuda-gated-delta-verify"
+path = "src/bin/cuda_gated_delta_verify.rs"
+required-features = ["cuda"]

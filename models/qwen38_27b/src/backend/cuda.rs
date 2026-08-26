@@ -159,6 +159,83 @@ pub const Q4_B64_A8_MATVEC_SYMBOL: &str = "ctox_q4_b64_a8_matvec_sm86";
 pub const Q2_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q2_b64_recovered_row_sm86";
 pub const Q4_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q4_b64_recovered_row_sm86";
 
+/// Verifier-only Qwen GatedDeltaNet recurrence. The production module ABI
+/// intentionally excludes this symbol until the FP16-state implementation
+/// passes the scalar-oracle and same-device roofline gates.
+// ref: ggml/src/ggml-cuda/gated_delta_net.cu:1-135
+pub const GATED_DELTA_F16_SYMBOL: &str = "ctox_gated_delta_recurrent_f16_sm86";
+
+/// Exact recurrent geometry in Qwen3.8-27B. Keeping it explicit prevents a
+/// successfully compiled but semantically different dynamic shape from being
+/// accepted by the verifier runtime.
+pub const GATED_DELTA_HEADS: usize = 48;
+pub const GATED_DELTA_KEY_DIM: usize = 128;
+pub const GATED_DELTA_VALUE_DIM: usize = 128;
+pub const GATED_DELTA_STATE_BYTES: usize =
+    GATED_DELTA_HEADS * GATED_DELTA_KEY_DIM * GATED_DELTA_VALUE_DIM * 2;
+
+/// Driver-API argument layout for `GATED_DELTA_F16_SYMBOL`. It is documented
+/// independently of `SM86_MODULE_ABI` so candidate cubins are inspectable
+/// without prematurely promoting the kernel.
+pub const GATED_DELTA_F16_PARAMS: &[KernelParam] = &[
+    KernelParam {
+        name: "query",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 0,
+    },
+    KernelParam {
+        name: "key",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 8,
+    },
+    KernelParam {
+        name: "value",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 16,
+    },
+    KernelParam {
+        name: "log_decay",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 24,
+    },
+    KernelParam {
+        name: "beta",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 32,
+    },
+    KernelParam {
+        name: "state",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 40,
+    },
+    KernelParam {
+        name: "output",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 48,
+    },
+    KernelParam {
+        name: "heads",
+        size_bytes: 4,
+        offset_bytes: 56,
+    },
+    KernelParam {
+        name: "key_dim",
+        size_bytes: 4,
+        offset_bytes: 60,
+    },
+    KernelParam {
+        name: "value_dim",
+        size_bytes: 4,
+        offset_bytes: 64,
+    },
+    KernelParam {
+        name: "epsilon",
+        size_bytes: 4,
+        offset_bytes: 68,
+    },
+];
+pub const GATED_DELTA_F16_PARAM_BYTES: u32 = 72;
+
 /// Module-level ABI contract for the SM86 kernel image: the compute
 /// capability the cubin must target and every kernel it must export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,6 +702,23 @@ mod tests {
             "ctox_q4_b64_fused_matvec_sm86",
         ];
         SM86_MODULE_ABI.validate_module((8, 6), &symbols).unwrap();
+    }
+
+    #[test]
+    fn gated_delta_candidate_pins_exact_qwen_geometry_and_driver_abi() {
+        assert_eq!(GATED_DELTA_HEADS, 48);
+        assert_eq!(GATED_DELTA_KEY_DIM, 128);
+        assert_eq!(GATED_DELTA_VALUE_DIM, 128);
+        assert_eq!(GATED_DELTA_STATE_BYTES, 1_572_864);
+        assert_eq!(GATED_DELTA_F16_PARAMS.len(), 11);
+        assert_eq!(GATED_DELTA_F16_PARAMS[0].offset_bytes, 0);
+        assert_eq!(GATED_DELTA_F16_PARAMS[6].offset_bytes, 48);
+        assert_eq!(GATED_DELTA_F16_PARAMS[10].offset_bytes, 68);
+        assert_eq!(GATED_DELTA_F16_PARAM_BYTES, 72);
+        assert!(!SM86_MODULE_ABI
+            .kernels
+            .iter()
+            .any(|kernel| kernel.symbol == GATED_DELTA_F16_SYMBOL));
     }
 
     #[test]

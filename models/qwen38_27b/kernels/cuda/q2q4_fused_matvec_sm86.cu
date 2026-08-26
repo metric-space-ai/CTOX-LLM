@@ -367,3 +367,93 @@ void ctox_q4_b64_recovered_row_sm86(const unsigned char* __restrict__ weights,
         * (1.0f / 15.0f) * load_f16(packed);
     output[column] = value * load_optional_f16(s_in, column) * s_out;
 }
+
+// Single-token Qwen GatedDeltaNet recurrence with persistent FP16 state.
+// This verifier candidate preserves the pinned upstream organization (one
+// block per value head, register-local column updates, warp reductions) while
+// using CTOX's signed memory contract: persistent state is FP16 and every
+// decay/update write rounds immediately. It is not part of the promoted CUDA
+// module ABI until same-device oracle and roofline evidence are recorded.
+//
+// ref: ggml/src/ggml-cuda/gated_delta_net.cu:1-135
+extern "C" __global__ __launch_bounds__(128, 4)
+void ctox_gated_delta_recurrent_f16_sm86(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ log_decay,
+    const float* __restrict__ beta,
+    __half* __restrict__ state,
+    float* __restrict__ output,
+    unsigned heads,
+    unsigned key_dim,
+    unsigned value_dim,
+    float epsilon) {
+    const unsigned head = blockIdx.x;
+    const unsigned value_index = threadIdx.x;
+    if (head >= heads || key_dim != 128u || value_dim != 128u) {
+        return;
+    }
+
+    const unsigned lane = value_index & (kWarpSize - 1u);
+    const unsigned warp = value_index / kWarpSize;
+    const unsigned qk_base = head * key_dim;
+    const float q = query[qk_base + value_index];
+    const float k = key[qk_base + value_index];
+    float q_norm = warp_sum(q * q);
+    float k_norm = warp_sum(k * k);
+
+    __shared__ float q_warp_norm[4];
+    __shared__ float k_warp_norm[4];
+    __shared__ float q_inverse;
+    __shared__ float k_inverse;
+    if (lane == 0u) {
+        q_warp_norm[warp] = q_norm;
+        k_warp_norm[warp] = k_norm;
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        q_norm = lane < 4u ? q_warp_norm[lane] : 0.0f;
+        k_norm = lane < 4u ? k_warp_norm[lane] : 0.0f;
+        q_norm = warp_sum(q_norm);
+        k_norm = warp_sum(k_norm);
+        if (lane == 0u) {
+            q_inverse = rsqrtf(q_norm + epsilon);
+            k_inverse = rsqrtf(k_norm + epsilon);
+        }
+    }
+    __syncthreads();
+
+    const unsigned state_head_base = head * key_dim * value_dim;
+    const unsigned value_offset = head * value_dim + value_index;
+    const float decay = expf(log_decay[head]);
+    float memory = 0.0f;
+#pragma unroll 1
+    for (unsigned key_index = 0u; key_index < 128u; ++key_index) {
+        const unsigned state_index = state_head_base
+            + key_index * value_dim + value_index;
+        const __half decayed = __float2half_rn(
+            __half2float(state[state_index]) * decay);
+        state[state_index] = decayed;
+        memory = fmaf(__half2float(decayed),
+                      key[qk_base + key_index] * k_inverse,
+                      memory);
+    }
+
+    const float delta = (value[value_offset] - memory) * beta[head];
+    const float query_scale = rsqrtf(static_cast<float>(key_dim));
+    float result = 0.0f;
+#pragma unroll 1
+    for (unsigned key_index = 0u; key_index < 128u; ++key_index) {
+        const unsigned state_index = state_head_base
+            + key_index * value_dim + value_index;
+        const __half updated = __float2half_rn(
+            __half2float(state[state_index])
+            + key[qk_base + key_index] * k_inverse * delta);
+        state[state_index] = updated;
+        result = fmaf(__half2float(updated),
+                      query[qk_base + key_index] * q_inverse * query_scale,
+                      result);
+    }
+    output[value_offset] = result;
+}

@@ -57,14 +57,15 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports five explicitly unpromoted
-  candidates: an A8 quantizer, two A8/dp4a projections, and two recovered-row
-  decoders:
+- The same verifier cubin additionally exports six explicitly unpromoted
+  candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
+  decoders, and the persistent-state GatedDelta recurrence:
   - `ctox_quantize_a8_b64_sm86`
   - `ctox_q2_b64_a8_matvec_sm86`
   - `ctox_q4_b64_a8_matvec_sm86`
   - `ctox_q2_b64_recovered_row_sm86`
   - `ctox_q4_b64_recovered_row_sm86`
+  - `ctox_gated_delta_recurrent_f16_sm86`
   These symbols are intentionally excluded from the production module ABI
   until their quality and complete-graph gates pass.
 - One launch fuses dequant, dot product, `s_in`, `s_out`, bias, and
@@ -84,6 +85,8 @@ On a CUDA 12 toolchain:
 cargo run --release --features cuda --bin qwen38-cuda-bench -- \
   --module target/cuda-sm86/q2q4_fused_matvec_sm86.cubin \
   --dtype q2 --rows 5120 --columns 5120
+cargo run --release --features cuda --bin qwen38-cuda-gated-delta-verify -- \
+  --module target/cuda-sm86/q2q4_fused_matvec_sm86.cubin --device 0
 ```
 
 The build script resolves the canonical `nvcc` target rather than trusting a
@@ -92,6 +95,18 @@ captures `cuobjdump` resource usage. The Rust verifier dynamically loads only
 the NVIDIA Driver API, requires compute capability 8.6, keeps the projection
 buffers resident across launches, and compares device output with the scalar
 CPU oracle before timing.
+
+The recurrent candidate accepts only Qwen3.8-27B's frozen 48-head,
+128-key-dimension, 128-value-dimension profile. Its state is exactly 1,572,864
+bytes of FP16 and has no FP32 shadow; query, key, value, decay, beta, and output
+add 98,688 reusable transient bytes. One 128-thread block owns one head and
+one thread owns one value column. Decay and update stores round immediately to
+FP16, matching the Rust and Metal oracle. CUDA 12.6 compiled the candidate for
+SM86 with 24 registers, 40 bytes shared memory, and zero stack/spill bytes
+(cubin SHA-256 `172b695ae89306ee4b0c59987c6ddc3c14c3ba6f547c797dc16f1af19ecbd242`).
+The numerical verifier is built for a later physical-GPU-2 run after the
+teacher/evaluation/activation pipeline releases GPU 1+2; GPU 0 remains
+reserved for Greppy. No numerical or performance promotion is claimed yet.
 
 The first GPU3 run is recorded in
 `benchmarks/cuda/sm86-q2q4-fused-matvec-20260826.json`. It proved both formats

@@ -17,8 +17,10 @@ use sha2::{Digest, Sha256};
 
 use super::cuda::{
     validate_mixed_operation, validate_operation, validate_recovered_row, CudaMixedRowSegment,
-    A8_QUANTIZE_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL,
-    Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL,
+    A8_QUANTIZE_SYMBOL, GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS, GATED_DELTA_KEY_DIM,
+    GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
+    Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
+    Q4_B64_RECOVERED_ROW_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -51,6 +53,7 @@ type CuModuleGetFunction =
 type CuModuleUnload = unsafe extern "C" fn(CuModule) -> CuResult;
 type CuMemAlloc = unsafe extern "C" fn(*mut CuDevicePtr, usize) -> CuResult;
 type CuMemFree = unsafe extern "C" fn(CuDevicePtr) -> CuResult;
+type CuMemsetD8 = unsafe extern "C" fn(CuDevicePtr, u8, usize) -> CuResult;
 type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CuResult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> CuResult;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> CuResult;
@@ -85,6 +88,7 @@ struct CudaDriver {
     module_unload: CuModuleUnload,
     mem_alloc: CuMemAlloc,
     mem_free: CuMemFree,
+    memset_d8: CuMemsetD8,
     mem_get_info: CuMemGetInfo,
     memcpy_htod: CuMemcpyHtoD,
     memcpy_dtoh: CuMemcpyDtoH,
@@ -113,6 +117,7 @@ impl CudaDriver {
                 module_unload: symbol(&library, b"cuModuleUnload\0")?,
                 mem_alloc: symbol(&library, b"cuMemAlloc_v2\0")?,
                 mem_free: symbol(&library, b"cuMemFree_v2\0")?,
+                memset_d8: symbol(&library, b"cuMemsetD8_v2\0")?,
                 mem_get_info: symbol(&library, b"cuMemGetInfo_v2\0")?,
                 memcpy_htod: symbol(&library, b"cuMemcpyHtoD_v2\0")?,
                 memcpy_dtoh: symbol(&library, b"cuMemcpyDtoH_v2\0")?,
@@ -160,6 +165,7 @@ struct CudaContextInner {
     q4_a8_function: CuFunction,
     q2_recovered_row_function: CuFunction,
     q4_recovered_row_function: CuFunction,
+    gated_delta_f16_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
 }
@@ -262,6 +268,42 @@ pub struct PreparedCudaRecoveredRow {
     s_in: DeviceBuffer,
     output: DeviceBuffer,
     resident_bytes: usize,
+}
+
+/// Exact Qwen3.8-27B recurrence geometry accepted by the CUDA verifier.
+/// Dynamic shapes remain rejected until their own kernel profile exists.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CudaGatedDeltaConfig {
+    pub heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub epsilon: f32,
+}
+
+impl CudaGatedDeltaConfig {
+    pub const QWEN38_27B: Self = Self {
+        heads: GATED_DELTA_HEADS,
+        key_dim: GATED_DELTA_KEY_DIM,
+        value_dim: GATED_DELTA_VALUE_DIM,
+        epsilon: 1.0e-6,
+    };
+}
+
+/// Persistent FP16 GatedDeltaNet state with reusable f32 step buffers. No
+/// host or device FP32 state shadow is retained.
+pub struct PreparedCudaGatedDelta {
+    context: Rc<CudaContextInner>,
+    config: CudaGatedDeltaConfig,
+    query: DeviceBuffer,
+    key: DeviceBuffer,
+    value: DeviceBuffer,
+    log_decay: DeviceBuffer,
+    beta: DeviceBuffer,
+    state: DeviceBuffer,
+    output: DeviceBuffer,
+    resident_state_bytes: usize,
+    transient_bytes: usize,
+    poisoned: bool,
 }
 
 impl CudaCandidateRuntime {
@@ -416,6 +458,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let gated_delta_f16_function =
+            match resolve_function(&driver, module, GATED_DELTA_F16_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         Ok(Self {
             inner: Rc::new(CudaContextInner {
                 driver,
@@ -428,6 +481,7 @@ impl CudaCandidateRuntime {
                 q4_a8_function,
                 q2_recovered_row_function,
                 q4_recovered_row_function,
+                gated_delta_f16_function,
                 device_name,
                 compute_capability,
             }),
@@ -456,6 +510,155 @@ impl CudaCandidateRuntime {
             )?;
         }
         Ok((free, total))
+    }
+
+    /// Allocate the exact Qwen3.8-27B persistent FP16 recurrent state and
+    /// reusable step buffers. The kernel profile is intentionally fixed at
+    /// 48x128x128; unsupported shapes fail before any device allocation.
+    pub fn prepare_gated_delta_f16(
+        &self,
+        config: CudaGatedDeltaConfig,
+    ) -> Result<PreparedCudaGatedDelta> {
+        if config.heads != GATED_DELTA_HEADS
+            || config.key_dim != GATED_DELTA_KEY_DIM
+            || config.value_dim != GATED_DELTA_VALUE_DIM
+            || !config.epsilon.is_finite()
+            || config.epsilon <= 0.0
+        {
+            return Err(EngineError::Shape(
+                "CUDA gated-delta requires the exact Qwen3.8-27B 48x128x128 profile".into(),
+            ));
+        }
+        let qk_values = config
+            .heads
+            .checked_mul(config.key_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA delta Q/K values overflow".into()))?;
+        let value_values = config
+            .heads
+            .checked_mul(config.value_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA delta values overflow".into()))?;
+        let qk_bytes = qk_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA delta Q/K bytes overflow".into()))?;
+        let value_bytes = value_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA delta value bytes overflow".into()))?;
+        let head_bytes = config
+            .heads
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA delta head bytes overflow".into()))?;
+        let transient_bytes = qk_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(value_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(head_bytes.checked_mul(2)?))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA delta transient bytes overflow".into())
+            })?;
+
+        let query = DeviceBuffer::allocate(self, qk_bytes)?;
+        let key = DeviceBuffer::allocate(self, qk_bytes)?;
+        let value = DeviceBuffer::allocate(self, value_bytes)?;
+        let log_decay = DeviceBuffer::allocate(self, head_bytes)?;
+        let beta = DeviceBuffer::allocate(self, head_bytes)?;
+        let state = DeviceBuffer::allocate(self, GATED_DELTA_STATE_BYTES)?;
+        let output = DeviceBuffer::allocate(self, value_bytes)?;
+        state.zero()?;
+        output.zero()?;
+        Ok(PreparedCudaGatedDelta {
+            context: Rc::clone(&self.inner),
+            config,
+            query,
+            key,
+            value,
+            log_decay,
+            beta,
+            state,
+            output,
+            resident_state_bytes: GATED_DELTA_STATE_BYTES,
+            transient_bytes,
+            poisoned: false,
+        })
+    }
+
+    /// Execute one token against the persistent FP16 recurrence. A failed
+    /// state-mutating launch poisons the object until the caller resets it;
+    /// there is no CPU or alternate-kernel fallback.
+    pub fn dispatch_gated_delta_f16(
+        &self,
+        prepared: &mut PreparedCudaGatedDelta,
+    ) -> Result<Vec<f32>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA gated-delta belongs to another context".into(),
+            ));
+        }
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA gated-delta state is poisoned; reset is required".into(),
+            ));
+        }
+        prepared.poisoned = true;
+        self.make_current()?;
+        let mut query = prepared.query.ptr();
+        let mut key = prepared.key.ptr();
+        let mut value = prepared.value.ptr();
+        let mut log_decay = prepared.log_decay.ptr();
+        let mut beta = prepared.beta.ptr();
+        let mut state = prepared.state.ptr();
+        let mut output = prepared.output.ptr();
+        let mut heads = prepared.config.heads as u32;
+        let mut key_dim = prepared.config.key_dim as u32;
+        let mut value_dim = prepared.config.value_dim as u32;
+        let mut epsilon = prepared.config.epsilon;
+        let mut params = [
+            (&mut query as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut key as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut value as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut log_decay as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut beta as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut state as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut heads as *mut u32).cast::<c_void>(),
+            (&mut key_dim as *mut u32).cast::<c_void>(),
+            (&mut value_dim as *mut u32).cast::<c_void>(),
+            (&mut epsilon as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.gated_delta_f16_function,
+                    heads,
+                    1,
+                    1,
+                    value_dim,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "gated-delta kernel launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "gated-delta context synchronization",
+            )?;
+        }
+        let output_values = prepared
+            .config
+            .heads
+            .checked_mul(prepared.config.value_dim)
+            .ok_or_else(|| EngineError::Shape("CUDA delta output shape overflows".into()))?;
+        let mut result = vec![0.0_f32; output_values];
+        prepared.output.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA gated-delta produced a non-finite output".into(),
+            ));
+        }
+        prepared.poisoned = false;
+        Ok(result)
     }
 
     pub fn prepare_recovered_row(
@@ -1424,6 +1627,65 @@ impl PreparedCudaRecoveredRow {
     }
 }
 
+impl PreparedCudaGatedDelta {
+    pub fn config(&self) -> CudaGatedDeltaConfig {
+        self.config
+    }
+
+    pub fn resident_state_bytes(&self) -> usize {
+        self.resident_state_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_step(
+        &self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        log_decay: &[f32],
+        beta: &[f32],
+    ) -> Result<()> {
+        let qk_values = self.config.heads * self.config.key_dim;
+        let value_values = self.config.heads * self.config.value_dim;
+        for (name, values, expected) in [
+            ("query", query, qk_values),
+            ("key", key, qk_values),
+            ("value", value, value_values),
+            ("log_decay", log_decay, self.config.heads),
+            ("beta", beta, self.config.heads),
+        ] {
+            if values.len() != expected || values.iter().any(|item| !item.is_finite()) {
+                return Err(EngineError::Shape(format!(
+                    "CUDA gated-delta {name} has invalid length or non-finite values"
+                )));
+            }
+        }
+        self.query.write(as_bytes(query))?;
+        self.key.write(as_bytes(key))?;
+        self.value.write(as_bytes(value))?;
+        self.log_decay.write(as_bytes(log_decay))?;
+        self.beta.write(as_bytes(beta))
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        self.state.zero()?;
+        self.output.zero()?;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    /// Readback is restricted to verifier evidence. Graph execution never
+    /// materializes a host-side state copy.
+    pub fn verifier_read_state(&self) -> Result<Vec<half::f16>> {
+        let mut state = vec![half::f16::ZERO; self.resident_state_bytes / 2];
+        self.state.copy_to(as_bytes_mut(&mut state))?;
+        Ok(state)
+    }
+}
+
 impl Drop for CudaContextInner {
     fn drop(&mut self) {
         unsafe {
@@ -1498,6 +1760,16 @@ impl DeviceBuffer {
             self.context.driver.check(
                 (self.context.driver.memcpy_dtoh)(bytes.as_mut_ptr().cast(), self.ptr, bytes.len()),
                 "device-to-host copy",
+            )
+        }
+    }
+
+    fn zero(&self) -> Result<()> {
+        self.context.make_current()?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.memset_d8)(self.ptr, 0, self.len),
+                "device-buffer zero",
             )
         }
     }
