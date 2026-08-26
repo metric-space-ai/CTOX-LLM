@@ -594,6 +594,9 @@ CUDA on rows 0, 1, 256, and 511; CPU-equation scale errors stayed below
 the unified cubin SHA-256 is
 `aa2ff687f159dad69da7b85086a9b359494b375d25eb0b7b8faed4b8800af3f4`.
 Evidence is in `benchmarks/cuda/sm86-batched-fused-a8-512-20260826.json`.
+`PreparedCudaProjectionGraph` binds the ordinary fan-out, attention-gate, and
+SwiGLU forms to its single admitted activation/output arena. The complete
+645-step executor transaction and one-barrier failure policy remain open.
 
 The direct causal paged-GQA prefill candidate maps one warp to each
 `(query_token, query_head)` pair and scans exactly that position's logical

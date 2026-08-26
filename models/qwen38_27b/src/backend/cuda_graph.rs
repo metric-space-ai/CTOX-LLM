@@ -2572,6 +2572,107 @@ impl PreparedCudaProjectionGraph {
         })
     }
 
+    /// Executes one frozen prompt-chunk projection fan-out through the graph-
+    /// owned maximum-width A8 and four-slot output arenas. The returned views
+    /// borrow the graph, preventing a later arena overwrite while they remain
+    /// live.
+    pub fn dispatch_prefill_projection_fanout_device<'a, const N: usize>(
+        &'a self,
+        runtime: &CudaCandidateRuntime,
+        input: CudaDeviceF32View<'_>,
+        tokens: usize,
+        names: [String; N],
+    ) -> Result<[CudaDeviceF32View<'a>; N]> {
+        let first = names.first().ok_or_else(|| {
+            EngineError::InvalidState("CUDA prefill projection fan-out cannot be empty".into())
+        })?;
+        let group = self.plan.group_for_projection(first)?;
+        let activation = self.activation(group)?;
+        let mut prepared = Vec::with_capacity(N);
+        for name in &names {
+            if self.plan.group_for_projection(name)? != group {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA prefill projection fan-out mixes activation groups at {name}"
+                )));
+            }
+            prepared.push((
+                self.projection(name)?,
+                prefill_projection_output_slot(name)?,
+            ));
+        }
+        runtime
+            .dispatch_batched_a8_arena_fanout_device(
+                activation,
+                self.prefill_workspaces.projection_activation(),
+                self.prefill_workspaces.projection_outputs(),
+                input,
+                tokens,
+                &prepared,
+            )?
+            .try_into()
+            .map_err(|_| EngineError::InvalidState("CUDA prefill fan-out count changed".into()))
+    }
+
+    /// Closes the full-attention chunk edge from paged GQA plus query gate to
+    /// the resident output projection without materializing a gated tensor.
+    pub fn dispatch_prefill_attention_gate_projection_device<'a>(
+        &'a self,
+        runtime: &CudaCandidateRuntime,
+        attention: CudaDeviceF32View<'_>,
+        gate: CudaDeviceF32View<'_>,
+        tokens: usize,
+        name: &str,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let group = self.plan.group_for_projection(name)?;
+        let activation = self.activation(group)?;
+        let projection = self.projection(name)?;
+        let slot = prefill_projection_output_slot(name)?;
+        runtime
+            .dispatch_batched_a8_arena_sigmoid_gate_fanout_device(
+                activation,
+                self.prefill_workspaces.projection_activation(),
+                self.prefill_workspaces.projection_outputs(),
+                attention,
+                gate,
+                tokens,
+                &[(projection, slot)],
+            )?
+            .pop()
+            .ok_or_else(|| {
+                EngineError::InvalidState("CUDA prefill attention projection has no output".into())
+            })
+    }
+
+    /// Closes the FFN chunk edge from gate/up projections to the resident down
+    /// projection through the same graph-owned arenas.
+    pub fn dispatch_prefill_swiglu_projection_device<'a>(
+        &'a self,
+        runtime: &CudaCandidateRuntime,
+        gate: CudaDeviceF32View<'_>,
+        up: CudaDeviceF32View<'_>,
+        tokens: usize,
+        name: &str,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let group = self.plan.group_for_projection(name)?;
+        let activation = self.activation(group)?;
+        let projection = self.projection(name)?;
+        let slot = prefill_projection_output_slot(name)?;
+        runtime
+            .dispatch_batched_a8_arena_swiglu_fanout_device(
+                activation,
+                self.prefill_workspaces.projection_activation(),
+                self.prefill_workspaces.projection_outputs(),
+                gate,
+                up,
+                tokens,
+                &[(projection, slot)],
+            )?
+            .pop()
+            .ok_or_else(|| {
+                EngineError::InvalidState("CUDA prefill SwiGLU projection has no output".into())
+            })
+    }
+
     pub fn mtp_draft_rows(&self) -> Option<usize> {
         self.mtp_draft_projection
             .as_ref()
