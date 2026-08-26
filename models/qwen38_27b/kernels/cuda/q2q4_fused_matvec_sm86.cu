@@ -417,6 +417,111 @@ void ctox_q4_b64_a8_matvec_sm86(const unsigned char* __restrict__ weights,
     }
 }
 
+// Restricted LM-head proposal path. The canonical row IDs are release-bound
+// and remain on device; target verification still executes the complete head.
+// The dp4a body and two-rows-per-warp launch organization are the same as the
+// pinned upstream-derived A8 verifier path above. This remains an unpromoted
+// candidate until the gathered/full oracle and roofline gates pass.
+// ref: ggml/src/ggml-cuda/vecdotq.cuh:115-137
+// ref: ggml/src/ggml-cuda/mmq.cuh:3542-3615
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_q2_b64_a8_gathered_matvec_sm86(
+    const unsigned char* __restrict__ weights,
+    const int8_t* __restrict__ q8_codes,
+    const float* __restrict__ q8_scales,
+    const __half* __restrict__ s_out,
+    const float* __restrict__ bias,
+    const uint32_t* __restrict__ row_ids,
+    float* __restrict__ output,
+    unsigned requested_rows,
+    unsigned columns,
+    unsigned activation) {
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned local_lane = lane & 15u;
+    const unsigned half_warp = lane / 16u;
+    const unsigned warp = threadIdx.x / kWarpSize;
+    const unsigned rows_per_block =
+        (blockDim.x / kWarpSize) * kRowsPerWarpA8;
+    const unsigned output_row =
+        blockIdx.x * rows_per_block + warp * kRowsPerWarpA8 + half_warp;
+    if (output_row >= requested_rows) {
+        return;
+    }
+    const unsigned source_row = row_ids[output_row];
+    const unsigned blocks_per_row = columns / kBlockLen;
+    const unsigned long long row_stride =
+        static_cast<unsigned long long>(blocks_per_row) * kQ2BlockBytes;
+    const unsigned char* row_weights = weights + source_row * row_stride;
+    float partial = 0.0f;
+    for (unsigned block = 0; block < blocks_per_row; ++block) {
+        const unsigned char* packed = row_weights + block * kQ2BlockBytes;
+        const int weights4 = pack_signed_q2(packed[2u + local_lane]);
+        const int activations4 = *reinterpret_cast<const int*>(
+            q8_codes + block * kBlockLen + local_lane * 4u);
+        const int dot = __dp4a(weights4, activations4, 0);
+        partial = fmaf(static_cast<float>(dot),
+                       load_f16(packed) * q8_scales[block] * (1.0f / 3.0f),
+                       partial);
+    }
+    const float total = half_warp_sum(partial);
+    if (local_lane == 0u) {
+        const float shifted = total
+            + (bias == nullptr ? 0.0f : bias[source_row]);
+        output[output_row] = apply_activation(
+            shifted * load_optional_f16(s_out, source_row), activation);
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_q4_b64_a8_gathered_matvec_sm86(
+    const unsigned char* __restrict__ weights,
+    const int8_t* __restrict__ q8_codes,
+    const float* __restrict__ q8_scales,
+    const __half* __restrict__ s_out,
+    const float* __restrict__ bias,
+    const uint32_t* __restrict__ row_ids,
+    float* __restrict__ output,
+    unsigned requested_rows,
+    unsigned columns,
+    unsigned activation) {
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned local_lane = lane & 15u;
+    const unsigned half_warp = lane / 16u;
+    const unsigned warp = threadIdx.x / kWarpSize;
+    const unsigned rows_per_block =
+        (blockDim.x / kWarpSize) * kRowsPerWarpA8;
+    const unsigned output_row =
+        blockIdx.x * rows_per_block + warp * kRowsPerWarpA8 + half_warp;
+    if (output_row >= requested_rows) {
+        return;
+    }
+    const unsigned source_row = row_ids[output_row];
+    const unsigned blocks_per_row = columns / kBlockLen;
+    const unsigned long long row_stride =
+        static_cast<unsigned long long>(blocks_per_row) * kQ4BlockBytes;
+    const unsigned char* row_weights = weights + source_row * row_stride;
+    float partial = 0.0f;
+    for (unsigned block = 0; block < blocks_per_row; ++block) {
+        const unsigned char* packed = row_weights + block * kQ4BlockBytes;
+        const unsigned codes = static_cast<unsigned>(packed[2u + local_lane * 2u])
+            | (static_cast<unsigned>(packed[3u + local_lane * 2u]) << 8u);
+        const int weights4 = pack_signed_q4(codes);
+        const int activations4 = *reinterpret_cast<const int*>(
+            q8_codes + block * kBlockLen + local_lane * 4u);
+        const int dot = __dp4a(weights4, activations4, 0);
+        partial = fmaf(static_cast<float>(dot),
+                       load_f16(packed) * q8_scales[block] * (1.0f / 15.0f),
+                       partial);
+    }
+    const float total = half_warp_sum(partial);
+    if (local_lane == 0u) {
+        const float shifted = total
+            + (bias == nullptr ? 0.0f : bias[source_row]);
+        output[output_row] = apply_activation(
+            shifted * load_optional_f16(s_out, source_row), activation);
+    }
+}
+
 // One packed embedding row is resolved by the artifact loader. Decode and
 // both recovery corrections stay fused so the graph receives only the final
 // resident activation vector. The code extraction mirrors the pinned

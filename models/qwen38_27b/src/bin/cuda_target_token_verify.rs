@@ -92,6 +92,7 @@ fn main() -> anyhow::Result<()> {
         &artifact,
         &Qwen38Config::default(),
         args.maximum_context_tokens,
+        None,
     )?;
     let graph_prepare_milliseconds = prepare_started.elapsed().as_secs_f64() * 1.0e3;
     let (free_after_prepare, _) = runtime.memory_info()?;

@@ -24,10 +24,11 @@ use super::cuda::{
     GATED_RMS_NORM_COLUMNS, GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS,
     LINEAR_CONV_KERNEL_WIDTH, LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL,
     PAGED_GQA_DESCRIPTOR_BYTES, PAGED_GQA_PARAMS_BYTES, PAGED_Q2Q4_GQA_F32_SYMBOL,
-    PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
-    Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
-    Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
-    RESIDUAL_RMS_NORM_F16_SYMBOL, SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
+    PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
+    Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_GATHERED_MATVEC_SYMBOL,
+    Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL,
+    QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL,
+    SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -187,6 +188,8 @@ struct CudaContextInner {
     sigmoid_gate_a8_quantize_function: CuFunction,
     q2_a8_function: CuFunction,
     q4_a8_function: CuFunction,
+    q2_a8_gathered_function: CuFunction,
+    q4_a8_gathered_function: CuFunction,
     q2_recovered_row_function: CuFunction,
     q4_recovered_row_function: CuFunction,
     gated_delta_prep_f32_function: CuFunction,
@@ -367,6 +370,102 @@ pub struct PreparedCudaA8Projection {
     weights: DeviceBuffer,
     s_out: Option<DeviceBuffer>,
     bias: Option<DeviceBuffer>,
+    output: DeviceBuffer,
+    resident_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CudaGatheredRowGroup {
+    dtype: TensorDType,
+    weight_offset: usize,
+    row_id_offset: usize,
+    output_offset: usize,
+    scale_row_offset: usize,
+    row_count: u32,
+}
+
+fn build_gathered_row_plan(
+    layout: &CudaA8ProjectionLayout,
+    projection_rows: u32,
+    row_ids: &[u32],
+) -> Result<(Vec<u32>, Vec<CudaGatheredRowGroup>)> {
+    if row_ids.is_empty()
+        || row_ids.windows(2).any(|pair| pair[0] >= pair[1])
+        || row_ids.last().is_some_and(|row| *row >= projection_rows)
+    {
+        return Err(EngineError::Shape(
+            "gathered CUDA row IDs must be non-empty, canonical, and in range".into(),
+        ));
+    }
+    let mut local_ids = Vec::with_capacity(row_ids.len());
+    let mut groups = Vec::new();
+    match layout {
+        CudaA8ProjectionLayout::Pure(dtype) => {
+            local_ids.extend_from_slice(row_ids);
+            groups.push(CudaGatheredRowGroup {
+                dtype: *dtype,
+                weight_offset: 0,
+                row_id_offset: 0,
+                output_offset: 0,
+                scale_row_offset: 0,
+                row_count: u32::try_from(row_ids.len()).map_err(|_| {
+                    EngineError::Shape("gathered CUDA row count exceeds u32".into())
+                })?,
+            });
+        }
+        CudaA8ProjectionLayout::Mixed(segments) => {
+            let mut requested = 0_usize;
+            for segment in segments {
+                let segment_end = segment
+                    .row_start
+                    .checked_add(segment.row_count)
+                    .ok_or_else(|| {
+                        EngineError::Shape("gathered CUDA segment row range overflows".into())
+                    })?;
+                let first = local_ids.len();
+                while requested < row_ids.len() && row_ids[requested] < segment_end {
+                    let row = row_ids[requested];
+                    if row < segment.row_start {
+                        return Err(EngineError::Shape(
+                            "gathered CUDA row precedes its mixed segment".into(),
+                        ));
+                    }
+                    local_ids.push(row - segment.row_start);
+                    requested += 1;
+                }
+                let count = local_ids.len() - first;
+                if count != 0 {
+                    groups.push(CudaGatheredRowGroup {
+                        dtype: segment.descriptor.dtype,
+                        weight_offset: segment.weight_offset,
+                        row_id_offset: first * std::mem::size_of::<u32>(),
+                        output_offset: first * std::mem::size_of::<f32>(),
+                        scale_row_offset: segment.row_start as usize,
+                        row_count: u32::try_from(count).map_err(|_| {
+                            EngineError::Shape("gathered CUDA segment count exceeds u32".into())
+                        })?,
+                    });
+                }
+            }
+            if requested != row_ids.len() {
+                return Err(EngineError::Shape(
+                    "gathered CUDA mixed segments do not cover every row ID".into(),
+                ));
+            }
+        }
+    }
+    Ok((local_ids, groups))
+}
+
+/// Release-bound subset of one resident LM head. It owns only canonical local
+/// row IDs plus compact logits; weights and A8 activation stay shared with the
+/// complete target projection.
+pub struct PreparedCudaGatheredA8Projection {
+    context: Rc<CudaContextInner>,
+    rows: u32,
+    columns: u32,
+    groups: Vec<CudaGatheredRowGroup>,
+    row_ids: DeviceBuffer,
     output: DeviceBuffer,
     resident_bytes: usize,
 }
@@ -794,6 +893,28 @@ impl CudaCandidateRuntime {
                 return Err(error);
             }
         };
+        let q2_a8_gathered_function =
+            match resolve_function(&driver, module, Q2_B64_A8_GATHERED_MATVEC_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let q4_a8_gathered_function =
+            match resolve_function(&driver, module, Q4_B64_A8_GATHERED_MATVEC_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let q2_recovered_row_function =
             match resolve_function(&driver, module, Q2_B64_RECOVERED_ROW_SYMBOL) {
                 Ok(function) => function,
@@ -949,6 +1070,8 @@ impl CudaCandidateRuntime {
                 sigmoid_gate_a8_quantize_function,
                 q2_a8_function,
                 q4_a8_function,
+                q2_a8_gathered_function,
+                q4_a8_gathered_function,
                 q2_recovered_row_function,
                 q4_recovered_row_function,
                 gated_delta_prep_f32_function,
@@ -3327,6 +3450,41 @@ impl CudaCandidateRuntime {
         })
     }
 
+    pub fn prepare_gathered_a8_projection(
+        &self,
+        projection: &PreparedCudaA8Projection,
+        row_ids: &[u32],
+    ) -> Result<PreparedCudaGatheredA8Projection> {
+        if !Rc::ptr_eq(&self.inner, &projection.context) {
+            return Err(EngineError::InvalidState(
+                "gathered CUDA projection belongs to another context".into(),
+            ));
+        }
+        let (local_ids, groups) =
+            build_gathered_row_plan(&projection.layout, projection.rows, row_ids)?;
+        self.make_current()?;
+        let row_ids = DeviceBuffer::from_bytes(self, as_bytes(&local_ids))?;
+        let output_bytes = local_ids
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("gathered CUDA output size overflows".into()))?;
+        let output = DeviceBuffer::allocate(self, output_bytes)?;
+        let resident_bytes = row_ids
+            .len()
+            .checked_add(output.len())
+            .ok_or_else(|| EngineError::Shape("gathered CUDA residency overflows".into()))?;
+        Ok(PreparedCudaGatheredA8Projection {
+            context: Rc::clone(&self.inner),
+            rows: u32::try_from(local_ids.len())
+                .map_err(|_| EngineError::Shape("gathered CUDA rows exceed u32".into()))?,
+            columns: projection.columns,
+            groups,
+            row_ids,
+            output,
+            resident_bytes,
+        })
+    }
+
     /// Quantizes the corrected activation once into symmetric Q8_B64 blocks.
     /// This legacy prepared object remains matrix-local. Use
     /// [`Self::prepare_shared_a8_activation`] for an actual fan-out.
@@ -3543,6 +3701,41 @@ impl CudaCandidateRuntime {
             .iter()
             .map(|projection| (*projection).device_output())
             .collect()
+    }
+
+    /// Executes only release-bound LM-head rows for an MTP proposal. The
+    /// target head remains a separate complete projection and verifies every
+    /// proposed token before commit.
+    pub fn dispatch_shared_a8_gathered_device<'a>(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        input: CudaDeviceF32View<'_>,
+        projection: &PreparedCudaA8Projection,
+        gathered: &'a PreparedCudaGatheredA8Projection,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        self.validate_shared_a8_fanout(activation, &[projection], 1)?;
+        if !Rc::ptr_eq(&self.inner, input.context) || !Rc::ptr_eq(&self.inner, &gathered.context) {
+            return Err(EngineError::InvalidState(
+                "gathered CUDA dispatch crosses driver contexts".into(),
+            ));
+        }
+        if input.values() != activation.columns as usize || gathered.columns != projection.columns {
+            return Err(EngineError::Shape(
+                "gathered CUDA activation or projection width differs".into(),
+            ));
+        }
+        self.launch_a8_quantization(
+            input.ptr()?,
+            activation.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            activation.q8_codes.ptr(),
+            activation.q8_scales.ptr(),
+            activation.columns,
+        )?;
+        for group in &gathered.groups {
+            self.launch_gathered_a8_projection(activation, projection, gathered, *group)?;
+        }
+        self.synchronize_after_launch("gathered A8 LM-head context synchronization")?;
+        gathered.device_output()
     }
 
     /// Verifier/roofline variant that replays the complete fan-out without
@@ -3978,6 +4171,71 @@ impl CudaCandidateRuntime {
         }
     }
 
+    fn launch_gathered_a8_projection(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        projection: &PreparedCudaA8Projection,
+        gathered: &PreparedCudaGatheredA8Projection,
+        group: CudaGatheredRowGroup,
+    ) -> Result<()> {
+        let function = match group.dtype {
+            TensorDType::Q2B64 => self.inner.q2_a8_gathered_function,
+            TensorDType::Q4B64 => self.inner.q4_a8_gathered_function,
+            _ => unreachable!("validated gathered CUDA segment is Q2 or Q4"),
+        };
+        let mut weights = device_ptr_offset(projection.weights.ptr(), group.weight_offset)?;
+        let mut q8_codes = activation.q8_codes.ptr();
+        let mut q8_scales = activation.q8_scales.ptr();
+        let mut s_out = projection
+            .s_out
+            .as_ref()
+            .map(|buffer| device_ptr_offset(buffer.ptr(), group.scale_row_offset * 2))
+            .transpose()?
+            .unwrap_or(0);
+        let mut bias = projection
+            .bias
+            .as_ref()
+            .map(|buffer| device_ptr_offset(buffer.ptr(), group.scale_row_offset * 4))
+            .transpose()?
+            .unwrap_or(0);
+        let mut row_ids = device_ptr_offset(gathered.row_ids.ptr(), group.row_id_offset)?;
+        let mut output = device_ptr_offset(gathered.output.ptr(), group.output_offset)?;
+        let mut rows = group.row_count;
+        let mut columns = projection.columns;
+        let mut activation_code = projection.activation;
+        let mut params = [
+            (&mut weights as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_out as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut bias as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut row_ids as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rows as *mut u32).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut activation_code as *mut u32).cast::<c_void>(),
+        ];
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    function,
+                    group.row_count.div_ceil(A8_ROWS_PER_BLOCK),
+                    1,
+                    1,
+                    THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "gathered A8 projection launch",
+            )
+        }
+    }
+
     /// Launches a resident operation repeatedly and synchronizes once. This
     /// amortizes host launch/copy overhead for per-op roofline measurement;
     /// production graph capture remains a separate promotion requirement.
@@ -4229,6 +4487,24 @@ impl PreparedCudaA8Projection {
         self.dtype
     }
 
+    pub fn rows(&self) -> usize {
+        self.rows as usize
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns as usize
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.output.f32_view(0, self.rows())
+    }
+}
+
+impl PreparedCudaGatheredA8Projection {
     pub fn rows(&self) -> usize {
         self.rows as usize
     }
@@ -5589,6 +5865,46 @@ mod tests {
     }
 
     #[test]
+    fn gathered_rows_preserve_canonical_order_across_q2_q4_segments() {
+        let mixed = CudaA8ProjectionLayout::Mixed(vec![
+            CudaMixedRowSegment {
+                descriptor: &Q2_B64_FUSED_MATVEC,
+                row_start: 0,
+                row_count: 3,
+                weight_offset: 0,
+            },
+            CudaMixedRowSegment {
+                descriptor: &Q4_B64_FUSED_MATVEC,
+                row_start: 3,
+                row_count: 2,
+                weight_offset: 3 * Q2_BLOCK_BYTES,
+            },
+            CudaMixedRowSegment {
+                descriptor: &Q2_B64_FUSED_MATVEC,
+                row_start: 5,
+                row_count: 3,
+                weight_offset: 3 * Q2_BLOCK_BYTES + 2 * Q4_BLOCK_BYTES,
+            },
+        ]);
+        let (local_ids, groups) = build_gathered_row_plan(&mixed, 8, &[0, 2, 3, 4, 7]).unwrap();
+        assert_eq!(local_ids, vec![0, 2, 0, 1, 2]);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].dtype, TensorDType::Q2B64);
+        assert_eq!(groups[0].row_count, 2);
+        assert_eq!(groups[0].row_id_offset, 0);
+        assert_eq!(groups[1].dtype, TensorDType::Q4B64);
+        assert_eq!(groups[1].row_count, 2);
+        assert_eq!(groups[1].row_id_offset, 2 * std::mem::size_of::<u32>());
+        assert_eq!(groups[1].output_offset, 2 * std::mem::size_of::<f32>());
+        assert_eq!(groups[1].scale_row_offset, 3);
+        assert_eq!(groups[2].dtype, TensorDType::Q2B64);
+        assert_eq!(groups[2].row_count, 1);
+        assert_eq!(groups[2].scale_row_offset, 5);
+        assert!(build_gathered_row_plan(&mixed, 8, &[3, 3]).is_err());
+        assert!(build_gathered_row_plan(&mixed, 8, &[8]).is_err());
+    }
+
+    #[test]
     fn checked_device_pointer_offsets_fail_closed() {
         assert_eq!(device_ptr_offset(1_024, 256).unwrap(), 1_280);
         assert!(device_ptr_offset(u64::MAX, 1).is_err());
@@ -5615,6 +5931,7 @@ mod tests {
         assert_owned::<PreparedCudaMixedA8MatVec>();
         assert_owned::<PreparedCudaA8Activation>();
         assert_owned::<PreparedCudaA8Projection>();
+        assert_owned::<PreparedCudaGatheredA8Projection>();
         assert_owned::<PreparedCudaRecoveredRow>();
         assert_owned::<PreparedCudaPagedGqa>();
         assert_owned::<PreparedCudaQueryGate>();

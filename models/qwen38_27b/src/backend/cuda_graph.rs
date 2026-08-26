@@ -15,8 +15,8 @@ use crate::backend::cuda_runtime::{
     CudaRmsNormConfig, PreparedCudaA8Activation, PreparedCudaA8Projection, PreparedCudaCausalConv,
     PreparedCudaEmbedding, PreparedCudaF32Checkpoint, PreparedCudaF32Concat,
     PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs, PreparedCudaGatedRmsNorm,
-    PreparedCudaPagedGqa, PreparedCudaPartialRope, PreparedCudaQueryGate,
-    PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
+    PreparedCudaGatheredA8Projection, PreparedCudaPagedGqa, PreparedCudaPartialRope,
+    PreparedCudaQueryGate, PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
 };
 use crate::backend::cuda_schedule::{
     CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaNormBinding,
@@ -619,6 +619,7 @@ pub struct PreparedCudaProjectionGraph {
     embedding: PreparedCudaEmbedding,
     activations: BTreeMap<String, PreparedCudaA8Activation>,
     projections: BTreeMap<String, PreparedCudaA8Projection>,
+    mtp_draft_projection: Option<PreparedCudaGatheredA8Projection>,
     linear_mixers: BTreeMap<usize, PreparedCudaLinearMixerLayer>,
     full_attention: BTreeMap<String, PreparedCudaFullAttentionLayer>,
     norms: PreparedCudaNormGraph,
@@ -873,6 +874,7 @@ impl PreparedCudaProjectionGraph {
         artifact: &ModelArtifact,
         config: &Qwen38Config,
         maximum_context_tokens: usize,
+        mtp_draft_token_ids: Option<&[u32]>,
     ) -> Result<Self> {
         if maximum_context_tokens < DEFAULT_KV_SINK_TOKENS + DEFAULT_KV_RECENT_TOKENS
             || maximum_context_tokens > config.max_position_embeddings
@@ -1146,6 +1148,23 @@ impl PreparedCudaProjectionGraph {
             })?,
             "CUDA speculative checkpoint bytes",
         )?;
+        let mtp_draft_projection = mtp_draft_token_ids
+            .map(|row_ids| {
+                let lm_head = projections.get("lm_head.weight").ok_or_else(|| {
+                    EngineError::InvalidState("CUDA LM head is not resident".into())
+                })?;
+                runtime.prepare_gathered_a8_projection(lm_head, row_ids)
+            })
+            .transpose()?;
+        if let Some(gathered) = &mtp_draft_projection {
+            graph_bytes = checked_add(
+                graph_bytes,
+                u64::try_from(gathered.resident_bytes()).map_err(|_| {
+                    EngineError::MemoryBudget("CUDA gathered LM-head bytes exceed u64".into())
+                })?,
+                "CUDA graph bytes",
+            )?;
+        }
         let graph = Self {
             artifact: artifact.clone(),
             plan,
@@ -1153,6 +1172,7 @@ impl PreparedCudaProjectionGraph {
             embedding,
             activations,
             projections,
+            mtp_draft_projection,
             linear_mixers,
             full_attention,
             norms,
@@ -1209,6 +1229,12 @@ impl PreparedCudaProjectionGraph {
         self.projections.get(name).ok_or_else(|| {
             EngineError::InvalidState(format!("prepared CUDA projection {name} not found"))
         })
+    }
+
+    pub fn mtp_draft_rows(&self) -> Option<usize> {
+        self.mtp_draft_projection
+            .as_ref()
+            .map(PreparedCudaGatheredA8Projection::rows)
     }
 
     pub fn linear_mixer_count(&self) -> usize {
@@ -1606,6 +1632,33 @@ impl PreparedCudaProjectionGraph {
         next_token_id: usize,
         absolute_position: usize,
     ) -> Result<CudaDeviceF32View<'a>> {
+        self.dispatch_mtp_draft_device_impl(
+            runtime,
+            config,
+            next_token_id,
+            absolute_position,
+            false,
+        )
+    }
+
+    pub fn dispatch_mtp_restricted_draft_device<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        next_token_id: usize,
+        absolute_position: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        self.dispatch_mtp_draft_device_impl(runtime, config, next_token_id, absolute_position, true)
+    }
+
+    fn dispatch_mtp_draft_device_impl<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        next_token_id: usize,
+        absolute_position: usize,
+        restricted: bool,
+    ) -> Result<CudaDeviceF32View<'a>> {
         if config != &Qwen38Config::default() {
             return Err(EngineError::Shape(
                 "CUDA MTP dispatch requires the frozen Qwen3.8-27B topology".into(),
@@ -1639,6 +1692,7 @@ impl PreparedCudaProjectionGraph {
             full_attention,
             norms,
             mtp_concat,
+            mtp_draft_projection,
             mtp_tokens,
             mtp_poisoned,
             ..
@@ -1727,14 +1781,37 @@ impl PreparedCudaProjectionGraph {
                 residual,
                 down,
             )?;
-            dispatch_projection_device(
-                runtime,
-                plan,
-                activations,
-                projections,
-                final_hidden,
-                "lm_head.weight",
-            )
+            if restricted {
+                let group = plan.group_for_projection("lm_head.weight")?;
+                let activation = activations.get(group).ok_or_else(|| {
+                    EngineError::InvalidState(
+                        "CUDA LM-head activation group is not resident".into(),
+                    )
+                })?;
+                let projection = projections.get("lm_head.weight").ok_or_else(|| {
+                    EngineError::InvalidState("CUDA LM head is not resident".into())
+                })?;
+                let gathered = mtp_draft_projection.as_ref().ok_or_else(|| {
+                    EngineError::InvalidState(
+                        "CUDA restricted MTP head was not prepared at load".into(),
+                    )
+                })?;
+                runtime.dispatch_shared_a8_gathered_device(
+                    activation,
+                    final_hidden,
+                    projection,
+                    gathered,
+                )
+            } else {
+                dispatch_projection_device(
+                    runtime,
+                    plan,
+                    activations,
+                    projections,
+                    final_hidden,
+                    "lm_head.weight",
+                )
+            }
         })?;
         *mtp_tokens = mtp_tokens
             .checked_add(1)

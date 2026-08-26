@@ -59,7 +59,7 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports eighteen explicitly unpromoted
+- The same verifier cubin additionally exports twenty explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
@@ -68,6 +68,8 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
   - `ctox_quantize_sigmoid_gate_a8_b64_sm86`
   - `ctox_q2_b64_a8_matvec_sm86`
   - `ctox_q4_b64_a8_matvec_sm86`
+  - `ctox_q2_b64_a8_gathered_matvec_sm86`
+  - `ctox_q4_b64_a8_gathered_matvec_sm86`
   - `ctox_q2_b64_recovered_row_sm86`
   - `ctox_q4_b64_recovered_row_sm86`
   - `ctox_qwen_gated_delta_prepare_f32_sm86`
@@ -344,9 +346,14 @@ speculative branch would violate the target-one-ahead invariant. Near the
 admitted context boundary, the returned draft block is shortened rather than
 overrunning KV capacity. `qwen38-cuda-executor-verify` exercises the complete
 lifecycle and hashes every token-boundary distribution, but its hardware run is
-pending. It currently reads full logits at verifier boundaries; restricted-row
-draft evaluation, device sampling, production quality, and roofline promotion
-remain open.
+pending. MTP proposals now dispatch only the release-bound canonical 40,000
+LM-head rows. Pure and mixed Q2/Q4 heads retain the same model allocation and
+split requested rows into segment-local launches without repacking weights or
+reordering compact logits. The gathered object owns 160,000 bytes of row IDs
+and 160,000 bytes of logits; the complete LM head remains independently
+available for mandatory target verification. Draft readback is therefore
+bounded to 40,000 logits rather than the full head. Device sampling, production
+quality, and roofline promotion remain open.
 
 The Unix-socket service cannot move the private driver context among its
 connection threads. `ThreadedCudaModelExecutor` therefore creates the

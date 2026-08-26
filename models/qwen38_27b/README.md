@@ -252,8 +252,11 @@ chained MTP4 target verification, bounded device checkpointing, accepted-prefix
 restore/replay, reset, allocation accounting, and unload through the shared
 Rust ABI. `qwen38-cuda-executor-verify` binds that lifecycle to the exact
 artifact, CUDA module, and canonical release draft-vocabulary hashes. Its
-complete hardware run, gathered-row draft head, device sampling, quality gates,
-and roofline promotion remain open. For IPC verification, a sendable adapter
+MTP proposals use a Q2/Q4-aware gathered projection over exactly the canonical
+40,000 draft rows while the full target head remains resident for verification;
+only 320,000 bytes of row IDs and compact logits are added to the graph. Its
+complete hardware run, device sampling, quality gates, and roofline promotion
+remain open. For IPC verification, a sendable adapter
 owns this deliberately thread-affine CUDA executor on one dedicated worker;
 the socket threads exchange typed commands and never move driver objects.
 

@@ -75,6 +75,7 @@ fn main() -> anyhow::Result<()> {
         &artifact,
         &Qwen38Config::default(),
         args.maximum_context_tokens,
+        None,
     )?;
     let activation_groups = graph.plan().group_count();
     let projections = graph.plan().projection_count();

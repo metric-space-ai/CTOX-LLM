@@ -158,6 +158,8 @@ pub const SWIGLU_A8_QUANTIZE_SYMBOL: &str = "ctox_quantize_swiglu_a8_b64_sm86";
 pub const SIGMOID_GATE_A8_QUANTIZE_SYMBOL: &str = "ctox_quantize_sigmoid_gate_a8_b64_sm86";
 pub const Q2_B64_A8_MATVEC_SYMBOL: &str = "ctox_q2_b64_a8_matvec_sm86";
 pub const Q4_B64_A8_MATVEC_SYMBOL: &str = "ctox_q4_b64_a8_matvec_sm86";
+pub const Q2_B64_A8_GATHERED_MATVEC_SYMBOL: &str = "ctox_q2_b64_a8_gathered_matvec_sm86";
+pub const Q4_B64_A8_GATHERED_MATVEC_SYMBOL: &str = "ctox_q4_b64_a8_gathered_matvec_sm86";
 pub const Q2_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q2_b64_recovered_row_sm86";
 pub const Q4_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q4_b64_recovered_row_sm86";
 

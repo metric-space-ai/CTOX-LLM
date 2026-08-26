@@ -2,9 +2,9 @@
 //!
 //! This remains a verifier candidate until full-model numerical, quality,
 //! unload, and roofline gates promote it. It never falls back to CPU model
-//! operators. Full target/MTP logits cross the host only at token boundaries
-//! for the engine-owned greedy sampler; restricted draft rows and a device
-//! sampler remain later performance work.
+//! operators. Full target logits cross the host only at verifier boundaries;
+//! MTP proposals use the release-bound gathered LM head. Device sampling
+//! remains later performance work.
 
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -428,6 +428,7 @@ impl ModelExecutor for CudaModelExecutor {
             artifact,
             &self.config,
             admitted_context,
+            Some(mtp_draft_token_ids),
         )?;
         let expected_checkpoint = profile
             .speculative_linear_state_bytes_per_session
@@ -572,13 +573,17 @@ impl ModelExecutor for CudaModelExecutor {
                 ));
             }
             let absolute_position = graph.target_tokens();
-            let view = graph.dispatch_mtp_draft_device(
+            let view = graph.dispatch_mtp_restricted_draft_device(
                 runtime,
                 &self.config,
                 token as usize,
                 absolute_position,
             )?;
-            Some(read_valid_logits(runtime, view)?)
+            Some(read_restricted_logits(
+                runtime,
+                view,
+                self.mtp_draft_token_ids.len(),
+            )?)
         } else {
             None
         };
@@ -608,20 +613,27 @@ impl ModelExecutor for CudaModelExecutor {
             let draft = current_draft.take().ok_or_else(|| {
                 EngineError::InvalidState("CUDA MTP draft chain ended early".into())
             })?;
-            let candidate = greedy_token(&draft)?;
-            draft_logits.push(DraftDistribution::Full(draft));
+            let candidate = greedy_restricted_token(&self.mtp_draft_token_ids, &draft)?;
+            draft_logits.push(DraftDistribution::Restricted {
+                token_ids: self.mtp_draft_token_ids.clone(),
+                logits: draft,
+            });
             target_verification_logits.push(current_target);
             candidate_tokens.push(candidate);
 
             if depth + 1 < speculative_draft_count {
                 let absolute_position = graph.target_tokens();
-                let next_draft_view = graph.dispatch_mtp_draft_device(
+                let next_draft_view = graph.dispatch_mtp_restricted_draft_device(
                     runtime,
                     &self.config,
                     candidate as usize,
                     absolute_position,
                 )?;
-                current_draft = Some(read_valid_logits(runtime, next_draft_view)?);
+                current_draft = Some(read_restricted_logits(
+                    runtime,
+                    next_draft_view,
+                    self.mtp_draft_token_ids.len(),
+                )?);
             }
             let candidate_position = graph.target_tokens();
             let next_target_view = graph.dispatch_target_token_device(
@@ -829,13 +841,34 @@ impl ModelExecutor for ThreadedCudaModelExecutor {
     }
 }
 
-fn greedy_token(logits: &[f32]) -> Result<u32> {
-    logits
+fn greedy_restricted_token(token_ids: &[u32], logits: &[f32]) -> Result<u32> {
+    if token_ids.len() != logits.len() || token_ids.is_empty() {
+        return Err(EngineError::InvalidArtifact(
+            "CUDA restricted token IDs and logits differ".into(),
+        ));
+    }
+    let index = logits
         .iter()
         .enumerate()
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
-        .map(|(token, _)| token as u32)
-        .ok_or_else(|| EngineError::InvalidArtifact("CUDA logits are empty".into()))
+        .map(|(index, _)| index)
+        .ok_or_else(|| EngineError::InvalidArtifact("CUDA logits are empty".into()))?;
+    Ok(token_ids[index])
+}
+
+fn read_restricted_logits(
+    runtime: &CudaCandidateRuntime,
+    view: crate::backend::cuda_runtime::CudaDeviceF32View<'_>,
+    expected: usize,
+) -> Result<Vec<f32>> {
+    let logits = runtime.verifier_read_f32_device(view)?;
+    if logits.len() != expected {
+        return Err(EngineError::InvalidArtifact(format!(
+            "CUDA restricted logits contain {} rows, expected {expected}",
+            logits.len()
+        )));
+    }
+    Ok(logits)
 }
 
 fn read_valid_logits(
@@ -862,5 +895,16 @@ mod tests {
     #[test]
     fn threaded_cuda_adapter_is_send_without_moving_the_driver_context() {
         assert_send::<ThreadedCudaModelExecutor>();
+    }
+
+    #[test]
+    fn restricted_greedy_maps_compact_logits_back_to_global_tokens() {
+        let token_ids = [7_u32, 101, 40_000, 151_664];
+        assert_eq!(
+            greedy_restricted_token(&token_ids, &[-1.0, 3.5, 2.0, 3.0]).unwrap(),
+            101
+        );
+        assert!(greedy_restricted_token(&token_ids, &[1.0]).is_err());
+        assert!(greedy_restricted_token(&[], &[]).is_err());
     }
 }

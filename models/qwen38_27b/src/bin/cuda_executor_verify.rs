@@ -49,6 +49,8 @@ struct Report {
     prefill_input_token: u32,
     decode_input_token: u32,
     draft_tokens: Vec<u32>,
+    draft_rows_per_step: usize,
+    all_drafts_restricted: bool,
     verified_draft_prefix: u32,
     accepted_drafts: u32,
     bonus_token: u32,
@@ -136,6 +138,14 @@ fn main() -> anyhow::Result<()> {
             && decoded.target_verification_logits.len() == 4
             && decoded.target_verification_logits[0] == decoded.target_logits,
         "CUDA executor did not return a verifiable MTP4 block"
+    );
+    anyhow::ensure!(
+        decoded.draft_logits.iter().all(|distribution| matches!(
+            distribution,
+            DraftDistribution::Restricted { token_ids, logits }
+                if token_ids == &mtp_draft_token_ids && logits.len() == token_ids.len()
+        )),
+        "CUDA executor did not use the exact release-bound gathered MTP head"
     );
     let bonus_logits = decoded
         .bonus_logits
@@ -226,6 +236,8 @@ fn main() -> anyhow::Result<()> {
             prefill_input_token: args.token_id,
             decode_input_token,
             draft_tokens,
+            draft_rows_per_step: mtp_draft_token_ids.len(),
+            all_drafts_restricted: true,
             verified_draft_prefix,
             accepted_drafts,
             bonus_token,
@@ -249,7 +261,7 @@ fn main() -> anyhow::Result<()> {
             replay_milliseconds,
             unload_milliseconds,
             allocations_zero_after_unload,
-            note: "Exercises the sendable Rust ModelExecutor ABI through the dedicated thread that owns every CUDA object, without CPU model-operation fallback. Full logits cross the host at verifier token boundaries. The supplied release-bound draft vocabulary is identity-checked but gathered-row MTP and device sampling remain performance work. Promotion still requires BF16/logit, quality, long-context, unload, and roofline evidence on the release checkpoint.",
+            note: "Exercises the sendable Rust ModelExecutor ABI through the dedicated thread that owns every CUDA object, without CPU model-operation fallback. MTP proposals execute exactly the release-bound gathered LM-head rows; complete target logits still cross the host at verifier boundaries and verify every draft. Device sampling remains performance work. Promotion still requires BF16/logit, quality, long-context, unload, and roofline evidence on the release checkpoint.",
         })?
     );
     Ok(())
