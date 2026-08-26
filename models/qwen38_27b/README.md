@@ -223,9 +223,14 @@ lifecycle and account one checkpoint equal to their active-state bytes. Paged
 KV now uses a constant-size append marker plus small page-slot metadata: an
 active four-token branch suppresses Q4 demotion and consumes the already
 budgeted boundary slot, so restore never copies the full Q2/Q4 arenas. Metal
-replay reproduces the original branch outputs exactly. Graph-wide all-or-
-nothing orchestration across every attention/linear owner remains required
-before the complete speculative branch is safe.
+replay reproduces the original branch outputs exactly. A graph-wide Metal
+transaction now coordinates the final normalized target hidden, all 17
+target/MTP attention owners, and all 48 paired causal-convolution/GatedDelta
+owners. Begin prevalidates the entire resource set before changing any owner;
+reject restores state in reverse order, while commit consumes every checkpoint
+as one logical operation. The Apple-device verifier proves both all-owner
+rollback and commit. Per-step encoder binding and the complete target+MTP
+executor remain open.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

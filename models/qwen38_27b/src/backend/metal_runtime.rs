@@ -134,6 +134,15 @@ pub struct PreparedMetalF32Checkpoint {
     active: bool,
 }
 
+/// Atomic speculative-state coordinator for the frozen Qwen target+MTP graph.
+/// It owns the target-hidden checkpoint while the 17 paged-attention and 48
+/// paired linear-state owners remain in their model-layer resources.
+pub struct PreparedMetalSpeculativeTransaction {
+    target_hidden: PreparedMetalF32Checkpoint,
+    active: bool,
+    poisoned: bool,
+}
+
 /// One shared Metal view over the complete immutable CTOXQ file mapping.
 ///
 /// `new_buffer_with_bytes_no_copy` does not retain the Rust mmap owner. The
@@ -585,6 +594,23 @@ impl PreparedMetalF32Checkpoint {
     pub fn clear(&mut self) {
         zero_buffer(&self.snapshot, self.resident_bytes());
         self.active = false;
+    }
+}
+
+impl PreparedMetalSpeculativeTransaction {
+    pub const ATTENTION_STATES: usize = 17;
+    pub const LINEAR_STATES: usize = 48;
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub fn target_hidden_checkpoint_bytes(&self) -> usize {
+        self.target_hidden.resident_bytes()
     }
 }
 
@@ -1504,6 +1530,239 @@ impl MetalCandidateRuntime {
             snapshot: new_zeroed_buffer(&self.device, bytes)?,
             active: false,
         })
+    }
+
+    pub fn prepare_speculative_transaction(
+        &self,
+        config: &crate::Qwen38Config,
+    ) -> Result<PreparedMetalSpeculativeTransaction> {
+        if config != &crate::Qwen38Config::default() {
+            return Err(EngineError::Shape(
+                "Metal speculative transaction requires the frozen Qwen3.8-27B topology".into(),
+            ));
+        }
+        Ok(PreparedMetalSpeculativeTransaction {
+            target_hidden: self.prepare_f32_checkpoint(config.hidden_size)?,
+            active: false,
+            poisoned: false,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_speculative_transaction(
+        &self,
+        transaction: &mut PreparedMetalSpeculativeTransaction,
+        workspace: &PreparedMetalDecodeWorkspace,
+        attentions: &mut [PreparedMetalPagedGqa],
+        convolutions: &mut [PreparedMappedMetalCausalConv],
+        recurrences: &mut [PreparedMetalGatedDelta],
+    ) -> Result<()> {
+        validate_metal_speculative_shape(
+            transaction,
+            workspace,
+            attentions,
+            convolutions,
+            recurrences,
+        )?;
+        if transaction.active
+            || transaction.poisoned
+            || transaction.target_hidden.is_active()
+            || attentions.iter().any(|state| {
+                state.poisoned
+                    || state.speculative_checkpoint.is_some()
+                    || state.free_q4_slots.is_empty()
+            })
+            || convolutions
+                .iter()
+                .any(|state| state.poisoned || state.checkpoint_valid)
+            || recurrences
+                .iter()
+                .any(|state| state.poisoned || state.checkpoint_valid)
+        {
+            return Err(EngineError::InvalidState(
+                "Metal speculative transaction requires every state owner to be healthy and idle"
+                    .into(),
+            ));
+        }
+
+        let mut attention_started = 0_usize;
+        let mut convolution_started = 0_usize;
+        let mut recurrence_started = 0_usize;
+        let begun = (|| {
+            self.snapshot_workspace_f32(
+                &mut transaction.target_hidden,
+                workspace,
+                MetalBufferSlot::Normalized,
+            )?;
+            for attention in attentions.iter_mut() {
+                attention.begin_speculative()?;
+                attention_started += 1;
+            }
+            for convolution in convolutions.iter_mut() {
+                convolution.begin_speculative(self)?;
+                convolution_started += 1;
+            }
+            for recurrence in recurrences.iter_mut() {
+                recurrence.begin_speculative(self)?;
+                recurrence_started += 1;
+            }
+            Ok(())
+        })();
+        if let Err(primary) = begun {
+            let mut rollback_errors = Vec::new();
+            for recurrence in recurrences[..recurrence_started].iter_mut().rev() {
+                if let Err(error) = recurrence.restore_speculative(self) {
+                    rollback_errors.push(error.to_string());
+                }
+            }
+            for convolution in convolutions[..convolution_started].iter_mut().rev() {
+                if let Err(error) = convolution.restore_speculative(self) {
+                    rollback_errors.push(error.to_string());
+                }
+            }
+            for attention in attentions[..attention_started].iter_mut().rev() {
+                if let Err(error) = attention.restore_speculative() {
+                    rollback_errors.push(error.to_string());
+                }
+            }
+            if transaction.target_hidden.is_active() {
+                if let Err(error) = self.restore_workspace_f32(
+                    &mut transaction.target_hidden,
+                    workspace,
+                    MetalBufferSlot::Normalized,
+                ) {
+                    rollback_errors.push(error.to_string());
+                }
+            }
+            if rollback_errors.is_empty() {
+                return Err(primary);
+            }
+            transaction.poisoned = true;
+            return Err(EngineError::InvalidState(format!(
+                "Metal speculative begin failed ({primary}) and rollback failed: {}",
+                rollback_errors.join("; ")
+            )));
+        }
+        transaction.active = true;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_speculative_transaction(
+        &self,
+        transaction: &mut PreparedMetalSpeculativeTransaction,
+        workspace: &PreparedMetalDecodeWorkspace,
+        attentions: &mut [PreparedMetalPagedGqa],
+        convolutions: &mut [PreparedMappedMetalCausalConv],
+        recurrences: &mut [PreparedMetalGatedDelta],
+    ) -> Result<()> {
+        validate_metal_speculative_shape(
+            transaction,
+            workspace,
+            attentions,
+            convolutions,
+            recurrences,
+        )?;
+        if !transaction.active
+            || transaction.poisoned
+            || !transaction.target_hidden.is_active()
+            || attentions
+                .iter()
+                .any(|state| state.speculative_checkpoint.is_none())
+            || convolutions.iter().any(|state| !state.checkpoint_valid)
+            || recurrences.iter().any(|state| !state.checkpoint_valid)
+        {
+            return Err(EngineError::InvalidState(
+                "Metal speculative restore requires one complete active transaction".into(),
+            ));
+        }
+        let mut errors = Vec::new();
+        for recurrence in recurrences.iter_mut().rev() {
+            if let Err(error) = recurrence.restore_speculative(self) {
+                errors.push(error.to_string());
+            }
+        }
+        for convolution in convolutions.iter_mut().rev() {
+            if let Err(error) = convolution.restore_speculative(self) {
+                errors.push(error.to_string());
+            }
+        }
+        for attention in attentions.iter_mut().rev() {
+            if let Err(error) = attention.restore_speculative() {
+                errors.push(error.to_string());
+            }
+        }
+        if let Err(error) = self.restore_workspace_f32(
+            &mut transaction.target_hidden,
+            workspace,
+            MetalBufferSlot::Normalized,
+        ) {
+            errors.push(error.to_string());
+        }
+        transaction.active = false;
+        if !errors.is_empty() {
+            transaction.poisoned = true;
+            return Err(EngineError::InvalidState(format!(
+                "Metal speculative transaction restore failed: {}",
+                errors.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_speculative_transaction(
+        &self,
+        transaction: &mut PreparedMetalSpeculativeTransaction,
+        workspace: &PreparedMetalDecodeWorkspace,
+        attentions: &mut [PreparedMetalPagedGqa],
+        convolutions: &mut [PreparedMappedMetalCausalConv],
+        recurrences: &mut [PreparedMetalGatedDelta],
+    ) -> Result<()> {
+        validate_metal_speculative_shape(
+            transaction,
+            workspace,
+            attentions,
+            convolutions,
+            recurrences,
+        )?;
+        if !transaction.active
+            || transaction.poisoned
+            || !transaction.target_hidden.is_active()
+            || attentions
+                .iter()
+                .any(|state| state.poisoned || state.speculative_checkpoint.is_none())
+            || convolutions
+                .iter()
+                .any(|state| state.poisoned || !state.checkpoint_valid)
+            || recurrences
+                .iter()
+                .any(|state| state.poisoned || !state.checkpoint_valid)
+        {
+            return Err(EngineError::InvalidState(
+                "Metal speculative commit requires one complete healthy transaction".into(),
+            ));
+        }
+        let committed = (|| {
+            for recurrence in recurrences.iter_mut() {
+                recurrence.commit_speculative()?;
+            }
+            for convolution in convolutions.iter_mut() {
+                convolution.commit_speculative()?;
+            }
+            for attention in attentions.iter_mut() {
+                attention.commit_speculative()?;
+            }
+            transaction.target_hidden.commit()
+        })();
+        transaction.active = false;
+        if let Err(error) = committed {
+            transaction.poisoned = true;
+            return Err(EngineError::InvalidState(format!(
+                "Metal speculative transaction commit failed after validation: {error}"
+            )));
+        }
+        Ok(())
     }
 
     /// Snapshot one exact decode-arena slot through a device-to-device blit.
@@ -4581,6 +4840,37 @@ fn partial_rope_tables(
     Ok((cosine, sine))
 }
 
+fn validate_metal_speculative_shape(
+    transaction: &PreparedMetalSpeculativeTransaction,
+    workspace: &PreparedMetalDecodeWorkspace,
+    attentions: &[PreparedMetalPagedGqa],
+    convolutions: &[PreparedMappedMetalCausalConv],
+    recurrences: &[PreparedMetalGatedDelta],
+) -> Result<()> {
+    if attentions.len() != PreparedMetalSpeculativeTransaction::ATTENTION_STATES
+        || convolutions.len() != PreparedMetalSpeculativeTransaction::LINEAR_STATES
+        || recurrences.len() != PreparedMetalSpeculativeTransaction::LINEAR_STATES
+    {
+        return Err(EngineError::Shape(format!(
+            "Metal speculative transaction requires exactly {} attention and {} paired linear states, got {}/{}/{}",
+            PreparedMetalSpeculativeTransaction::ATTENTION_STATES,
+            PreparedMetalSpeculativeTransaction::LINEAR_STATES,
+            attentions.len(),
+            convolutions.len(),
+            recurrences.len()
+        )));
+    }
+    let normalized = workspace.binding(MetalBufferSlot::Normalized)?;
+    if normalized.values != transaction.target_hidden.values() {
+        return Err(EngineError::Shape(format!(
+            "Metal speculative target-hidden checkpoint has {} values, normalized workspace slot has {}",
+            transaction.target_hidden.values(),
+            normalized.values
+        )));
+    }
+    Ok(())
+}
+
 fn validate_metal_input(input: &[f32], columns: usize) -> Result<()> {
     if input.len() != columns {
         return Err(EngineError::Shape(format!(
@@ -5107,6 +5397,244 @@ mod tests {
             .is_err());
         checkpoint.clear();
         assert!(!checkpoint.is_active());
+    }
+
+    #[test]
+    fn complete_speculative_transaction_restores_or_commits_all_state_classes() {
+        let config = Qwen38Config::default();
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("decode workspace plan");
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let mut workspace = runtime
+            .prepare_decode_workspace(&plan)
+            .expect("allocate shared decode arena");
+        let normalized = workspace
+            .binding(MetalBufferSlot::Normalized)
+            .expect("normalized target-hidden binding");
+        let original_hidden: Vec<f32> = (0..normalized.values)
+            .map(|index| index as f32 * 0.000_125 - 0.25)
+            .collect();
+        let speculative_hidden = vec![0.625_f32; normalized.values];
+        workspace
+            .write_f32(MetalBufferSlot::Normalized, &original_hidden)
+            .expect("write committed target hidden");
+
+        let attention_config = MetalPagedGqaConfig {
+            query_heads: 4,
+            key_value_heads: 2,
+            head_dim: 64,
+            maximum_tokens: 16,
+            page_tokens: 4,
+            sink_tokens: 4,
+            recent_tokens: 4,
+        };
+        let mut attentions = (0..PreparedMetalSpeculativeTransaction::ATTENTION_STATES)
+            .map(|_| {
+                runtime
+                    .prepare_paged_gqa_decode(attention_config)
+                    .expect("prepare graph attention state")
+            })
+            .collect::<Vec<_>>();
+        let recurrence_config = MetalGatedDeltaConfig {
+            heads: 1,
+            key_dim: 64,
+            value_dim: 64,
+            epsilon: 1.0e-6,
+        };
+        let mut recurrences = (0..PreparedMetalSpeculativeTransaction::LINEAR_STATES)
+            .map(|_| {
+                runtime
+                    .prepare_gated_delta_f16(recurrence_config)
+                    .expect("prepare graph recurrent state")
+            })
+            .collect::<Vec<_>>();
+
+        let channels = 64;
+        let kernel = 4;
+        let directory = tempdir().expect("temporary graph-state artifact directory");
+        let path = directory.path().join("graph-state-convolution.ctoxq");
+        write_mixed_fixture(&path, 3, 5, channels * kernel);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open graph-state convolution fixture");
+        let weight = artifact
+            .float_tensor("matrix.weight.s_in")
+            .expect("resolve graph-state convolution weight");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import graph-state convolution mapping");
+        let mut convolutions = (0..PreparedMetalSpeculativeTransaction::LINEAR_STATES)
+            .map(|_| {
+                runtime
+                    .prepare_mapped_causal_conv_f16(&mapping, weight, &[0.0; 64], channels, kernel)
+                    .expect("prepare graph convolution state")
+            })
+            .collect::<Vec<_>>();
+        drop(mapping);
+        drop(artifact);
+
+        let original_conv = convolutions[0].verifier_read_state();
+        let original_recurrence = recurrences[0].verifier_read_state();
+        let mut transaction = runtime
+            .prepare_speculative_transaction(&config)
+            .expect("prepare frozen graph transaction");
+        assert!(!transaction.is_active());
+        assert!(!transaction.is_poisoned());
+        assert_eq!(
+            transaction.target_hidden_checkpoint_bytes(),
+            normalized.bytes
+        );
+        assert!(runtime
+            .begin_speculative_transaction(
+                &mut transaction,
+                &workspace,
+                &mut attentions[..16],
+                &mut convolutions,
+                &mut recurrences,
+            )
+            .is_err());
+        assert!(!transaction.is_active());
+
+        runtime
+            .begin_speculative_transaction(
+                &mut transaction,
+                &workspace,
+                &mut attentions,
+                &mut convolutions,
+                &mut recurrences,
+            )
+            .expect("begin complete speculative graph transaction");
+        assert!(transaction.is_active());
+        assert!(runtime
+            .begin_speculative_transaction(
+                &mut transaction,
+                &workspace,
+                &mut attentions,
+                &mut convolutions,
+                &mut recurrences,
+            )
+            .is_err());
+        workspace
+            .write_f32(MetalBufferSlot::Normalized, &speculative_hidden)
+            .expect("write speculative target hidden");
+        let query = vec![0.13_f32; attention_config.query_heads * attention_config.head_dim];
+        let key = vec![0.19_f32; attention_config.key_value_heads * attention_config.head_dim];
+        let value = vec![-0.17_f32; attention_config.key_value_heads * attention_config.head_dim];
+        runtime
+            .append_and_dispatch_paged_gqa(&mut attentions[0], &query, &key, &value)
+            .expect("advance speculative attention state");
+        let conv_input = vec![0.23_f32; channels];
+        convolutions[0]
+            .write_input(&conv_input)
+            .expect("write speculative convolution input");
+        runtime
+            .dispatch_mapped_causal_conv_f16(&mut convolutions[0])
+            .expect("advance speculative convolution state");
+        let recurrent_qk = vec![0.11_f32; recurrence_config.key_dim];
+        let recurrent_value = vec![-0.09_f32; recurrence_config.value_dim];
+        recurrences[0]
+            .write_step(
+                &recurrent_qk,
+                &recurrent_qk,
+                &recurrent_value,
+                &[-0.02],
+                &[0.55],
+            )
+            .expect("write speculative recurrent inputs");
+        runtime
+            .dispatch_gated_delta_f16(&mut recurrences[0])
+            .expect("advance speculative recurrent state");
+        assert_ne!(convolutions[0].verifier_read_state(), original_conv);
+        assert_ne!(recurrences[0].verifier_read_state(), original_recurrence);
+        assert_eq!(attentions[0].tokens(), 1);
+
+        runtime
+            .restore_speculative_transaction(
+                &mut transaction,
+                &workspace,
+                &mut attentions,
+                &mut convolutions,
+                &mut recurrences,
+            )
+            .expect("restore complete speculative graph transaction");
+        assert!(!transaction.is_active());
+        assert!(!transaction.is_poisoned());
+        assert_eq!(
+            workspace
+                .read_f32(MetalBufferSlot::Normalized)
+                .expect("read restored target hidden"),
+            original_hidden
+        );
+        assert_eq!(attentions[0].tokens(), 0);
+        assert_eq!(convolutions[0].verifier_read_state(), original_conv);
+        assert_eq!(recurrences[0].verifier_read_state(), original_recurrence);
+        assert!(attentions
+            .iter()
+            .all(|state| state.speculative_checkpoint.is_none()));
+        assert!(convolutions.iter().all(|state| !state.checkpoint_valid));
+        assert!(recurrences.iter().all(|state| !state.checkpoint_valid));
+
+        runtime
+            .begin_speculative_transaction(
+                &mut transaction,
+                &workspace,
+                &mut attentions,
+                &mut convolutions,
+                &mut recurrences,
+            )
+            .expect("begin committed graph branch");
+        workspace
+            .write_f32(MetalBufferSlot::Normalized, &speculative_hidden)
+            .expect("rewrite committed target hidden");
+        runtime
+            .append_and_dispatch_paged_gqa(&mut attentions[0], &query, &key, &value)
+            .expect("advance committed attention branch");
+        convolutions[0]
+            .write_input(&conv_input)
+            .expect("rewrite committed convolution input");
+        runtime
+            .dispatch_mapped_causal_conv_f16(&mut convolutions[0])
+            .expect("advance committed convolution branch");
+        recurrences[0]
+            .write_step(
+                &recurrent_qk,
+                &recurrent_qk,
+                &recurrent_value,
+                &[-0.02],
+                &[0.55],
+            )
+            .expect("rewrite committed recurrent inputs");
+        runtime
+            .dispatch_gated_delta_f16(&mut recurrences[0])
+            .expect("advance committed recurrent branch");
+        runtime
+            .commit_speculative_transaction(
+                &mut transaction,
+                &workspace,
+                &mut attentions,
+                &mut convolutions,
+                &mut recurrences,
+            )
+            .expect("commit complete speculative graph transaction");
+        assert!(!transaction.is_active());
+        assert_eq!(
+            workspace
+                .read_f32(MetalBufferSlot::Normalized)
+                .expect("read committed target hidden"),
+            speculative_hidden
+        );
+        assert_eq!(attentions[0].tokens(), 1);
+        assert_ne!(convolutions[0].verifier_read_state(), original_conv);
+        assert_ne!(recurrences[0].verifier_read_state(), original_recurrence);
+        assert!(runtime
+            .commit_speculative_transaction(
+                &mut transaction,
+                &workspace,
+                &mut attentions,
+                &mut convolutions,
+                &mut recurrences,
+            )
+            .is_err());
     }
 
     #[test]

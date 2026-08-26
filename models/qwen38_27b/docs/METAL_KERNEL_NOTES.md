@@ -76,6 +76,20 @@ arenas. A four-token branch restores to the exact eight-token prefix and its
 replay produces bit-identical Metal attention outputs. The CPU packed mirror
 is still verifier-only and remains a promotion blocker.
 
+`PreparedMetalSpeculativeTransaction` composes those primitives into one
+all-or-nothing operation for the frozen decode graph: the final normalized
+target-hidden arena slot, exactly 17 target/MTP attention owners, and exactly
+48 paired convolution/GatedDelta owners. Begin rejects a wrong resource count,
+wrong target-hidden width, poisoned owner, active checkpoint, or missing Q4
+boundary slot before taking the first snapshot. A begin failure restores only
+the already-started prefix in reverse ownership order. Explicit reject restores
+all recurrence, convolution, attention, and target-hidden state in reverse
+order and poisons the coordinator if any restore fails. Commit first validates
+the complete active set, then consumes every checkpoint. Its Apple-device test
+mutates all four state classes, proves graph-wide restoration, repeats the same
+branch, and proves graph-wide commit. This closes atomic speculative-state
+orchestration, not per-step encoder binding or the full target+MTP executor.
+
 ## Entry points
 
 | Kernel | DType | Block layout |
@@ -401,8 +415,9 @@ dequantization array before this source was accepted.
   path has controlled performance evidence. The MTP block and sampling do not
   exist yet. A deterministic shared decode arena and its single Metal buffer
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
-  available together with bounded paged-KV rollback, but per-step encoder
-  binding, the prefill arena, graph-wide atomic orchestration, removal of the
-  verifier CPU KV mirror, and complete model-graph execution remain unfinished.
+  available together with bounded paged-KV rollback and one graph-wide atomic
+  target+MTP state transaction. Per-step encoder binding, the prefill arena,
+  removal of the verifier CPU KV mirror, and complete model-graph execution
+  remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.
