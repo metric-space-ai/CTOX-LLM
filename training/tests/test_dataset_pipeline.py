@@ -161,7 +161,11 @@ from verify_activation_stats import (  # noqa: E402
     expected_batch as expected_activation_batch,
     expected_keys as expected_activation_keys,
 )
-from run_teacher_batches import cache_environment, completed_batch_matches  # noqa: E402
+from run_teacher_batches import (  # noqa: E402
+    cache_environment,
+    completed_batch_matches,
+    gpu_weight_memory_for_batch,
+)
 from run_activation_batches import (  # noqa: E402
     completed_batch_matches as completed_activation_batch_matches,
 )
@@ -1913,6 +1917,19 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertTrue(completed_batch_matches(run, verification, batch, "r", "p"))
         verification["samples"] = 31
         self.assertFalse(completed_batch_matches(run, verification, batch, "r", "p"))
+
+    def test_long_context_batches_select_the_declared_lower_weight_tier(self) -> None:
+        self.assertEqual(gpu_weight_memory_for_batch(16, 14, 65_536, 65_535), 16)
+        self.assertEqual(gpu_weight_memory_for_batch(16, 14, 65_536, 65_536), 14)
+        self.assertEqual(gpu_weight_memory_for_batch(16, None, 65_536, 131_072), 16)
+        for values in [
+            (0, 14, 65_536, 131_072),
+            (16, 17, 65_536, 131_072),
+            (16, 14, 0, 131_072),
+            (16, 14, 65_536, 0),
+        ]:
+            with self.assertRaises(ValueError):
+                gpu_weight_memory_for_batch(*values)
 
     def test_sparse_teacher_losses_preserve_topk_and_residual_semantics(self) -> None:
         if torch is None:

@@ -29,6 +29,30 @@ def cache_environment(
     return environment
 
 
+def gpu_weight_memory_for_batch(
+    default_gib: int,
+    long_context_gib: int | None,
+    long_context_threshold_tokens: int,
+    maximum_sample_tokens: int,
+) -> int:
+    """Select one deterministic weight-placement tier before model load."""
+    if default_gib <= 0:
+        raise ValueError("default GPU weight memory must be positive")
+    if long_context_threshold_tokens <= 0:
+        raise ValueError("long-context threshold must be positive")
+    if maximum_sample_tokens <= 0:
+        raise ValueError("maximum sample tokens must be positive")
+    if long_context_gib is None:
+        return default_gib
+    if long_context_gib <= 0 or long_context_gib > default_gib:
+        raise ValueError(
+            "long-context GPU weight memory must be positive and no larger than the default"
+        )
+    if maximum_sample_tokens >= long_context_threshold_tokens:
+        return long_context_gib
+    return default_gib
+
+
 def completed_batch_matches(
     run: dict[str, Any],
     verification: dict[str, Any],
@@ -68,6 +92,16 @@ def main() -> None:
     parser.add_argument("--gpus", type=int, default=3)
     parser.add_argument("--reserved-gpu-hours", type=float, default=4.0)
     parser.add_argument("--gpu-weight-memory-gib", type=int, default=16)
+    parser.add_argument(
+        "--long-context-gpu-weight-memory-gib",
+        type=int,
+        help="deterministic lower weight placement for batches at or above the token threshold",
+    )
+    parser.add_argument(
+        "--long-context-threshold-tokens",
+        type=int,
+        default=65_536,
+    )
     parser.add_argument("--cpu-offload-memory-gib", type=int, default=96)
     parser.add_argument("--mtp-device", default="cuda:2")
     parser.add_argument("--prefill-chunk-tokens", type=int, default=512)
@@ -97,6 +131,12 @@ def main() -> None:
     environment.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     for batch in batches[args.start_batch:end_batch]:
         index = int(batch["batch_index"])
+        gpu_weight_memory_gib = gpu_weight_memory_for_batch(
+            args.gpu_weight_memory_gib,
+            args.long_context_gpu_weight_memory_gib,
+            args.long_context_threshold_tokens,
+            int(batch["maximum_sample_tokens"]),
+        )
         cache = args.output_root / f"{args.output_prefix}-batch-{index:03d}-v1"
         verification_path = args.output_root / f"{args.output_prefix}-batch-{index:03d}-v1-verification-v1.json"
         run_path = cache / "run.json"
@@ -138,7 +178,7 @@ def main() -> None:
             "--start-sample", str(batch["start_sample"]),
             "--max-samples", str(batch["samples"]),
             "--use-fla-kernel",
-            "--gpu-weight-memory-gib", str(args.gpu_weight_memory_gib),
+            "--gpu-weight-memory-gib", str(gpu_weight_memory_gib),
             "--cpu-offload-memory-gib", str(args.cpu_offload_memory_gib),
             "--mtp-device", args.mtp_device,
             "--prefill-chunk-tokens", str(args.prefill_chunk_tokens),
@@ -147,7 +187,7 @@ def main() -> None:
             cache_command.append("--resume")
         print(
             f"batch={index} status={'cache-resume' if resume else 'cache-start'} samples={batch['samples']} "
-            f"tokens={batch['sequence_tokens']}",
+            f"tokens={batch['sequence_tokens']} gpu_weight_memory_gib={gpu_weight_memory_gib}",
             flush=True,
         )
         subprocess.run(cache_command, check=True, env=environment)

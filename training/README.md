@@ -201,6 +201,15 @@ identity without treating failed or smoke directories as evidence.
 runs the content verifier. It skips existing work only when the completed run,
 source slice, teacher revision, provenance hash, and verification sample count
 all agree; partial directories stop the orchestrator for inspection.
+Teacher and activation batch runners accept an explicit two-tier placement
+contract: `--gpu-weight-memory-gib` remains the ordinary value, while
+`--long-context-gpu-weight-memory-gib` applies at or above
+`--long-context-threshold-tokens` (65,536 by default). Selection is made from
+the immutable batch maximum before model load and is printed with every batch.
+This reserves attention/KV headroom for 128K-class samples without changing
+model, data, quantization, or recovery semantics. The lower tier must be
+positive and cannot exceed the ordinary tier; an invalid profile fails before
+starting any batch.
 `--hf-home` binds the already provisioned Hugging Face cache root explicitly
 for the model and pinned-kernel subprocesses; this prevents a stale host login
 cache or symlink from changing where an admitted run reads and writes.

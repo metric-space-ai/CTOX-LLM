@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from run_teacher_batches import cache_environment
+from run_teacher_batches import cache_environment, gpu_weight_memory_for_batch
 
 
 def sha256(path: Path) -> str:
@@ -59,6 +59,16 @@ def main() -> None:
     parser.add_argument("--gpus", type=int, default=2)
     parser.add_argument("--reserved-gpu-hours", type=float, default=4.0)
     parser.add_argument("--gpu-weight-memory-gib", type=int, default=16)
+    parser.add_argument(
+        "--long-context-gpu-weight-memory-gib",
+        type=int,
+        help="deterministic lower weight placement for batches at or above the token threshold",
+    )
+    parser.add_argument(
+        "--long-context-threshold-tokens",
+        type=int,
+        default=65_536,
+    )
     parser.add_argument("--cpu-offload-memory-gib", type=int, default=96)
     parser.add_argument("--mtp-device", default="cuda:1")
     parser.add_argument("--prefill-chunk-tokens", type=int, default=512)
@@ -85,6 +95,12 @@ def main() -> None:
 
     for batch in batches[args.start_batch:end_batch]:
         index = int(batch["batch_index"])
+        gpu_weight_memory_gib = gpu_weight_memory_for_batch(
+            args.gpu_weight_memory_gib,
+            args.long_context_gpu_weight_memory_gib,
+            args.long_context_threshold_tokens,
+            int(batch["maximum_sample_tokens"]),
+        )
         artifact = args.output_root / f"{args.output_prefix}-batch-{index:03d}-v1.safetensors"
         verification_path = (
             args.output_root
@@ -140,7 +156,7 @@ def main() -> None:
             str(batch["samples"]),
             "--use-fla-kernel",
             "--gpu-weight-memory-gib",
-            str(args.gpu_weight_memory_gib),
+            str(gpu_weight_memory_gib),
             "--cpu-offload-memory-gib",
             str(args.cpu_offload_memory_gib),
             "--mtp-device",
@@ -150,7 +166,7 @@ def main() -> None:
         ]
         print(
             f"batch={index} status=collect-start samples={batch['samples']} "
-            f"tokens={batch['sequence_tokens']}",
+            f"tokens={batch['sequence_tokens']} gpu_weight_memory_gib={gpu_weight_memory_gib}",
             flush=True,
         )
         subprocess.run(collect_command, check=True, env=environment)
