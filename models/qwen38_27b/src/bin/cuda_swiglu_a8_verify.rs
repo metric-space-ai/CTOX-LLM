@@ -34,6 +34,7 @@ struct Report<'a> {
     avoided_swiglu_f32_bytes: usize,
     maximum_scale_absolute_error: f32,
     code_mismatches: usize,
+    down_projection_device_chain_verified: bool,
     driver_free_bytes_before_prepare: usize,
     driver_free_bytes_after_prepare: usize,
     driver_free_bytes_after_drop: usize,
@@ -93,14 +94,23 @@ fn main() -> anyhow::Result<()> {
 
     let (free_before_prepare, _) = runtime.memory_info()?;
     let prepared = runtime.prepare_shared_a8_activation(&operation)?;
+    let down_projection = runtime.prepare_shared_a8_projection(&operation)?;
     let gate_staging = runtime.prepare_verifier_f32_tensor(&gate)?;
     let up_staging = runtime.prepare_verifier_f32_tensor(&up)?;
     let (free_after_prepare, _) = runtime.memory_info()?;
-    runtime.quantize_shared_a8_swiglu_device(
+    let projection_refs = [&down_projection];
+    let down_views = runtime.dispatch_shared_a8_swiglu_fanout_device(
         &prepared,
         gate_staging.device_view()?,
         up_staging.device_view()?,
+        &projection_refs,
     )?;
+    let down_output = runtime.verifier_read_f32(down_views[0])?;
+    let down_projection_device_chain_verified = down_output.iter().all(|value| *value == 0.0);
+    anyhow::ensure!(
+        down_projection_device_chain_verified,
+        "zero-weight down projection produced a non-zero value"
+    );
     let (actual_codes, actual_scales) = prepared.verifier_read_quantized()?;
 
     let mut maximum_scale_absolute_error = 0.0_f32;
@@ -124,9 +134,10 @@ fn main() -> anyhow::Result<()> {
     );
     anyhow::ensure!(code_mismatches == 0, "SwiGLU A8 codes differ");
 
-    let prepared_activation_bytes = prepared.resident_bytes();
+    let prepared_activation_bytes = prepared.resident_bytes() + down_projection.resident_bytes();
     let verifier_staging_bytes = gate_staging.resident_bytes() + up_staging.resident_bytes();
     drop(prepared);
+    drop(down_projection);
     drop(gate_staging);
     drop(up_staging);
     let (free_after_drop, _) = runtime.memory_info()?;
@@ -155,6 +166,7 @@ fn main() -> anyhow::Result<()> {
             avoided_swiglu_f32_bytes: columns * std::mem::size_of::<f32>(),
             maximum_scale_absolute_error,
             code_mismatches,
+            down_projection_device_chain_verified,
             driver_free_bytes_before_prepare: free_before_prepare,
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,

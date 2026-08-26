@@ -154,6 +154,10 @@ rereading a 69,632-byte f32 SwiGLU tensor for every token and layer. Its
 verifier compares every A8 code and block scale with the Rust oracle before
 the candidate may feed the existing Q2/Q4 dp4a down projection. CUDA 12.6
 reports 18 registers, 12 bytes shared memory, and no stack or spill traffic.
+The device graph now enqueues this quantizer and its identity-bound Q2/Q4 down
+projection consecutively, synchronizing only once after the projection set.
+The verifier requires both exact A8 codes/scales and a device-resident down
+projection output, so the fused edge is not merely tested in isolation.
 
 The general Qwen `(1 + weight)` RMSNorm candidate uses one 256-thread block
 per row and an eight-warp reduction, so hidden width 5,120 does not serialize

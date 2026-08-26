@@ -2918,6 +2918,33 @@ impl CudaCandidateRuntime {
         )
     }
 
+    /// Complete Qwen FFN middle edge: fused SwiGLU/A8 quantization followed
+    /// by one or more identity-bound down projections in the same CUDA stream.
+    /// The host synchronizes only after every projection has been enqueued.
+    pub fn dispatch_shared_a8_swiglu_fanout_device<'a>(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        gate: CudaDeviceF32View<'_>,
+        up: CudaDeviceF32View<'_>,
+        projections: &[&'a PreparedCudaA8Projection],
+    ) -> Result<Vec<CudaDeviceF32View<'a>>> {
+        self.validate_shared_a8_fanout(activation, projections, 1)?;
+        self.quantize_shared_a8_swiglu_device(activation, gate, up)?;
+        for projection in projections {
+            self.launch_shared_a8_projection(activation, projection)?;
+        }
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "shared SwiGLU A8 fan-out context synchronization",
+            )?;
+        }
+        projections
+            .iter()
+            .map(|projection| (*projection).device_output())
+            .collect()
+    }
+
     /// Quantizes one corrected activation, launches every byte-identity-bound
     /// projection, synchronizes once, and returns outputs in caller order.
     pub fn dispatch_shared_a8_fanout(
@@ -3173,10 +3200,6 @@ impl CudaCandidateRuntime {
                     ptr::null_mut(),
                 ),
                 "SwiGLU A8 quantization launch",
-            )?;
-            self.inner.driver.check(
-                (self.inner.driver.ctx_synchronize)(),
-                "SwiGLU A8 quantization context synchronization",
             )
         }
     }
