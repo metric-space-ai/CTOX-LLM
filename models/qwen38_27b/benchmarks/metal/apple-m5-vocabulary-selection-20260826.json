@@ -1,0 +1,74 @@
+{
+  "format": "ctox.metal-argmax-candidate-evidence.v1",
+  "captured_at": "2026-08-26",
+  "status": "verifier_only_not_promotion_evidence",
+  "source_commit": "00d8bfcb341717d4614047a2c898726b83274e42",
+  "host_profile": {
+    "device": "Apple M5",
+    "os": "macOS 26.2 (25C56)",
+    "rustc": "1.97.0 (2d8144b78 2026-07-07)",
+    "metal_frontend": "Apple metal 32023.883 (metalfe-32023.883)"
+  },
+  "source_sha256": {
+    "kernels/metal/q2q4_fused_matvec.metal": "6191b690f7f771decbeb32863a018c0c28eee541876cb8e0f2b405d89e38ea98",
+    "target/release/qwen38-metal-selection-bench": "11e5e15ba59d0786154ce2c27c183ea9f889d0095dfe616cdbf1a36b5f7fbde7"
+  },
+  "contract": {
+    "valid_tokenizer_values": 248077,
+    "padded_lm_head_rows": 248320,
+    "padded_rows_selectable": false,
+    "logical_input_bytes": 992308,
+    "returned_bytes": 8,
+    "selected_token": 248076,
+    "tie_rule": "larger_valid_token_id",
+    "nonfinite_policy": "fail_closed"
+  },
+  "single_ordered_sweep": {
+    "warmup_commands": 10,
+    "measured_commands": 40,
+    "dispatches_per_command": 64,
+    "warning": "The monotonic group order showed ramp/order sensitivity and is retained only as raw candidate evidence; it did not select the default.",
+    "runs": [
+      { "groups": 8, "mean_microseconds": 62.1543296875, "logical_gb_per_second": 15.9652272817 },
+      { "groups": 16, "mean_microseconds": 60.3604332031, "logical_gb_per_second": 16.4397097128 },
+      { "groups": 32, "mean_microseconds": 34.1980632813, "logical_gb_per_second": 29.0164969823 },
+      { "groups": 64, "mean_microseconds": 23.3086425781, "logical_gb_per_second": 42.5725349159 },
+      { "groups": 128, "mean_microseconds": 28.857421875, "logical_gb_per_second": 34.3865784095 },
+      { "groups": 256, "mean_microseconds": 19.4641277344, "logical_gb_per_second": 50.9813752531 }
+    ]
+  },
+  "interleaved_32_vs_256": {
+    "warmup_commands": 20,
+    "measured_commands": 80,
+    "dispatches_per_command": 64,
+    "selections_per_run": 5120,
+    "execution_order": [32, 256, 256, 32, 32, 256, 256, 32, 32, 256],
+    "runs": [
+      { "groups": 32, "mean_microseconds": 15.9584716797, "logical_gb_per_second": 62.1806410988 },
+      { "groups": 256, "mean_microseconds": 19.1682617188, "logical_gb_per_second": 51.7682831422 },
+      { "groups": 256, "mean_microseconds": 17.4252361328, "logical_gb_per_second": 56.9466027569 },
+      { "groups": 32, "mean_microseconds": 14.4547201172, "logical_gb_per_second": 68.6494094631 },
+      { "groups": 32, "mean_microseconds": 13.9153076172, "logical_gb_per_second": 71.3105327815 },
+      { "groups": 256, "mean_microseconds": 16.9505535156, "logical_gb_per_second": 58.5413331243 },
+      { "groups": 256, "mean_microseconds": 17.450390625, "logical_gb_per_second": 56.8645150315 },
+      { "groups": 32, "mean_microseconds": 14.5799722656, "logical_gb_per_second": 68.0596630722 },
+      { "groups": 32, "mean_microseconds": 14.8075927734, "logical_gb_per_second": 67.0134582429 },
+      { "groups": 256, "mean_microseconds": 16.9119222656, "logical_gb_per_second": 58.6750568276 }
+    ],
+    "medians": {
+      "groups_32_mean_microseconds": 14.5799722656,
+      "groups_32_logical_gb_per_second": 68.0596630722,
+      "groups_256_mean_microseconds": 17.4252361328,
+      "groups_256_logical_gb_per_second": 56.9466027569,
+      "groups_32_latency_advantage_percent": 16.3284092423
+    },
+    "selected_default_groups": 32
+  },
+  "limitations": [
+    "Each command buffer contains repeated resident two-stage selections to amortize standalone command submission and completion overhead.",
+    "Logical GB/s counts one read of every valid f32 logit; it is not a Metal hardware-counter bandwidth measurement.",
+    "The standalone verifier owns a copied logit input. The production graph must bind the kernels directly to resident LM-head output before promotion.",
+    "This evidence covers deterministic greedy target selection, not sampling, the complete decoder graph, or final model quality."
+  ],
+  "conclusion": "The 32-group two-stage candidate deterministically selects across the complete valid vocabulary, rejects non-finite device values, and outperforms the 256-group alternative in an interleaved comparison. It remains unpromoted until direct graph binding and complete executor evidence exist."
+}

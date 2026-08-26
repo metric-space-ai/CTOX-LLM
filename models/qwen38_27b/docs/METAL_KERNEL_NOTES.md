@@ -192,6 +192,14 @@ bind the same kernels directly to the mapped LM-head output and retain only
 536 bytes of partial/result/parameter state. Any NaN or infinity fails
 closed.
 
+On Apple M5, an interleaved five-run comparison measured the selected 32-group
+profile at a median 14.580 microseconds per resident selection (68.060 logical
+GB/s) versus 17.425 microseconds (56.947 logical GB/s) for 256 groups. These
+figures amortize command-buffer overhead with 64 selections per command and do
+not constitute hardware-counter roofline evidence. The raw sweep, alternating
+run order, hashes, and limitations are recorded in
+`benchmarks/metal/apple-m5-vocabulary-selection-20260826.json`.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
