@@ -95,6 +95,14 @@ allocations independently. `unload` succeeds only when every counter is zero;
 otherwise the engine enters `unload_failed` and exposes the residue through
 health. This is the contract required by model-TTL and process-TTL owners.
 
+The CUDA candidate now uses independently owned prepared objects backed by one
+private, thread-affine driver context. Device buffers free themselves before
+the last context owner unloads the module and destroys the context; there is
+no process-global CUDA allocator cache. The model daemon must keep these
+objects on a dedicated CUDA executor thread. A GPU3 fixture demonstrated exact
+return of the complete observed driver allocation on `drop`; production
+admission still requires the same evidence for the complete resident graph.
+
 The CPU correctness executor composes the complete target and native MTP
 graphs for sequential prefill/decode, including independent MTP KV state,
 target-final-hidden handoff, chained MTP4 target verification, and tested

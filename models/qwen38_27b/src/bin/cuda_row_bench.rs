@@ -57,6 +57,11 @@ struct Report<'a> {
     total_dispatches: usize,
     packed_weight_bytes: usize,
     requested_resident_buffer_bytes: usize,
+    driver_free_bytes_before_prepare: usize,
+    driver_free_bytes_after_prepare: usize,
+    driver_free_bytes_after_drop: usize,
+    observed_allocation_bytes: usize,
+    observed_reclaimed_bytes: usize,
     elapsed_milliseconds: f64,
     mean_dispatch_milliseconds: f64,
     maximum_absolute_error: f32,
@@ -99,7 +104,10 @@ fn main() -> anyhow::Result<()> {
     };
     let oracle = CpuBackend::scalar_verifier().recovered_row(&operation)?;
     let runtime = CudaCandidateRuntime::new(&module, args.device)?;
+    let (free_before_prepare, _) = runtime.memory_info()?;
     let prepared = runtime.prepare_recovered_row(&operation)?;
+    let requested_resident_buffer_bytes = prepared.resident_bytes();
+    let (free_after_prepare, _) = runtime.memory_info()?;
     let device_output = runtime.dispatch_recovered_row(&prepared)?;
     let mut maximum_absolute_error = 0.0_f32;
     let mut maximum_relative_error = 0.0_f32;
@@ -133,6 +141,8 @@ fn main() -> anyhow::Result<()> {
         .checked_mul(args.dispatches_per_sync)
         .context("dispatch count overflows")?;
     let mean_seconds = elapsed / total_dispatches as f64;
+    drop(prepared);
+    let (free_after_drop, _) = runtime.memory_info()?;
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
@@ -156,7 +166,12 @@ fn main() -> anyhow::Result<()> {
             dispatches_per_sync: args.dispatches_per_sync,
             total_dispatches,
             packed_weight_bytes: weights.len(),
-            requested_resident_buffer_bytes: prepared.resident_bytes(),
+            requested_resident_buffer_bytes,
+            driver_free_bytes_before_prepare: free_before_prepare,
+            driver_free_bytes_after_prepare: free_after_prepare,
+            driver_free_bytes_after_drop: free_after_drop,
+            observed_allocation_bytes: free_before_prepare.saturating_sub(free_after_prepare),
+            observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
             elapsed_milliseconds: elapsed * 1.0e3,
             mean_dispatch_milliseconds: mean_seconds * 1.0e3,
             maximum_absolute_error,

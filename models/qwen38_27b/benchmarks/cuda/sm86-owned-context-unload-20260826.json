@@ -1,0 +1,42 @@
+{
+  "format": "ctox.cuda-sm86-owned-context-unload-evidence.v1",
+  "status": "candidate_ownership_evidence_not_full_graph_promotion",
+  "captured_at": "2026-08-26",
+  "host": "gpu3",
+  "device": {
+    "physical_index": 1,
+    "name": "NVIDIA RTX A4500",
+    "compute_capability": "8.6"
+  },
+  "runtime_sources": {
+    "src/backend/cuda_runtime.rs": "7562f6cfe5de0c823bf9ef591db10d204b8f35e940c3d506c3ef9d2a73e9ab68",
+    "src/bin/cuda_row_bench.rs": "4acd1303ac3dd4e79de38cf8b093772863e108c977a9666623e4809085f81549"
+  },
+  "ownership_contract": {
+    "context_owner": "single_threaded_Rc_CudaContextInner",
+    "prepared_objects_have_borrowed_runtime_lifetime": false,
+    "device_buffers_hold_context_owner": true,
+    "buffer_drop_order": "cuMemFree_before_releasing_context_owner",
+    "last_owner_drop_order": "cuModuleUnload_then_cuCtxDestroy",
+    "global_allocator_cache": false,
+    "executor_threading": "one dedicated CUDA executor thread"
+  },
+  "measurement": {
+    "operation": "prepared_q2_recovered_embedding_row",
+    "logical_requested_resident_buffer_bytes": 32160,
+    "driver_allocation_granule_bytes": 2097152,
+    "driver_free_bytes_before_prepare": 3403218944,
+    "driver_free_bytes_after_prepare": 3401121792,
+    "driver_free_bytes_after_drop": 3403218944,
+    "observed_allocation_bytes": 2097152,
+    "observed_reclaimed_bytes": 2097152,
+    "reclaimed_without_process_exit": true,
+    "reclaimed_without_cache_trim": true
+  },
+  "limitations": [
+    "This measurement covers all allocations of one prepared operation, not the eventual complete model graph high-watermark.",
+    "The private context remained alive during the before/after query so context overhead cancels; final module/context destruction is guaranteed by last-owner RAII but was not measured with an external NVML sampler here.",
+    "The context is intentionally thread-affine; a production daemon must route CUDA calls through one dedicated executor thread."
+  ],
+  "conclusion": "Prepared CUDA graph objects are independently owned and release their complete observed driver allocation immediately on drop. This removes the self-referential-lifetime blocker for an embeddable executor, while full-graph unload and external NVML evidence remain promotion gates."
+}

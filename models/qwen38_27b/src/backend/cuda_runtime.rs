@@ -9,6 +9,7 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::mem::size_of_val;
 use std::ptr;
+use std::rc::Rc;
 use std::slice;
 
 use libloading::Library;
@@ -49,6 +50,7 @@ type CuModuleGetFunction =
 type CuModuleUnload = unsafe extern "C" fn(CuModule) -> CuResult;
 type CuMemAlloc = unsafe extern "C" fn(*mut CuDevicePtr, usize) -> CuResult;
 type CuMemFree = unsafe extern "C" fn(CuDevicePtr) -> CuResult;
+type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CuResult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> CuResult;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> CuResult;
 type CuLaunchKernel = unsafe extern "C" fn(
@@ -82,6 +84,7 @@ struct CudaDriver {
     module_unload: CuModuleUnload,
     mem_alloc: CuMemAlloc,
     mem_free: CuMemFree,
+    mem_get_info: CuMemGetInfo,
     memcpy_htod: CuMemcpyHtoD,
     memcpy_dtoh: CuMemcpyDtoH,
     launch_kernel: CuLaunchKernel,
@@ -109,6 +112,7 @@ impl CudaDriver {
                 module_unload: symbol(&library, b"cuModuleUnload\0")?,
                 mem_alloc: symbol(&library, b"cuMemAlloc_v2\0")?,
                 mem_free: symbol(&library, b"cuMemFree_v2\0")?,
+                mem_get_info: symbol(&library, b"cuMemGetInfo_v2\0")?,
                 memcpy_htod: symbol(&library, b"cuMemcpyHtoD_v2\0")?,
                 memcpy_dtoh: symbol(&library, b"cuMemcpyDtoH_v2\0")?,
                 launch_kernel: symbol(&library, b"cuLaunchKernel\0")?,
@@ -141,6 +145,10 @@ impl CudaDriver {
 
 /// Verifier-only CUDA context and loaded SM86 module.
 pub struct CudaCandidateRuntime {
+    inner: Rc<CudaContextInner>,
+}
+
+struct CudaContextInner {
     driver: CudaDriver,
     context: CuContext,
     module: CuModule,
@@ -157,60 +165,60 @@ pub struct CudaCandidateRuntime {
 
 /// Device-resident buffers for one pure Q2 or Q4 projection. Immutable model
 /// and recovery buffers remain allocated across repeated token dispatches.
-pub struct PreparedCudaMatVec<'runtime> {
-    runtime: &'runtime CudaCandidateRuntime,
+pub struct PreparedCudaMatVec {
+    context: Rc<CudaContextInner>,
     dtype: TensorDType,
     rows: u32,
     columns: u32,
     activation: u32,
-    weights: DeviceBuffer<'runtime>,
-    input: DeviceBuffer<'runtime>,
-    s_in: Option<DeviceBuffer<'runtime>>,
-    s_out: Option<DeviceBuffer<'runtime>>,
-    bias: Option<DeviceBuffer<'runtime>>,
-    output: DeviceBuffer<'runtime>,
+    weights: DeviceBuffer,
+    input: DeviceBuffer,
+    s_in: Option<DeviceBuffer>,
+    s_out: Option<DeviceBuffer>,
+    bias: Option<DeviceBuffer>,
+    output: DeviceBuffer,
     resident_bytes: usize,
 }
 
 /// Explicit A8 activation buffers paired with the same immutable logical
 /// Q2/Q4 weights. The activation codes are transient per input and never
 /// become part of a backend-specific model artifact.
-pub struct PreparedCudaA8MatVec<'runtime> {
-    base: PreparedCudaMatVec<'runtime>,
-    q8_codes: DeviceBuffer<'runtime>,
-    q8_scales: DeviceBuffer<'runtime>,
+pub struct PreparedCudaA8MatVec {
+    base: PreparedCudaMatVec,
+    q8_codes: DeviceBuffer,
+    q8_scales: DeviceBuffer,
     resident_bytes: usize,
 }
 
 /// One canonical mixed Q2/Q4 payload with shared transient A8 activation.
 /// Segment metadata points into `weights`; no segment is copied or repacked.
-pub struct PreparedCudaMixedA8MatVec<'runtime> {
-    runtime: &'runtime CudaCandidateRuntime,
+pub struct PreparedCudaMixedA8MatVec {
+    context: Rc<CudaContextInner>,
     rows: u32,
     columns: u32,
     activation: u32,
     segments: Vec<CudaMixedRowSegment>,
-    weights: DeviceBuffer<'runtime>,
-    input: DeviceBuffer<'runtime>,
-    s_in: Option<DeviceBuffer<'runtime>>,
-    s_out: Option<DeviceBuffer<'runtime>>,
-    bias: Option<DeviceBuffer<'runtime>>,
-    output: DeviceBuffer<'runtime>,
-    q8_codes: DeviceBuffer<'runtime>,
-    q8_scales: DeviceBuffer<'runtime>,
+    weights: DeviceBuffer,
+    input: DeviceBuffer,
+    s_in: Option<DeviceBuffer>,
+    s_out: Option<DeviceBuffer>,
+    bias: Option<DeviceBuffer>,
+    output: DeviceBuffer,
+    q8_codes: DeviceBuffer,
+    q8_scales: DeviceBuffer,
     resident_bytes: usize,
 }
 
 /// One loader-resolved embedding row with both recovery corrections and its
 /// decoded activation resident on the device.
-pub struct PreparedCudaRecoveredRow<'runtime> {
-    runtime: &'runtime CudaCandidateRuntime,
+pub struct PreparedCudaRecoveredRow {
+    context: Rc<CudaContextInner>,
     dtype: TensorDType,
     columns: u32,
     s_out: f32,
-    weights: DeviceBuffer<'runtime>,
-    s_in: DeviceBuffer<'runtime>,
-    output: DeviceBuffer<'runtime>,
+    weights: DeviceBuffer,
+    s_in: DeviceBuffer,
+    output: DeviceBuffer,
     resident_bytes: usize,
 }
 
@@ -367,33 +375,51 @@ impl CudaCandidateRuntime {
                 }
             };
         Ok(Self {
-            driver,
-            context,
-            module,
-            q2_function,
-            q4_function,
-            a8_quantize_function,
-            q2_a8_function,
-            q4_a8_function,
-            q2_recovered_row_function,
-            q4_recovered_row_function,
-            device_name,
-            compute_capability,
+            inner: Rc::new(CudaContextInner {
+                driver,
+                context,
+                module,
+                q2_function,
+                q4_function,
+                a8_quantize_function,
+                q2_a8_function,
+                q4_a8_function,
+                q2_recovered_row_function,
+                q4_recovered_row_function,
+                device_name,
+                compute_capability,
+            }),
         })
     }
 
     pub fn device_name(&self) -> &str {
-        &self.device_name
+        &self.inner.device_name
     }
 
     pub fn compute_capability(&self) -> (u32, u32) {
-        self.compute_capability
+        self.inner.compute_capability
     }
 
-    pub fn prepare_recovered_row<'runtime>(
-        &'runtime self,
+    /// Driver-reported memory in the private context. Verifiers use this to
+    /// prove that dropping prepared graph objects returns every owned device
+    /// allocation without waiting for process exit or a global cache trim.
+    pub fn memory_info(&self) -> Result<(usize, usize)> {
+        self.make_current()?;
+        let mut free = 0_usize;
+        let mut total = 0_usize;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.mem_get_info)(&mut free, &mut total),
+                "device memory query",
+            )?;
+        }
+        Ok((free, total))
+    }
+
+    pub fn prepare_recovered_row(
+        &self,
         operation: &RecoveredRow<'_>,
-    ) -> Result<PreparedCudaRecoveredRow<'runtime>> {
+    ) -> Result<PreparedCudaRecoveredRow> {
         let descriptor = validate_recovered_row(operation)?;
         self.make_current()?;
         let weights = DeviceBuffer::from_bytes(self, operation.weights)?;
@@ -412,7 +438,7 @@ impl CudaCandidateRuntime {
             .and_then(|total| total.checked_add(output.len()))
             .ok_or_else(|| EngineError::Shape("CUDA recovered-row residency overflows".into()))?;
         Ok(PreparedCudaRecoveredRow {
-            runtime: self,
+            context: Rc::clone(&self.inner),
             dtype: descriptor.dtype,
             columns: operation.columns as u32,
             s_out: operation.s_out,
@@ -423,16 +449,13 @@ impl CudaCandidateRuntime {
         })
     }
 
-    pub fn dispatch_recovered_row(
-        &self,
-        prepared: &PreparedCudaRecoveredRow<'_>,
-    ) -> Result<Vec<f32>> {
+    pub fn dispatch_recovered_row(&self, prepared: &PreparedCudaRecoveredRow) -> Result<Vec<f32>> {
         self.dispatch_prepared_recovered_row_repeated(prepared, 1)
     }
 
     pub fn dispatch_prepared_recovered_row_repeated(
         &self,
-        prepared: &PreparedCudaRecoveredRow<'_>,
+        prepared: &PreparedCudaRecoveredRow,
         dispatches: usize,
     ) -> Result<Vec<f32>> {
         if dispatches == 0 {
@@ -440,15 +463,15 @@ impl CudaCandidateRuntime {
                 "CUDA recovered-row dispatch count must be positive".into(),
             ));
         }
-        if !ptr::eq(self, prepared.runtime) {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
             return Err(EngineError::InvalidState(
                 "prepared CUDA recovered row belongs to another context".into(),
             ));
         }
         self.make_current()?;
         let function = match prepared.dtype {
-            TensorDType::Q2B64 => self.q2_recovered_row_function,
-            TensorDType::Q4B64 => self.q4_recovered_row_function,
+            TensorDType::Q2B64 => self.inner.q2_recovered_row_function,
+            TensorDType::Q4B64 => self.inner.q4_recovered_row_function,
             _ => unreachable!("validated CUDA recovered row is Q2 or Q4"),
         };
         for _ in 0..dispatches {
@@ -465,8 +488,8 @@ impl CudaCandidateRuntime {
                 (&mut columns as *mut u32).cast::<c_void>(),
             ];
             unsafe {
-                self.driver.check(
-                    (self.driver.launch_kernel)(
+                self.inner.driver.check(
+                    (self.inner.driver.launch_kernel)(
                         function,
                         prepared.columns.div_ceil(THREADS_PER_BLOCK),
                         1,
@@ -484,8 +507,8 @@ impl CudaCandidateRuntime {
             }
         }
         unsafe {
-            self.driver.check(
-                (self.driver.ctx_synchronize)(),
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
                 "recovered-row context synchronization",
             )?;
         }
@@ -504,10 +527,7 @@ impl CudaCandidateRuntime {
         self.dispatch_prepared(&prepared)
     }
 
-    pub fn prepare_fused_matvec<'runtime>(
-        &'runtime self,
-        operation: &FusedMatVec<'_>,
-    ) -> Result<PreparedCudaMatVec<'runtime>> {
+    pub fn prepare_fused_matvec(&self, operation: &FusedMatVec<'_>) -> Result<PreparedCudaMatVec> {
         let descriptor = validate_operation(operation)?;
         self.make_current()?;
         let weights = DeviceBuffer::from_bytes(self, operation.weights)?;
@@ -532,7 +552,7 @@ impl CudaCandidateRuntime {
             .and_then(|total| total.checked_add(output.len()))
             .ok_or_else(|| EngineError::Shape("CUDA resident byte count overflows".into()))?;
         Ok(PreparedCudaMatVec {
-            runtime: self,
+            context: Rc::clone(&self.inner),
             dtype: descriptor.dtype,
             rows: operation.rows as u32,
             columns: operation.columns as u32,
@@ -550,14 +570,14 @@ impl CudaCandidateRuntime {
         })
     }
 
-    pub fn dispatch_prepared(&self, prepared: &PreparedCudaMatVec<'_>) -> Result<Vec<f32>> {
+    pub fn dispatch_prepared(&self, prepared: &PreparedCudaMatVec) -> Result<Vec<f32>> {
         self.dispatch_prepared_repeated(prepared, 1)
     }
 
-    pub fn prepare_a8_fused_matvec<'runtime>(
-        &'runtime self,
+    pub fn prepare_a8_fused_matvec(
+        &self,
         operation: &FusedMatVec<'_>,
-    ) -> Result<PreparedCudaA8MatVec<'runtime>> {
+    ) -> Result<PreparedCudaA8MatVec> {
         let base = self.prepare_fused_matvec(operation)?;
         let q8_codes = DeviceBuffer::allocate(self, operation.columns)?;
         let scale_bytes = a8_scale_bytes(operation.columns)?;
@@ -575,10 +595,10 @@ impl CudaCandidateRuntime {
         })
     }
 
-    pub fn prepare_mixed_a8_fused_matvec<'runtime>(
-        &'runtime self,
+    pub fn prepare_mixed_a8_fused_matvec(
+        &self,
         operation: &FusedMatVec<'_>,
-    ) -> Result<PreparedCudaMixedA8MatVec<'runtime>> {
+    ) -> Result<PreparedCudaMixedA8MatVec> {
         let segments = validate_mixed_operation(operation)?;
         self.make_current()?;
         let weights = DeviceBuffer::from_bytes(self, operation.weights)?;
@@ -607,7 +627,7 @@ impl CudaCandidateRuntime {
             .and_then(|total| total.checked_add(q8_scales.len()))
             .ok_or_else(|| EngineError::Shape("mixed CUDA resident byte count overflows".into()))?;
         Ok(PreparedCudaMixedA8MatVec {
-            runtime: self,
+            context: Rc::clone(&self.inner),
             rows: operation.rows as u32,
             columns: operation.columns as u32,
             activation: match operation.activation {
@@ -630,8 +650,8 @@ impl CudaCandidateRuntime {
     /// Quantizes the corrected activation once into symmetric Q8_B64 blocks.
     /// Callers may share this result across projections that consume the same
     /// input, such as Q/K/V or gate/up matrices.
-    pub fn quantize_prepared_a8(&self, prepared: &PreparedCudaA8MatVec<'_>) -> Result<()> {
-        if !ptr::eq(self, prepared.base.runtime) {
+    pub fn quantize_prepared_a8(&self, prepared: &PreparedCudaA8MatVec) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.base.context) {
             return Err(EngineError::InvalidState(
                 "prepared CUDA A8 operation belongs to another context".into(),
             ));
@@ -645,11 +665,8 @@ impl CudaCandidateRuntime {
         )
     }
 
-    pub fn quantize_prepared_mixed_a8(
-        &self,
-        prepared: &PreparedCudaMixedA8MatVec<'_>,
-    ) -> Result<()> {
-        if !ptr::eq(self, prepared.runtime) {
+    pub fn quantize_prepared_mixed_a8(&self, prepared: &PreparedCudaMixedA8MatVec) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
             return Err(EngineError::InvalidState(
                 "prepared mixed CUDA A8 operation belongs to another context".into(),
             ));
@@ -685,9 +702,9 @@ impl CudaCandidateRuntime {
             (&mut columns as *mut u32).cast::<c_void>(),
         ];
         unsafe {
-            self.driver.check(
-                (self.driver.launch_kernel)(
-                    self.a8_quantize_function,
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.a8_quantize_function,
                     column_count.div_ceil(64),
                     1,
                     1,
@@ -704,10 +721,7 @@ impl CudaCandidateRuntime {
         }
     }
 
-    pub fn dispatch_a8_fused_matvec(
-        &self,
-        prepared: &PreparedCudaA8MatVec<'_>,
-    ) -> Result<Vec<f32>> {
+    pub fn dispatch_a8_fused_matvec(&self, prepared: &PreparedCudaA8MatVec) -> Result<Vec<f32>> {
         self.quantize_prepared_a8(prepared)?;
         self.dispatch_prepared_a8_repeated(prepared, 1)
     }
@@ -716,7 +730,7 @@ impl CudaCandidateRuntime {
     /// current input first; repeated execution is a verifier/roofline tool.
     pub fn dispatch_prepared_a8_repeated(
         &self,
-        prepared: &PreparedCudaA8MatVec<'_>,
+        prepared: &PreparedCudaA8MatVec,
         dispatches: usize,
     ) -> Result<Vec<f32>> {
         if dispatches == 0 {
@@ -724,7 +738,7 @@ impl CudaCandidateRuntime {
                 "CUDA A8 repeated dispatch count must be positive".into(),
             ));
         }
-        if !ptr::eq(self, prepared.base.runtime) {
+        if !Rc::ptr_eq(&self.inner, &prepared.base.context) {
             return Err(EngineError::InvalidState(
                 "prepared CUDA A8 operation belongs to another context".into(),
             ));
@@ -745,8 +759,8 @@ impl CudaCandidateRuntime {
             )?;
         }
         unsafe {
-            self.driver.check(
-                (self.driver.ctx_synchronize)(),
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
                 "A8 context synchronization",
             )?;
         }
@@ -762,7 +776,7 @@ impl CudaCandidateRuntime {
 
     pub fn dispatch_mixed_a8_fused_matvec(
         &self,
-        prepared: &PreparedCudaMixedA8MatVec<'_>,
+        prepared: &PreparedCudaMixedA8MatVec,
     ) -> Result<Vec<f32>> {
         self.quantize_prepared_mixed_a8(prepared)?;
         self.dispatch_prepared_mixed_a8_repeated(prepared, 1)
@@ -773,7 +787,7 @@ impl CudaCandidateRuntime {
     /// remain resident for the complete mixed projection.
     pub fn dispatch_prepared_mixed_a8_repeated(
         &self,
-        prepared: &PreparedCudaMixedA8MatVec<'_>,
+        prepared: &PreparedCudaMixedA8MatVec,
         dispatches: usize,
     ) -> Result<Vec<f32>> {
         if dispatches == 0 {
@@ -781,7 +795,7 @@ impl CudaCandidateRuntime {
                 "mixed CUDA A8 repeated dispatch count must be positive".into(),
             ));
         }
-        if !ptr::eq(self, prepared.runtime) {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
             return Err(EngineError::InvalidState(
                 "prepared mixed CUDA A8 operation belongs to another context".into(),
             ));
@@ -819,8 +833,8 @@ impl CudaCandidateRuntime {
             }
         }
         unsafe {
-            self.driver.check(
-                (self.driver.ctx_synchronize)(),
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
                 "mixed A8 context synchronization",
             )?;
         }
@@ -849,8 +863,8 @@ impl CudaCandidateRuntime {
         activation_code: u32,
     ) -> Result<()> {
         let function = match dtype {
-            TensorDType::Q2B64 => self.q2_a8_function,
-            TensorDType::Q4B64 => self.q4_a8_function,
+            TensorDType::Q2B64 => self.inner.q2_a8_function,
+            TensorDType::Q4B64 => self.inner.q4_a8_function,
             _ => unreachable!("validated CUDA A8 segment is Q2 or Q4"),
         };
         let mut weights = weights_ptr;
@@ -874,8 +888,8 @@ impl CudaCandidateRuntime {
             (&mut activation as *mut u32).cast::<c_void>(),
         ];
         unsafe {
-            self.driver.check(
-                (self.driver.launch_kernel)(
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
                     function,
                     row_count.div_ceil(A8_ROWS_PER_BLOCK),
                     1,
@@ -898,7 +912,7 @@ impl CudaCandidateRuntime {
     /// production graph capture remains a separate promotion requirement.
     pub fn dispatch_prepared_repeated(
         &self,
-        prepared: &PreparedCudaMatVec<'_>,
+        prepared: &PreparedCudaMatVec,
         dispatches: usize,
     ) -> Result<Vec<f32>> {
         if dispatches == 0 {
@@ -906,15 +920,15 @@ impl CudaCandidateRuntime {
                 "CUDA repeated dispatch count must be positive".into(),
             ));
         }
-        if !ptr::eq(self, prepared.runtime) {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
             return Err(EngineError::InvalidState(
                 "prepared CUDA operation belongs to another context".into(),
             ));
         }
         self.make_current()?;
         let function = match prepared.dtype {
-            TensorDType::Q2B64 => self.q2_function,
-            TensorDType::Q4B64 => self.q4_function,
+            TensorDType::Q2B64 => self.inner.q2_function,
+            TensorDType::Q4B64 => self.inner.q4_function,
             _ => unreachable!("CUDA validation accepts only Q2/Q4"),
         };
         let warps_per_block = THREADS_PER_BLOCK / WARP_SIZE;
@@ -941,8 +955,8 @@ impl CudaCandidateRuntime {
                 (&mut activation as *mut u32).cast::<c_void>(),
             ];
             unsafe {
-                self.driver.check(
-                    (self.driver.launch_kernel)(
+                self.inner.driver.check(
+                    (self.inner.driver.launch_kernel)(
                         function,
                         grid_x,
                         1,
@@ -960,8 +974,10 @@ impl CudaCandidateRuntime {
             }
         }
         unsafe {
-            self.driver
-                .check((self.driver.ctx_synchronize)(), "context synchronization")?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "context synchronization",
+            )?;
         }
         let mut output = vec![0.0_f32; prepared.rows as usize];
         prepared.output.copy_to(as_bytes_mut(&mut output))?;
@@ -974,6 +990,12 @@ impl CudaCandidateRuntime {
     }
 
     fn make_current(&self) -> Result<()> {
+        self.inner.make_current()
+    }
+}
+
+impl CudaContextInner {
+    fn make_current(&self) -> Result<()> {
         unsafe {
             self.driver.check(
                 (self.driver.ctx_set_current)(self.context),
@@ -983,7 +1005,7 @@ impl CudaCandidateRuntime {
     }
 }
 
-impl PreparedCudaMatVec<'_> {
+impl PreparedCudaMatVec {
     pub fn dtype(&self) -> TensorDType {
         self.dtype
     }
@@ -1017,7 +1039,7 @@ impl PreparedCudaMatVec<'_> {
     }
 }
 
-impl PreparedCudaA8MatVec<'_> {
+impl PreparedCudaA8MatVec {
     pub fn dtype(&self) -> TensorDType {
         self.base.dtype()
     }
@@ -1039,7 +1061,7 @@ impl PreparedCudaA8MatVec<'_> {
     }
 }
 
-impl PreparedCudaMixedA8MatVec<'_> {
+impl PreparedCudaMixedA8MatVec {
     pub fn rows(&self) -> usize {
         self.rows as usize
     }
@@ -1073,7 +1095,7 @@ impl PreparedCudaMixedA8MatVec<'_> {
     }
 }
 
-impl PreparedCudaRecoveredRow<'_> {
+impl PreparedCudaRecoveredRow {
     pub fn dtype(&self) -> TensorDType {
         self.dtype
     }
@@ -1087,7 +1109,7 @@ impl PreparedCudaRecoveredRow<'_> {
     }
 }
 
-impl Drop for CudaCandidateRuntime {
+impl Drop for CudaContextInner {
     fn drop(&mut self) {
         unsafe {
             let _ = (self.driver.ctx_set_current)(self.context);
@@ -1097,14 +1119,14 @@ impl Drop for CudaCandidateRuntime {
     }
 }
 
-struct DeviceBuffer<'runtime> {
-    runtime: &'runtime CudaCandidateRuntime,
+struct DeviceBuffer {
+    context: Rc<CudaContextInner>,
     ptr: CuDevicePtr,
     len: usize,
 }
 
-impl<'runtime> DeviceBuffer<'runtime> {
-    fn allocate(runtime: &'runtime CudaCandidateRuntime, len: usize) -> Result<Self> {
+impl DeviceBuffer {
+    fn allocate(runtime: &CudaCandidateRuntime, len: usize) -> Result<Self> {
         if len == 0 {
             return Err(EngineError::Shape(
                 "CUDA device allocation must be non-empty".into(),
@@ -1113,15 +1135,19 @@ impl<'runtime> DeviceBuffer<'runtime> {
         runtime.make_current()?;
         let mut ptr = 0;
         unsafe {
-            runtime.driver.check(
-                (runtime.driver.mem_alloc)(&mut ptr, len),
+            runtime.inner.driver.check(
+                (runtime.inner.driver.mem_alloc)(&mut ptr, len),
                 "device allocation",
             )?;
         }
-        Ok(Self { runtime, ptr, len })
+        Ok(Self {
+            context: Rc::clone(&runtime.inner),
+            ptr,
+            len,
+        })
     }
 
-    fn from_bytes(runtime: &'runtime CudaCandidateRuntime, bytes: &[u8]) -> Result<Self> {
+    fn from_bytes(runtime: &CudaCandidateRuntime, bytes: &[u8]) -> Result<Self> {
         let buffer = Self::allocate(runtime, bytes.len())?;
         buffer.write(bytes)?;
         Ok(buffer)
@@ -1135,10 +1161,10 @@ impl<'runtime> DeviceBuffer<'runtime> {
                 self.len
             )));
         }
-        self.runtime.make_current()?;
+        self.context.make_current()?;
         unsafe {
-            self.runtime.driver.check(
-                (self.runtime.driver.memcpy_htod)(self.ptr, bytes.as_ptr().cast(), bytes.len()),
+            self.context.driver.check(
+                (self.context.driver.memcpy_htod)(self.ptr, bytes.as_ptr().cast(), bytes.len()),
                 "host-to-device copy",
             )
         }
@@ -1152,10 +1178,10 @@ impl<'runtime> DeviceBuffer<'runtime> {
                 self.len
             )));
         }
-        self.runtime.make_current()?;
+        self.context.make_current()?;
         unsafe {
-            self.runtime.driver.check(
-                (self.runtime.driver.memcpy_dtoh)(bytes.as_mut_ptr().cast(), self.ptr, bytes.len()),
+            self.context.driver.check(
+                (self.context.driver.memcpy_dtoh)(bytes.as_mut_ptr().cast(), self.ptr, bytes.len()),
                 "device-to-host copy",
             )
         }
@@ -1170,19 +1196,19 @@ impl<'runtime> DeviceBuffer<'runtime> {
     }
 }
 
-impl Drop for DeviceBuffer<'_> {
+impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        let _ = self.runtime.make_current();
+        let _ = self.context.make_current();
         unsafe {
-            let _ = (self.runtime.driver.mem_free)(self.ptr);
+            let _ = (self.context.driver.mem_free)(self.ptr);
         }
     }
 }
 
-fn optional_scale_buffer<'runtime>(
-    runtime: &'runtime CudaCandidateRuntime,
+fn optional_scale_buffer(
+    runtime: &CudaCandidateRuntime,
     scales: Option<ScaleSlice<'_>>,
-) -> Result<Option<DeviceBuffer<'runtime>>> {
+) -> Result<Option<DeviceBuffer>> {
     match scales {
         Some(ScaleSlice::F16Le(bytes)) => DeviceBuffer::from_bytes(runtime, bytes).map(Some),
         Some(ScaleSlice::F32(_)) => unreachable!("validated CUDA scales are FP16"),
@@ -1321,5 +1347,14 @@ mod tests {
     fn driver_parameter_widths_match_cuda_abi() {
         assert_eq!(std::mem::size_of::<CuDevicePtr>(), 8);
         assert_eq!(std::mem::size_of::<u32>(), 4);
+    }
+
+    #[test]
+    fn prepared_graph_objects_own_their_context_without_borrowed_lifetimes() {
+        fn assert_owned<T: 'static>() {}
+        assert_owned::<PreparedCudaMatVec>();
+        assert_owned::<PreparedCudaA8MatVec>();
+        assert_owned::<PreparedCudaMixedA8MatVec>();
+        assert_owned::<PreparedCudaRecoveredRow>();
     }
 }

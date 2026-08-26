@@ -133,6 +133,23 @@ copies output back for comparison; production graph wiring must instead keep
 the activation device-resident. Full evidence is in
 `benchmarks/cuda/sm86-recovered-row-20260826.json`.
 
+## Runtime ownership and unload
+
+Prepared CUDA graph objects now own a reference to a private, thread-affine
+driver context instead of borrowing `CudaCandidateRuntime`. This permits one
+model executor to own the runtime and every resident graph object without a
+self-referential Rust structure. Each device buffer calls `cuMemFree` before
+releasing its context owner; the last owner unloads the module and destroys
+the context. No process-global CUDA allocator cache exists in this path.
+
+GPU3 driver evidence recorded in
+`benchmarks/cuda/sm86-owned-context-unload-20260826.json` observed 2 MiB of
+driver allocation for a 32,160-byte prepared fixture and the exact same 2 MiB
+returned immediately after `drop`, without process exit or cache trimming.
+The final daemon must drive the context on one dedicated executor thread.
+Complete-model high-watermark and an external unload measurement remain
+promotion gates.
+
 ## Promotion evidence still required (per `docs/PROMOTION_GATES.md`)
 
 1. Full-model A8 activation-quality gates after recovery, including the

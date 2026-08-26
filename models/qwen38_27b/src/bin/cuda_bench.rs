@@ -87,13 +87,13 @@ struct Report<'a> {
     note: &'static str,
 }
 
-enum Prepared<'runtime> {
-    Exact(PreparedCudaMatVec<'runtime>),
-    A8(PreparedCudaA8MatVec<'runtime>),
-    MixedA8(PreparedCudaMixedA8MatVec<'runtime>),
+enum Prepared {
+    Exact(PreparedCudaMatVec),
+    A8(PreparedCudaA8MatVec),
+    MixedA8(PreparedCudaMixedA8MatVec),
 }
 
-impl Prepared<'_> {
+impl Prepared {
     fn resident_bytes(&self) -> usize {
         match self {
             Self::Exact(prepared) => prepared.resident_bytes(),
