@@ -215,9 +215,14 @@ materializes that plan as exactly one shared Metal buffer, exposes only the
 validated buffer/offset pairs, and passes write/read plus drop/recreate device
 tests. Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
-the final barrier retains target and MTP logits as explicit reads. Kernel
-encoder dispatch against those views and the complete executor remain open. A
-bounded f32 checkpoint can now snapshot and restore an
+the final barrier retains target and MTP logits as explicit reads. The first
+exact decode chain now binds those views directly: embedding writes `HiddenA`,
+layer-0 RMSNorm writes `Normalized`, and all four linear-attention projections
+write `LinearQkv`, `LinearZ`, `LinearA`, and `LinearB` through one command
+encoder and one final wait. These graph preparations retain no operation-local
+input/output activation buffers; separately stored recovery inputs must be
+byte-identical. The remaining 642 schedule steps and the complete executor
+remain open. A bounded f32 checkpoint can now snapshot and restore an
 exact arena slot through a Metal device-to-device blit with no host mirror. It
 is single-use and fail-closed across snapshot/restore/commit, providing the
 target-hidden primitive needed by MTP replay. FP16 causal-convolution and

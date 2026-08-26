@@ -220,6 +220,17 @@ resident output plus one byte-identical packed `s_in` to every Q/K/V or Gate/Up
 projection branch; a mismatched mapping or correction offset fails before a
 command buffer is submitted.
 
+The schedule-bound form removes even those reusable operation-local hidden and
+projection outputs. Embedding, RMSNorm, and projection preparation retain only
+mmap-backed tensor offsets plus fixed bias/parameter blocks. The first three
+frozen decode steps bind `HiddenA`, `Normalized`, `LinearQkv`, `LinearZ`,
+`LinearA`, and `LinearB` directly to typed offsets in the single 1,173,760-byte
+arena. All four Q2/Q4 projections accept distinct artifact offsets only when
+their packed FP16 `s_in` bytes are identical. Slot, size, mapping, arena-owner,
+or correction mismatch fails before submission. The Apple-device Golden test
+executes the three steps with one command encoder and one wait, reading outputs
+only after completion.
+
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
 complete row, reduces the f32 sum of squares without threadgroup scratch, and
@@ -435,7 +446,9 @@ dequantization array before this source was accepted.
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
   target+MTP state transaction. All 645 steps have real shared-buffer views;
-  kernel encoder dispatch, the prefill arena, removal of the verifier CPU KV
-  mirror, and complete model-graph execution remain unfinished.
+  exact kernel dispatch now covers steps 0-2 (embedding, layer-0 RMSNorm, and
+  all four linear-attention projections). The remaining 642 schedule steps,
+  the prefill arena, removal of the verifier CPU KV mirror, and complete
+  model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

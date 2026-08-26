@@ -201,9 +201,9 @@ struct MappedMetalArtifactInner {
 }
 
 /// Reusable projection whose immutable weights and recovery scales are
-/// offsets into one shared no-copy CTOXQ mapping. A standalone projection owns
-/// an input buffer; a graph projection consumes an upstream device buffer and
-/// allocates only bias, output, and small parameter blocks.
+/// offsets into one shared no-copy CTOXQ mapping. Standalone projections own
+/// input/output buffers, external-input projections own only output, and
+/// shared-arena graph projections own neither activation endpoint.
 pub struct PreparedMappedMetalMatVec {
     dtype: TensorDType,
     rows: usize,
@@ -213,7 +213,7 @@ pub struct PreparedMappedMetalMatVec {
     mapping: MappedMetalArtifact,
     input_buffer: Option<Buffer>,
     bias_buffer: Buffer,
-    output_buffer: Buffer,
+    output_buffer: Option<Buffer>,
     transient_bytes: usize,
 }
 
@@ -257,8 +257,8 @@ struct MappedMetalGatherDispatch {
 
 /// One recovered embedding row decoded directly from the shared CTOXQ mmap.
 /// The complete packed row and FP16 correction tensors are mapping offsets;
-/// only the resulting f32 hidden vector and 32-byte parameter block allocate
-/// transient Metal storage.
+/// standalone dispatch allocates the resulting f32 hidden vector; graph
+/// dispatch binds an arena view and retains only the 32-byte parameter block.
 pub struct PreparedMappedMetalRecoveredRow {
     dtype: TensorDType,
     columns: usize,
@@ -283,7 +283,7 @@ pub struct PreparedMappedMetalEmbedding {
     s_in_offset: u64,
     s_out_base: u64,
     segments: Vec<MappedMetalEmbeddingSegment>,
-    output_buffer: Buffer,
+    output_buffer: Option<Buffer>,
     params_buffer: Buffer,
     transient_bytes: usize,
 }
@@ -299,15 +299,16 @@ struct MappedMetalEmbeddingSegment {
 }
 
 /// Qwen `(1 + weight)` RMSNorm with an mmap-backed FP16 weight vector.
-/// Input/output remain reusable f32 graph buffers; no expanded f32 weight
-/// copy is created at load time.
+/// Standalone input/output can remain reusable f32 buffers, while graph mode
+/// binds both endpoints to shared-arena views. No expanded f32 weight copy is
+/// created at load time.
 pub struct PreparedMappedMetalRmsNorm {
     rows: usize,
     columns: usize,
     mapping: MappedMetalArtifact,
     weight_offset: u64,
-    input_buffer: Buffer,
-    output_buffer: Buffer,
+    input_buffer: Option<Buffer>,
+    output_buffer: Option<Buffer>,
     params_buffer: Buffer,
     transient_bytes: usize,
 }
@@ -928,6 +929,14 @@ impl PreparedMappedMetalMatVec {
         }
         Ok(())
     }
+
+    fn owned_output(&self) -> Result<&Buffer> {
+        self.output_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph projection has no operation-local output buffer".into(),
+            )
+        })
+    }
 }
 
 impl PreparedMappedMetalGatheredMatVec {
@@ -994,6 +1003,14 @@ impl PreparedMappedMetalEmbedding {
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
     }
+
+    fn owned_output(&self) -> Result<&Buffer> {
+        self.output_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph embedding has no operation-local output buffer".into(),
+            )
+        })
+    }
 }
 
 impl PreparedMappedMetalRmsNorm {
@@ -1019,14 +1036,29 @@ impl PreparedMappedMetalRmsNorm {
             .checked_mul(self.columns)
             .ok_or_else(|| EngineError::Shape("Metal RMSNorm input shape overflows".into()))?;
         validate_metal_input(input, expected)?;
+        let input_buffer = self.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("Metal graph RMSNorm has no host input buffer".into())
+        })?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 input.as_ptr(),
-                self.input_buffer.contents().cast::<f32>(),
+                input_buffer.contents().cast::<f32>(),
                 input.len(),
             );
         }
         Ok(())
+    }
+
+    fn owned_input(&self) -> Result<&Buffer> {
+        self.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("Metal graph RMSNorm has no operation-local input".into())
+        })
+    }
+
+    fn owned_output(&self) -> Result<&Buffer> {
+        self.output_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("Metal graph RMSNorm has no operation-local output".into())
+        })
     }
 }
 
@@ -2347,7 +2379,13 @@ impl MetalCandidateRuntime {
         mapping: &MappedMetalArtifact,
         operation: &FusedMatVec<'_>,
     ) -> Result<PreparedMappedMetalMatVec> {
-        self.prepare_mapped_fused_matvec_internal(mapping, operation, DEFAULT_SIMDGROUPS, true)
+        self.prepare_mapped_fused_matvec_internal(
+            mapping,
+            operation,
+            DEFAULT_SIMDGROUPS,
+            true,
+            true,
+        )
     }
 
     /// Prepare a projection whose input will be supplied by an upstream Metal
@@ -2357,7 +2395,29 @@ impl MetalCandidateRuntime {
         mapping: &MappedMetalArtifact,
         operation: &FusedMatVec<'_>,
     ) -> Result<PreparedMappedMetalMatVec> {
-        self.prepare_mapped_fused_matvec_internal(mapping, operation, DEFAULT_SIMDGROUPS, false)
+        self.prepare_mapped_fused_matvec_internal(
+            mapping,
+            operation,
+            DEFAULT_SIMDGROUPS,
+            false,
+            true,
+        )
+    }
+
+    /// Prepare immutable projection resources for shared-arena graph I/O.
+    /// Neither input nor output activation storage is allocated here.
+    pub fn prepare_mapped_fused_matvec_graph_io(
+        &self,
+        mapping: &MappedMetalArtifact,
+        operation: &FusedMatVec<'_>,
+    ) -> Result<PreparedMappedMetalMatVec> {
+        self.prepare_mapped_fused_matvec_internal(
+            mapping,
+            operation,
+            DEFAULT_SIMDGROUPS,
+            false,
+            false,
+        )
     }
 
     pub fn prepare_mapped_fused_matvec_with_simdgroups(
@@ -2366,7 +2426,7 @@ impl MetalCandidateRuntime {
         operation: &FusedMatVec<'_>,
         simdgroups: usize,
     ) -> Result<PreparedMappedMetalMatVec> {
-        self.prepare_mapped_fused_matvec_internal(mapping, operation, simdgroups, true)
+        self.prepare_mapped_fused_matvec_internal(mapping, operation, simdgroups, true, true)
     }
 
     fn prepare_mapped_fused_matvec_internal(
@@ -2375,6 +2435,7 @@ impl MetalCandidateRuntime {
         operation: &FusedMatVec<'_>,
         simdgroups: usize,
         own_input: bool,
+        own_output: bool,
     ) -> Result<PreparedMappedMetalMatVec> {
         let segment_contracts: Vec<(TensorDType, usize, usize, MetalFusedMatVecParams)> =
             if operation.dtype == TensorDType::MixedQ2Q4B64 {
@@ -2421,9 +2482,10 @@ impl MetalCandidateRuntime {
             .rows
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| EngineError::Shape("Metal output byte size overflows".into()))?;
-        let output_buffer = self
-            .device
-            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let output_buffer = own_output.then(|| {
+            self.device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         let mut dispatches = Vec::with_capacity(segment_contracts.len());
         for (dtype, row_start, weight_offset, params) in segment_contracts {
             let pipeline = match dtype {
@@ -2480,7 +2542,7 @@ impl MetalCandidateRuntime {
         };
         let transient_bytes = input_bytes
             .checked_add(size_of_val(bias))
-            .and_then(|total| total.checked_add(output_bytes))
+            .and_then(|total| total.checked_add(if own_output { output_bytes } else { 0 }))
             .and_then(|total| total.checked_add(parameter_bytes))
             .ok_or_else(|| EngineError::Shape("Metal transient byte count overflows".into()))?;
         Ok(PreparedMappedMetalMatVec {
@@ -2751,6 +2813,24 @@ impl MetalCandidateRuntime {
         mapping: &MappedMetalArtifact,
         matrix: RecoveredMatrixView<'_>,
     ) -> Result<PreparedMappedMetalEmbedding> {
+        self.prepare_mapped_embedding_internal(mapping, matrix, true)
+    }
+
+    /// Prepare the resident embedding table for a graph-owned output view.
+    pub fn prepare_mapped_embedding_graph_output(
+        &self,
+        mapping: &MappedMetalArtifact,
+        matrix: RecoveredMatrixView<'_>,
+    ) -> Result<PreparedMappedMetalEmbedding> {
+        self.prepare_mapped_embedding_internal(mapping, matrix, false)
+    }
+
+    fn prepare_mapped_embedding_internal(
+        &self,
+        mapping: &MappedMetalArtifact,
+        matrix: RecoveredMatrixView<'_>,
+        own_output: bool,
+    ) -> Result<PreparedMappedMetalEmbedding> {
         let validation_input = vec![0.0_f32; matrix.matrix.columns];
         let operation = matrix.operation(&validation_input, Activation::Identity)?;
         let contracts = if operation.dtype == TensorDType::MixedQ2Q4B64 {
@@ -2817,9 +2897,10 @@ impl MetalCandidateRuntime {
             .columns
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| EngineError::Shape("Metal embedding output bytes overflow".into()))?;
-        let output_buffer = self
-            .device
-            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let output_buffer = own_output.then(|| {
+            self.device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         let params = MetalFusedMatVecParams {
             rows: 1,
             columns: u32::try_from(operation.columns)
@@ -2834,7 +2915,7 @@ impl MetalCandidateRuntime {
             reserved0: 0,
         };
         let params_buffer = buffer_with_data(&self.device, &params.encode());
-        let transient_bytes = output_bytes
+        let transient_bytes = (if own_output { output_bytes } else { 0 })
             .checked_add(MetalFusedMatVecParams::BYTE_LEN)
             .ok_or_else(|| EngineError::Shape("Metal embedding transient bytes overflow".into()))?;
         Ok(PreparedMappedMetalEmbedding {
@@ -2862,6 +2943,44 @@ impl MetalCandidateRuntime {
         rows: usize,
         columns: usize,
         epsilon: f32,
+    ) -> Result<PreparedMappedMetalRmsNorm> {
+        self.prepare_mapped_rms_norm_1p_internal(
+            mapping, weight, input, rows, columns, epsilon, true,
+        )
+    }
+
+    /// Prepare immutable RMSNorm resources for graph-owned input/output views.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_mapped_rms_norm_1p_graph_io(
+        &self,
+        mapping: &MappedMetalArtifact,
+        weight: FloatTensorView<'_>,
+        validation_input: &[f32],
+        rows: usize,
+        columns: usize,
+        epsilon: f32,
+    ) -> Result<PreparedMappedMetalRmsNorm> {
+        self.prepare_mapped_rms_norm_1p_internal(
+            mapping,
+            weight,
+            validation_input,
+            rows,
+            columns,
+            epsilon,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_mapped_rms_norm_1p_internal(
+        &self,
+        mapping: &MappedMetalArtifact,
+        weight: FloatTensorView<'_>,
+        input: &[f32],
+        rows: usize,
+        columns: usize,
+        epsilon: f32,
+        own_io: bool,
     ) -> Result<PreparedMappedMetalRmsNorm> {
         let value_count = rows
             .checked_mul(columns)
@@ -2908,13 +3027,14 @@ impl MetalCandidateRuntime {
         let value_bytes = value_count
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| EngineError::Shape("Metal RMSNorm value bytes overflow".into()))?;
-        let input_buffer = buffer_with_data(&self.device, as_bytes(input));
-        let output_buffer = self
-            .device
-            .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let input_buffer = own_io.then(|| buffer_with_data(&self.device, as_bytes(input)));
+        let output_buffer = own_io.then(|| {
+            self.device
+                .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         let params_buffer = buffer_with_data(&self.device, &params.encode());
         let transient_bytes = value_bytes
-            .checked_mul(2)
+            .checked_mul(if own_io { 2 } else { 0 })
             .and_then(|bytes| bytes.checked_add(MetalRmsNormParams::BYTE_LEN))
             .ok_or_else(|| EngineError::Shape("Metal RMSNorm transient bytes overflow".into()))?;
         Ok(PreparedMappedMetalRmsNorm {
@@ -3598,6 +3718,7 @@ impl MetalCandidateRuntime {
                 "Metal external-input projection requires an upstream graph dispatch".into(),
             )
         })?;
+        let output_buffer = prepared.owned_output()?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-q2q4-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
@@ -3631,7 +3752,7 @@ impl MetalCandidateRuntime {
             );
             encoder.set_buffer(
                 MetalBufferAbi::OUTPUT as u64,
-                Some(&prepared.output_buffer),
+                Some(output_buffer),
                 dispatch.output_offset,
             );
             encoder.set_buffer(
@@ -3664,11 +3785,7 @@ impl MetalCandidateRuntime {
             )));
         }
         let output = unsafe {
-            slice::from_raw_parts(
-                prepared.output_buffer.contents().cast::<f32>(),
-                prepared.rows,
-            )
-            .to_vec()
+            slice::from_raw_parts(output_buffer.contents().cast::<f32>(), prepared.rows).to_vec()
         };
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
@@ -3866,6 +3983,17 @@ impl MetalCandidateRuntime {
         prepared: &PreparedMappedMetalEmbedding,
         token: usize,
     ) -> Result<()> {
+        self.encode_mapped_embedding_to(encoder, prepared, token, prepared.owned_output()?, 0)
+    }
+
+    fn encode_mapped_embedding_to(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalEmbedding,
+        token: usize,
+        output_buffer: &Buffer,
+        output_offset: u64,
+    ) -> Result<()> {
         if token >= prepared.rows {
             return Err(EngineError::Shape(format!(
                 "Metal embedding token {token} exceeds {} rows",
@@ -3924,8 +4052,8 @@ impl MetalCandidateRuntime {
         );
         encoder.set_buffer(
             MetalBufferAbi::OUTPUT as u64,
-            Some(&prepared.output_buffer),
-            0,
+            Some(output_buffer),
+            output_offset,
         );
         encoder.set_buffer(
             MetalBufferAbi::PARAMS as u64,
@@ -3962,6 +4090,7 @@ impl MetalCandidateRuntime {
                 prepared.rows
             )));
         }
+        let output_buffer = prepared.owned_output()?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-resident-embedding-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
@@ -3976,11 +4105,7 @@ impl MetalCandidateRuntime {
             )));
         }
         let output = unsafe {
-            slice::from_raw_parts(
-                prepared.output_buffer.contents().cast::<f32>(),
-                prepared.columns,
-            )
-            .to_vec()
+            slice::from_raw_parts(output_buffer.contents().cast::<f32>(), prepared.columns).to_vec()
         };
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
@@ -4010,25 +4135,19 @@ impl MetalCandidateRuntime {
                 "Metal RMSNorm dispatch count must be positive".into(),
             ));
         }
+        let input_buffer = prepared.owned_input()?;
+        let output_buffer = prepared.owned_output()?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-rms-norm-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.rms_norm_1p_pipeline);
-        encoder.set_buffer(
-            MetalRmsNormBufferAbi::INPUT as u64,
-            Some(&prepared.input_buffer),
-            0,
-        );
+        encoder.set_buffer(MetalRmsNormBufferAbi::INPUT as u64, Some(input_buffer), 0);
         encoder.set_buffer(
             MetalRmsNormBufferAbi::WEIGHT as u64,
             Some(&prepared.mapping.inner.buffer),
             prepared.weight_offset,
         );
-        encoder.set_buffer(
-            MetalRmsNormBufferAbi::OUTPUT as u64,
-            Some(&prepared.output_buffer),
-            0,
-        );
+        encoder.set_buffer(MetalRmsNormBufferAbi::OUTPUT as u64, Some(output_buffer), 0);
         encoder.set_buffer(
             MetalRmsNormBufferAbi::PARAMS as u64,
             Some(&prepared.params_buffer),
@@ -4061,8 +4180,7 @@ impl MetalCandidateRuntime {
             .checked_mul(prepared.columns)
             .ok_or_else(|| EngineError::Shape("Metal RMSNorm output shape overflows".into()))?;
         let output = unsafe {
-            slice::from_raw_parts(prepared.output_buffer.contents().cast::<f32>(), value_count)
-                .to_vec()
+            slice::from_raw_parts(output_buffer.contents().cast::<f32>(), value_count).to_vec()
         };
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
@@ -4627,13 +4745,9 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         norm: &PreparedMappedMetalRmsNorm,
         projection: &PreparedMappedMetalMatVec,
-    ) {
-        self.encode_mapped_norm_projection_with_input(
-            encoder,
-            norm,
-            projection,
-            &norm.input_buffer,
-        );
+    ) -> Result<()> {
+        let input = norm.owned_input()?;
+        self.encode_mapped_norm_projection_with_input(encoder, norm, projection, input)
     }
 
     fn encode_mapped_norm_projection_with_input(
@@ -4642,9 +4756,18 @@ impl MetalCandidateRuntime {
         norm: &PreparedMappedMetalRmsNorm,
         projection: &PreparedMappedMetalMatVec,
         input_buffer: &Buffer,
-    ) {
-        self.encode_mapped_norm_with_input(encoder, norm, input_buffer);
-        self.encode_mapped_projection_with_input(encoder, projection, &norm.output_buffer);
+    ) -> Result<()> {
+        let norm_output = norm.owned_output()?;
+        let projection_output = projection.owned_output()?;
+        self.encode_mapped_norm_between(encoder, norm, input_buffer, 0, norm_output, 0);
+        self.encode_mapped_projection_between(
+            encoder,
+            projection,
+            norm_output,
+            0,
+            projection_output,
+            0,
+        )
     }
 
     fn encode_mapped_norm_with_input(
@@ -4652,9 +4775,28 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         norm: &PreparedMappedMetalRmsNorm,
         input_buffer: &Buffer,
+    ) -> Result<()> {
+        let output_buffer = norm.owned_output()?;
+        self.encode_mapped_norm_between(encoder, norm, input_buffer, 0, output_buffer, 0);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_norm_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        norm: &PreparedMappedMetalRmsNorm,
+        input_buffer: &Buffer,
+        input_offset: u64,
+        output_buffer: &Buffer,
+        output_offset: u64,
     ) {
         encoder.set_compute_pipeline_state(&self.rms_norm_1p_pipeline);
-        encoder.set_buffer(MetalRmsNormBufferAbi::INPUT as u64, Some(input_buffer), 0);
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::INPUT as u64,
+            Some(input_buffer),
+            input_offset,
+        );
         encoder.set_buffer(
             MetalRmsNormBufferAbi::WEIGHT as u64,
             Some(&norm.mapping.inner.buffer),
@@ -4662,8 +4804,8 @@ impl MetalCandidateRuntime {
         );
         encoder.set_buffer(
             MetalRmsNormBufferAbi::OUTPUT as u64,
-            Some(&norm.output_buffer),
-            0,
+            Some(output_buffer),
+            output_offset,
         );
         encoder.set_buffer(
             MetalRmsNormBufferAbi::PARAMS as u64,
@@ -4689,8 +4831,33 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         projection: &PreparedMappedMetalMatVec,
         input_buffer: &Buffer,
-    ) {
-        encoder.set_buffer(MetalBufferAbi::INPUT as u64, Some(input_buffer), 0);
+    ) -> Result<()> {
+        let output_buffer = projection.owned_output()?;
+        self.encode_mapped_projection_between(
+            encoder,
+            projection,
+            input_buffer,
+            0,
+            output_buffer,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_projection_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        projection: &PreparedMappedMetalMatVec,
+        input_buffer: &Buffer,
+        input_offset: u64,
+        output_buffer: &Buffer,
+        output_offset: u64,
+    ) -> Result<()> {
+        encoder.set_buffer(
+            MetalBufferAbi::INPUT as u64,
+            Some(input_buffer),
+            input_offset,
+        );
         encoder.set_buffer(
             MetalBufferAbi::S_IN as u64,
             Some(&projection.mapping.inner.buffer),
@@ -4720,8 +4887,14 @@ impl MetalCandidateRuntime {
             );
             encoder.set_buffer(
                 MetalBufferAbi::OUTPUT as u64,
-                Some(&projection.output_buffer),
-                dispatch.output_offset,
+                Some(output_buffer),
+                output_offset
+                    .checked_add(dispatch.output_offset)
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget(
+                            "Metal projection output view offset overflows".into(),
+                        )
+                    })?,
             );
             encoder.set_buffer(
                 MetalBufferAbi::PARAMS as u64,
@@ -4743,6 +4916,7 @@ impl MetalCandidateRuntime {
             };
             encoder.dispatch_thread_groups(grid, threads);
         }
+        Ok(())
     }
 
     /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
@@ -4768,16 +4942,13 @@ impl MetalCandidateRuntime {
             ));
         }
 
+        let embedding_output = embedding.owned_output()?;
+        let projection_output = projection.owned_output()?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-embedding-norm-projection-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
         self.encode_mapped_embedding(encoder, embedding, token)?;
-        self.encode_mapped_norm_projection_with_input(
-            encoder,
-            norm,
-            projection,
-            &embedding.output_buffer,
-        );
+        self.encode_mapped_norm_projection_with_input(encoder, norm, projection, embedding_output)?;
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -4788,11 +4959,8 @@ impl MetalCandidateRuntime {
             )));
         }
         let output = unsafe {
-            slice::from_raw_parts(
-                projection.output_buffer.contents().cast::<f32>(),
-                projection.rows,
-            )
-            .to_vec()
+            slice::from_raw_parts(projection_output.contents().cast::<f32>(), projection.rows)
+                .to_vec()
         };
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
@@ -4834,13 +5002,19 @@ impl MetalCandidateRuntime {
             }
         }
 
+        let embedding_output = embedding.owned_output()?;
+        let norm_output = norm.owned_output()?;
+        let projection_outputs = projections
+            .iter()
+            .map(|projection| projection.owned_output())
+            .collect::<Result<Vec<_>>>()?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-embedding-norm-fanout-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
         self.encode_mapped_embedding(encoder, embedding, token)?;
-        self.encode_mapped_norm_with_input(encoder, norm, &embedding.output_buffer);
+        self.encode_mapped_norm_with_input(encoder, norm, embedding_output)?;
         for projection in projections {
-            self.encode_mapped_projection_with_input(encoder, projection, &norm.output_buffer);
+            self.encode_mapped_projection_with_input(encoder, projection, norm_output)?;
         }
         encoder.end_encoding();
         command_buffer.commit();
@@ -4853,13 +5027,11 @@ impl MetalCandidateRuntime {
         }
         projections
             .iter()
-            .map(|projection| {
+            .zip(projection_outputs)
+            .map(|(projection, output_buffer)| {
                 let output = unsafe {
-                    slice::from_raw_parts(
-                        projection.output_buffer.contents().cast::<f32>(),
-                        projection.rows,
-                    )
-                    .to_vec()
+                    slice::from_raw_parts(output_buffer.contents().cast::<f32>(), projection.rows)
+                        .to_vec()
                 };
                 if output.iter().any(|value| !value.is_finite()) {
                     return Err(EngineError::InvalidState(
@@ -4867,6 +5039,196 @@ impl MetalCandidateRuntime {
                     ));
                 }
                 Ok(output)
+            })
+            .collect()
+    }
+
+    /// Dispatch the exact first three operations of the frozen decode graph:
+    /// embedding, layer-0 RMSNorm, and the four-way linear-attention fan-out.
+    /// All activations are typed views into one schedule-derived arena. The
+    /// prepared graph resources own only immutable parameters and tiny command
+    /// metadata; no operation-local input or output activation is allocated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+        &self,
+        embedding: &PreparedMappedMetalEmbedding,
+        token: usize,
+        norm: &PreparedMappedMetalRmsNorm,
+        projections: [&PreparedMappedMetalMatVec; 4],
+        embedding_output: &PreparedMetalDecodeBufferView<'_>,
+        normalized_output: &PreparedMetalDecodeBufferView<'_>,
+        projection_outputs: [&PreparedMetalDecodeBufferView<'_>; 4],
+    ) -> Result<Vec<Vec<f32>>> {
+        const OUTPUT_SLOTS: [MetalBufferSlot; 4] = [
+            MetalBufferSlot::LinearQkv,
+            MetalBufferSlot::LinearZ,
+            MetalBufferSlot::LinearA,
+            MetalBufferSlot::LinearB,
+        ];
+        if token >= embedding.rows
+            || embedding.columns != norm.columns
+            || norm.rows != 1
+            || embedding.output_buffer.is_some()
+            || norm.input_buffer.is_some()
+            || norm.output_buffer.is_some()
+            || !Rc::ptr_eq(&embedding.mapping.inner, &norm.mapping.inner)
+        {
+            return Err(EngineError::InvalidState(
+                "Metal graph embedding/norm resources or shapes are incompatible".into(),
+            ));
+        }
+        if embedding_output.slot() != MetalBufferSlot::HiddenA
+            || embedding_output.values() != embedding.columns
+            || normalized_output.slot() != MetalBufferSlot::Normalized
+            || normalized_output.values() != norm.columns
+            || embedding_output.bytes()
+                != embedding
+                    .columns
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget("Metal embedding arena view overflows".into())
+                    })?
+            || normalized_output.bytes()
+                != norm
+                    .columns
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget("Metal normalized arena view overflows".into())
+                    })?
+        {
+            return Err(EngineError::Shape(
+                "Metal graph embedding/norm arena views do not match the frozen slots".into(),
+            ));
+        }
+        let first = projections[0];
+        let correction_bytes = first
+            .columns
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal s_in byte count overflows".into()))?;
+        let first_s_in_start = usize::try_from(first.s_in_offset)
+            .map_err(|_| EngineError::InvalidArtifact("Metal s_in offset exceeds usize".into()))?;
+        let first_s_in_end = first_s_in_start
+            .checked_add(correction_bytes)
+            .ok_or_else(|| EngineError::InvalidArtifact("Metal s_in range overflows".into()))?;
+        let first_s_in = first
+            .mapping
+            .inner
+            .artifact
+            .mapped_bytes()
+            .get(first_s_in_start..first_s_in_end)
+            .ok_or_else(|| {
+                EngineError::InvalidArtifact("Metal s_in range exceeds mapping".into())
+            })?;
+        for ((projection, output), expected_slot) in projections
+            .iter()
+            .zip(projection_outputs.iter())
+            .zip(OUTPUT_SLOTS)
+        {
+            self.validate_mapped_norm_projection(norm, projection)?;
+            if projection.output_buffer.is_some()
+                || output.slot() != expected_slot
+                || output.values() != projection.rows
+                || output.bytes()
+                    != projection
+                        .rows
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .ok_or_else(|| {
+                            EngineError::MemoryBudget(
+                                "Metal projection arena view overflows".into(),
+                            )
+                        })?
+            {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "Metal graph projection does not match arena slot {expected_slot:?}"
+                )));
+            }
+            let s_in_start = usize::try_from(projection.s_in_offset).map_err(|_| {
+                EngineError::InvalidArtifact("Metal fan-out s_in offset exceeds usize".into())
+            })?;
+            let s_in_end = s_in_start.checked_add(correction_bytes).ok_or_else(|| {
+                EngineError::InvalidArtifact("Metal fan-out s_in range overflows".into())
+            })?;
+            if projection
+                .mapping
+                .inner
+                .artifact
+                .mapped_bytes()
+                .get(s_in_start..s_in_end)
+                != Some(first_s_in)
+            {
+                return Err(EngineError::InvalidArtifact(
+                    "Metal graph fan-out projections do not share byte-identical s_in".into(),
+                ));
+            }
+        }
+        let arena = embedding_output.buffer();
+        if !std::ptr::eq(arena, normalized_output.buffer())
+            || projection_outputs
+                .iter()
+                .any(|output| !std::ptr::eq(arena, output.buffer()))
+        {
+            return Err(EngineError::InvalidState(
+                "Metal graph chain requires one shared activation arena".into(),
+            ));
+        }
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-shared-arena-embedding-norm-linear-fanout");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_embedding_to(
+            encoder,
+            embedding,
+            token,
+            arena,
+            embedding_output.offset(),
+        )?;
+        self.encode_mapped_norm_between(
+            encoder,
+            norm,
+            arena,
+            embedding_output.offset(),
+            arena,
+            normalized_output.offset(),
+        );
+        for (projection, output) in projections.iter().zip(projection_outputs.iter()) {
+            self.encode_mapped_projection_between(
+                encoder,
+                projection,
+                arena,
+                normalized_output.offset(),
+                arena,
+                output.offset(),
+            )?;
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal shared-arena graph chain ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+
+        projection_outputs
+            .iter()
+            .map(|output| {
+                let offset = usize::try_from(output.offset()).map_err(|_| {
+                    EngineError::MemoryBudget("Metal output view offset exceeds usize".into())
+                })?;
+                let values = unsafe {
+                    slice::from_raw_parts(
+                        arena.contents().cast::<u8>().add(offset).cast::<f32>(),
+                        output.values(),
+                    )
+                    .to_vec()
+                };
+                if values.iter().any(|value| !value.is_finite()) {
+                    return Err(EngineError::InvalidState(
+                        "Metal shared-arena graph chain produced non-finite output".into(),
+                    ));
+                }
+                Ok(values)
             })
             .collect()
     }
@@ -4881,11 +5243,12 @@ impl MetalCandidateRuntime {
         projection: &PreparedMappedMetalMatVec,
     ) -> Result<Vec<f32>> {
         self.validate_mapped_norm_projection(norm, projection)?;
+        let projection_output = projection.owned_output()?;
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-rmsnorm-projection-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
-        self.encode_mapped_norm_projection(encoder, norm, projection);
+        self.encode_mapped_norm_projection(encoder, norm, projection)?;
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -4896,11 +5259,8 @@ impl MetalCandidateRuntime {
             )));
         }
         let output = unsafe {
-            slice::from_raw_parts(
-                projection.output_buffer.contents().cast::<f32>(),
-                projection.rows,
-            )
-            .to_vec()
+            slice::from_raw_parts(projection_output.contents().cast::<f32>(), projection.rows)
+                .to_vec()
         };
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
@@ -4922,6 +5282,7 @@ impl MetalCandidateRuntime {
         selector: &PreparedMetalArgMaxScratch,
     ) -> Result<u32> {
         self.validate_mapped_norm_projection(norm, projection)?;
+        let projection_output = projection.owned_output()?;
         if selector.values > projection.rows {
             return Err(EngineError::Shape(format!(
                 "Metal selector has {} valid values, projection has {} rows",
@@ -4932,8 +5293,8 @@ impl MetalCandidateRuntime {
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-lm-head-selection-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
-        self.encode_mapped_norm_projection(encoder, norm, projection);
-        self.encode_argmax_f32(encoder, &projection.output_buffer, selector);
+        self.encode_mapped_norm_projection(encoder, norm, projection)?;
+        self.encode_argmax_f32(encoder, projection_output, selector);
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -5378,7 +5739,7 @@ mod tests {
     use crate::backend::cpu::CpuBackend;
     use crate::backend::metal_graph::MetalProjectionPlan;
     use crate::backend::metal_schedule::{MetalDecodeOperation, MetalDecodeSchedule};
-    use crate::backend::{Activation, Backend};
+    use crate::backend::{Activation, Backend, RecoveredRowMatVec};
     use crate::format::{
         ArtifactBuilder, FileHeader, ModelManifest, PackedTensor, QuantSegment, TensorEntry,
         DEFAULT_ALIGNMENT, HEADER_BYTES,
@@ -5420,6 +5781,54 @@ mod tests {
             }
         }
         packed
+    }
+
+    fn repeated_packed_weights(dtype: TensorDType, rows: usize, columns: usize) -> Vec<u8> {
+        let values: [f32; BLOCK_LEN] = std::array::from_fn(|index| {
+            (index as f32 * 0.031).sin() * 0.7 + (index as f32 * 0.013).cos() * 0.2
+        });
+        let block = match dtype {
+            TensorDType::Q2B64 => Q2Block64::quantize(&values)
+                .expect("finite repeated Q2 block")
+                .encode()
+                .to_vec(),
+            TensorDType::Q4B64 => Q4Block64::quantize(&values)
+                .expect("finite repeated Q4 block")
+                .encode()
+                .to_vec(),
+            _ => unreachable!(),
+        };
+        block.repeat(rows * columns / BLOCK_LEN)
+    }
+
+    fn repeated_recovered_tensors(
+        name: &str,
+        dtype: TensorDType,
+        rows: usize,
+        columns: usize,
+        s_in: &[u8],
+        s_out: f32,
+    ) -> Vec<PackedTensor> {
+        vec![
+            PackedTensor {
+                name: name.into(),
+                dtype,
+                shape: vec![rows as u64, columns as u64],
+                bytes: repeated_packed_weights(dtype, rows, columns),
+            },
+            PackedTensor {
+                name: format!("{name}.s_in"),
+                dtype: TensorDType::F16,
+                shape: vec![columns as u64],
+                bytes: s_in.to_vec(),
+            },
+            PackedTensor {
+                name: format!("{name}.s_out"),
+                dtype: TensorDType::F16,
+                shape: vec![rows as u64],
+                bytes: f16_bytes(&vec![s_out; rows]),
+            },
+        ]
     }
 
     fn aligned(value: usize) -> usize {
@@ -6819,6 +7228,224 @@ mod tests {
                         "embedding fan-out branch {branch} token {token} row {row}: expected {expected}, got {actual}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn graph_embedding_norm_linear_fanout_uses_only_shared_arena_views() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let config = Qwen38Config::default();
+        let columns = config.hidden_size;
+        let embedding_rows = 8;
+        let epsilon = config.rms_norm_epsilon;
+        let s_in_values = vec![0.9375_f32; columns];
+        let s_in = f16_bytes(&s_in_values);
+        let norm_values: Vec<f32> = (0..columns)
+            .map(|index| 0.05 * (index % 11) as f32 - 0.2)
+            .collect();
+        let directory = tempdir().expect("temporary shared-arena graph directory");
+        let path = directory.path().join("shared-arena-graph.ctoxq");
+        let mut tensors = repeated_recovered_tensors(
+            "embedding.weight",
+            TensorDType::Q2B64,
+            embedding_rows,
+            columns,
+            &s_in,
+            0.875,
+        );
+        tensors.push(PackedTensor {
+            name: "layer0.input_norm.weight".into(),
+            dtype: TensorDType::F16,
+            shape: vec![columns as u64],
+            bytes: f16_bytes(&norm_values),
+        });
+        let projection_specs = [
+            (
+                "layer0.linear.qkv.weight",
+                TensorDType::Q2B64,
+                2 * config.linear_num_key_heads * config.linear_key_head_dim
+                    + config.linear_num_value_heads * config.linear_value_head_dim,
+            ),
+            (
+                "layer0.linear.z.weight",
+                TensorDType::Q4B64,
+                config.linear_num_value_heads * config.linear_value_head_dim,
+            ),
+            (
+                "layer0.linear.a.weight",
+                TensorDType::Q2B64,
+                config.linear_num_value_heads,
+            ),
+            (
+                "layer0.linear.b.weight",
+                TensorDType::Q4B64,
+                config.linear_num_value_heads,
+            ),
+        ];
+        for (name, dtype, rows) in projection_specs {
+            tensors.extend(repeated_recovered_tensors(
+                name, dtype, rows, columns, &s_in, 1.0625,
+            ));
+        }
+        ArtifactBuilder {
+            model: "test/qwen38-shared-arena".into(),
+            revision: "0123456789abcdef".into(),
+            target: "canonical-b64".into(),
+            alignment: DEFAULT_ALIGNMENT,
+            tensors,
+        }
+        .write_new(&path)
+        .expect("write shared-arena graph fixture");
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open shared-arena graph fixture");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("map shared-arena graph fixture");
+        let embedding_matrix = artifact
+            .recovered_matrix("embedding.weight")
+            .expect("resolve graph embedding");
+        let norm_weight = artifact
+            .float_tensor("layer0.input_norm.weight")
+            .expect("resolve graph RMSNorm");
+        let validation_input = vec![0.0_f32; columns];
+        let embedding = runtime
+            .prepare_mapped_embedding_graph_output(&mapping, embedding_matrix)
+            .expect("prepare graph embedding without output buffer");
+        let norm = runtime
+            .prepare_mapped_rms_norm_1p_graph_io(
+                &mapping,
+                norm_weight,
+                &validation_input,
+                1,
+                columns,
+                epsilon,
+            )
+            .expect("prepare graph RMSNorm without activation buffers");
+        let projection_matrices = projection_specs.map(|(name, _, _)| {
+            artifact
+                .recovered_matrix(name)
+                .expect("resolve graph projection")
+        });
+        let projection_contracts = projection_matrices.map(|matrix| {
+            matrix
+                .operation(&validation_input, Activation::Identity)
+                .expect("build graph projection contract")
+        });
+        let prepared_projections = projection_contracts.map(|operation| {
+            runtime
+                .prepare_mapped_fused_matvec_graph_io(&mapping, &operation)
+                .expect("prepare graph projection without activation buffers")
+        });
+        assert_eq!(
+            embedding.transient_bytes(),
+            MetalFusedMatVecParams::BYTE_LEN
+        );
+        assert_eq!(norm.transient_bytes(), MetalRmsNormParams::BYTE_LEN);
+        for projection in &prepared_projections {
+            assert_eq!(
+                projection.transient_bytes(),
+                std::mem::size_of::<f32>() + MetalFusedMatVecParams::BYTE_LEN
+            );
+            assert!(projection.write_input(&validation_input).is_err());
+        }
+        assert!(norm.write_input(&validation_input).is_err());
+        assert!(runtime.dispatch_mapped_embedding(&embedding, 0).is_err());
+
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let workspace_plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("shared decode workspace plan");
+        let workspace = runtime
+            .prepare_decode_workspace(&workspace_plan)
+            .expect("allocate shared decode arena");
+        let resource_plan = MetalProjectionPlan::qwen38(&config).expect("projection resource plan");
+        let binding_plan = MetalDecodeBindingPlan::qwen38(&schedule, &resource_plan, &config)
+            .expect("decode binding plan");
+        let program = workspace
+            .bind_decode_program(&binding_plan)
+            .expect("bind real shared-arena views");
+        let embedding_output = &program.steps()[0].writes()[0];
+        let normalized_output = &program.steps()[1].writes()[0];
+        let linear_outputs = [
+            &program.steps()[2].writes()[0],
+            &program.steps()[2].writes()[1],
+            &program.steps()[2].writes()[2],
+            &program.steps()[2].writes()[3],
+        ];
+        let projection_refs = [
+            &prepared_projections[0],
+            &prepared_projections[1],
+            &prepared_projections[2],
+            &prepared_projections[3],
+        ];
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                embedding_output,
+                normalized_output,
+                [
+                    linear_outputs[1],
+                    linear_outputs[0],
+                    linear_outputs[2],
+                    linear_outputs[3],
+                ],
+            )
+            .is_err());
+
+        let hidden = cpu
+            .recovered_row(
+                &embedding_matrix
+                    .row_operation(1)
+                    .expect("resolve oracle embedding row"),
+            )
+            .expect("decode oracle embedding row");
+        let normalized =
+            crate::reference::rms_norm_1p_weight(&hidden, 1, columns, &norm_values, epsilon)
+                .expect("normalize oracle embedding");
+        let corrected_input: Vec<f32> = normalized
+            .iter()
+            .zip(&s_in_values)
+            .map(|(value, scale)| value * scale)
+            .collect();
+        let expected = projection_matrices
+            .iter()
+            .map(|matrix| {
+                let row = matrix
+                    .row_operation(0)
+                    .expect("resolve oracle projection row");
+                let value = cpu
+                    .recovered_row_matvec(&RecoveredRowMatVec {
+                        dtype: row.dtype,
+                        weights: row.weights,
+                        corrected_input: &corrected_input,
+                        s_out: row.s_out,
+                    })
+                    .expect("execute oracle projection row");
+                vec![value; matrix.matrix.rows]
+            })
+            .collect::<Vec<_>>();
+        let actual = runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .expect("dispatch first three decode steps through shared arena");
+        for (branch, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+            for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 4.0e-4_f32.max(expected.abs() * 7.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "shared-arena branch {branch} row {row}: expected {expected}, got {actual}"
+                );
             }
         }
     }
