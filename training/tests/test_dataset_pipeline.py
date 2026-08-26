@@ -168,6 +168,7 @@ from run_teacher_batches import (  # noqa: E402
 )
 from run_activation_batches import (  # noqa: E402
     completed_batch_matches as completed_activation_batch_matches,
+    validate_batch_plan as validate_activation_batch_plan,
 )
 from finalize_activation_assignment import verified_artifacts  # noqa: E402
 
@@ -357,6 +358,59 @@ class DatasetPipelineTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "sequence limit"):
             activation_batches(records, token_counts, 3, 70, 59)
+
+    def test_activation_runner_rebuilds_and_rehashes_its_batch_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "records.jsonl"
+            source.write_text(
+                "\n".join(
+                    json.dumps({"id": sample_id}) for sample_id in ("a", "b", "c")
+                )
+                + "\n"
+            )
+            token_plan = root / "tokens.json"
+            token_plan.write_text(
+                json.dumps(
+                    {
+                        "samples": [
+                            {"id": "a", "sequence_tokens": 11},
+                            {"id": "b", "sequence_tokens": 13},
+                            {"id": "c", "sequence_tokens": 17},
+                        ]
+                    }
+                )
+            )
+            records = [{"id": sample_id} for sample_id in ("a", "b", "c")]
+            token_counts = {"a": 11, "b": 13, "c": 17}
+            batches = activation_batches(records, token_counts, 2, 32, 32)
+            plan = {
+                "format": "ctox.activation-batch-plan.v1",
+                "input": str(source.resolve()),
+                "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "cache_plans": [
+                    {
+                        "path": str(token_plan.resolve()),
+                        "sha256": hashlib.sha256(token_plan.read_bytes()).hexdigest(),
+                    }
+                ],
+                "limits": {
+                    "max_samples": 2,
+                    "max_batch_tokens": 32,
+                    "max_sequence_tokens": 32,
+                },
+                "summary": {
+                    "batches": len(batches),
+                    "samples": 3,
+                    "sequence_tokens": 41,
+                },
+                "batches": batches,
+            }
+            self.assertEqual(validate_activation_batch_plan(plan, source), batches)
+
+            token_plan.write_text(token_plan.read_text() + "\n")
+            with self.assertRaisesRegex(ValueError, "token-count plan changed"):
+                validate_activation_batch_plan(plan, source)
 
     def test_activation_statistics_save_is_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

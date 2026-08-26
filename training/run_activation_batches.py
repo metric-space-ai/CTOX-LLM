@@ -12,7 +12,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from plan_activation_batches import activation_batches
 from run_teacher_batches import cache_environment, gpu_weight_memory_for_batch
+from select_activation_calibration import load_jsonl, load_token_counts
 
 
 def sha256(path: Path) -> str:
@@ -42,6 +44,65 @@ def completed_batch_matches(
         and int(verification.get("sequence_tokens", -1))
         == int(batch["sequence_tokens"])
     )
+
+
+def validate_batch_plan(
+    batch_plan: dict[str, Any],
+    input_path: Path,
+) -> list[dict[str, Any]]:
+    """Rebuild the immutable batch schedule from its still-hashed token plans."""
+
+    if batch_plan.get("format") != "ctox.activation-batch-plan.v1":
+        raise ValueError("unsupported activation batch-plan format")
+    resolved_input = input_path.expanduser().resolve()
+    if Path(str(batch_plan.get("input", ""))).expanduser().resolve() != resolved_input:
+        raise ValueError("activation input path differs from the batch plan")
+    input_bytes = resolved_input.read_bytes()
+    if hashlib.sha256(input_bytes).hexdigest() != batch_plan.get("input_sha256"):
+        raise ValueError("activation input does not match the batch plan")
+    records = load_jsonl(resolved_input)
+    record_ids = {str(record["id"]) for record in records}
+    if len(record_ids) != len(records):
+        raise ValueError("activation input contains duplicate sample ids")
+
+    cache_plan_records = batch_plan.get("cache_plans")
+    if not isinstance(cache_plan_records, list) or not cache_plan_records:
+        raise ValueError("activation batch plan has no token-count sources")
+    cache_plan_paths = []
+    for record in cache_plan_records:
+        if not isinstance(record, dict):
+            raise ValueError("activation token-count source is not an object")
+        path = Path(str(record.get("path", ""))).expanduser().resolve()
+        encoded = path.read_bytes()
+        actual_sha256 = hashlib.sha256(encoded).hexdigest()
+        if actual_sha256 != record.get("sha256"):
+            raise ValueError(
+                f"activation token-count plan changed: {path} is {actual_sha256}, "
+                f"expected {record.get('sha256')}"
+            )
+        cache_plan_paths.append(path)
+    token_counts = load_token_counts(cache_plan_paths, record_ids)
+
+    limits = batch_plan.get("limits")
+    if not isinstance(limits, dict):
+        raise ValueError("activation batch plan has no limits")
+    rebuilt = activation_batches(
+        records,
+        token_counts,
+        int(limits["max_samples"]),
+        int(limits["max_batch_tokens"]),
+        int(limits["max_sequence_tokens"]),
+    )
+    if rebuilt != batch_plan.get("batches"):
+        raise ValueError("activation batches differ from their token-count sources")
+    summary = {
+        "batches": len(rebuilt),
+        "samples": sum(int(batch["samples"]) for batch in rebuilt),
+        "sequence_tokens": sum(int(batch["sequence_tokens"]) for batch in rebuilt),
+    }
+    if summary != batch_plan.get("summary"):
+        raise ValueError("activation batch summary differs from the rebuilt schedule")
+    return rebuilt
 
 
 def main() -> None:
@@ -78,14 +139,13 @@ def main() -> None:
 
     batch_plan_bytes = args.batch_plan.read_bytes()
     batch_plan = json.loads(batch_plan_bytes)
-    if batch_plan.get("format") != "ctox.activation-batch-plan.v1":
-        raise SystemExit("unsupported activation batch-plan format")
-    if sha256(args.input) != batch_plan.get("input_sha256"):
-        raise SystemExit("activation input does not match the batch plan")
+    try:
+        batches = validate_batch_plan(batch_plan, args.input)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
     quant_plan_sha256 = sha256(args.plan)
     provenance_sha256 = sha256(args.local_model_provenance)
     batch_plan_sha256 = hashlib.sha256(batch_plan_bytes).hexdigest()
-    batches = batch_plan["batches"]
     end_batch = len(batches) if args.end_batch is None else args.end_batch
     if not 0 <= args.start_batch < end_batch <= len(batches):
         raise SystemExit("invalid activation batch range")

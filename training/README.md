@@ -210,6 +210,11 @@ This reserves attention/KV headroom for 128K-class samples without changing
 model, data, quantization, or recovery semantics. The lower tier must be
 positive and cannot exceed the ordinary tier; an invalid profile fails before
 starting any batch.
+Before launching an activation batch, `run_activation_batches.py` rehashes
+every token-count cache plan named by the immutable batch plan, reloads the
+complete materialized cohort, and deterministically rebuilds every batch and
+summary count. A stale source hash or a schedule that claims samples not
+derivable from its named token plans fails before model load.
 `--hf-home` binds the already provisioned Hugging Face cache root explicitly
 for the model and pinned-kernel subprocesses; this prevents a stale host login
 cache or symlink from changing where an admitted run reads and writes.
