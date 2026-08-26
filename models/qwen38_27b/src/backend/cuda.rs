@@ -533,6 +533,8 @@ pub const GATED_RMS_NORM_F16_SYMBOL: &str = "ctox_gated_rms_norm_f16_sm86";
 pub const QWEN_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_rms_norm_f16_sm86";
 pub const RESIDUAL_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_residual_rms_norm_f16_sm86";
 pub const PARTIAL_ROPE_F32_SYMBOL: &str = "ctox_partial_rope_f32_sm86";
+pub const ROPE_TABLE_BATCH_F32_SYMBOL: &str = "ctox_rope_table_batch_f32_sm86";
+pub const PARTIAL_ROPE_BATCH_F32_SYMBOL: &str = "ctox_partial_rope_batch_f32_sm86";
 pub const QUERY_GATE_NORM_ROPE_F32_SYMBOL: &str = "ctox_qwen_query_gate_norm_rope_f32_sm86";
 pub const PACK_PAGED_KV_Q4_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_f32_sm86";
 pub const PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_batch_f32_sm86";
@@ -1653,6 +1655,8 @@ mod tests {
             QWEN_RMS_NORM_F16_SYMBOL,
             RESIDUAL_RMS_NORM_F16_SYMBOL,
             PARTIAL_ROPE_F32_SYMBOL,
+            ROPE_TABLE_BATCH_F32_SYMBOL,
+            PARTIAL_ROPE_BATCH_F32_SYMBOL,
             QUERY_GATE_NORM_ROPE_F32_SYMBOL,
             PACK_PAGED_KV_Q4_F32_SYMBOL,
             PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL,

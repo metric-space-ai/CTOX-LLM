@@ -29,13 +29,13 @@ use super::cuda::{
     PAGED_GQA_DESCRIPTOR_BYTES, PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
     PAGED_GQA_SPLIT_SEGMENTS, PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL,
     PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL,
-    PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_BATCHED_MMQ_SYMBOL,
-    Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
-    Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_BATCHED_MATMUL_SYMBOL, Q4_B64_A8_BATCHED_MMQ_SYMBOL,
-    Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
-    Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
-    RESIDUAL_RMS_NORM_F16_SYMBOL, SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
-    TOPK_TOPP_SAMPLE_F32_SYMBOL,
+    PARTIAL_ROPE_BATCH_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_BATCHED_MATMUL_SYMBOL,
+    Q2_B64_A8_BATCHED_MMQ_SYMBOL, Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
+    Q2_B64_FUSED_MATVEC, Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_BATCHED_MATMUL_SYMBOL,
+    Q4_B64_A8_BATCHED_MMQ_SYMBOL, Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL,
+    Q4_B64_FUSED_MATVEC, Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL,
+    QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL, ROPE_TABLE_BATCH_F32_SYMBOL,
+    SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL, TOPK_TOPP_SAMPLE_F32_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -236,6 +236,8 @@ struct CudaContextInner {
     qwen_rms_norm_f16_function: CuFunction,
     residual_rms_norm_f16_function: CuFunction,
     partial_rope_f32_function: CuFunction,
+    rope_table_batch_f32_function: CuFunction,
+    partial_rope_batch_f32_function: CuFunction,
     query_gate_norm_rope_f32_function: CuFunction,
     pack_paged_kv_q4_f32_function: CuFunction,
     pack_paged_kv_q4_batch_f32_function: CuFunction,
@@ -822,6 +824,18 @@ pub struct PreparedCudaPartialRope {
     transient_bytes: usize,
 }
 
+/// Shared prompt-chunk RoPE table. Query and key operators borrow the same
+/// position/frequency values; only the active token prefix is initialized.
+pub struct PreparedCudaBatchedRopeWorkspace {
+    context: Rc<CudaContextInner>,
+    token_capacity: u32,
+    rotary_dim: u32,
+    theta: f32,
+    cosine: DeviceBuffer,
+    sine: DeviceBuffer,
+    transient_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CudaQueryGateConfig {
     pub heads: usize,
@@ -1293,6 +1307,28 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let rope_table_batch_f32_function =
+            match resolve_function(&driver, module, ROPE_TABLE_BATCH_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let partial_rope_batch_f32_function =
+            match resolve_function(&driver, module, PARTIAL_ROPE_BATCH_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let query_gate_norm_rope_f32_function =
             match resolve_function(&driver, module, QUERY_GATE_NORM_ROPE_F32_SYMBOL) {
                 Ok(function) => function,
@@ -1433,6 +1469,8 @@ impl CudaCandidateRuntime {
                 qwen_rms_norm_f16_function,
                 residual_rms_norm_f16_function,
                 partial_rope_f32_function,
+                rope_table_batch_f32_function,
+                partial_rope_batch_f32_function,
                 query_gate_norm_rope_f32_function,
                 pack_paged_kv_q4_f32_function,
                 pack_paged_kv_q4_batch_f32_function,
@@ -3459,6 +3497,207 @@ impl CudaCandidateRuntime {
         };
         prepared.write_position(0)?;
         Ok(prepared)
+    }
+
+    pub fn prepare_batched_rope_workspace(
+        &self,
+        config: CudaPartialRopeConfig,
+        token_capacity: usize,
+    ) -> Result<PreparedCudaBatchedRopeWorkspace> {
+        if config.heads == 0
+            || config.head_dim == 0
+            || config.rotary_dim == 0
+            || !config.rotary_dim.is_multiple_of(2)
+            || config.rotary_dim > config.head_dim
+            || !config.theta.is_finite()
+            || config.theta <= 0.0
+            || u32::try_from(config.rotary_dim).is_err()
+        {
+            return Err(EngineError::Shape(
+                "invalid CUDA batched RoPE geometry or theta".into(),
+            ));
+        }
+        let token_capacity = validate_a8_batch_capacity(token_capacity)?;
+        let table_bytes = (token_capacity as usize)
+            .checked_mul(config.rotary_dim / 2)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA batched RoPE table overflows".into()))?;
+        self.make_current()?;
+        Ok(PreparedCudaBatchedRopeWorkspace {
+            context: Rc::clone(&self.inner),
+            token_capacity,
+            rotary_dim: config.rotary_dim as u32,
+            theta: config.theta,
+            cosine: DeviceBuffer::allocate(self, table_bytes)?,
+            sine: DeviceBuffer::allocate(self, table_bytes)?,
+            transient_bytes: table_bytes * 2,
+        })
+    }
+
+    /// Builds the compact prompt position table once. Query and key operators
+    /// may then consume the same workspace without repeating transcendental
+    /// work per head or per projection.
+    pub fn write_batched_rope_positions(
+        &self,
+        workspace: &PreparedCudaBatchedRopeWorkspace,
+        start_position: u64,
+        token_count: usize,
+    ) -> Result<()> {
+        let token_count = validate_a8_batch_capacity(token_count)?;
+        if !Rc::ptr_eq(&self.inner, &workspace.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA batched RoPE workspace belongs to another context".into(),
+            ));
+        }
+        if token_count > workspace.token_capacity
+            || workspace.rotary_dim == 0
+            || !workspace.rotary_dim.is_multiple_of(2)
+        {
+            return Err(EngineError::Shape(
+                "CUDA batched RoPE token count or workspace is invalid".into(),
+            ));
+        }
+        start_position
+            .checked_add(token_count as u64)
+            .ok_or_else(|| EngineError::Shape("CUDA batched RoPE position overflows".into()))?;
+        self.make_current()?;
+        let mut cosine = workspace.cosine.ptr();
+        let mut sine = workspace.sine.ptr();
+        let mut first_position = start_position;
+        let mut table_tokens = token_count;
+        let mut rotary_dim = workspace.rotary_dim;
+        let mut theta = workspace.theta;
+        let mut table_params = [
+            (&mut cosine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut sine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut first_position as *mut u64).cast::<c_void>(),
+            (&mut table_tokens as *mut u32).cast::<c_void>(),
+            (&mut rotary_dim as *mut u32).cast::<c_void>(),
+            (&mut theta as *mut f32).cast::<c_void>(),
+        ];
+        let table_values = token_count
+            .checked_mul(rotary_dim / 2)
+            .ok_or_else(|| EngineError::Shape("CUDA batched RoPE table grid overflows".into()))?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.rope_table_batch_f32_function,
+                    table_values.div_ceil(LINEAR_THREADS_PER_BLOCK),
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    table_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "batched RoPE table kernel launch",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Applies a previously built prompt table in place to token-major Q or K.
+    pub fn dispatch_batched_partial_rope_with_table_f32_device<'a>(
+        &self,
+        workspace: &PreparedCudaBatchedRopeWorkspace,
+        config: CudaPartialRopeConfig,
+        values: CudaDeviceF32View<'a>,
+        token_count: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let token_count = validate_a8_batch_capacity(token_count)?;
+        if !Rc::ptr_eq(&self.inner, &workspace.context) || !Rc::ptr_eq(&self.inner, values.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA batched partial RoPE crosses driver contexts".into(),
+            ));
+        }
+        if token_count > workspace.token_capacity
+            || config.rotary_dim as u32 != workspace.rotary_dim
+            || config.theta.to_bits() != workspace.theta.to_bits()
+            || config.heads == 0
+            || config.head_dim == 0
+            || config.rotary_dim == 0
+            || !config.rotary_dim.is_multiple_of(2)
+            || config.rotary_dim > config.head_dim
+            || u32::try_from(config.heads).is_err()
+            || u32::try_from(config.head_dim).is_err()
+        {
+            return Err(EngineError::Shape(
+                "CUDA batched partial RoPE workspace/config mismatch".into(),
+            ));
+        }
+        let expected_values = (token_count as usize)
+            .checked_mul(config.heads)
+            .and_then(|values| values.checked_mul(config.head_dim))
+            .ok_or_else(|| EngineError::Shape("CUDA batched RoPE tensor overflows".into()))?;
+        if values.values() != expected_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA batched partial RoPE has {} values, expected {expected_values}",
+                values.values()
+            )));
+        }
+        self.make_current()?;
+        let mut values_ptr = values.ptr()?;
+        let mut cosine = workspace.cosine.ptr();
+        let mut sine = workspace.sine.ptr();
+        let mut table_tokens = token_count;
+        let mut heads = config.heads as u32;
+        let mut head_dim = config.head_dim as u32;
+        let mut rotary_dim = config.rotary_dim as u32;
+        let mut apply_params = [
+            (&mut values_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut cosine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut sine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut table_tokens as *mut u32).cast::<c_void>(),
+            (&mut heads as *mut u32).cast::<c_void>(),
+            (&mut head_dim as *mut u32).cast::<c_void>(),
+            (&mut rotary_dim as *mut u32).cast::<c_void>(),
+        ];
+        let pair_count = heads
+            .checked_mul(rotary_dim / 2)
+            .ok_or_else(|| EngineError::Shape("CUDA batched RoPE pair grid overflows".into()))?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.partial_rope_batch_f32_function,
+                    pair_count.div_ceil(LINEAR_THREADS_PER_BLOCK),
+                    token_count,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    apply_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "batched partial-RoPE kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("batched partial-RoPE context synchronization")?;
+        Ok(values)
+    }
+
+    /// Convenience path for one consumer. Full-attention prefill should call
+    /// `write_batched_rope_positions` once and apply the table to both Q/K.
+    pub fn dispatch_batched_partial_rope_f32_device<'a>(
+        &self,
+        workspace: &PreparedCudaBatchedRopeWorkspace,
+        config: CudaPartialRopeConfig,
+        values: CudaDeviceF32View<'a>,
+        start_position: u64,
+        token_count: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        self.write_batched_rope_positions(workspace, start_position, token_count)?;
+        self.dispatch_batched_partial_rope_with_table_f32_device(
+            workspace,
+            config,
+            values,
+            token_count,
+        )
     }
 
     pub fn dispatch_partial_rope_f32(
@@ -7650,6 +7889,16 @@ impl PreparedCudaPartialRope {
         }
         self.cosine.write(as_bytes(&cosine))?;
         self.sine.write(as_bytes(&sine))
+    }
+}
+
+impl PreparedCudaBatchedRopeWorkspace {
+    pub fn token_capacity(&self) -> usize {
+        self.token_capacity as usize
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
     }
 }
 

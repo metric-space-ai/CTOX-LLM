@@ -121,6 +121,11 @@ path = "src/bin/cuda_linear_ops_verify.rs"
 required-features = ["cuda"]
 
 [[bin]]
+name = "qwen38-cuda-batched-rope-verify"
+path = "src/bin/cuda_batched_rope_verify.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "qwen38-cuda-causal-conv-scan-verify"
 path = "src/bin/cuda_causal_conv_scan_verify.rs"
 required-features = ["cuda"]

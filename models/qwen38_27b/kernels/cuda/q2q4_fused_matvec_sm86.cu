@@ -1264,6 +1264,71 @@ void ctox_partial_rope_f32_sm86(
     values[base + index + half_dim] = right * cosine[index] + left * sine[index];
 }
 
+// Build one compact [token, rotary-pair] table for the prompt chunk. Query and
+// key RoPE share these values, avoiding repeated transcendental work per head.
+// ref: ggml/src/ggml-cuda/rope.cu:254-270
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_rope_table_batch_f32_sm86(
+    float* __restrict__ cosine,
+    float* __restrict__ sine,
+    unsigned long long start_position,
+    unsigned token_count,
+    unsigned rotary_dim,
+    float theta) {
+    const unsigned half_dim = rotary_dim / 2u;
+    const unsigned table_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned table_values = token_count * half_dim;
+    if (table_index >= table_values || rotary_dim == 0u
+        || (rotary_dim & 1u) != 0u || theta <= 0.0f) {
+        return;
+    }
+    const unsigned token = table_index / half_dim;
+    const unsigned pair = table_index - token * half_dim;
+    const float exponent = __fdiv_rn(
+        -2.0f * static_cast<float>(pair), static_cast<float>(rotary_dim));
+    // The module is compiled with fast single-precision math for MMQ. RoPE at
+    // 128K+ cannot tolerate the corresponding approximate sincos intrinsic,
+    // so use correctly rounded f32 boundaries around double libdevice calls.
+    const float inverse_frequency = static_cast<float>(
+        pow(static_cast<double>(theta), static_cast<double>(exponent)));
+    const float angle = __fmul_rn(
+        static_cast<float>(start_position + token), inverse_frequency);
+    sine[table_index] = static_cast<float>(sin(static_cast<double>(angle)));
+    cosine[table_index] = static_cast<float>(cos(static_cast<double>(angle)));
+}
+
+// Apply the shared prompt table in place to token-major Q or K. The Y grid
+// owns tokens and the X grid owns (head, rotary-pair), eliminating the host
+// token loop while preserving the untouched non-rotary tail exactly.
+// ref: ggml/src/ggml-cuda/rope.cu:116-183
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_partial_rope_batch_f32_sm86(
+    float* __restrict__ values,
+    const float* __restrict__ cosine,
+    const float* __restrict__ sine,
+    unsigned token_count,
+    unsigned heads,
+    unsigned head_dim,
+    unsigned rotary_dim) {
+    const unsigned token = blockIdx.y;
+    const unsigned pair_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned half_dim = rotary_dim / 2u;
+    const unsigned pair_count = heads * half_dim;
+    if (token >= token_count || pair_index >= pair_count || rotary_dim == 0u
+        || (rotary_dim & 1u) != 0u || rotary_dim > head_dim) {
+        return;
+    }
+    const unsigned head = pair_index / half_dim;
+    const unsigned pair = pair_index - head * half_dim;
+    const unsigned base = (token * heads + head) * head_dim;
+    const unsigned table_index = token * half_dim + pair;
+    const float left = values[base + pair];
+    const float right = values[base + pair + half_dim];
+    values[base + pair] = left * cosine[table_index] - right * sine[table_index];
+    values[base + pair + half_dim] =
+        right * cosine[table_index] + left * sine[table_index];
+}
+
 // Qwen q_proj emits one [query(256), gate(256)] pair per head. This candidate
 // fuses that semantic deinterleave with per-head Qwen (1 + weight) RMSNorm and
 // NeoX partial RoPE, while copying gate rows into a contiguous producer buffer.

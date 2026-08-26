@@ -303,9 +303,12 @@ production-shaped KV page packer consumes token-major device K/V views and
 submits one two-dimensional launch per crossed page rather than one launch per
 token. On the 40-token SM86 fixture, five page launches produce bit-identical
 all-Q4 attention and the same 24-Q2/16-Q4 mixed cache as the scalar oracle;
-the pack kernel uses 16 registers with no spills. Batched key RoPE and executor
-replacement of the current sequential loop remain open. The schedule names
-batched key RoPE and persistent KV append
+the pack kernel uses 16 registers with no spills. Batched partial RoPE now
+builds one compact position table on device and shares it across token-major
+query and key views; at position 131,071 both remain within `5.97e-8` of the
+sequential CUDA path and preserve every non-rotary tail value bit-for-bit.
+Batched query/gate deinterleave+RMSNorm and executor replacement of the current
+sequential loop remain open. The schedule names batched key RoPE and persistent KV append
 explicitly before every causal GQA scan; these state mutations can no longer
 be hidden by a nominal attention step.
 
