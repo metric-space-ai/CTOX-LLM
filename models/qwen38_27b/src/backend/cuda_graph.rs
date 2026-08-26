@@ -10,11 +10,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::cuda_runtime::{
-    CudaCandidateRuntime, PreparedCudaA8Activation, PreparedCudaA8Projection,
+    CudaCandidateRuntime, CudaCausalConvConfig, CudaGatedDeltaConfig, CudaGatedRmsNormConfig,
+    CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig, CudaRmsNormConfig,
+    PreparedCudaA8Activation, PreparedCudaA8Projection, PreparedCudaCausalConv,
+    PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs, PreparedCudaGatedRmsNorm,
+    PreparedCudaPagedGqa, PreparedCudaPartialRope, PreparedCudaQueryGate, PreparedCudaRmsNorm,
 };
 use crate::backend::{Activation, ScaleSlice};
+use crate::config::LayerKind;
 use crate::fanout::qwen38_fanout_groups;
-use crate::loader::ModelArtifact;
+use crate::kv_cache::{DEFAULT_KV_PAGE_TOKENS, DEFAULT_KV_RECENT_TOKENS, DEFAULT_KV_SINK_TOKENS};
+use crate::loader::{FloatTensorView, ModelArtifact};
 use crate::tensor_contract::{expected_tensor_contract, validate_tensor_contract, TensorClass};
 use crate::{EngineError, Qwen38Config, Result};
 
@@ -167,8 +173,101 @@ pub struct PreparedCudaProjectionGraph {
     plan: CudaProjectionPlan,
     activations: BTreeMap<String, PreparedCudaA8Activation>,
     projections: BTreeMap<String, PreparedCudaA8Projection>,
+    linear_mixers: BTreeMap<usize, PreparedCudaLinearMixerLayer>,
+    full_attention: BTreeMap<String, PreparedCudaFullAttentionLayer>,
     model_bytes: u64,
     graph_bytes: u64,
+    session_bytes: u64,
+}
+
+pub struct PreparedCudaFullAttentionLayer {
+    key: String,
+    query_gate: PreparedCudaQueryGate,
+    key_norm: PreparedCudaRmsNorm,
+    key_rope: PreparedCudaPartialRope,
+    kv: PreparedCudaPagedGqa,
+    model_bytes: u64,
+    graph_bytes: u64,
+    session_bytes: u64,
+}
+
+impl PreparedCudaFullAttentionLayer {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn query_gate(&self) -> &PreparedCudaQueryGate {
+        &self.query_gate
+    }
+
+    pub fn key_norm(&self) -> &PreparedCudaRmsNorm {
+        &self.key_norm
+    }
+
+    pub fn key_rope(&self) -> &PreparedCudaPartialRope {
+        &self.key_rope
+    }
+
+    pub fn kv_mut(&mut self) -> &mut PreparedCudaPagedGqa {
+        &mut self.kv
+    }
+
+    pub fn model_bytes(&self) -> u64 {
+        self.model_bytes
+    }
+
+    pub fn graph_bytes(&self) -> u64 {
+        self.graph_bytes
+    }
+
+    pub fn session_bytes(&self) -> u64 {
+        self.session_bytes
+    }
+}
+
+pub struct PreparedCudaLinearMixerLayer {
+    layer: usize,
+    convolution: PreparedCudaCausalConv,
+    inputs: PreparedCudaGatedDeltaInputs,
+    recurrence: PreparedCudaGatedDelta,
+    norm: PreparedCudaGatedRmsNorm,
+    model_bytes: u64,
+    graph_bytes: u64,
+    session_bytes: u64,
+}
+
+impl PreparedCudaLinearMixerLayer {
+    pub fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub fn model_bytes(&self) -> u64 {
+        self.model_bytes
+    }
+
+    pub fn graph_bytes(&self) -> u64 {
+        self.graph_bytes
+    }
+
+    pub fn session_bytes(&self) -> u64 {
+        self.session_bytes
+    }
+
+    pub fn convolution_mut(&mut self) -> &mut PreparedCudaCausalConv {
+        &mut self.convolution
+    }
+
+    pub fn inputs_mut(&mut self) -> &mut PreparedCudaGatedDeltaInputs {
+        &mut self.inputs
+    }
+
+    pub fn recurrence_mut(&mut self) -> &mut PreparedCudaGatedDelta {
+        &mut self.recurrence
+    }
+
+    pub fn norm(&self) -> &PreparedCudaGatedRmsNorm {
+        &self.norm
+    }
 }
 
 impl PreparedCudaProjectionGraph {
@@ -176,13 +275,26 @@ impl PreparedCudaProjectionGraph {
         runtime: &CudaCandidateRuntime,
         artifact: &ModelArtifact,
         config: &Qwen38Config,
+        maximum_context_tokens: usize,
     ) -> Result<Self> {
+        if maximum_context_tokens < DEFAULT_KV_SINK_TOKENS + DEFAULT_KV_RECENT_TOKENS
+            || maximum_context_tokens > config.max_position_embeddings
+        {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA context {maximum_context_tokens} must be between {} and {} tokens",
+                DEFAULT_KV_SINK_TOKENS + DEFAULT_KV_RECENT_TOKENS,
+                config.max_position_embeddings
+            )));
+        }
         validate_tensor_contract(artifact.manifest(), config)?;
         let plan = CudaProjectionPlan::qwen38(config)?;
         let mut activations = BTreeMap::new();
         let mut projections = BTreeMap::new();
+        let mut linear_mixers = BTreeMap::new();
+        let mut full_attention = BTreeMap::new();
         let mut model_bytes = 0_u64;
         let mut graph_bytes = 0_u64;
+        let mut session_bytes = 0_u64;
 
         for group in plan.groups() {
             let first_name = group.projection_names.first().ok_or_else(|| {
@@ -262,13 +374,133 @@ impl PreparedCudaProjectionGraph {
                 plan.projection_count()
             )));
         }
+
+        for layer in 0..config.num_hidden_layers {
+            if config.layer_kind(layer) != Some(LayerKind::LinearAttention) {
+                continue;
+            }
+            let prefix = format!("model.language_model.layers.{layer}.linear_attn");
+            let convolution = runtime.prepare_causal_conv_f16(
+                CudaCausalConvConfig::QWEN38_27B,
+                artifact_f16(artifact, &format!("{prefix}.conv1d.weight"))?,
+            )?;
+            let inputs = runtime.prepare_gated_delta_inputs_f32_le(
+                artifact_f32(artifact, &format!("{prefix}.A_log"))?,
+                artifact_f32(artifact, &format!("{prefix}.dt_bias"))?,
+            )?;
+            let recurrence = runtime.prepare_gated_delta_f16(CudaGatedDeltaConfig::QWEN38_27B)?;
+            let norm = runtime.prepare_gated_rms_norm_f16(
+                CudaGatedRmsNormConfig::QWEN38_27B,
+                artifact_f16(artifact, &format!("{prefix}.norm.weight"))?,
+            )?;
+            let mixer_model_bytes = sum_usize(
+                [
+                    convolution.model_bytes(),
+                    inputs.model_bytes(),
+                    norm.model_bytes(),
+                ],
+                "CUDA linear mixer model bytes",
+            )?;
+            let mixer_graph_bytes = sum_usize(
+                [
+                    convolution.transient_bytes(),
+                    inputs.transient_bytes(),
+                    recurrence.transient_bytes(),
+                    norm.transient_bytes(),
+                ],
+                "CUDA linear mixer graph bytes",
+            )?;
+            let mixer_session_bytes = sum_usize(
+                [
+                    convolution.resident_state_bytes(),
+                    recurrence.resident_state_bytes(),
+                ],
+                "CUDA linear mixer session bytes",
+            )?;
+            model_bytes = checked_add(model_bytes, mixer_model_bytes, "CUDA model bytes")?;
+            graph_bytes = checked_add(graph_bytes, mixer_graph_bytes, "CUDA graph bytes")?;
+            session_bytes = checked_add(session_bytes, mixer_session_bytes, "CUDA session bytes")?;
+            let mixer = PreparedCudaLinearMixerLayer {
+                layer,
+                convolution,
+                inputs,
+                recurrence,
+                norm,
+                model_bytes: mixer_model_bytes,
+                graph_bytes: mixer_graph_bytes,
+                session_bytes: mixer_session_bytes,
+            };
+            if linear_mixers.insert(layer, mixer).is_some() {
+                return Err(EngineError::InvalidState(format!(
+                    "duplicate CUDA linear mixer layer {layer}"
+                )));
+            }
+        }
+        if linear_mixers.len() != config.linear_attention_layers() {
+            return Err(EngineError::InvalidState(format!(
+                "prepared CUDA graph has {} linear mixers, expected {}",
+                linear_mixers.len(),
+                config.linear_attention_layers()
+            )));
+        }
+
+        for layer in 0..config.num_hidden_layers {
+            if config.layer_kind(layer) != Some(LayerKind::FullAttention) {
+                continue;
+            }
+            let key = format!("target:{layer}");
+            let prefix = format!("model.language_model.layers.{layer}.self_attn");
+            let prepared = prepare_full_attention(
+                runtime,
+                artifact,
+                config,
+                &key,
+                &prefix,
+                maximum_context_tokens,
+            )?;
+            model_bytes = checked_add(model_bytes, prepared.model_bytes, "CUDA model bytes")?;
+            graph_bytes = checked_add(graph_bytes, prepared.graph_bytes, "CUDA graph bytes")?;
+            session_bytes =
+                checked_add(session_bytes, prepared.session_bytes, "CUDA session bytes")?;
+            if full_attention.insert(key.clone(), prepared).is_some() {
+                return Err(EngineError::InvalidState(format!(
+                    "duplicate CUDA full-attention layer {key}"
+                )));
+            }
+        }
+        let mtp_key = "mtp:0".to_owned();
+        let mtp = prepare_full_attention(
+            runtime,
+            artifact,
+            config,
+            &mtp_key,
+            "mtp.layers.0.self_attn",
+            maximum_context_tokens,
+        )?;
+        model_bytes = checked_add(model_bytes, mtp.model_bytes, "CUDA model bytes")?;
+        graph_bytes = checked_add(graph_bytes, mtp.graph_bytes, "CUDA graph bytes")?;
+        session_bytes = checked_add(session_bytes, mtp.session_bytes, "CUDA session bytes")?;
+        full_attention.insert(mtp_key, mtp);
+        let expected_full_attention = config
+            .full_attention_layers()
+            .checked_add(config.mtp_num_hidden_layers)
+            .ok_or_else(|| EngineError::Shape("CUDA full-attention count overflows".into()))?;
+        if full_attention.len() != expected_full_attention {
+            return Err(EngineError::InvalidState(format!(
+                "prepared CUDA graph has {} full-attention states, expected {expected_full_attention}",
+                full_attention.len()
+            )));
+        }
         Ok(Self {
             artifact: artifact.clone(),
             plan,
             activations,
             projections,
+            linear_mixers,
+            full_attention,
             model_bytes,
             graph_bytes,
+            session_bytes,
         })
     }
 
@@ -292,6 +524,38 @@ impl PreparedCudaProjectionGraph {
         })
     }
 
+    pub fn linear_mixer_count(&self) -> usize {
+        self.linear_mixers.len()
+    }
+
+    pub fn linear_mixer(&self, layer: usize) -> Result<&PreparedCudaLinearMixerLayer> {
+        self.linear_mixers.get(&layer).ok_or_else(|| {
+            EngineError::InvalidState(format!("prepared CUDA linear mixer {layer} not found"))
+        })
+    }
+
+    pub fn linear_mixer_mut(&mut self, layer: usize) -> Result<&mut PreparedCudaLinearMixerLayer> {
+        self.linear_mixers.get_mut(&layer).ok_or_else(|| {
+            EngineError::InvalidState(format!("prepared CUDA linear mixer {layer} not found"))
+        })
+    }
+
+    pub fn full_attention_count(&self) -> usize {
+        self.full_attention.len()
+    }
+
+    pub fn full_attention(&self, key: &str) -> Result<&PreparedCudaFullAttentionLayer> {
+        self.full_attention.get(key).ok_or_else(|| {
+            EngineError::InvalidState(format!("prepared CUDA full attention {key} not found"))
+        })
+    }
+
+    pub fn full_attention_mut(&mut self, key: &str) -> Result<&mut PreparedCudaFullAttentionLayer> {
+        self.full_attention.get_mut(key).ok_or_else(|| {
+            EngineError::InvalidState(format!("prepared CUDA full attention {key} not found"))
+        })
+    }
+
     pub fn model_bytes(&self) -> u64 {
         self.model_bytes
     }
@@ -300,8 +564,96 @@ impl PreparedCudaProjectionGraph {
         self.graph_bytes
     }
 
+    pub fn session_bytes(&self) -> u64 {
+        self.session_bytes
+    }
+
     pub fn resident_bytes(&self) -> Result<u64> {
-        checked_add(self.model_bytes, self.graph_bytes, "CUDA resident bytes")
+        checked_add(
+            checked_add(self.model_bytes, self.graph_bytes, "CUDA resident bytes")?,
+            self.session_bytes,
+            "CUDA resident bytes",
+        )
+    }
+}
+
+fn prepare_full_attention(
+    runtime: &CudaCandidateRuntime,
+    artifact: &ModelArtifact,
+    config: &Qwen38Config,
+    key: &str,
+    prefix: &str,
+    maximum_context_tokens: usize,
+) -> Result<PreparedCudaFullAttentionLayer> {
+    let query_gate = runtime.prepare_query_gate_norm_rope_f32(
+        CudaQueryGateConfig::QWEN38_27B,
+        artifact_f16(artifact, &format!("{prefix}.q_norm.weight"))?,
+    )?;
+    let key_norm = runtime.prepare_qwen_rms_norm_f16(
+        CudaRmsNormConfig {
+            rows: config.num_key_value_heads,
+            columns: config.head_dim,
+            epsilon: config.rms_norm_epsilon,
+        },
+        artifact_f16(artifact, &format!("{prefix}.k_norm.weight"))?,
+    )?;
+    let key_rope = runtime.prepare_partial_rope_f32(CudaPartialRopeConfig {
+        heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        rotary_dim: config.rotary_dim,
+        theta: config.rope_theta,
+    })?;
+    let kv = runtime.prepare_paged_q2q4_gqa(CudaPagedGqaConfig {
+        query_heads: config.num_attention_heads,
+        key_value_heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        maximum_tokens: maximum_context_tokens,
+        page_tokens: DEFAULT_KV_PAGE_TOKENS,
+        sink_tokens: DEFAULT_KV_SINK_TOKENS,
+        recent_tokens: DEFAULT_KV_RECENT_TOKENS,
+    })?;
+    let model_bytes = sum_usize(
+        [query_gate.model_bytes(), key_norm.model_bytes()],
+        "CUDA full-attention model bytes",
+    )?;
+    let graph_bytes = sum_usize(
+        [
+            query_gate.transient_bytes(),
+            key_norm.transient_bytes(),
+            key_rope.transient_bytes(),
+            kv.transient_bytes(),
+        ],
+        "CUDA full-attention graph bytes",
+    )?;
+    let session_bytes = u64::try_from(kv.packed_device_bytes())
+        .map_err(|_| EngineError::MemoryBudget("CUDA packed KV bytes exceed u64".into()))?;
+    Ok(PreparedCudaFullAttentionLayer {
+        key: key.to_owned(),
+        query_gate,
+        key_norm,
+        key_rope,
+        kv,
+        model_bytes,
+        graph_bytes,
+        session_bytes,
+    })
+}
+
+fn artifact_f16<'a>(artifact: &'a ModelArtifact, name: &str) -> Result<&'a [u8]> {
+    match artifact.float_tensor(name)? {
+        FloatTensorView::F16Le(bytes) => Ok(bytes),
+        FloatTensorView::F32Le(_) => Err(EngineError::UnsupportedDType(format!(
+            "CUDA tensor {name} must remain packed FP16"
+        ))),
+    }
+}
+
+fn artifact_f32<'a>(artifact: &'a ModelArtifact, name: &str) -> Result<&'a [u8]> {
+    match artifact.float_tensor(name)? {
+        FloatTensorView::F32Le(bytes) => Ok(bytes),
+        FloatTensorView::F16Le(_) => Err(EngineError::UnsupportedDType(format!(
+            "CUDA tensor {name} must remain packed F32"
+        ))),
     }
 }
 
@@ -324,6 +676,14 @@ fn packed_f16(scales: ScaleSlice<'_>) -> Result<&[u8]> {
 fn checked_add(left: u64, right: u64, label: &str) -> Result<u64> {
     left.checked_add(right)
         .ok_or_else(|| EngineError::MemoryBudget(format!("{label} overflow")))
+}
+
+fn sum_usize<const N: usize>(values: [usize; N], label: &str) -> Result<u64> {
+    values.into_iter().try_fold(0_u64, |total, value| {
+        let value = u64::try_from(value)
+            .map_err(|_| EngineError::MemoryBudget(format!("{label} exceeds u64")))?;
+        checked_add(total, value, label)
+    })
 }
 
 #[cfg(test)]

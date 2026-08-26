@@ -20,6 +20,8 @@ struct Args {
     module: PathBuf,
     #[arg(long, default_value_t = 0)]
     device: i32,
+    #[arg(long, default_value_t = 131_072)]
+    maximum_context_tokens: usize,
 }
 
 #[derive(Serialize)]
@@ -33,8 +35,12 @@ struct Report<'a> {
     artifact_file_bytes: u64,
     activation_groups: usize,
     projections: usize,
+    linear_mixer_layers: usize,
+    full_attention_states: usize,
+    maximum_context_tokens: usize,
     requested_model_bytes: u64,
     requested_graph_bytes: u64,
+    requested_session_bytes: u64,
     requested_resident_bytes: u64,
     driver_total_bytes: usize,
     driver_free_bytes_before_prepare: usize,
@@ -58,12 +64,19 @@ fn main() -> anyhow::Result<()> {
     let artifact_manifest_sha256 = artifact.manifest_sha256().to_owned();
     let runtime = CudaCandidateRuntime::new(&module, args.device)?;
     let (free_before_prepare, total) = runtime.memory_info()?;
-    let graph =
-        PreparedCudaProjectionGraph::prepare(&runtime, &artifact, &Qwen38Config::default())?;
+    let graph = PreparedCudaProjectionGraph::prepare(
+        &runtime,
+        &artifact,
+        &Qwen38Config::default(),
+        args.maximum_context_tokens,
+    )?;
     let activation_groups = graph.plan().group_count();
     let projections = graph.plan().projection_count();
+    let linear_mixer_layers = graph.linear_mixer_count();
+    let full_attention_states = graph.full_attention_count();
     let requested_model_bytes = graph.model_bytes();
     let requested_graph_bytes = graph.graph_bytes();
+    let requested_session_bytes = graph.session_bytes();
     let requested_resident_bytes = graph.resident_bytes()?;
     let (free_after_prepare, _) = runtime.memory_info()?;
     anyhow::ensure!(
@@ -94,8 +107,12 @@ fn main() -> anyhow::Result<()> {
             artifact_file_bytes,
             activation_groups,
             projections,
+            linear_mixer_layers,
+            full_attention_states,
+            maximum_context_tokens: args.maximum_context_tokens,
             requested_model_bytes,
             requested_graph_bytes,
+            requested_session_bytes,
             requested_resident_bytes,
             driver_total_bytes: total,
             driver_free_bytes_before_prepare: free_before_prepare,
@@ -104,7 +121,7 @@ fn main() -> anyhow::Result<()> {
             observed_allocation_bytes: free_before_prepare.saturating_sub(free_after_prepare),
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
             checksum_and_prepare_milliseconds: elapsed_milliseconds,
-            note: "Full checksum plus all 505 non-embedding target/MTP projection uploads. This proves artifact binding and unload only; token mixers, embedding, KV, logits execution, and roofline promotion remain separate gates.",
+            note: "Full checksum, all 505 non-embedding target/MTP projections, 48 linear-attention state groups, and 16 target plus one MTP packed Q2/Q4 KV state. This proves artifact binding/residency/unload only; embedding, decoder execution, logits, and roofline promotion remain separate gates.",
         })?
     );
     Ok(())

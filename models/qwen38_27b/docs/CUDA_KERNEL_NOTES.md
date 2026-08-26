@@ -296,9 +296,15 @@ down/output/LM-head/MTP-fusion edge retains its own correction identity. Load
 fails before dispatch when any member differs in columns or packed `s_in`
 bytes. The `qwen38-cuda-graph-load-verify` binary checks every tensor digest,
 uploads that complete projection graph, reports immutable model versus graph
-bytes, drops all 767 prepared objects, and requires driver free memory to
-return exactly to its pre-load value. This does not yet include embedding,
-float token-mixer parameters, KV/session state, or execution.
+bytes, drops every prepared object, and requires driver free memory to return
+exactly to its pre-load value. The same load graph now also owns all 48 linear
+layers' mmap-loaded FP16 convolution/norm weights, direct packed F32
+`A_log`/`dt_bias`, FP16 convolution history and GatedDelta recurrent state.
+All 16 target full-attention layers plus the resident MTP layer own query/key
+normalization, RoPE buffers and context-sized Q2/Q4 paged KV arenas. The
+verifier defaults to 128K and reports model, reusable graph and session bytes
+separately. Embedding, decoder residual/input norms, remaining MTP norms and
+actual schedule execution are not yet included.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not

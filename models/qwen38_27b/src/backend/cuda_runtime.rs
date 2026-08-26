@@ -976,13 +976,28 @@ impl CudaCandidateRuntime {
                 )));
             }
         }
+        self.prepare_gated_delta_inputs_f32_le(as_bytes(a_log), as_bytes(dt_bias))
+    }
+
+    /// Prepares immutable GatedDelta parameters directly from their canonical
+    /// little-endian F32 artifact representation. No widened or duplicate host
+    /// vectors are constructed by the production loader.
+    pub fn prepare_gated_delta_inputs_f32_le(
+        &self,
+        a_log_f32_le: &[u8],
+        dt_bias_f32_le: &[u8],
+    ) -> Result<PreparedCudaGatedDeltaInputs> {
+        let head_bytes = GATED_DELTA_HEADS
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA delta head bytes overflow".into()))?;
+        validate_f32_buffer(a_log_f32_le, head_bytes, "GatedDelta A_log")?;
+        validate_f32_buffer(dt_bias_f32_le, head_bytes, "GatedDelta dt_bias")?;
         let qk_values = GATED_DELTA_HEADS * GATED_DELTA_KEY_DIM;
         let qk_bytes = qk_values * std::mem::size_of::<f32>();
-        let head_bytes = GATED_DELTA_HEADS * std::mem::size_of::<f32>();
         Ok(PreparedCudaGatedDeltaInputs {
             context: Rc::clone(&self.inner),
-            a_log: DeviceBuffer::from_bytes(self, as_bytes(a_log))?,
-            dt_bias: DeviceBuffer::from_bytes(self, as_bytes(dt_bias))?,
+            a_log: DeviceBuffer::from_bytes(self, a_log_f32_le)?,
+            dt_bias: DeviceBuffer::from_bytes(self, dt_bias_f32_le)?,
             query: DeviceBuffer::allocate(self, qk_bytes)?,
             key: DeviceBuffer::allocate(self, qk_bytes)?,
             log_decay: DeviceBuffer::allocate(self, head_bytes)?,
@@ -4492,6 +4507,24 @@ fn validate_f16_buffer(bytes: &[u8], expected: usize, name: &str) -> Result<()> 
     Ok(())
 }
 
+fn validate_f32_buffer(bytes: &[u8], expected: usize, name: &str) -> Result<()> {
+    if bytes.len() != expected || !bytes.len().is_multiple_of(4) {
+        return Err(EngineError::Shape(format!(
+            "CUDA {name} has {} bytes, expected {expected}",
+            bytes.len()
+        )));
+    }
+    if bytes
+        .chunks_exact(4)
+        .any(|word| !f32::from_le_bytes([word[0], word[1], word[2], word[3]]).is_finite())
+    {
+        return Err(EngineError::InvalidArtifact(format!(
+            "CUDA {name} contains a non-finite F32 value"
+        )));
+    }
+    Ok(())
+}
+
 fn a8_scale_bytes(columns: usize) -> Result<usize> {
     columns
         .checked_div(64)
@@ -4847,6 +4880,19 @@ mod tests {
         };
         assert!(matches!(
             validate_recovered_a8_projection_layout(recovered),
+            Err(EngineError::InvalidArtifact(_))
+        ));
+    }
+
+    #[test]
+    fn artifact_f32_validation_rejects_wrong_size_and_nonfinite_values() {
+        let finite = 1.25_f32.to_le_bytes().repeat(GATED_DELTA_HEADS);
+        validate_f32_buffer(&finite, GATED_DELTA_HEADS * 4, "test").unwrap();
+        assert!(validate_f32_buffer(&finite[..finite.len() - 4], finite.len(), "test").is_err());
+        let mut nonfinite = finite;
+        nonfinite[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(matches!(
+            validate_f32_buffer(&nonfinite, nonfinite.len(), "test"),
             Err(EngineError::InvalidArtifact(_))
         ));
     }
