@@ -30,6 +30,8 @@ struct Args {
     absolute_tolerance: f32,
     #[arg(long, default_value_t = 1.0e-3)]
     relative_tolerance: f32,
+    #[arg(long)]
+    mtp_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -46,6 +48,14 @@ struct StateEvidence {
     attention_metadata_sha256: String,
     attention_layers: usize,
     cached_tokens_per_attention_layer: usize,
+    mtp_cached_tokens: usize,
+}
+
+#[derive(Default)]
+struct ContinuationEvidence {
+    input_token: Option<u32>,
+    mtp_logits: Option<Vec<f32>>,
+    target_logits: Option<Vec<f32>>,
 }
 
 #[derive(Serialize)]
@@ -59,6 +69,7 @@ struct Report<'a> {
     token_ids: Vec<u32>,
     tokens: usize,
     maximum_context_tokens: usize,
+    mtp_enabled: bool,
     sequential_logits_f32le_sha256: String,
     batched_logits_f32le_sha256: String,
     logits_bit_exact: bool,
@@ -66,12 +77,20 @@ struct Report<'a> {
     maximum_relative_logit_error: f32,
     sequential_greedy_token: u32,
     batched_greedy_token: u32,
+    continuation_input_token: Option<u32>,
+    sequential_mtp_continuation_f32le_sha256: Option<String>,
+    batched_mtp_continuation_f32le_sha256: Option<String>,
+    maximum_absolute_mtp_continuation_error: Option<f32>,
+    sequential_target_continuation_f32le_sha256: Option<String>,
+    batched_target_continuation_f32le_sha256: Option<String>,
+    maximum_absolute_target_continuation_error: Option<f32>,
     linear_state_f16le_sha256: String,
     linear_state_matches_bit_exact: bool,
     attention_metadata_sha256: String,
     attention_metadata_matches_bit_exact: bool,
     attention_layers: usize,
     cached_tokens_per_attention_layer: usize,
+    mtp_cached_tokens: usize,
     sequential_submissions: SubmissionDelta,
     batched_submissions: SubmissionDelta,
     synchronization_reduction: u64,
@@ -89,8 +108,8 @@ struct Report<'a> {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     anyhow::ensure!(
-        (1..=512).contains(&args.token_ids.len()),
-        "token_ids must contain one complete chunk in 1..=512"
+        (2..=512).contains(&args.token_ids.len()),
+        "token_ids must contain one complete chunk in 2..=512"
     );
     anyhow::ensure!(
         args.maximum_context_tokens >= args.token_ids.len(),
@@ -134,6 +153,9 @@ fn main() -> anyhow::Result<()> {
     let sequential_started = Instant::now();
     let mut sequential_logits = Vec::new();
     for (position, token) in args.token_ids.iter().copied().enumerate() {
+        if args.mtp_enabled && position > 0 {
+            let _ = graph.dispatch_mtp_draft_device(&runtime, &config, token as usize, position)?;
+        }
         let logits =
             graph.dispatch_target_token_device(&runtime, &config, token as usize, position)?;
         if position + 1 == args.token_ids.len() {
@@ -142,13 +164,25 @@ fn main() -> anyhow::Result<()> {
     }
     let sequential_milliseconds = sequential_started.elapsed().as_secs_f64() * 1.0e3;
     ensure_logits(&sequential_logits, "sequential")?;
+    let sequential_continuation = dispatch_continuation(
+        &runtime,
+        &mut graph,
+        &config,
+        &sequential_logits,
+        args.mtp_enabled,
+    )?;
     let sequential_state = capture_state(&mut graph, &config)?;
     let sequential_stats = submission_delta(sequential_stats_before, runtime.submission_stats())?;
+    let expected_sequential_submissions = args.token_ids.len()
+        + usize::from(args.mtp_enabled) * (args.token_ids.len().saturating_sub(1) + 2);
+    let expected_target_tokens = args.token_ids.len() + usize::from(args.mtp_enabled);
+    let expected_mtp_tokens = usize::from(args.mtp_enabled) * args.token_ids.len();
     anyhow::ensure!(
-        graph.target_tokens() == args.token_ids.len()
-            && sequential_stats.token_submission_attempts == args.token_ids.len() as u64
-            && sequential_stats.token_submission_commits == args.token_ids.len() as u64,
-        "sequential path did not commit exactly one transaction per token"
+        graph.target_tokens() == expected_target_tokens
+            && graph.mtp_tokens() == expected_mtp_tokens
+            && sequential_stats.token_submission_attempts == expected_sequential_submissions as u64
+            && sequential_stats.token_submission_commits == expected_sequential_submissions as u64,
+        "sequential path did not commit the exact target/MTP transactions"
     );
 
     graph.reset_session()?;
@@ -159,21 +193,38 @@ fn main() -> anyhow::Result<()> {
 
     let batched_stats_before = runtime.submission_stats();
     let batched_started = Instant::now();
-    let batched_view = graph.dispatch_target_prefill_chunk_without_mtp_device(
-        &runtime,
-        &config,
-        &args.token_ids,
-        0,
-    )?;
+    let batched_view = if args.mtp_enabled {
+        graph.dispatch_target_prefill_chunk_with_mtp_device(
+            &runtime,
+            &config,
+            &args.token_ids,
+            0,
+        )?
+    } else {
+        graph.dispatch_target_prefill_chunk_without_mtp_device(
+            &runtime,
+            &config,
+            &args.token_ids,
+            0,
+        )?
+    };
     let batched_logits = runtime.verifier_read_f32_device(batched_view)?;
     let batched_milliseconds = batched_started.elapsed().as_secs_f64() * 1.0e3;
     ensure_logits(&batched_logits, "batched")?;
+    let batched_continuation = dispatch_continuation(
+        &runtime,
+        &mut graph,
+        &config,
+        &batched_logits,
+        args.mtp_enabled,
+    )?;
     let batched_state = capture_state(&mut graph, &config)?;
     let batched_stats = submission_delta(batched_stats_before, runtime.submission_stats())?;
     anyhow::ensure!(
-        graph.target_tokens() == args.token_ids.len()
-            && batched_stats.token_submission_attempts == 1
-            && batched_stats.token_submission_commits == 1,
+        graph.target_tokens() == expected_target_tokens
+            && graph.mtp_tokens() == expected_mtp_tokens
+            && batched_stats.token_submission_attempts == 1 + 2 * u64::from(args.mtp_enabled)
+            && batched_stats.token_submission_commits == 1 + 2 * u64::from(args.mtp_enabled),
         "batched path did not commit the chunk as one transaction"
     );
 
@@ -189,6 +240,32 @@ fn main() -> anyhow::Result<()> {
         sequential_greedy_token == batched_greedy_token,
         "batched greedy token {batched_greedy_token} differs from sequential token {sequential_greedy_token}"
     );
+    anyhow::ensure!(
+        sequential_continuation.input_token == batched_continuation.input_token,
+        "batched continuation selected another input token"
+    );
+    let (
+        sequential_mtp_continuation_f32le_sha256,
+        batched_mtp_continuation_f32le_sha256,
+        maximum_absolute_mtp_continuation_error,
+    ) = compare_optional_logits(
+        "MTP continuation",
+        sequential_continuation.mtp_logits.as_deref(),
+        batched_continuation.mtp_logits.as_deref(),
+        args.absolute_tolerance,
+        args.relative_tolerance,
+    )?;
+    let (
+        sequential_target_continuation_f32le_sha256,
+        batched_target_continuation_f32le_sha256,
+        maximum_absolute_target_continuation_error,
+    ) = compare_optional_logits(
+        "target continuation",
+        sequential_continuation.target_logits.as_deref(),
+        batched_continuation.target_logits.as_deref(),
+        args.absolute_tolerance,
+        args.relative_tolerance,
+    )?;
     let linear_state_matches_bit_exact =
         sequential_state.linear_f16le_sha256 == batched_state.linear_f16le_sha256;
     anyhow::ensure!(
@@ -220,6 +297,7 @@ fn main() -> anyhow::Result<()> {
         "CUDA model prefill graph retained {} bytes after drop",
         free_before_prepare.saturating_sub(free_after_drop)
     );
+    let prompt_tokens = args.token_ids.len();
 
     println!(
         "{}",
@@ -235,8 +313,9 @@ fn main() -> anyhow::Result<()> {
             module_sha256,
             artifact_manifest_sha256,
             token_ids: args.token_ids,
-            tokens: sequential_state.cached_tokens_per_attention_layer,
+            tokens: prompt_tokens,
             maximum_context_tokens: args.maximum_context_tokens,
+            mtp_enabled: args.mtp_enabled,
             sequential_logits_f32le_sha256,
             batched_logits_f32le_sha256,
             logits_bit_exact,
@@ -244,12 +323,20 @@ fn main() -> anyhow::Result<()> {
             maximum_relative_logit_error,
             sequential_greedy_token,
             batched_greedy_token,
+            continuation_input_token: sequential_continuation.input_token,
+            sequential_mtp_continuation_f32le_sha256,
+            batched_mtp_continuation_f32le_sha256,
+            maximum_absolute_mtp_continuation_error,
+            sequential_target_continuation_f32le_sha256,
+            batched_target_continuation_f32le_sha256,
+            maximum_absolute_target_continuation_error,
             linear_state_f16le_sha256: sequential_state.linear_f16le_sha256,
             linear_state_matches_bit_exact,
             attention_metadata_sha256: sequential_state.attention_metadata_sha256,
             attention_metadata_matches_bit_exact,
             attention_layers: sequential_state.attention_layers,
             cached_tokens_per_attention_layer: sequential_state.cached_tokens_per_attention_layer,
+            mtp_cached_tokens: sequential_state.mtp_cached_tokens,
             sequential_submissions: sequential_stats,
             batched_submissions: batched_stats,
             synchronization_reduction,
@@ -261,10 +348,65 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_drop: free_after_drop,
             observed_allocation_bytes: free_before_prepare.saturating_sub(free_after_prepare),
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
-            note: "Runs the same complete 64-layer target model first through sequential token transactions and then through one 645-step target-only prefill chunk after an explicit reset. It compares final logits under declared tolerances, the greedy decision, bit-exact linear recurrence/convolution state, every full-attention layer's cache precision metadata, synchronization counts, and allocator reclamation. MTP batching, BF16 quality, throughput promotion, and multi-chunk boundary equivalence remain separate gates.",
+            note: "Runs the same complete 64-layer target and optional causally shifted MTP prompt state first through sequential token transactions and then through one 645-step layer-major chunk after an explicit reset. It compares final target logits, the greedy decision, the next MTP and target continuation logits, bit-exact target linear recurrence/convolution state, target and MTP cache precision metadata, synchronization counts, and allocator reclamation. BF16 quality, throughput promotion, and multi-chunk boundary equivalence remain separate gates.",
         })?
     );
     Ok(())
+}
+
+fn dispatch_continuation(
+    runtime: &CudaCandidateRuntime,
+    graph: &mut PreparedCudaProjectionGraph,
+    config: &Qwen38Config,
+    prompt_logits: &[f32],
+    enabled: bool,
+) -> anyhow::Result<ContinuationEvidence> {
+    if !enabled {
+        return Ok(ContinuationEvidence::default());
+    }
+    let input_token = greedy_token(prompt_logits)?;
+    let position = graph.target_tokens();
+    let mtp_view =
+        graph.dispatch_mtp_draft_device(runtime, config, input_token as usize, position)?;
+    let mtp_logits = runtime.verifier_read_f32_device(mtp_view)?;
+    ensure_logits(&mtp_logits, "MTP continuation")?;
+    let target_view =
+        graph.dispatch_target_token_device(runtime, config, input_token as usize, position)?;
+    let target_logits = runtime.verifier_read_f32_device(target_view)?;
+    ensure_logits(&target_logits, "target continuation")?;
+    Ok(ContinuationEvidence {
+        input_token: Some(input_token),
+        mtp_logits: Some(mtp_logits),
+        target_logits: Some(target_logits),
+    })
+}
+
+fn compare_optional_logits(
+    label: &str,
+    expected: Option<&[f32]>,
+    actual: Option<&[f32]>,
+    absolute_tolerance: f32,
+    relative_tolerance: f32,
+) -> anyhow::Result<(Option<String>, Option<String>, Option<f32>)> {
+    match (expected, actual) {
+        (None, None) => Ok((None, None, None)),
+        (Some(expected), Some(actual)) => {
+            let (maximum_absolute, _) =
+                compare_logits(expected, actual, absolute_tolerance, relative_tolerance)?;
+            let expected_greedy = greedy_token(expected)?;
+            let actual_greedy = greedy_token(actual)?;
+            anyhow::ensure!(
+                expected_greedy == actual_greedy,
+                "{label} greedy token differs: {expected_greedy}/{actual_greedy}"
+            );
+            Ok((
+                Some(digest_f32(expected)),
+                Some(digest_f32(actual)),
+                Some(maximum_absolute),
+            ))
+        }
+        _ => anyhow::bail!("{label} exists on only one execution path"),
+    }
 }
 
 fn capture_state(
@@ -317,11 +459,24 @@ fn capture_state(
         graph.target_tokens() == cached_tokens_per_attention_layer.unwrap_or(0),
         "target token counter differs from full-attention cache metadata"
     );
+    let mtp_cached_tokens = {
+        let kv = graph.full_attention_mut("mtp:0")?.kv_mut();
+        attention.update(u64::MAX.to_le_bytes());
+        attention.update((kv.tokens() as u64).to_le_bytes());
+        attention.update((kv.q2_tokens() as u64).to_le_bytes());
+        attention.update((kv.q4_tokens() as u64).to_le_bytes());
+        kv.tokens()
+    };
+    anyhow::ensure!(
+        graph.mtp_tokens() == mtp_cached_tokens,
+        "MTP token counter differs from its full-attention cache metadata"
+    );
     Ok(StateEvidence {
         linear_f16le_sha256: format!("{:x}", linear.finalize()),
         attention_metadata_sha256: format!("{:x}", attention.finalize()),
-        attention_layers,
+        attention_layers: attention_layers + 1,
         cached_tokens_per_attention_layer: cached_tokens_per_attention_layer.unwrap_or(0),
+        mtp_cached_tokens,
     })
 }
 

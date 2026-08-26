@@ -673,61 +673,31 @@ impl ModelExecutor for CudaModelExecutor {
             .expect("validated CUDA graph")
             .reset_session()?;
         let mut target_logits = Vec::new();
-        if !mtp_enabled {
-            let runtime = self.runtime.as_ref().expect("validated CUDA runtime");
-            let graph = self.graph.as_mut().expect("validated CUDA graph");
-            let chunk_tokens = graph.prefill_workspaces().max_chunk_tokens();
-            for chunk in tokens.chunks(chunk_tokens) {
-                if cancellation.is_cancelled() {
-                    graph.reset_session()?;
-                    return Err(EngineError::Cancelled);
-                }
-                let start_position = graph.target_tokens();
-                let view = graph.dispatch_target_prefill_chunk_without_mtp_device(
+        let runtime = self.runtime.as_ref().expect("validated CUDA runtime");
+        let graph = self.graph.as_mut().expect("validated CUDA graph");
+        let chunk_tokens = graph.prefill_workspaces().max_chunk_tokens();
+        for chunk in tokens.chunks(chunk_tokens) {
+            if cancellation.is_cancelled() {
+                graph.reset_session()?;
+                return Err(EngineError::Cancelled);
+            }
+            let start_position = graph.target_tokens();
+            let view = if mtp_enabled {
+                graph.dispatch_target_prefill_chunk_with_mtp_device(
                     runtime,
                     &self.config,
                     chunk,
                     start_position,
-                )?;
-                if start_position + chunk.len() == tokens.len() {
-                    target_logits = match self.mtp_output_mode {
-                        CudaMtpOutputMode::CompactGreedy => Vec::new(),
-                        CudaMtpOutputMode::FullVerifierLogits => read_valid_logits(runtime, view)?,
-                    };
-                }
-            }
-            return Ok(ExecutorStep {
-                target_logits,
-                draft_logits: Vec::new(),
-                target_verification_logits: Vec::new(),
-                bonus_logits: None,
-                compact_greedy_mtp: None,
-            });
-        }
-        for (position, token) in tokens.iter().copied().enumerate() {
-            if cancellation.is_cancelled() {
-                return Err(EngineError::Cancelled);
-            }
-            if mtp_enabled && position > 0 {
-                let runtime = self.runtime.as_ref().expect("validated CUDA runtime");
-                let graph = self.graph.as_mut().expect("validated CUDA graph");
-                let _ = graph.dispatch_mtp_draft_device(
+                )?
+            } else {
+                graph.dispatch_target_prefill_chunk_without_mtp_device(
                     runtime,
                     &self.config,
-                    token as usize,
-                    position,
-                )?;
-            }
-            let is_last = position + 1 == tokens.len();
-            let runtime = self.runtime.as_ref().expect("validated CUDA runtime");
-            let graph = self.graph.as_mut().expect("validated CUDA graph");
-            let view = graph.dispatch_target_token_device(
-                runtime,
-                &self.config,
-                token as usize,
-                position,
-            )?;
-            if is_last {
+                    chunk,
+                    start_position,
+                )?
+            };
+            if start_position + chunk.len() == tokens.len() {
                 target_logits = match self.mtp_output_mode {
                     CudaMtpOutputMode::CompactGreedy => Vec::new(),
                     CudaMtpOutputMode::FullVerifierLogits => read_valid_logits(runtime, view)?,

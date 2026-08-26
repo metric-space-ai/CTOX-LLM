@@ -260,7 +260,7 @@ state through a device-only concatenation buffer and reuses the same embedding,
 attention, FFN, norm, and LM-head operators. Its hardware run and subsequent
 target verification use a second complete target transition and report either
 an accepted draft or the target fallback without hiding rejection. A
-verifier-only `CudaModelExecutor` now drives load, warmup, sequential prefill,
+verifier-only `CudaModelExecutor` now drives load, warmup, layer-major prefill,
 chained MTP4 target verification, bounded device checkpointing, accepted-prefix
 restore/replay, reset, allocation accounting, and unload through the shared
 Rust ABI. `qwen38-cuda-executor-verify` binds that lifecycle to the exact
@@ -328,12 +328,12 @@ sequential CUDA path, CPU-equation scale error stayed below `1.12e-8`, and all
 `benchmarks/cuda/sm86-batched-fused-a8-512-20260826.json`; graph-wide binding
 now exposes all three arena-backed projection forms, while the 645-step
 target-only executor transaction now dispatches them layer-major with one
-barrier per chunk. MTP-enabled prefill deliberately retains the sequential
-causal path until the native MTP chunk scan is implemented. Its chunk contract
-now proves the first-token omission, prior-chunk hidden boundary, and one-step
-KV/RoPE offset, while a direct `cuMemcpy2D_v2` primitive provides device-only
-strided row assembly without another CUDA kernel. Complete-model
-hardware evidence for the new target-only path remains open. A
+barrier per chunk. MTP-enabled prefill uses the same batched projections and
+causal attention path. Its chunk contract proves the first-token omission,
+prior-chunk hidden boundary, and one-step KV/RoPE offset, while a direct
+`cuMemcpy2D_v2` primitive provides device-only strided row assembly without
+another CUDA kernel. Complete-model hardware evidence for both paths remains
+open. A
 pinned-`get_rows`-structured batched embedding
 candidate now keeps FP16 `s_in`/`s_out` resident and gathers a whole token-ID
 chunk in at most one launch per canonical Q2/Q4 segment. The final 857-Q2/

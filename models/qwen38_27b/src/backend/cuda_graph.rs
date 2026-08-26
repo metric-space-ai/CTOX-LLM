@@ -1304,7 +1304,6 @@ fn bind_prefill_step(
                     "mtp.layers.0.mlp.gate_proj.weight".to_owned(),
                     "mtp.layers.0.mlp.up_proj.weight".to_owned(),
                     "mtp.layers.0.mlp.down_proj.weight".to_owned(),
-                    "lm_head.weight".to_owned(),
                 ],
                 &mut resources,
             )?;
@@ -2013,9 +2012,42 @@ impl PreparedCudaFullAttentionLayer {
         start_position: usize,
         tokens: usize,
     ) -> Result<(CudaDeviceF32View<'a>, CudaDeviceF32View<'a>)> {
-        if self.kv.tokens() != start_position {
+        self.dispatch_prefill_with_positions_device(
+            runtime,
+            key_norm_workspace,
+            rope_workspace,
+            query_gate_output,
+            attention_output,
+            query_gate_input,
+            key_input,
+            value_input,
+            start_position,
+            start_position,
+            tokens,
+        )
+    }
+
+    /// Variant used by MTP prefill, whose first cached token corresponds to
+    /// absolute RoPE position one. Target prefill passes identical cache and
+    /// RoPE starts through [`Self::dispatch_prefill_device`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_prefill_with_positions_device<'a>(
+        &mut self,
+        runtime: &CudaCandidateRuntime,
+        key_norm_workspace: &'a PreparedCudaBatchedRmsNormWorkspace,
+        rope_workspace: &'a PreparedCudaBatchedRopeWorkspace,
+        query_gate_output: &'a PreparedCudaBatchedQueryGateOutput,
+        attention_output: &'a PreparedCudaPagedGqaPrefillOutput,
+        query_gate_input: CudaDeviceF32View<'_>,
+        key_input: CudaDeviceF32View<'_>,
+        value_input: CudaDeviceF32View<'_>,
+        cache_start_token: usize,
+        rope_start_position: usize,
+        tokens: usize,
+    ) -> Result<(CudaDeviceF32View<'a>, CudaDeviceF32View<'a>)> {
+        if self.kv.tokens() != cache_start_token {
             return Err(EngineError::InvalidState(format!(
-                "CUDA full-attention prefill starts at {start_position}, but its KV cache has {} tokens",
+                "CUDA full-attention prefill cache starts at {cache_start_token}, but its KV cache has {} tokens",
                 self.kv.tokens()
             )));
         }
@@ -2025,7 +2057,7 @@ impl PreparedCudaFullAttentionLayer {
             kv,
             ..
         } = self;
-        runtime.write_batched_rope_positions(rope_workspace, start_position as u64, tokens)?;
+        runtime.write_batched_rope_positions(rope_workspace, rope_start_position as u64, tokens)?;
         let (query, gate) = runtime.dispatch_batched_query_gate_norm_rope_with_table_device(
             query_gate,
             rope_workspace,
@@ -2942,9 +2974,7 @@ impl PreparedCudaProjectionGraph {
     }
 
     /// Executes one target-only prompt chunk through the frozen 645-step
-    /// program. MTP is the sole explicitly disabled schedule step; callers
-    /// that request MTP continue to use the state-aligned path until its
-    /// batched causal scan is implemented.
+    /// program. MTP is the sole explicitly disabled schedule step.
     pub fn dispatch_target_prefill_chunk_without_mtp_device<'a>(
         &'a mut self,
         runtime: &CudaCandidateRuntime,
@@ -2952,12 +2982,47 @@ impl PreparedCudaProjectionGraph {
         token_ids: &[u32],
         start_position: usize,
     ) -> Result<CudaDeviceF32View<'a>> {
+        self.dispatch_target_prefill_chunk_device_impl(
+            runtime,
+            config,
+            token_ids,
+            start_position,
+            false,
+        )
+    }
+
+    /// Executes target and the causally shifted one-layer MTP prompt state in
+    /// one chunk transaction. Target remains exactly one token ahead of MTP.
+    pub fn dispatch_target_prefill_chunk_with_mtp_device<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        token_ids: &[u32],
+        start_position: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        self.dispatch_target_prefill_chunk_device_impl(
+            runtime,
+            config,
+            token_ids,
+            start_position,
+            true,
+        )
+    }
+
+    fn dispatch_target_prefill_chunk_device_impl<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        token_ids: &[u32],
+        start_position: usize,
+        mtp_enabled: bool,
+    ) -> Result<CudaDeviceF32View<'a>> {
         if config != &Qwen38Config::default() {
             return Err(EngineError::Shape(
                 "CUDA target prefill requires the frozen Qwen3.8-27B topology".into(),
             ));
         }
-        if self.poisoned || self.speculative_base.is_some() {
+        if self.poisoned || (mtp_enabled && self.mtp_poisoned) || self.speculative_base.is_some() {
             return Err(EngineError::InvalidState(
                 "CUDA target prefill requires a healthy graph without a speculative branch".into(),
             ));
@@ -2976,6 +3041,9 @@ impl PreparedCudaProjectionGraph {
             start_position,
             token_count: token_ids.len(),
         };
+        let mtp_alignment = mtp_enabled
+            .then(|| CudaMtpPrefillAlignment::qwen38(chunk, self.target_tokens, self.mtp_tokens))
+            .transpose()?;
         let Self {
             plan,
             prefill_bindings,
@@ -2988,6 +3056,8 @@ impl PreparedCudaProjectionGraph {
             prefill_workspaces,
             target_tokens,
             poisoned,
+            mtp_tokens,
+            mtp_poisoned,
             ..
         } = self;
         let mut cursor = prefill_bindings.execution_cursor(
@@ -2996,6 +3066,9 @@ impl PreparedCudaProjectionGraph {
             config.max_position_embeddings,
         )?;
         *poisoned = true;
+        if mtp_enabled {
+            *mtp_poisoned = true;
+        }
         let tokens = token_ids.len();
         let dispatch = runtime.run_token_submission(
             "target prefill chunk commit synchronization",
@@ -3237,13 +3310,35 @@ impl PreparedCudaProjectionGraph {
                     "lm_head.weight",
                 )?;
                 advance_prefill(&mut cursor, None, CudaPrefillOperation::LastTokenLmHead)?;
-                cursor.skip_disabled_mtp()?;
+                if let Some(alignment) = mtp_alignment {
+                    dispatch_mtp_prefill_parts(
+                        runtime,
+                        config,
+                        plan,
+                        activations,
+                        projections,
+                        full_attention,
+                        norms,
+                        prefill_workspaces,
+                        embedded,
+                        normalized,
+                        alignment,
+                    )?;
+                    cursor.advance_mtp(alignment)?;
+                } else {
+                    cursor.skip_disabled_mtp()?;
+                }
                 Ok(logits)
             },
         );
         let logits = dispatch?;
         advance_prefill(&mut cursor, None, CudaPrefillOperation::ChunkBarrier)?;
-        *target_tokens = cursor.finish()?;
+        if let Some(alignment) = mtp_alignment {
+            (*target_tokens, *mtp_tokens) = cursor.finish_with_mtp(alignment)?;
+            *mtp_poisoned = false;
+        } else {
+            *target_tokens = cursor.finish()?;
+        }
         *poisoned = false;
         Ok(logits)
     }
@@ -3703,6 +3798,255 @@ fn advance_prefill(
         .ok_or_else(|| EngineError::InvalidState("CUDA prefill schedule ended early".into()))?
         .schedule_index;
     cursor.advance(schedule_index, layer, operation)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mtp_prefill_parts(
+    runtime: &CudaCandidateRuntime,
+    config: &Qwen38Config,
+    plan: &CudaProjectionPlan,
+    activations: &BTreeMap<String, PreparedCudaA8Activation>,
+    projections: &BTreeMap<String, PreparedCudaA8Projection>,
+    full_attention: &mut BTreeMap<String, PreparedCudaFullAttentionLayer>,
+    norms: &PreparedCudaNormGraph,
+    workspaces: &PreparedCudaPrefillWorkspaces,
+    embedded_target: CudaDeviceF32View<'_>,
+    normalized_target: CudaDeviceF32View<'_>,
+    alignment: CudaMtpPrefillAlignment,
+) -> Result<()> {
+    let hidden = config.hidden_size;
+    let target_rows = alignment.chunk.token_count;
+    let final_target_norm = format!("target:{}:post_ffn:final", config.num_hidden_layers - 1);
+    let retained_target_hidden = norms.residual(&final_target_norm)?.normalized_output()?;
+    let latest_target_hidden = normalized_target.slice(
+        target_rows
+            .checked_sub(1)
+            .and_then(|row| row.checked_mul(hidden))
+            .ok_or_else(|| EngineError::Shape("CUDA target boundary row overflows".into()))?,
+        hidden,
+    )?;
+
+    if alignment.rows == 0 {
+        runtime.copy_f32_rows_device(
+            latest_target_hidden,
+            hidden,
+            retained_target_hidden,
+            hidden,
+            0,
+            1,
+            hidden,
+        )?;
+        return Ok(());
+    }
+
+    let previous_hidden =
+        workspaces
+            .projection_outputs()
+            .device_output(0, hidden, alignment.rows)?;
+    if alignment.previous_chunk_hidden_rows == 1 {
+        runtime.copy_f32_rows_device(
+            retained_target_hidden,
+            hidden,
+            previous_hidden,
+            hidden,
+            0,
+            1,
+            hidden,
+        )?;
+    }
+    if alignment.current_chunk_hidden_rows > 0 {
+        let destination = previous_hidden.slice(
+            alignment
+                .previous_chunk_hidden_rows
+                .checked_mul(hidden)
+                .ok_or_else(|| {
+                    EngineError::Shape("CUDA MTP hidden destination offset overflows".into())
+                })?,
+            alignment
+                .current_chunk_hidden_rows
+                .checked_mul(hidden)
+                .ok_or_else(|| {
+                    EngineError::Shape("CUDA MTP hidden destination length overflows".into())
+                })?,
+        )?;
+        runtime.copy_f32_rows_device(
+            normalized_target,
+            hidden,
+            destination,
+            hidden,
+            0,
+            alignment.current_chunk_hidden_rows,
+            hidden,
+        )?;
+    }
+    runtime.copy_f32_rows_device(
+        latest_target_hidden,
+        hidden,
+        retained_target_hidden,
+        hidden,
+        0,
+        1,
+        hidden,
+    )?;
+
+    let embedding_values = alignment
+        .rows
+        .checked_mul(hidden)
+        .ok_or_else(|| EngineError::Shape("CUDA MTP embedding slice overflows".into()))?;
+    let mtp_embedding = embedded_target.slice(
+        alignment
+            .input_token_offset
+            .checked_mul(hidden)
+            .ok_or_else(|| EngineError::Shape("CUDA MTP embedding offset overflows".into()))?,
+        embedding_values,
+    )?;
+    let normalized_embedding = runtime.dispatch_batched_qwen_rms_norm_f16_device(
+        norms.regular("mtp:pre_embedding")?,
+        workspaces.hidden_norm(),
+        mtp_embedding,
+        alignment.rows,
+    )?;
+    let concat_width = hidden
+        .checked_mul(2)
+        .ok_or_else(|| EngineError::Shape("CUDA MTP concat width overflows".into()))?;
+    let projection_input =
+        workspaces
+            .projection_outputs()
+            .device_output(1, concat_width, alignment.rows)?;
+    runtime.copy_f32_rows_device(
+        normalized_embedding,
+        hidden,
+        projection_input,
+        concat_width,
+        0,
+        alignment.rows,
+        hidden,
+    )?;
+    let normalized_previous = runtime.dispatch_batched_qwen_rms_norm_f16_device(
+        norms.regular("mtp:pre_hidden")?,
+        workspaces.hidden_norm(),
+        previous_hidden,
+        alignment.rows,
+    )?;
+    runtime.copy_f32_rows_device(
+        normalized_previous,
+        hidden,
+        projection_input,
+        concat_width,
+        hidden,
+        alignment.rows,
+        hidden,
+    )?;
+
+    let [mut residual] = dispatch_prefill_projection_fanout_parts(
+        runtime,
+        plan,
+        activations,
+        projections,
+        workspaces,
+        projection_input,
+        alignment.rows,
+        ["mtp.fc.weight".to_owned()],
+    )?;
+    let retained_residual = workspaces.embedding().device_output(alignment.rows)?;
+    runtime.copy_f32_rows_device(
+        residual,
+        hidden,
+        retained_residual,
+        hidden,
+        0,
+        alignment.rows,
+        hidden,
+    )?;
+    residual = retained_residual;
+    let mut normalized = runtime.dispatch_batched_qwen_rms_norm_f16_device(
+        norms.regular("mtp:input")?,
+        workspaces.hidden_norm(),
+        residual,
+        alignment.rows,
+    )?;
+    let [query_gate, key, value] = dispatch_prefill_projection_fanout_parts(
+        runtime,
+        plan,
+        activations,
+        projections,
+        workspaces,
+        normalized,
+        alignment.rows,
+        [
+            "mtp.layers.0.self_attn.q_proj.weight".to_owned(),
+            "mtp.layers.0.self_attn.k_proj.weight".to_owned(),
+            "mtp.layers.0.self_attn.v_proj.weight".to_owned(),
+        ],
+    )?;
+    let attention = full_attention.get_mut("mtp:0").ok_or_else(|| {
+        EngineError::InvalidState("CUDA MTP full-attention state is not resident".into())
+    })?;
+    let (attention_output, gate) = attention.dispatch_prefill_with_positions_device(
+        runtime,
+        workspaces.key_norm(),
+        workspaces.rope(),
+        workspaces.query_gate(),
+        workspaces.paged_gqa_output(),
+        query_gate,
+        key,
+        value,
+        alignment.cache_start_token,
+        alignment.rope_start_position,
+        alignment.rows,
+    )?;
+    let attention_output = dispatch_prefill_fused_projection_parts(
+        runtime,
+        plan,
+        activations,
+        projections,
+        workspaces,
+        attention_output,
+        gate,
+        alignment.rows,
+        "mtp.layers.0.self_attn.o_proj.weight",
+        PrefillFusedEdge::AttentionGate,
+    )?;
+    (residual, normalized) = runtime.dispatch_batched_residual_rms_norm_f16_device(
+        norms.residual("mtp:post_attention")?,
+        workspaces.hidden_norm(),
+        residual,
+        attention_output,
+        alignment.rows,
+    )?;
+    let [gate, up] = dispatch_prefill_projection_fanout_parts(
+        runtime,
+        plan,
+        activations,
+        projections,
+        workspaces,
+        normalized,
+        alignment.rows,
+        [
+            "mtp.layers.0.mlp.gate_proj.weight".to_owned(),
+            "mtp.layers.0.mlp.up_proj.weight".to_owned(),
+        ],
+    )?;
+    let down = dispatch_prefill_fused_projection_parts(
+        runtime,
+        plan,
+        activations,
+        projections,
+        workspaces,
+        gate,
+        up,
+        alignment.rows,
+        "mtp.layers.0.mlp.down_proj.weight",
+        PrefillFusedEdge::SwiGlu,
+    )?;
+    let _ = runtime.dispatch_batched_residual_rms_norm_f16_device(
+        norms.residual("mtp:final")?,
+        workspaces.hidden_norm(),
+        residual,
+        down,
+        alignment.rows,
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

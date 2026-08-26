@@ -375,7 +375,7 @@ that checkpoint, replays both the MTP and target transition, and requires the
 repeated target logits to be bit-identical.
 
 `CudaModelExecutor` now assembles the same graph behind the stable Rust
-`ModelExecutor` ABI. It supports sequential prefill, up to four chained drafts,
+`ModelExecutor` ABI. It supports layer-major prefill, up to four chained drafts,
 full-target verification, device-side checkpoint/restore, replay of exactly the
 accepted causal prefix, reset, and fail-closed unload without CPU model
 operations. Even a fully accepted block is restored and replayed: the final
@@ -600,19 +600,19 @@ prefill, bounded to 512 tokens. It uses the graph-owned embedding, norm,
 projection, attention, and linear-mixer workspaces, executes the final LM head
 only for the last row, and exposes one commit barrier per chunk. Its fail-
 closed cursor permits only the explicitly disabled MTP step to be skipped.
-MTP-enabled prefill retains the already correct sequential causal path until a
-batched MTP scan preserves the target-one-ahead invariant. This is source and
-unit-test integration; complete-model SM86 numerical, memory, and latency
-evidence remains required before promotion.
-`CudaMtpPrefillAlignment` now makes that missing invariant executable: the
+MTP-enabled prefill now dispatches the native one-layer MTP graph over the
+causally shifted chunk while preserving the target-one-ahead invariant. This
+is source and unit-test integration; complete-model SM86 numerical, memory,
+and latency evidence remains required before promotion.
+`CudaMtpPrefillAlignment` makes that invariant executable: the
 first target chunk emits `N-1` MTP rows, later chunks emit `N`, the first row
 after a boundary consumes the retained prior target hidden state, and MTP KV
 cache indices remain exactly one behind their absolute RoPE positions. The
 cursor cannot commit both counters unless target remains exactly one token
 ahead. Row assembly uses the official `cuMemcpy2D_v2` Driver API primitive, so
-the eventual `[embedding_i, hidden_{i-1}]` matrix needs two strided
+the `[embedding_i, hidden_{i-1}]` matrix needs two strided
 device-to-device copies rather than a host token loop or another custom CUDA
-kernel. Hardware verification and the MTP layer-major dispatch remain open.
+kernel. Hardware verification remains open.
 `PreparedCudaProjectionGraph` binds the ordinary fan-out, attention-gate, and
 SwiGLU forms to its single admitted activation/output arena. The complete
 target-only 645-step executor transaction is now exposed through a dedicated
@@ -621,7 +621,8 @@ full-model verifier:
 ```text
 cargo run --release --features cuda --bin qwen38-cuda-model-prefill-verify -- \
   --artifact <release.ctoxq> --module <qwen38-sm86.fatbin> \
-  --device <worker-visible-device> --token-ids <comma-delimited-token-ids>
+  --device <worker-visible-device> --token-ids <comma-delimited-token-ids> \
+  --mtp-enabled
 ```
 
 The direct causal paged-GQA prefill candidate maps one warp to each
