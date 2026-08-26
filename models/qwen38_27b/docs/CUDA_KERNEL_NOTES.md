@@ -494,6 +494,21 @@ a controlled roofline result. It also has not yet replaced the sequential
 token loop in the complete prefill graph. Controlled sustainable-bandwidth,
 full-graph numerical, and end-to-end prefill evidence remain required.
 
+The first layer-major causal scan reuses the pinned SSM-convolution channel
+mapping and advances a token-major `[tokens, 10240]` chunk inside one launch.
+It preserves the exact decode-owned FP16 `[10240, 4]` history and weight
+buffers. CUDA 12.6 compiled the scan with 22 registers and no stack or spills.
+On an RTX A4500, a 17-token scan matched 17 sequential device launches
+bit-for-bit for every output and for the final FP16 state; the final state also
+matched the scalar oracle exactly. Maximum device-vs-oracle absolute error was
+`5.97e-8`, and all 2,088,960 verifier-owned bytes were reclaimed immediately.
+The module SHA-256 was
+`c1a0789a8c38e89cc529c19c24156ac958030dbb5e8be7dbf6062d114c426049`.
+Evidence is recorded in
+`benchmarks/cuda/sm86-causal-conv-scan-20260826.json`. The run used physical
+GPU 2 alongside the teacher workload, so it is correctness and lifecycle
+evidence, not controlled latency or roofline evidence.
+
 The loader-resolved embedding-row candidate decodes one canonical Q2 or Q4 row
 and fuses packed FP16 `s_in` plus scalar `s_out` on device. The production
 owner now keeps the entire pure/mixed table resident and launches directly at

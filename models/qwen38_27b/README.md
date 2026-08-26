@@ -285,8 +285,11 @@ last prompt token, and exposes one cancellation/commit barrier per bounded
 chunk. Batched activation/output workspaces are separate from resident matrix
 owners, so enabling a 512-token chunk does not duplicate model weights. The
 standalone MMQ verifier exercises this same graph-facing path and the shared
-two-buffer batched RMSNorm workspace. Complete causal token-mixer scans and
-executor replacement of the current sequential prefill loop are still open.
+two-buffer batched RMSNorm workspace. The first causal-convolution scan now
+matches sequential CUDA output and final FP16 state bit-for-bit across a
+17-token hardware fixture. Batched GatedDelta preparation/recurrence, paged
+GQA prefill, and executor replacement of the current sequential loop remain
+open.
 
 An isolated mixed-Q2/Q4 split-KV attention candidate now covers the five
 causal tail queries used by MTP4 verification. Sixteen KV segments expose

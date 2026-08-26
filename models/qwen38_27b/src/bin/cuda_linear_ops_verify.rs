@@ -43,6 +43,9 @@ struct Report<'a> {
     convolution_state_bytes: usize,
     convolution_transient_bytes: usize,
     convolution_device_view_staging_bytes: usize,
+    convolution_scan_transient_bytes: usize,
+    convolution_scan_device_view_staging_bytes: usize,
+    convolution_scan_verifier_owner_bytes: usize,
     gated_norm_rows: usize,
     gated_norm_columns: usize,
     gated_norm_model_bytes: usize,
@@ -60,6 +63,8 @@ struct Report<'a> {
     partial_rope_device_view_staging_bytes: usize,
     maximum_convolution_absolute_error: f32,
     maximum_convolution_relative_error: f32,
+    maximum_convolution_scan_absolute_delta: f32,
+    convolution_scan_matches_sequential_state_exactly: bool,
     maximum_gated_norm_absolute_error: f32,
     maximum_gated_norm_relative_error: f32,
     maximum_qwen_norm_absolute_error: f32,
@@ -119,21 +124,26 @@ fn main() -> anyhow::Result<()> {
     let mut maximum_convolution_absolute_error = 0.0_f32;
     let mut maximum_convolution_relative_error = 0.0_f32;
     let mut state_matches_oracle_exactly = true;
-    for token in 0..args.tokens {
-        let input: Vec<f32> = (0..conv_config.channels)
-            .map(|channel| ((channel + token * 7) as f32 * 0.031).sin() * 0.65)
-            .collect();
+    let conv_inputs: Vec<f32> = (0..args.tokens)
+        .flat_map(|token| {
+            (0..conv_config.channels)
+                .map(move |channel| ((channel + token * 7) as f32 * 0.031).sin() * 0.65)
+        })
+        .collect();
+    let mut sequential_convolution = Vec::with_capacity(conv_inputs.len());
+    for (token, input) in conv_inputs.chunks_exact(conv_config.channels).enumerate() {
         let expected = causal_conv_silu_update_f16_state(
-            &input,
+            input,
             &mut oracle_state,
             &conv_weight,
             conv_config.channels,
             conv_config.kernel_width,
         )?;
-        conv_input_staging.write(&input)?;
+        conv_input_staging.write(input)?;
         let actual_view = runtime
             .dispatch_causal_conv_f16_device(&mut conv, conv_input_staging.device_view()?)?;
         let actual = runtime.verifier_read_f32(actual_view)?;
+        sequential_convolution.extend_from_slice(&actual);
         track_error(
             &expected,
             &actual,
@@ -150,7 +160,36 @@ fn main() -> anyhow::Result<()> {
         state_matches_oracle_exactly &= conv.verifier_read_state()? == oracle_state;
     }
     anyhow::ensure!(state_matches_oracle_exactly, "convolution state differs");
+    let mut scan_conv = runtime.prepare_causal_conv_f16(conv_config, &conv_weight_bytes)?;
+    let scan_output = runtime.prepare_causal_conv_scan_output(conv_config, args.tokens)?;
+    let scan_input_staging = runtime.prepare_verifier_f32_tensor(&conv_inputs)?;
+    let scan_view = runtime.dispatch_causal_conv_f16_scan_device(
+        &mut scan_conv,
+        &scan_output,
+        scan_input_staging.device_view()?,
+        args.tokens,
+    )?;
+    let scan_convolution = runtime.verifier_read_f32(scan_view)?;
+    let mut maximum_convolution_scan_absolute_delta = 0.0_f32;
+    let mut ignored_relative_delta = 0.0_f32;
+    track_error(
+        &sequential_convolution,
+        &scan_convolution,
+        &mut maximum_convolution_scan_absolute_delta,
+        &mut ignored_relative_delta,
+    );
+    anyhow::ensure!(
+        scan_convolution == sequential_convolution,
+        "causal-convolution scan differs from sequential device execution"
+    );
+    let convolution_scan_matches_sequential_state_exactly =
+        scan_conv.verifier_read_state()? == oracle_state;
+    anyhow::ensure!(
+        convolution_scan_matches_sequential_state_exactly,
+        "causal-convolution scan state differs from sequential state"
+    );
     conv.reset()?;
+    scan_conv.reset()?;
     let reset_zero_state_verified = conv
         .verifier_read_state()?
         .iter()
@@ -365,6 +404,10 @@ fn main() -> anyhow::Result<()> {
     let convolution_state_bytes = conv.resident_state_bytes();
     let convolution_transient_bytes = conv.transient_bytes();
     let convolution_device_view_staging_bytes = conv_input_staging.resident_bytes();
+    let convolution_scan_transient_bytes = scan_output.transient_bytes();
+    let convolution_scan_device_view_staging_bytes = scan_input_staging.resident_bytes();
+    let convolution_scan_verifier_owner_bytes =
+        scan_conv.model_bytes() + scan_conv.resident_state_bytes() + scan_conv.transient_bytes();
     let gated_norm_model_bytes = norm.model_bytes();
     let gated_norm_transient_bytes = norm.transient_bytes();
     let gated_norm_device_view_staging_bytes =
@@ -382,6 +425,9 @@ fn main() -> anyhow::Result<()> {
     let (free_after_prepare, _) = runtime.memory_info()?;
     drop(conv);
     drop(conv_input_staging);
+    drop(scan_conv);
+    drop(scan_output);
+    drop(scan_input_staging);
     drop(norm);
     drop(norm_input_staging);
     drop(norm_gate_staging);
@@ -400,6 +446,9 @@ fn main() -> anyhow::Result<()> {
         + convolution_state_bytes
         + convolution_transient_bytes
         + convolution_device_view_staging_bytes
+        + convolution_scan_transient_bytes
+        + convolution_scan_device_view_staging_bytes
+        + convolution_scan_verifier_owner_bytes
         + gated_norm_model_bytes
         + gated_norm_transient_bytes
         + gated_norm_device_view_staging_bytes
@@ -419,7 +468,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v5",
+            format: "ctox.cuda-sm86-linear-ops-f16-verifier.v6",
             status: "pass",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -435,6 +484,9 @@ fn main() -> anyhow::Result<()> {
             convolution_state_bytes,
             convolution_transient_bytes,
             convolution_device_view_staging_bytes,
+            convolution_scan_transient_bytes,
+            convolution_scan_device_view_staging_bytes,
+            convolution_scan_verifier_owner_bytes,
             gated_norm_rows: norm_config.rows,
             gated_norm_columns: norm_config.columns,
             gated_norm_model_bytes,
@@ -452,6 +504,8 @@ fn main() -> anyhow::Result<()> {
             partial_rope_device_view_staging_bytes,
             maximum_convolution_absolute_error,
             maximum_convolution_relative_error,
+            maximum_convolution_scan_absolute_delta,
+            convolution_scan_matches_sequential_state_exactly,
             maximum_gated_norm_absolute_error,
             maximum_gated_norm_relative_error,
             maximum_qwen_norm_absolute_error,
@@ -469,7 +523,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes,
-            note: "Verifier-only candidates; causal convolution, Qwen RMSNorm, fused residual-plus-Qwen-RMSNorm, and gated RMSNorm consume producer-owned CUDA device views, while partial RoPE mutates its producer-owned view in place. Readback is restricted to the verifier. No CPU fallback and not promoted into the production CUDA ABI.",
+            note: "Verifier-only candidates; causal convolution now includes one token-major causal scan that must match sequential device execution and final FP16 state exactly. Qwen RMSNorm, fused residual-plus-Qwen-RMSNorm, and gated RMSNorm consume producer-owned CUDA device views, while partial RoPE mutates its producer-owned view in place. Readback is restricted to the verifier. No CPU fallback and not promoted into the production CUDA ABI.",
         })?
     );
     Ok(())

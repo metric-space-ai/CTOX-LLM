@@ -904,6 +904,45 @@ void ctox_causal_conv_silu_f16_sm86(
     output[channel] = sum / (1.0f + expf(-sum));
 }
 
+// Multi-token form of the same state transition. The upstream SSM convolution
+// maps independent channels to threads; this adaptation keeps that mapping and
+// advances each channel through the prompt in causal token order inside one
+// launch. Input/output are token-major `[tokens, channels]`, while persistent
+// state remains the identical FP16 `[channels, 4]` allocation used by decode.
+// This is an unpromoted verifier candidate until sequential equivalence and
+// representative prefill roofline evidence are recorded.
+// ref: ggml/src/ggml-cuda/ssm-conv.cu:1-95
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_causal_conv_silu_scan_f16_sm86(
+    const float* __restrict__ input,
+    const __half* __restrict__ weight,
+    __half* __restrict__ state,
+    float* __restrict__ output,
+    unsigned tokens,
+    unsigned channels,
+    unsigned kernel_width) {
+    const unsigned channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels || tokens == 0u || kernel_width != 4u) {
+        return;
+    }
+    const unsigned base = channel * kernel_width;
+#pragma unroll 1
+    for (unsigned token = 0u; token < tokens; ++token) {
+        state[base] = state[base + 1u];
+        state[base + 1u] = state[base + 2u];
+        state[base + 2u] = state[base + 3u];
+        state[base + 3u] = __float2half_rn(input[token * channels + channel]);
+        float sum = 0.0f;
+#pragma unroll
+        for (unsigned index = 0u; index < 4u; ++index) {
+            sum = fmaf(__half2float(state[base + index]),
+                       __half2float(weight[base + index]),
+                       sum);
+        }
+        output[token * channels + channel] = sum / (1.0f + expf(-sum));
+    }
+}
+
 // GatedDeltaNet's direct-weight RMSNorm fused with SiLU(gate). One warp owns
 // one 128-value head. The learned weight stays FP16 and is widened only in
 // registers; this deliberately does not apply Qwen's residual-norm +1 rule.

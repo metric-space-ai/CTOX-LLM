@@ -20,13 +20,13 @@ use sha2::{Digest, Sha256};
 use super::cuda::{
     validate_mixed_operation, validate_operation, validate_recovered_row, CudaMixedRowSegment,
     A8_BATCHED_QUANTIZE_SYMBOL, A8_QUANTIZE_SYMBOL, ARGMAX_F32_SYMBOL, CAUSAL_CONV_F16_SYMBOL,
-    CUDA_SAMPLER_MAX_TOP_K, DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL, GATED_DELTA_F16_SYMBOL,
-    GATED_DELTA_HEADS, GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS, GATED_DELTA_PREP_F32_SYMBOL,
-    GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
-    GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
-    LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES,
-    PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, PAGED_GQA_SPLIT_SEGMENTS,
-    PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL,
+    CAUSAL_CONV_SCAN_F16_SYMBOL, CUDA_SAMPLER_MAX_TOP_K, DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
+    GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS, GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS,
+    GATED_DELTA_PREP_F32_SYMBOL, GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM,
+    GATED_RMS_NORM_COLUMNS, GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS,
+    LINEAR_CONV_KERNEL_WIDTH, LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL,
+    PAGED_GQA_DESCRIPTOR_BYTES, PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+    PAGED_GQA_SPLIT_SEGMENTS, PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL,
     PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL,
     Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_BATCHED_MMQ_SYMBOL,
     Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
@@ -228,6 +228,7 @@ struct CudaContextInner {
     gated_delta_prep_f32_function: CuFunction,
     gated_delta_f16_function: CuFunction,
     causal_conv_f16_function: CuFunction,
+    causal_conv_scan_f16_function: CuFunction,
     gated_rms_norm_f16_function: CuFunction,
     qwen_rms_norm_f16_function: CuFunction,
     residual_rms_norm_f16_function: CuFunction,
@@ -687,6 +688,17 @@ pub struct PreparedCudaCausalConv {
     transient_bytes: usize,
     poisoned: bool,
     checkpoint_valid: bool,
+}
+
+/// Bounded token-major output for a causal-convolution prefill scan. The
+/// resident FP16 weight, state, and speculative checkpoint remain owned once
+/// by [`PreparedCudaCausalConv`].
+pub struct PreparedCudaCausalConvScanOutput {
+    context: Rc<CudaContextInner>,
+    token_capacity: u32,
+    channels: u32,
+    output: DeviceBuffer,
+    transient_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1154,6 +1166,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let causal_conv_scan_f16_function =
+            match resolve_function(&driver, module, CAUSAL_CONV_SCAN_F16_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let gated_rms_norm_f16_function =
             match resolve_function(&driver, module, GATED_RMS_NORM_F16_SYMBOL) {
                 Ok(function) => function,
@@ -1309,6 +1332,7 @@ impl CudaCandidateRuntime {
                 gated_delta_prep_f32_function,
                 gated_delta_f16_function,
                 causal_conv_f16_function,
+                causal_conv_scan_f16_function,
                 gated_rms_norm_f16_function,
                 qwen_rms_norm_f16_function,
                 residual_rms_norm_f16_function,
@@ -2310,6 +2334,121 @@ impl CudaCandidateRuntime {
             )?;
         }
         self.synchronize_after_launch("causal-convolution context synchronization")
+    }
+
+    pub fn prepare_causal_conv_scan_output(
+        &self,
+        config: CudaCausalConvConfig,
+        token_capacity: usize,
+    ) -> Result<PreparedCudaCausalConvScanOutput> {
+        if config != CudaCausalConvConfig::QWEN38_27B {
+            return Err(EngineError::Shape(
+                "CUDA convolution scan requires the exact Qwen3.8-27B profile".into(),
+            ));
+        }
+        let token_capacity = validate_a8_batch_capacity(token_capacity)?;
+        let output_bytes = (token_capacity as usize)
+            .checked_mul(config.channels)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA convolution scan output overflows".into())
+            })?;
+        self.make_current()?;
+        Ok(PreparedCudaCausalConvScanOutput {
+            context: Rc::clone(&self.inner),
+            token_capacity,
+            channels: config.channels as u32,
+            output: DeviceBuffer::allocate(self, output_bytes)?,
+            transient_bytes: output_bytes,
+        })
+    }
+
+    /// Advances the exact decode state through a token-major prompt chunk in
+    /// one causal device scan. A failed launch leaves the state owner poisoned
+    /// so callers must reset rather than silently continuing from ambiguity.
+    pub fn dispatch_causal_conv_f16_scan_device<'a>(
+        &self,
+        prepared: &mut PreparedCudaCausalConv,
+        output: &'a PreparedCudaCausalConvScanOutput,
+        input: CudaDeviceF32View<'_>,
+        tokens: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let tokens = validate_a8_batch_capacity(tokens)?;
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &output.context)
+            || !Rc::ptr_eq(&self.inner, input.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA convolution scan crosses driver contexts".into(),
+            ));
+        }
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA convolution state is poisoned; reset is required".into(),
+            ));
+        }
+        if output.channels != prepared.config.channels as u32 || tokens > output.token_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA convolution scan {tokens}x{} exceeds output capacity {}x{}",
+                prepared.config.channels, output.token_capacity, output.channels
+            )));
+        }
+        let expected = (tokens as usize)
+            .checked_mul(prepared.config.channels)
+            .ok_or_else(|| EngineError::Shape("CUDA convolution scan shape overflows".into()))?;
+        if input.values() != expected {
+            return Err(EngineError::Shape(format!(
+                "CUDA convolution scan input has {} values, expected {expected}",
+                input.values()
+            )));
+        }
+        prepared.poisoned = true;
+        self.dispatch_causal_conv_f16_scan_inner(prepared, output, input.ptr()?, tokens)?;
+        prepared.poisoned = false;
+        output.device_output(tokens as usize)
+    }
+
+    fn dispatch_causal_conv_f16_scan_inner(
+        &self,
+        prepared: &PreparedCudaCausalConv,
+        output: &PreparedCudaCausalConvScanOutput,
+        mut input: CuDevicePtr,
+        mut tokens: u32,
+    ) -> Result<()> {
+        self.make_current()?;
+        let mut weight = prepared.weight.ptr();
+        let mut state = prepared.state.ptr();
+        let mut output_ptr = output.output.ptr();
+        let mut channels = prepared.config.channels as u32;
+        let mut kernel_width = prepared.config.kernel_width as u32;
+        let mut params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut weight as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut state as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut tokens as *mut u32).cast::<c_void>(),
+            (&mut channels as *mut u32).cast::<c_void>(),
+            (&mut kernel_width as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.causal_conv_scan_f16_function,
+                    channels.div_ceil(LINEAR_THREADS_PER_BLOCK),
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "causal-convolution scan kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("causal-convolution scan context synchronization")
     }
 
     pub fn prepare_gated_rms_norm_f16(
@@ -6561,6 +6700,28 @@ impl PreparedCudaCausalConv {
     }
 }
 
+impl PreparedCudaCausalConvScanOutput {
+    pub fn token_capacity(&self) -> usize {
+        self.token_capacity as usize
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn device_output(&self, tokens: usize) -> Result<CudaDeviceF32View<'_>> {
+        let tokens = validate_a8_batch_capacity(tokens)?;
+        if tokens > self.token_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA convolution scan requests {tokens} tokens, capacity is {}",
+                self.token_capacity
+            )));
+        }
+        self.output
+            .f32_view(0, tokens as usize * self.channels as usize)
+    }
+}
+
 impl PreparedCudaGatedRmsNorm {
     pub fn config(&self) -> CudaGatedRmsNormConfig {
         self.config
@@ -7922,6 +8083,7 @@ mod tests {
         assert_owned::<PreparedCudaA8Projection>();
         assert_owned::<PreparedCudaBatchedA8Output>();
         assert_owned::<PreparedCudaBatchedRmsNormWorkspace>();
+        assert_owned::<PreparedCudaCausalConvScanOutput>();
         assert_owned::<PreparedCudaGatheredA8Projection>();
         assert_owned::<PreparedCudaArgmax>();
         assert_owned::<PreparedCudaRecoveredRow>();
