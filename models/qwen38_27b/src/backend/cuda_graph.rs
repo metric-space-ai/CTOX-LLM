@@ -24,8 +24,8 @@ use crate::backend::cuda_runtime::{
     PreparedCudaQueryGate, PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
 };
 use crate::backend::cuda_schedule::{
-    CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaNormBinding, CudaPrefillChunk,
-    CudaPrefillOperation, CudaPrefillSchedule, CudaPrefillStep,
+    CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaMtpPrefillAlignment,
+    CudaNormBinding, CudaPrefillChunk, CudaPrefillOperation, CudaPrefillSchedule, CudaPrefillStep,
 };
 use crate::backend::{Activation, ScaleSlice};
 use crate::config::LayerKind;
@@ -754,6 +754,26 @@ impl<'a> CudaPrefillExecutionCursor<'a> {
         Ok(())
     }
 
+    /// Records the MTP causal scan only when it is bound to the exact target
+    /// chunk owned by this cursor. The alignment separately proves the
+    /// target-one-ahead cache/RoPE contract before mutable MTP state commits.
+    pub fn advance_mtp(&mut self, alignment: CudaMtpPrefillAlignment) -> Result<()> {
+        if alignment.chunk != self.chunk {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA MTP alignment {:?} differs from active prefill chunk {:?}",
+                alignment.chunk, self.chunk
+            )));
+        }
+        let expected = self.next_step().ok_or_else(|| {
+            EngineError::InvalidState("CUDA prefill chunk is already complete".into())
+        })?;
+        self.advance(
+            expected.schedule_index,
+            None,
+            CudaPrefillOperation::MtpPrefillCausalScan,
+        )
+    }
+
     /// Return the new committed token position only after all 645 operations
     /// and the final host-visible barrier have completed in order.
     pub fn finish(self) -> Result<usize> {
@@ -768,6 +788,27 @@ impl<'a> CudaPrefillExecutionCursor<'a> {
             .start_position
             .checked_add(self.chunk.token_count)
             .ok_or_else(|| EngineError::MemoryBudget("CUDA prefill commit overflows".into()))
+    }
+
+    pub fn finish_with_mtp(self, alignment: CudaMtpPrefillAlignment) -> Result<(usize, usize)> {
+        if alignment.chunk != self.chunk {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA MTP alignment {:?} differs from completed prefill chunk {:?}",
+                alignment.chunk, self.chunk
+            )));
+        }
+        let target_tokens = self.finish()?;
+        let expected_target_tokens = alignment
+            .committed_mtp_tokens
+            .checked_add(1)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA MTP token count overflows".into()))?;
+        if target_tokens != expected_target_tokens {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA MTP prefill completed target/MTP {target_tokens}/{}",
+                alignment.committed_mtp_tokens
+            )));
+        }
+        Ok((target_tokens, alignment.committed_mtp_tokens))
     }
 }
 
@@ -4461,6 +4502,45 @@ mod tests {
             CudaPrefillOperation::ChunkBarrier
         );
         assert!(cursor.skip_disabled_mtp().is_err());
+    }
+
+    #[test]
+    fn mtp_prefill_cursor_commits_aligned_target_and_mtp_counters() {
+        let config = Qwen38Config::default();
+        let projections = CudaProjectionPlan::qwen38(&config).unwrap();
+        let schedule = CudaPrefillSchedule::qwen38(&config, 512).unwrap();
+        let bindings = CudaPrefillBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
+        let chunk = CudaPrefillChunk {
+            start_position: 512,
+            token_count: 8,
+        };
+        let alignment = CudaMtpPrefillAlignment::qwen38(chunk, 512, 511).unwrap();
+        let mut cursor = bindings.execution_cursor(chunk, 512, 1_024).unwrap();
+        while cursor
+            .next_step()
+            .is_some_and(|step| step.operation != CudaPrefillOperation::MtpPrefillCausalScan)
+        {
+            let step = cursor.next_step().unwrap().clone();
+            cursor
+                .advance(step.schedule_index, step.layer, step.operation)
+                .unwrap();
+        }
+        let wrong_alignment = CudaMtpPrefillAlignment::qwen38(
+            CudaPrefillChunk {
+                start_position: 0,
+                token_count: 8,
+            },
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(cursor.advance_mtp(wrong_alignment).is_err());
+        cursor.advance_mtp(alignment).unwrap();
+        let barrier = cursor.next_step().unwrap().clone();
+        cursor
+            .advance(barrier.schedule_index, barrier.layer, barrier.operation)
+            .unwrap();
+        assert_eq!(cursor.finish_with_mtp(alignment).unwrap(), (520, 519));
     }
 
     #[test]

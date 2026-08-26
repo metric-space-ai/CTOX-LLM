@@ -604,6 +604,15 @@ MTP-enabled prefill retains the already correct sequential causal path until a
 batched MTP scan preserves the target-one-ahead invariant. This is source and
 unit-test integration; complete-model SM86 numerical, memory, and latency
 evidence remains required before promotion.
+`CudaMtpPrefillAlignment` now makes that missing invariant executable: the
+first target chunk emits `N-1` MTP rows, later chunks emit `N`, the first row
+after a boundary consumes the retained prior target hidden state, and MTP KV
+cache indices remain exactly one behind their absolute RoPE positions. The
+cursor cannot commit both counters unless target remains exactly one token
+ahead. Row assembly uses the official `cuMemcpy2D_v2` Driver API primitive, so
+the eventual `[embedding_i, hidden_{i-1}]` matrix needs two strided
+device-to-device copies rather than a host token loop or another custom CUDA
+kernel. Hardware verification and the MTP layer-major dispatch remain open.
 `PreparedCudaProjectionGraph` binds the ordinary fan-out, attention-gate, and
 SwiGLU forms to its single admitted activation/output arena. The complete
 target-only 645-step executor transaction is now exposed through a dedicated

@@ -149,6 +149,91 @@ pub struct CudaPrefillChunk {
     pub token_count: usize,
 }
 
+/// Exact causal alignment for the one-layer MTP program attached to a target
+/// prefill chunk. MTP consumes the embedding at absolute position `i` together
+/// with the final target hidden state at `i - 1`, so its cache index is always
+/// one behind its RoPE position. The first prompt token has no MTP row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaMtpPrefillAlignment {
+    pub chunk: CudaPrefillChunk,
+    pub input_token_offset: usize,
+    pub rows: usize,
+    pub previous_chunk_hidden_rows: usize,
+    pub current_chunk_hidden_rows: usize,
+    pub cache_start_token: usize,
+    pub rope_start_position: usize,
+    pub committed_mtp_tokens: usize,
+}
+
+impl CudaMtpPrefillAlignment {
+    pub fn qwen38(
+        chunk: CudaPrefillChunk,
+        committed_target_tokens: usize,
+        committed_mtp_tokens: usize,
+    ) -> Result<Self> {
+        if chunk.token_count == 0 || chunk.start_position != committed_target_tokens {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA MTP prefill chunk {:?} does not start at committed target position {committed_target_tokens}",
+                chunk
+            )));
+        }
+        if committed_target_tokens == 0 {
+            if committed_mtp_tokens != 0 {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA initial MTP prefill has {committed_mtp_tokens} committed rows"
+                )));
+            }
+        } else {
+            let expected_target_tokens = committed_mtp_tokens.checked_add(1).ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA MTP token count overflows".into())
+            })?;
+            if committed_target_tokens != expected_target_tokens {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA MTP prefill requires target exactly one token ahead, observed {committed_target_tokens}/{committed_mtp_tokens}"
+                )));
+            }
+        }
+
+        let first_chunk = committed_target_tokens == 0;
+        let input_token_offset = usize::from(first_chunk);
+        let previous_chunk_hidden_rows = usize::from(!first_chunk);
+        let current_chunk_hidden_rows = chunk.token_count.saturating_sub(1);
+        let rows = previous_chunk_hidden_rows
+            .checked_add(current_chunk_hidden_rows)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA MTP prefill rows overflow".into()))?;
+        let cache_start_token = committed_mtp_tokens;
+        let rope_start_position = chunk
+            .start_position
+            .checked_add(input_token_offset)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA MTP RoPE position overflows".into()))?;
+        let committed_mtp_tokens = committed_mtp_tokens
+            .checked_add(rows)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA MTP token count overflows".into()))?;
+        let committed_target_after = chunk
+            .start_position
+            .checked_add(chunk.token_count)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA target token count overflows".into()))?;
+        let expected_target_after = committed_mtp_tokens
+            .checked_add(1)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA MTP token count overflows".into()))?;
+        if committed_target_after != expected_target_after {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA MTP prefill alignment would commit target/MTP {committed_target_after}/{committed_mtp_tokens}"
+            )));
+        }
+        Ok(Self {
+            chunk,
+            input_token_offset,
+            rows,
+            previous_chunk_hidden_rows,
+            current_chunk_hidden_rows,
+            cache_start_token,
+            rope_start_position,
+            committed_mtp_tokens,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CudaPrefillSchedule {
     pub steps: Vec<CudaPrefillStep>,
@@ -884,5 +969,70 @@ mod tests {
         assert!(schedule.chunks(0, 131_072).is_err());
         assert!(schedule.chunks(131_073, 131_072).is_err());
         assert!(CudaPrefillSchedule::qwen38(&Qwen38Config::default(), 65_536).is_err());
+    }
+
+    #[test]
+    fn mtp_prefill_alignment_skips_only_the_first_prompt_token() {
+        let first = CudaMtpPrefillAlignment::qwen38(
+            CudaPrefillChunk {
+                start_position: 0,
+                token_count: 512,
+            },
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(first.input_token_offset, 1);
+        assert_eq!(first.rows, 511);
+        assert_eq!(first.previous_chunk_hidden_rows, 0);
+        assert_eq!(first.current_chunk_hidden_rows, 511);
+        assert_eq!(first.cache_start_token, 0);
+        assert_eq!(first.rope_start_position, 1);
+        assert_eq!(first.committed_mtp_tokens, 511);
+
+        let second = CudaMtpPrefillAlignment::qwen38(
+            CudaPrefillChunk {
+                start_position: 512,
+                token_count: 512,
+            },
+            512,
+            511,
+        )
+        .unwrap();
+        assert_eq!(second.input_token_offset, 0);
+        assert_eq!(second.rows, 512);
+        assert_eq!(second.previous_chunk_hidden_rows, 1);
+        assert_eq!(second.current_chunk_hidden_rows, 511);
+        assert_eq!(second.cache_start_token, 511);
+        assert_eq!(second.rope_start_position, 512);
+        assert_eq!(second.committed_mtp_tokens, 1_023);
+    }
+
+    #[test]
+    fn one_token_prompt_preserves_target_one_ahead_state() {
+        let alignment = CudaMtpPrefillAlignment::qwen38(
+            CudaPrefillChunk {
+                start_position: 0,
+                token_count: 1,
+            },
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(alignment.rows, 0);
+        assert_eq!(alignment.committed_mtp_tokens, 0);
+    }
+
+    #[test]
+    fn mtp_prefill_alignment_rejects_divergent_counters() {
+        assert!(CudaMtpPrefillAlignment::qwen38(
+            CudaPrefillChunk {
+                start_position: 512,
+                token_count: 16,
+            },
+            512,
+            512,
+        )
+        .is_err());
     }
 }

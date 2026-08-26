@@ -84,6 +84,7 @@ type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CuResult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> CuResult;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> CuResult;
 type CuMemcpyDtoD = unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize) -> CuResult;
+type CuMemcpy2D = unsafe extern "C" fn(*const CudaMemcpy2DDescriptor) -> CuResult;
 type CuLaunchKernel = unsafe extern "C" fn(
     CuFunction,
     u32,
@@ -99,6 +100,75 @@ type CuLaunchKernel = unsafe extern "C" fn(
 ) -> CuResult;
 type CuGetErrorName = unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult;
 type CuGetErrorString = unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult;
+
+const CU_MEMORYTYPE_DEVICE: u32 = 2;
+
+/// CUDA Driver API `CUDA_MEMCPY2D`. All unused host/array fields remain null;
+/// the model runtime admits device-to-device row copies only.
+#[repr(C)]
+struct CudaMemcpy2DDescriptor {
+    src_x_in_bytes: usize,
+    src_y: usize,
+    src_memory_type: u32,
+    src_host: *const c_void,
+    src_device: CuDevicePtr,
+    src_array: *mut c_void,
+    src_pitch: usize,
+    dst_x_in_bytes: usize,
+    dst_y: usize,
+    dst_memory_type: u32,
+    dst_host: *mut c_void,
+    dst_device: CuDevicePtr,
+    dst_array: *mut c_void,
+    dst_pitch: usize,
+    width_in_bytes: usize,
+    height: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct F32Copy2DGeometry {
+    source_row_values: usize,
+    destination_row_values: usize,
+    destination_column: usize,
+    rows: usize,
+    columns: usize,
+}
+
+impl F32Copy2DGeometry {
+    fn validate(self, source_values: usize, destination_values: usize) -> Result<()> {
+        if self.rows == 0
+            || self.columns == 0
+            || self.columns > self.source_row_values
+            || self
+                .destination_column
+                .checked_add(self.columns)
+                .is_none_or(|end| end > self.destination_row_values)
+        {
+            return Err(EngineError::Shape(
+                "CUDA f32 2-D copy has empty or invalid row geometry".into(),
+            ));
+        }
+        let source_end = self
+            .rows
+            .checked_sub(1)
+            .and_then(|row| row.checked_mul(self.source_row_values))
+            .and_then(|offset| offset.checked_add(self.columns))
+            .ok_or_else(|| EngineError::Shape("CUDA f32 2-D source shape overflows".into()))?;
+        let destination_end = self
+            .rows
+            .checked_sub(1)
+            .and_then(|row| row.checked_mul(self.destination_row_values))
+            .and_then(|offset| offset.checked_add(self.destination_column))
+            .and_then(|offset| offset.checked_add(self.columns))
+            .ok_or_else(|| EngineError::Shape("CUDA f32 2-D destination shape overflows".into()))?;
+        if source_end > source_values || destination_end > destination_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA f32 2-D copy touches source/destination {source_end}/{destination_end} values, available {source_values}/{destination_values}"
+            )));
+        }
+        Ok(())
+    }
+}
 
 struct CudaDriver {
     _library: Library,
@@ -120,6 +190,7 @@ struct CudaDriver {
     memcpy_htod: CuMemcpyHtoD,
     memcpy_dtoh: CuMemcpyDtoH,
     memcpy_dtod: CuMemcpyDtoD,
+    memcpy_2d: CuMemcpy2D,
     launch_kernel: CuLaunchKernel,
     get_error_name: CuGetErrorName,
     get_error_string: CuGetErrorString,
@@ -150,6 +221,7 @@ impl CudaDriver {
                 memcpy_htod: symbol(&library, b"cuMemcpyHtoD_v2\0")?,
                 memcpy_dtoh: symbol(&library, b"cuMemcpyDtoH_v2\0")?,
                 memcpy_dtod: symbol(&library, b"cuMemcpyDtoD_v2\0")?,
+                memcpy_2d: symbol(&library, b"cuMemcpy2D_v2\0")?,
                 launch_kernel: symbol(&library, b"cuLaunchKernel\0")?,
                 get_error_name: symbol(&library, b"cuGetErrorName\0")?,
                 get_error_string: symbol(&library, b"cuGetErrorString\0")?,
@@ -1979,6 +2051,74 @@ impl CudaCandidateRuntime {
             .copy_from_buffer(&prepared.snapshot, "target-hidden checkpoint restore")?;
         prepared.valid = false;
         Ok(())
+    }
+
+    /// Copies one compact f32 rectangle between device views using the CUDA
+    /// Driver API. This is the no-kernel primitive used to assemble row-major
+    /// MTP `[embedding, previous_target_hidden]` inputs with two strided
+    /// copies; it never stages values through the host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_f32_rows_device(
+        &self,
+        source: CudaDeviceF32View<'_>,
+        source_row_values: usize,
+        destination: CudaDeviceF32View<'_>,
+        destination_row_values: usize,
+        destination_column: usize,
+        rows: usize,
+        columns: usize,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, source.context) || !Rc::ptr_eq(&self.inner, destination.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA f32 2-D copy crosses driver contexts".into(),
+            ));
+        }
+        let geometry = F32Copy2DGeometry {
+            source_row_values,
+            destination_row_values,
+            destination_column,
+            rows,
+            columns,
+        };
+        geometry.validate(source.values(), destination.values())?;
+        let value_bytes = std::mem::size_of::<f32>();
+        let descriptor = CudaMemcpy2DDescriptor {
+            src_x_in_bytes: 0,
+            src_y: 0,
+            src_memory_type: CU_MEMORYTYPE_DEVICE,
+            src_host: ptr::null(),
+            src_device: source.ptr()?,
+            src_array: ptr::null_mut(),
+            src_pitch: source_row_values.checked_mul(value_bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA f32 2-D source pitch overflows".into())
+            })?,
+            dst_x_in_bytes: destination_column.checked_mul(value_bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA f32 2-D destination offset overflows".into())
+            })?,
+            dst_y: 0,
+            dst_memory_type: CU_MEMORYTYPE_DEVICE,
+            dst_host: ptr::null_mut(),
+            dst_device: destination.ptr()?,
+            dst_array: ptr::null_mut(),
+            dst_pitch: destination_row_values
+                .checked_mul(value_bytes)
+                .ok_or_else(|| {
+                    EngineError::MemoryBudget("CUDA f32 2-D destination pitch overflows".into())
+                })?,
+            width_in_bytes: columns
+                .checked_mul(value_bytes)
+                .ok_or_else(|| EngineError::MemoryBudget("CUDA f32 2-D width overflows".into()))?,
+            height: rows,
+        };
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_2d)(&descriptor),
+                "f32 device row copy",
+            )?;
+        }
+        self.synchronize_after_launch("f32 device row-copy context synchronization")
     }
 
     pub fn dispatch_f32_concat_device<'a>(
@@ -10006,6 +10146,27 @@ mod tests {
     use super::*;
     use crate::format::QuantSegment;
     use crate::loader::{FloatTensorView, QuantizedMatrixView};
+
+    #[test]
+    fn driver_2d_descriptor_and_mtp_row_geometry_are_exact() {
+        assert_eq!(std::mem::size_of::<CudaMemcpy2DDescriptor>(), 128);
+        let geometry = F32Copy2DGeometry {
+            source_row_values: 5,
+            destination_row_values: 10,
+            destination_column: 5,
+            rows: 3,
+            columns: 5,
+        };
+        geometry.validate(15, 30).unwrap();
+        assert!(geometry.validate(14, 30).is_err());
+        assert!(geometry.validate(15, 29).is_err());
+        assert!(F32Copy2DGeometry {
+            destination_column: 6,
+            ..geometry
+        }
+        .validate(15, 30)
+        .is_err());
+    }
 
     #[test]
     fn launch_geometry_covers_partial_last_block() {

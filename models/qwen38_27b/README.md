@@ -329,7 +329,10 @@ sequential CUDA path, CPU-equation scale error stayed below `1.12e-8`, and all
 now exposes all three arena-backed projection forms, while the 645-step
 target-only executor transaction now dispatches them layer-major with one
 barrier per chunk. MTP-enabled prefill deliberately retains the sequential
-causal path until the native MTP chunk scan is implemented; complete-model
+causal path until the native MTP chunk scan is implemented. Its chunk contract
+now proves the first-token omission, prior-chunk hidden boundary, and one-step
+KV/RoPE offset, while a direct `cuMemcpy2D_v2` primitive provides device-only
+strided row assembly without another CUDA kernel. Complete-model
 hardware evidence for the new target-only path remains open. A
 pinned-`get_rows`-structured batched embedding
 candidate now keeps FP16 `s_in`/`s_out` resident and gathers a whole token-ID
