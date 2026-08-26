@@ -61,6 +61,7 @@ struct Report<'a> {
     cpu_oracle_executed: bool,
     resident_bytes: usize,
     resident_graph_workspace_bytes: usize,
+    resident_arena_workspace_bytes: usize,
     resident_norm_workspace_bytes: usize,
     baseline_mean_batch_milliseconds: f64,
     mmq_mean_batch_milliseconds: f64,
@@ -74,6 +75,8 @@ struct Report<'a> {
     baseline_mmq_maximum_relative_delta: f32,
     mmq_graph_maximum_absolute_delta: f32,
     mmq_graph_maximum_relative_delta: f32,
+    mmq_arena_maximum_absolute_delta: f32,
+    mmq_arena_maximum_relative_delta: f32,
     norm_workspace_maximum_absolute_delta: f32,
     note: &'static str,
 }
@@ -203,6 +206,34 @@ fn main() -> anyhow::Result<()> {
         .resident_bytes()
         .checked_add(graph_output.resident_bytes())
         .context("CUDA graph workspace residency overflows")?;
+    let arena_activation = runtime.prepare_shared_a8_activation(&operation)?;
+    let arena_workspace =
+        runtime.prepare_batched_a8_workspace(args.batch_rows, args.columns * 2)?;
+    let arena_outputs =
+        runtime.prepare_batched_a8_output_arena(args.batch_rows, [args.rows, 1, 1, 1])?;
+    let arena_view = runtime
+        .dispatch_batched_a8_arena_fanout_device(
+            &arena_activation,
+            &arena_workspace,
+            &arena_outputs,
+            graph_input.device_view()?,
+            args.batch_rows,
+            &[(&graph_projection, 0)],
+        )?
+        .into_iter()
+        .next()
+        .context("batched CUDA arena fan-out returned no output")?;
+    let arena_values = runtime.verifier_read_f32(arena_view)?;
+    let (mmq_arena_maximum_absolute_delta, mmq_arena_maximum_relative_delta) = compare(
+        &mmq_output,
+        &arena_values,
+        args.absolute_tolerance,
+        args.relative_tolerance,
+    )?;
+    let resident_arena_workspace_bytes = arena_workspace
+        .transient_bytes()
+        .checked_add(arena_outputs.transient_bytes())
+        .context("CUDA arena workspace residency overflows")?;
     let norm_weight = f16_bytes(
         &(0..args.columns)
             .map(|column| 0.01 * (column % 7) as f32)
@@ -271,6 +302,7 @@ fn main() -> anyhow::Result<()> {
             cpu_oracle_executed: !args.skip_cpu_oracle,
             resident_bytes: prepared.resident_bytes(),
             resident_graph_workspace_bytes,
+            resident_arena_workspace_bytes,
             resident_norm_workspace_bytes: norm_workspace.transient_bytes(),
             baseline_mean_batch_milliseconds: baseline_mean_batch_seconds * 1_000.0,
             mmq_mean_batch_milliseconds: mmq_mean_batch_seconds * 1_000.0,
@@ -284,6 +316,8 @@ fn main() -> anyhow::Result<()> {
             baseline_mmq_maximum_relative_delta,
             mmq_graph_maximum_absolute_delta,
             mmq_graph_maximum_relative_delta,
+            mmq_arena_maximum_absolute_delta,
+            mmq_arena_maximum_relative_delta,
             norm_workspace_maximum_absolute_delta,
             note: "Verifier-only comparison of the 2-D dp4a baseline, standalone SM86 MMQ tile, and the device-resident graph workspace path. The graph path shares immutable projection weights and keeps activation/output transients separate. Production promotion still requires complete layer-major chunk scheduling, recurrent/attention scans, representative Qwen shapes, and stable roofline evidence.",
         })?

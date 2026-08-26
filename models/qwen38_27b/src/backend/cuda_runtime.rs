@@ -439,6 +439,18 @@ pub struct PreparedCudaBatchedA8Activation {
     resident_bytes: usize,
 }
 
+/// Maximum-width A8 scratch shared across recovery groups. Immutable `s_in`
+/// remains in [`PreparedCudaA8Activation`]; dispatch validates that owner
+/// against every projection before overwriting this arena.
+pub struct PreparedCudaBatchedA8Workspace {
+    context: Rc<CudaContextInner>,
+    batch_capacity: u32,
+    column_capacity: u32,
+    q8_codes: DeviceBuffer,
+    q8_scales: DeviceBuffer,
+    transient_bytes: usize,
+}
+
 enum CudaA8ProjectionLayout {
     Pure(TensorDType),
     Mixed(Vec<CudaMixedRowSegment>),
@@ -470,6 +482,18 @@ pub struct PreparedCudaBatchedA8Output {
     rows: u32,
     output: DeviceBuffer,
     resident_bytes: usize,
+}
+
+/// Four fixed-address row-major output slots for the frozen Qwen prefill
+/// fan-outs. A slot may host a narrower projection; only its active compact
+/// prefix is exposed to downstream operators.
+pub struct PreparedCudaBatchedA8OutputArena {
+    context: Rc<CudaContextInner>,
+    batch_capacity: u32,
+    slot_rows: [u32; 4],
+    slot_offsets: [usize; 4],
+    output: DeviceBuffer,
+    transient_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5798,6 +5822,42 @@ impl CudaCandidateRuntime {
         })
     }
 
+    /// Allocates one maximum-width activation arena. Recovery scale ownership
+    /// stays in the resident per-group activation object, so this does not
+    /// duplicate 262 `s_in` tensors.
+    pub fn prepare_batched_a8_workspace(
+        &self,
+        batch_capacity: usize,
+        column_capacity: usize,
+    ) -> Result<PreparedCudaBatchedA8Workspace> {
+        let batch_capacity = validate_a8_batch_capacity(batch_capacity)?;
+        if column_capacity == 0
+            || !column_capacity.is_multiple_of(BLOCK_LEN)
+            || u32::try_from(column_capacity).is_err()
+        {
+            return Err(EngineError::Shape(
+                "CUDA batched A8 workspace requires positive u32 block-aligned columns".into(),
+            ));
+        }
+        let code_bytes = (batch_capacity as usize)
+            .checked_mul(column_capacity)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA A8 arena codes overflow".into()))?;
+        let scale_bytes = (batch_capacity as usize)
+            .checked_mul(a8_scale_bytes(column_capacity)?)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA A8 arena scales overflow".into()))?;
+        self.make_current()?;
+        Ok(PreparedCudaBatchedA8Workspace {
+            context: Rc::clone(&self.inner),
+            batch_capacity,
+            column_capacity: column_capacity as u32,
+            q8_codes: DeviceBuffer::allocate(self, code_bytes)?,
+            q8_scales: DeviceBuffer::allocate(self, scale_bytes)?,
+            transient_bytes: code_bytes.checked_add(scale_bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA A8 arena residency overflows".into())
+            })?,
+        })
+    }
+
     /// Prepares matrix-local state without duplicating the input, `s_in`, or
     /// A8 buffers. Dispatch still fails closed unless its activation carries
     /// the byte-identical correction identity.
@@ -5923,6 +5983,47 @@ impl CudaCandidateRuntime {
             rows: projection.rows,
             resident_bytes: output.len(),
             output,
+        })
+    }
+
+    /// Allocates the fixed four-slot output arena selected by the model graph.
+    pub fn prepare_batched_a8_output_arena(
+        &self,
+        batch_capacity: usize,
+        slot_rows: [usize; 4],
+    ) -> Result<PreparedCudaBatchedA8OutputArena> {
+        let batch_capacity = validate_a8_batch_capacity(batch_capacity)?;
+        if slot_rows
+            .into_iter()
+            .any(|rows| rows == 0 || u32::try_from(rows).is_err())
+        {
+            return Err(EngineError::Shape(
+                "CUDA A8 output arena slots must be positive u32 row counts".into(),
+            ));
+        }
+        let mut slot_offsets = [0_usize; 4];
+        let mut total_values = 0_usize;
+        for (slot, rows) in slot_rows.into_iter().enumerate() {
+            slot_offsets[slot] = total_values;
+            total_values = total_values
+                .checked_add((batch_capacity as usize).checked_mul(rows).ok_or_else(|| {
+                    EngineError::MemoryBudget("CUDA output arena slot overflows".into())
+                })?)
+                .ok_or_else(|| {
+                    EngineError::MemoryBudget("CUDA output arena values overflow".into())
+                })?;
+        }
+        let transient_bytes = total_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA output arena bytes overflow".into()))?;
+        self.make_current()?;
+        Ok(PreparedCudaBatchedA8OutputArena {
+            context: Rc::clone(&self.inner),
+            batch_capacity,
+            slot_rows: slot_rows.map(|rows| rows as u32),
+            slot_offsets,
+            output: DeviceBuffer::allocate(self, transient_bytes)?,
+            transient_bytes,
         })
     }
 
@@ -6261,6 +6362,116 @@ impl CudaCandidateRuntime {
             .collect()
     }
 
+    /// Production-shaped fan-out over the single maximum-width activation
+    /// arena and four fixed output slots. The resident activation contributes
+    /// the exact recovery identity and `s_in`; transient codes never become a
+    /// second model owner.
+    pub fn dispatch_batched_a8_arena_fanout_device<'a>(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        workspace: &PreparedCudaBatchedA8Workspace,
+        outputs: &'a PreparedCudaBatchedA8OutputArena,
+        input: CudaDeviceF32View<'_>,
+        batch_rows: usize,
+        projections: &[(&PreparedCudaA8Projection, usize)],
+    ) -> Result<Vec<CudaDeviceF32View<'a>>> {
+        let batch_rows = validate_a8_batch_capacity(batch_rows)?;
+        if projections.is_empty() {
+            return Err(EngineError::Shape(
+                "CUDA A8 arena fan-out requires at least one projection".into(),
+            ));
+        }
+        if !Rc::ptr_eq(&self.inner, &activation.context)
+            || !Rc::ptr_eq(&self.inner, &workspace.context)
+            || !Rc::ptr_eq(&self.inner, &outputs.context)
+            || !Rc::ptr_eq(&self.inner, input.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA A8 arena fan-out crosses driver contexts".into(),
+            ));
+        }
+        if batch_rows > workspace.batch_capacity || batch_rows > outputs.batch_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA A8 arena does not admit {batch_rows} prompt rows"
+            )));
+        }
+        if activation.columns > workspace.column_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA activation needs {} columns, arena admits {}",
+                activation.columns, workspace.column_capacity
+            )));
+        }
+        let input_values = (batch_rows as usize)
+            .checked_mul(activation.columns as usize)
+            .ok_or_else(|| EngineError::Shape("CUDA A8 arena input shape overflows".into()))?;
+        if input.values() != input_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA A8 arena input has {} values, expected {input_values}",
+                input.values()
+            )));
+        }
+        let mut used_slots = [false; 4];
+        for (projection, slot) in projections {
+            if *slot >= outputs.slot_rows.len() || used_slots[*slot] {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA A8 arena output slot {slot} is invalid or aliased"
+                )));
+            }
+            used_slots[*slot] = true;
+            if !Rc::ptr_eq(&self.inner, &projection.context) {
+                return Err(EngineError::InvalidState(
+                    "CUDA A8 arena projection belongs to another context".into(),
+                ));
+            }
+            if projection.columns != activation.columns
+                || projection.correction_identity != activation.correction_identity
+            {
+                return Err(EngineError::InvalidArtifact(
+                    "CUDA A8 arena projection s_in identity differs".into(),
+                ));
+            }
+            if projection.rows > outputs.slot_rows[*slot] {
+                return Err(EngineError::MemoryBudget(format!(
+                    "CUDA A8 projection needs {} rows, slot {slot} admits {}",
+                    projection.rows, outputs.slot_rows[*slot]
+                )));
+            }
+        }
+
+        self.launch_batched_a8_quantization(
+            input.ptr()?,
+            activation.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            workspace.q8_codes.ptr(),
+            workspace.q8_scales.ptr(),
+            activation.columns,
+            batch_rows,
+        )?;
+        for (projection, slot) in projections {
+            let output_ptr = device_ptr_offset(
+                outputs.output.ptr(),
+                outputs.slot_offsets[*slot]
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| {
+                        EngineError::Shape("CUDA output slot offset overflows".into())
+                    })?,
+            )?;
+            self.launch_batched_a8_projection_buffers(
+                workspace.q8_codes.ptr(),
+                workspace.q8_scales.ptr(),
+                projection,
+                output_ptr,
+                batch_rows,
+            )?;
+        }
+        self.synchronize_after_launch("CUDA A8 arena fan-out context synchronization")?;
+        projections
+            .iter()
+            .map(|(projection, slot)| {
+                outputs.device_output(*slot, projection.rows(), batch_rows as usize)
+            })
+            .collect()
+    }
+
     /// Executes only release-bound LM-head rows for an MTP proposal. The
     /// target head remains a separate complete projection and verifies every
     /// proposed token before commit.
@@ -6421,15 +6632,32 @@ impl CudaCandidateRuntime {
         output: &PreparedCudaBatchedA8Output,
         batch_rows: u32,
     ) -> Result<()> {
+        self.launch_batched_a8_projection_buffers(
+            activation.q8_codes.ptr(),
+            activation.q8_scales.ptr(),
+            projection,
+            output.output.ptr(),
+            batch_rows,
+        )
+    }
+
+    fn launch_batched_a8_projection_buffers(
+        &self,
+        q8_codes: CuDevicePtr,
+        q8_scales: CuDevicePtr,
+        projection: &PreparedCudaA8Projection,
+        output: CuDevicePtr,
+        batch_rows: u32,
+    ) -> Result<()> {
         match &projection.layout {
             CudaA8ProjectionLayout::Pure(dtype) => self.launch_batched_a8_mmq_projection(
                 *dtype,
                 projection.weights.ptr(),
-                activation.q8_codes.ptr(),
-                activation.q8_scales.ptr(),
+                q8_codes,
+                q8_scales,
                 projection.s_out.as_ref().map_or(0, DeviceBuffer::ptr),
                 projection.bias.as_ref().map_or(0, DeviceBuffer::ptr),
-                output.output.ptr(),
+                output,
                 projection.rows,
                 projection.columns,
                 batch_rows,
@@ -6442,8 +6670,8 @@ impl CudaCandidateRuntime {
                     self.launch_batched_a8_mmq_projection(
                         segment.descriptor.dtype,
                         device_ptr_offset(projection.weights.ptr(), segment.weight_offset)?,
-                        activation.q8_codes.ptr(),
-                        activation.q8_scales.ptr(),
+                        q8_codes,
+                        q8_scales,
                         projection
                             .s_out
                             .as_ref()
@@ -6456,7 +6684,7 @@ impl CudaCandidateRuntime {
                             .map(|buffer| device_ptr_offset(buffer.ptr(), row_start * 4))
                             .transpose()?
                             .unwrap_or(0),
-                        device_ptr_offset(output.output.ptr(), row_start * 4)?,
+                        device_ptr_offset(output, row_start * 4)?,
                         segment.row_count,
                         projection.columns,
                         batch_rows,
@@ -7507,6 +7735,20 @@ impl PreparedCudaBatchedA8Activation {
     }
 }
 
+impl PreparedCudaBatchedA8Workspace {
+    pub fn batch_capacity(&self) -> usize {
+        self.batch_capacity as usize
+    }
+
+    pub fn column_capacity(&self) -> usize {
+        self.column_capacity as usize
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+}
+
 impl PreparedCudaA8Projection {
     pub fn dtype(&self) -> TensorDType {
         self.dtype
@@ -7554,6 +7796,42 @@ impl PreparedCudaBatchedA8Output {
             .checked_mul(self.rows())
             .ok_or_else(|| EngineError::Shape("CUDA batched output view overflows".into()))?;
         self.output.f32_view(0, values)
+    }
+}
+
+impl PreparedCudaBatchedA8OutputArena {
+    pub fn batch_capacity(&self) -> usize {
+        self.batch_capacity as usize
+    }
+
+    pub fn slot_rows(&self) -> [usize; 4] {
+        self.slot_rows.map(|rows| rows as usize)
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn device_output(
+        &self,
+        slot: usize,
+        rows: usize,
+        batch_rows: usize,
+    ) -> Result<CudaDeviceF32View<'_>> {
+        let batch_rows = validate_a8_batch_capacity(batch_rows)?;
+        if slot >= self.slot_rows.len()
+            || rows == 0
+            || rows > self.slot_rows[slot] as usize
+            || batch_rows > self.batch_capacity
+        {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA output arena does not admit slot {slot}, {batch_rows}x{rows}"
+            )));
+        }
+        let values = (batch_rows as usize)
+            .checked_mul(rows)
+            .ok_or_else(|| EngineError::Shape("CUDA output arena view overflows".into()))?;
+        self.output.f32_view(self.slot_offsets[slot], values)
     }
 }
 
@@ -9282,8 +9560,10 @@ mod tests {
         assert_owned::<PreparedCudaMixedA8MatVec>();
         assert_owned::<PreparedCudaA8Activation>();
         assert_owned::<PreparedCudaBatchedA8Activation>();
+        assert_owned::<PreparedCudaBatchedA8Workspace>();
         assert_owned::<PreparedCudaA8Projection>();
         assert_owned::<PreparedCudaBatchedA8Output>();
+        assert_owned::<PreparedCudaBatchedA8OutputArena>();
         assert_owned::<PreparedCudaBatchedRmsNormWorkspace>();
         assert_owned::<PreparedCudaCausalConvScanOutput>();
         assert_owned::<PreparedCudaGatedDeltaScanInputs>();

@@ -13,6 +13,7 @@ use crate::backend::cuda_runtime::{
     CudaCandidateRuntime, CudaCausalConvConfig, CudaDeviceF32View, CudaGatedDeltaConfig,
     CudaGatedRmsNormConfig, CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig,
     CudaRmsNormConfig, PreparedCudaA8Activation, PreparedCudaA8Projection,
+    PreparedCudaBatchedA8OutputArena, PreparedCudaBatchedA8Workspace,
     PreparedCudaBatchedQueryGateOutput, PreparedCudaBatchedRmsNormWorkspace,
     PreparedCudaBatchedRopeWorkspace, PreparedCudaCausalConv, PreparedCudaEmbedding,
     PreparedCudaF32Checkpoint, PreparedCudaF32Concat, PreparedCudaGatedDelta,
@@ -1328,11 +1329,14 @@ pub struct PreparedCudaProjectionGraph {
 pub struct PreparedCudaPrefillWorkspaces {
     max_chunk_tokens: usize,
     budget: CudaPrefillWorkspaceBudget,
+    projection_budget: CudaPrefillProjectionWorkspacePlan,
     hidden_norm: PreparedCudaBatchedRmsNormWorkspace,
     key_norm: PreparedCudaBatchedRmsNormWorkspace,
     rope: PreparedCudaBatchedRopeWorkspace,
     query_gate: PreparedCudaBatchedQueryGateOutput,
     paged_gqa_output: PreparedCudaPagedGqaPrefillOutput,
+    projection_activation: PreparedCudaBatchedA8Workspace,
+    projection_outputs: PreparedCudaBatchedA8OutputArena,
 }
 
 impl PreparedCudaPrefillWorkspaces {
@@ -1341,8 +1345,14 @@ impl PreparedCudaPrefillWorkspaces {
         config: &Qwen38Config,
         max_chunk_tokens: usize,
         maximum_context_tokens: usize,
+        projection_budget: CudaPrefillProjectionWorkspacePlan,
     ) -> Result<Self> {
         let budget = CudaPrefillWorkspaceBudget::qwen38(config, max_chunk_tokens)?;
+        if projection_budget.max_chunk_tokens != max_chunk_tokens {
+            return Err(EngineError::InvalidState(
+                "CUDA attention/projection workspace chunk capacities differ".into(),
+            ));
+        }
         let hidden_norm =
             runtime.prepare_batched_rms_norm_workspace(max_chunk_tokens, config.hidden_size)?;
         let key_rows = max_chunk_tokens
@@ -1370,12 +1380,20 @@ impl PreparedCudaPrefillWorkspaces {
             },
             max_chunk_tokens,
         )?;
+        let projection_activation = runtime
+            .prepare_batched_a8_workspace(max_chunk_tokens, projection_budget.activation_columns)?;
+        let projection_outputs = runtime.prepare_batched_a8_output_arena(
+            max_chunk_tokens,
+            projection_budget.output_slot_rows,
+        )?;
         let actual = [
             hidden_norm.transient_bytes(),
             key_norm.transient_bytes(),
             rope.transient_bytes(),
             query_gate.transient_bytes(),
             paged_gqa_output.transient_bytes(),
+            projection_activation.transient_bytes(),
+            projection_outputs.transient_bytes(),
         ]
         .into_iter()
         .try_fold(0_u64, |total, bytes| {
@@ -1384,20 +1402,27 @@ impl PreparedCudaPrefillWorkspaces {
             })?;
             checked_add(total, bytes, "CUDA prefill workspace allocation")
         })?;
-        if actual != budget.total_bytes {
+        let planned = checked_add(
+            budget.total_bytes,
+            projection_budget.total_bytes,
+            "CUDA complete prefill workspace bytes",
+        )?;
+        if actual != planned {
             return Err(EngineError::InvalidState(format!(
-                "CUDA prefill workspace allocated {actual} bytes, planned {}",
-                budget.total_bytes
+                "CUDA prefill workspace allocated {actual} bytes, planned {planned}"
             )));
         }
         Ok(Self {
             max_chunk_tokens,
             budget,
+            projection_budget,
             hidden_norm,
             key_norm,
             rope,
             query_gate,
             paged_gqa_output,
+            projection_activation,
+            projection_outputs,
         })
     }
 
@@ -1409,8 +1434,12 @@ impl PreparedCudaPrefillWorkspaces {
         self.budget
     }
 
+    pub fn projection_budget(&self) -> CudaPrefillProjectionWorkspacePlan {
+        self.projection_budget
+    }
+
     pub fn transient_bytes(&self) -> u64 {
-        self.budget.total_bytes
+        self.budget.total_bytes + self.projection_budget.total_bytes
     }
 
     pub fn hidden_norm(&self) -> &PreparedCudaBatchedRmsNormWorkspace {
@@ -1431,6 +1460,14 @@ impl PreparedCudaPrefillWorkspaces {
 
     pub fn paged_gqa_output(&self) -> &PreparedCudaPagedGqaPrefillOutput {
         &self.paged_gqa_output
+    }
+
+    pub fn projection_activation(&self) -> &PreparedCudaBatchedA8Workspace {
+        &self.projection_activation
+    }
+
+    pub fn projection_outputs(&self) -> &PreparedCudaBatchedA8OutputArena {
+        &self.projection_outputs
     }
 }
 
@@ -1931,6 +1968,7 @@ impl PreparedCudaProjectionGraph {
             config,
             prefill_bindings.max_chunk_tokens(),
             maximum_context_tokens,
+            prefill_bindings.projection_workspace(),
         )?;
         graph_bytes = checked_add(
             graph_bytes,
