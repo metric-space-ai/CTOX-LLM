@@ -298,6 +298,25 @@ pub struct PagedKvCache {
     pages: Vec<QuantizedKvPage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvCacheUpdate {
+    pub page_index: usize,
+    pub token_in_page: usize,
+    pub demoted_pages: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KvPageView<'a> {
+    pub page_index: usize,
+    pub first_token: usize,
+    pub tokens: usize,
+    pub precision: KvPrecision,
+    pub values_per_token: usize,
+    /// Canonical little-endian Q2_B64 or Q4_B64 blocks, token-major as
+    /// `[K heads, V heads]`. Backends may upload this slice directly.
+    pub bytes: &'a [u8],
+}
+
 impl PagedKvCache {
     pub fn new(
         maximum_tokens: usize,
@@ -346,7 +365,7 @@ impl PagedKvCache {
         )
     }
 
-    pub fn push(&mut self, key: &[f32], value: &[f32]) -> Result<()> {
+    pub fn push(&mut self, key: &[f32], value: &[f32]) -> Result<KvCacheUpdate> {
         if self.tokens >= self.maximum_tokens
             || key.len() != self.component_values
             || value.len() != self.component_values
@@ -370,11 +389,18 @@ impl PagedKvCache {
             .expect("a KV page was created")
             .push(&combined)?;
         self.tokens += 1;
-        self.demote_old_pages()
+        let page_index = self.pages.len() - 1;
+        let token_in_page = self.pages[page_index].tokens() - 1;
+        Ok(KvCacheUpdate {
+            page_index,
+            token_in_page,
+            demoted_pages: self.demote_old_pages()?,
+        })
     }
 
-    fn demote_old_pages(&mut self) -> Result<()> {
+    fn demote_old_pages(&mut self) -> Result<Vec<usize>> {
         let recent_start = self.tokens.saturating_sub(self.recent_tokens);
+        let mut demoted = Vec::new();
         for (page_index, page) in self.pages.iter_mut().enumerate() {
             let page_start = page_index * self.page_tokens;
             let page_end = page_start + page.tokens();
@@ -383,9 +409,10 @@ impl PagedKvCache {
                 && page_end <= recent_start
             {
                 page.requantize(KvPrecision::Q2)?;
+                demoted.push(page_index);
             }
         }
-        Ok(())
+        Ok(demoted)
     }
 
     pub fn tokens(&self) -> usize {
@@ -448,6 +475,20 @@ impl PagedKvCache {
             .filter(|page| page.precision == KvPrecision::Q4)
             .map(QuantizedKvPage::tokens)
             .sum()
+    }
+
+    pub fn page_views(&self) -> impl ExactSizeIterator<Item = KvPageView<'_>> {
+        self.pages
+            .iter()
+            .enumerate()
+            .map(|(page_index, page)| KvPageView {
+                page_index,
+                first_token: page_index * self.page_tokens,
+                tokens: page.tokens(),
+                precision: page.precision,
+                values_per_token: page.values_per_token,
+                bytes: &page.bytes,
+            })
     }
 
     pub fn maximum_boundary_q4_tokens(&self) -> usize {
@@ -529,9 +570,12 @@ mod tests {
     fn paged_cache_demotes_only_pages_outside_sink_and_recent_windows() {
         let mut cache = PagedKvCache::new(16, 64, 4, 4, 4).unwrap();
         for token in 0..16 {
-            cache
+            let update = cache
                 .push(&[token as f32; 64], &[-(token as f32); 64])
                 .unwrap();
+            if token == 11 {
+                assert_eq!(update.demoted_pages, vec![1]);
+            }
         }
         assert_eq!(cache.tokens(), 16);
         assert_eq!(cache.q4_tokens(), 8);
@@ -544,6 +588,13 @@ mod tests {
             cache.projected_packed_bytes(16).unwrap(),
             cache.packed_bytes()
         );
+        let views = cache.page_views().collect::<Vec<_>>();
+        assert_eq!(views.len(), 4);
+        assert_eq!(views[0].first_token, 0);
+        assert_eq!(views[1].first_token, 4);
+        assert_eq!(views[1].precision, KvPrecision::Q2);
+        assert_eq!(views[3].tokens, 4);
+        assert_eq!(views[3].bytes.len(), views[3].tokens * 2 * Q4_BLOCK_BYTES);
         let key = cache.flattened_key(1, 64).unwrap();
         let value = cache.flattened_value(1, 64).unwrap();
         assert_eq!(key.len(), 16 * 64);

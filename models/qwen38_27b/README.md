@@ -171,6 +171,10 @@ replay-on-reject keeps MTP4 below 9.7 GiB: 9.68562 GiB with 14.73 MiB calculated
 headroom. This still requires numerical and Android PSS/accelerator-memory
 evidence. Historical artifact hashes and byte counts are unchanged.
 
+[`docs/PAGED_KV_NOTES.md`](docs/PAGED_KV_NOTES.md) defines the canonical
+128-token page layout and the zero-copy page-view/update contract used to wire
+the same logical Q2/Q4 cache into CUDA, Metal, and Snapdragon Vulkan kernels.
+
 [`docs/WIRE_PROTOCOL_V1.md`](docs/WIRE_PROTOCOL_V1.md) defines the matching
 versioned Unix-socket/named-pipe control and token-stream contract. The bring-up
 server negotiates and reports health but remains fail-closed with

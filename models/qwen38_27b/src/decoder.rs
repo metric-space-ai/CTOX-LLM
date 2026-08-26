@@ -254,7 +254,9 @@ impl FullAttentionState {
                     value_heads[head].extend_from_slice(&value[start..start + self.head_dim]);
                 }
             }
-            FullAttentionStorage::Paged(cache) => cache.push(key, value)?,
+            FullAttentionStorage::Paged(cache) => {
+                cache.push(key, value)?;
+            }
         }
         self.tokens += 1;
         Ok(())
