@@ -672,6 +672,7 @@ class DatasetPipelineTests(unittest.TestCase):
 
             reused = root / "reused.json"
             verification(reused, "1" * 64, root / "old-cache")
+            reused_bytes = reused.read_bytes()
             reused_sha256 = hashlib.sha256(reused.read_bytes()).hexdigest()
             plan = root / "plan.json"
             plan.write_text(
@@ -682,6 +683,7 @@ class DatasetPipelineTests(unittest.TestCase):
                     }
                 )
             )
+            plan_sha256 = hashlib.sha256(plan.read_bytes()).hexdigest()
             grouped = root / "new-batch-000-v1-verification-v1.json"
             verification(grouped, "2" * 64, root / "new-cache")
             expected = root / "expected.jsonl"
@@ -697,8 +699,9 @@ class DatasetPipelineTests(unittest.TestCase):
                 "build_teacher_cache_set.py",
                 "--verification",
                 str(reused),
-                "--batch-group",
+                "--bound-batch-group",
                 str(plan),
+                plan_sha256,
                 str(root),
                 "new",
                 "--expected-input",
@@ -720,8 +723,9 @@ class DatasetPipelineTests(unittest.TestCase):
                 "--bound-verification",
                 str(reused),
                 reused_sha256,
-                "--batch-group",
+                "--bound-batch-group",
                 str(plan),
+                plan_sha256,
                 str(root),
                 "new",
                 "--expected-input",
@@ -741,6 +745,10 @@ class DatasetPipelineTests(unittest.TestCase):
             self.assertEqual(document["expected_input"]["records"], 2)
             self.assertEqual(document["batch_groups"][0]["samples"], 1)
             self.assertEqual(
+                document["batch_groups"][0]["expected_batch_plan_sha256"],
+                plan_sha256,
+            )
+            self.assertEqual(
                 document["bound_verifications"],
                 [
                     {
@@ -758,8 +766,9 @@ class DatasetPipelineTests(unittest.TestCase):
                 "--bound-verification",
                 str(reused),
                 reused_sha256,
-                "--batch-group",
+                "--bound-batch-group",
                 str(plan),
+                plan_sha256,
                 str(root),
                 "new",
                 "--expected-input",
@@ -774,6 +783,33 @@ class DatasetPipelineTests(unittest.TestCase):
             ]
             with patch.object(sys, "argv", changed_arguments):
                 with self.assertRaisesRegex(SystemExit, "bound verification changed"):
+                    build_teacher_cache_set_main()
+
+            reused.write_bytes(reused_bytes)
+            current_reused_sha256 = hashlib.sha256(reused.read_bytes()).hexdigest()
+            plan.write_text(plan.read_text() + "\n")
+            changed_plan_arguments = [
+                "build_teacher_cache_set.py",
+                "--bound-verification",
+                str(reused),
+                current_reused_sha256,
+                "--bound-batch-group",
+                str(plan),
+                plan_sha256,
+                str(root),
+                "new",
+                "--expected-input",
+                str(expected),
+                "--teacher-revision",
+                revision,
+                "--teacher-provenance-sha256",
+                provenance,
+                "--output",
+                str(changed_output),
+                "--skip-artifact-rehash",
+            ]
+            with patch.object(sys, "argv", changed_plan_arguments):
+                with self.assertRaisesRegex(SystemExit, "bound batch plan changed"):
                     build_teacher_cache_set_main()
 
     def test_committed_general_purpose_evidence_covers_every_declared_domain(

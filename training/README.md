@@ -261,6 +261,11 @@ Release assembly supplies every previously audited reuse through repeatable
 documents before parsing them and records their paths, byte counts, and hashes
 in the cache-set manifest; a valid but different replacement verification is
 not accepted merely because it covers the same sample identity.
+The new batch portion follows the same rule through repeatable
+`--bound-batch-group PLAN SHA256 VERIFICATION_ROOT PREFIX` arguments. Supplying
+`--expected-input` makes both hash-bound forms mandatory for explicit reuse and
+batch groups, closing the final cohort against replacement plans as well as
+replacement verification documents.
 The trainer reopens that set only with its expected manifest SHA-256, then
 reconstructs and compares the sample count, artifact bytes, content root, and
 every underlying batch-verification hash before the first optimization step.

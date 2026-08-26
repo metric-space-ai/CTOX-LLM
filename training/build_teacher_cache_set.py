@@ -66,6 +66,14 @@ def main() -> None:
         metavar=("PLAN", "VERIFICATION_ROOT", "PREFIX"),
         help="repeatable batch-plan/root/prefix group for a combined final cache set",
     )
+    parser.add_argument(
+        "--bound-batch-group",
+        nargs=4,
+        action="append",
+        default=[],
+        metavar=("PLAN", "SHA256", "VERIFICATION_ROOT", "PREFIX"),
+        help="repeatable batch group whose exact plan bytes are frozen by SHA-256",
+    )
     parser.add_argument("--verification", type=Path, action="append", default=[])
     parser.add_argument(
         "--bound-verification",
@@ -88,10 +96,18 @@ def main() -> None:
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
     try:
-        if args.expected_input is not None and args.verification:
-            raise ValueError(
-                "an expected-input final cache set requires bound explicit verifications"
-            )
+        if args.expected_input is not None:
+            if args.verification:
+                raise ValueError(
+                    "an expected-input final cache set requires bound explicit verifications"
+                )
+            if args.batch_group or any(
+                value is not None
+                for value in (args.batch_plan, args.verification_root, args.prefix)
+            ):
+                raise ValueError(
+                    "an expected-input final cache set requires bound batch groups"
+                )
         plan_arguments = (args.batch_plan, args.verification_root, args.prefix)
         has_legacy_group = any(value is not None for value in plan_arguments)
         if has_legacy_group and (
@@ -99,6 +115,7 @@ def main() -> None:
             or args.verification
             or args.bound_verification
             or args.batch_group
+            or args.bound_batch_group
         ):
             raise ValueError(
                 "legacy batch-plan arguments must be complete and cannot be combined"
@@ -108,6 +125,7 @@ def main() -> None:
             and not args.verification
             and not args.bound_verification
             and not args.batch_group
+            and not args.bound_batch_group
         ):
             raise ValueError(
                 "provide verifications, batch groups, or batch plan, root, and prefix"
@@ -116,6 +134,7 @@ def main() -> None:
             raw_groups = [(str(args.batch_plan), str(args.verification_root), args.prefix)]
         else:
             raw_groups = args.batch_group
+        bound_raw_groups = args.bound_batch_group
         verification_paths = [path.expanduser().resolve() for path in args.verification]
         bound_verifications = []
         for raw_path, expected_sha256 in args.bound_verification:
@@ -140,12 +159,31 @@ def main() -> None:
         if len(verification_paths) != len(set(verification_paths)):
             raise ValueError("explicit teacher-cache verification path occurs more than once")
         explicit_batch_count = len(verification_paths)
-        if raw_groups:
+        if raw_groups or bound_raw_groups:
             batch_groups = []
             group_ranges = []
             batch_offset = explicit_batch_count
             for raw_plan, raw_root, prefix in raw_groups:
                 paths, record, samples = batch_group(Path(raw_plan), Path(raw_root), prefix)
+                verification_paths.extend(paths)
+                batch_groups.append(record)
+                group_ranges.append((batch_offset, len(paths), samples))
+                batch_offset += len(paths)
+            for raw_plan, expected_sha256, raw_root, prefix in bound_raw_groups:
+                if not SHA256.fullmatch(expected_sha256):
+                    raise ValueError(
+                        f"bound batch-plan SHA-256 is invalid: {expected_sha256}"
+                    )
+                paths, record, samples = batch_group(
+                    Path(raw_plan), Path(raw_root), prefix
+                )
+                actual_sha256 = str(record["batch_plan_sha256"])
+                if actual_sha256 != expected_sha256:
+                    raise ValueError(
+                        f"bound batch plan changed: {Path(raw_plan).resolve()} is "
+                        f"{actual_sha256}, expected {expected_sha256}"
+                    )
+                record["expected_batch_plan_sha256"] = expected_sha256
                 verification_paths.extend(paths)
                 batch_groups.append(record)
                 group_ranges.append((batch_offset, len(paths), samples))
