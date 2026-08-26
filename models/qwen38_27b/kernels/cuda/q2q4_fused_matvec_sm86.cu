@@ -457,3 +457,75 @@ void ctox_gated_delta_recurrent_f16_sm86(
     }
     output[value_offset] = result;
 }
+
+// Qwen's width-4 depthwise causal convolution. Each channel owns an
+// independent FP16 history and FP16 weight row; input/output arithmetic and
+// fused SiLU stay f32. The exact frozen production geometry is validated by
+// the Rust host before this verifier candidate is launched.
+// ref: ggml/src/ggml-cuda/ssm-conv.cu:1-95
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_causal_conv_silu_f16_sm86(
+    const float* __restrict__ input,
+    const __half* __restrict__ weight,
+    __half* __restrict__ state,
+    float* __restrict__ output,
+    unsigned channels,
+    unsigned kernel_width) {
+    const unsigned channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels || kernel_width != 4u) {
+        return;
+    }
+    const unsigned base = channel * kernel_width;
+    state[base] = state[base + 1u];
+    state[base + 1u] = state[base + 2u];
+    state[base + 2u] = state[base + 3u];
+    state[base + 3u] = __float2half_rn(input[channel]);
+    float sum = 0.0f;
+#pragma unroll
+    for (unsigned index = 0u; index < 4u; ++index) {
+        sum = fmaf(__half2float(state[base + index]),
+                   __half2float(weight[base + index]),
+                   sum);
+    }
+    output[channel] = sum / (1.0f + expf(-sum));
+}
+
+// GatedDeltaNet's direct-weight RMSNorm fused with SiLU(gate). One warp owns
+// one 128-value head. The learned weight stays FP16 and is widened only in
+// registers; this deliberately does not apply Qwen's residual-norm +1 rule.
+// ref: ggml/src/ggml-cuda/norm.cu:1-148
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_gated_rms_norm_f16_sm86(
+    const float* __restrict__ input,
+    const float* __restrict__ gate,
+    const __half* __restrict__ weight,
+    float* __restrict__ output,
+    unsigned rows,
+    unsigned columns,
+    float epsilon) {
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned warp = threadIdx.x / kWarpSize;
+    const unsigned warps_per_block = blockDim.x / kWarpSize;
+    const unsigned row = blockIdx.x * warps_per_block + warp;
+    if (row >= rows || columns != 128u) {
+        return;
+    }
+    const unsigned row_offset = row * columns;
+    float sum_squares = 0.0f;
+#pragma unroll
+    for (unsigned slot = 0u; slot < 4u; ++slot) {
+        const float item = input[row_offset + lane + slot * kWarpSize];
+        sum_squares = fmaf(item, item, sum_squares);
+    }
+    const float inverse = rsqrtf(warp_sum(sum_squares)
+        * (1.0f / static_cast<float>(columns)) + epsilon);
+#pragma unroll
+    for (unsigned slot = 0u; slot < 4u; ++slot) {
+        const unsigned column = lane + slot * kWarpSize;
+        const unsigned index = row_offset + column;
+        const float gate_value = gate[index];
+        const float silu_gate = gate_value / (1.0f + expf(-gate_value));
+        output[index] = input[index] * inverse
+            * __half2float(weight[column]) * silu_gate;
+    }
+}

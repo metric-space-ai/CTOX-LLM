@@ -17,8 +17,10 @@ use sha2::{Digest, Sha256};
 
 use super::cuda::{
     validate_mixed_operation, validate_operation, validate_recovered_row, CudaMixedRowSegment,
-    A8_QUANTIZE_SYMBOL, GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS, GATED_DELTA_KEY_DIM,
-    GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
+    A8_QUANTIZE_SYMBOL, CAUSAL_CONV_F16_SYMBOL, GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS,
+    GATED_DELTA_KEY_DIM, GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
+    GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
+    LINEAR_CONV_STATE_BYTES, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
     Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
     Q4_B64_RECOVERED_ROW_SYMBOL,
 };
@@ -36,6 +38,7 @@ type CuDevicePtr = u64;
 
 const CUDA_SUCCESS: CuResult = 0;
 const THREADS_PER_BLOCK: u32 = 128;
+const LINEAR_THREADS_PER_BLOCK: u32 = 256;
 const WARP_SIZE: u32 = 32;
 const A8_ROWS_PER_BLOCK: u32 = (THREADS_PER_BLOCK / WARP_SIZE) * 2;
 
@@ -166,6 +169,8 @@ struct CudaContextInner {
     q2_recovered_row_function: CuFunction,
     q4_recovered_row_function: CuFunction,
     gated_delta_f16_function: CuFunction,
+    causal_conv_f16_function: CuFunction,
+    gated_rms_norm_f16_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
 }
@@ -304,6 +309,58 @@ pub struct PreparedCudaGatedDelta {
     resident_state_bytes: usize,
     transient_bytes: usize,
     poisoned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaCausalConvConfig {
+    pub channels: usize,
+    pub kernel_width: usize,
+}
+
+impl CudaCausalConvConfig {
+    pub const QWEN38_27B: Self = Self {
+        channels: LINEAR_CONV_CHANNELS,
+        kernel_width: LINEAR_CONV_KERNEL_WIDTH,
+    };
+}
+
+pub struct PreparedCudaCausalConv {
+    context: Rc<CudaContextInner>,
+    config: CudaCausalConvConfig,
+    input: DeviceBuffer,
+    weight: DeviceBuffer,
+    state: DeviceBuffer,
+    output: DeviceBuffer,
+    model_bytes: usize,
+    resident_state_bytes: usize,
+    transient_bytes: usize,
+    poisoned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CudaGatedRmsNormConfig {
+    pub rows: usize,
+    pub columns: usize,
+    pub epsilon: f32,
+}
+
+impl CudaGatedRmsNormConfig {
+    pub const QWEN38_27B: Self = Self {
+        rows: GATED_RMS_NORM_ROWS,
+        columns: GATED_RMS_NORM_COLUMNS,
+        epsilon: 1.0e-6,
+    };
+}
+
+pub struct PreparedCudaGatedRmsNorm {
+    context: Rc<CudaContextInner>,
+    config: CudaGatedRmsNormConfig,
+    input: DeviceBuffer,
+    gate: DeviceBuffer,
+    weight: DeviceBuffer,
+    output: DeviceBuffer,
+    model_bytes: usize,
+    transient_bytes: usize,
 }
 
 impl CudaCandidateRuntime {
@@ -469,6 +526,28 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let causal_conv_f16_function =
+            match resolve_function(&driver, module, CAUSAL_CONV_F16_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let gated_rms_norm_f16_function =
+            match resolve_function(&driver, module, GATED_RMS_NORM_F16_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         Ok(Self {
             inner: Rc::new(CudaContextInner {
                 driver,
@@ -482,6 +561,8 @@ impl CudaCandidateRuntime {
                 q2_recovered_row_function,
                 q4_recovered_row_function,
                 gated_delta_f16_function,
+                causal_conv_f16_function,
+                gated_rms_norm_f16_function,
                 device_name,
                 compute_capability,
             }),
@@ -658,6 +739,207 @@ impl CudaCandidateRuntime {
             ));
         }
         prepared.poisoned = false;
+        Ok(result)
+    }
+
+    pub fn prepare_causal_conv_f16(
+        &self,
+        config: CudaCausalConvConfig,
+        weight_f16_le: &[u8],
+    ) -> Result<PreparedCudaCausalConv> {
+        if config != CudaCausalConvConfig::QWEN38_27B {
+            return Err(EngineError::Shape(
+                "CUDA causal convolution requires the exact Qwen3.8-27B 10240x4 profile".into(),
+            ));
+        }
+        validate_f16_buffer(weight_f16_le, LINEAR_CONV_STATE_BYTES, "convolution weight")?;
+        let value_bytes = config
+            .channels
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA convolution values overflow".into()))?;
+        let input = DeviceBuffer::allocate(self, value_bytes)?;
+        let weight = DeviceBuffer::from_bytes(self, weight_f16_le)?;
+        let state = DeviceBuffer::allocate(self, LINEAR_CONV_STATE_BYTES)?;
+        let output = DeviceBuffer::allocate(self, value_bytes)?;
+        input.zero()?;
+        state.zero()?;
+        output.zero()?;
+        Ok(PreparedCudaCausalConv {
+            context: Rc::clone(&self.inner),
+            config,
+            input,
+            weight,
+            state,
+            output,
+            model_bytes: weight_f16_le.len(),
+            resident_state_bytes: LINEAR_CONV_STATE_BYTES,
+            transient_bytes: value_bytes * 2,
+            poisoned: false,
+        })
+    }
+
+    pub fn dispatch_causal_conv_f16(
+        &self,
+        prepared: &mut PreparedCudaCausalConv,
+    ) -> Result<Vec<f32>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA convolution belongs to another context".into(),
+            ));
+        }
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA convolution state is poisoned; reset is required".into(),
+            ));
+        }
+        prepared.poisoned = true;
+        self.make_current()?;
+        let mut input = prepared.input.ptr();
+        let mut weight = prepared.weight.ptr();
+        let mut state = prepared.state.ptr();
+        let mut output = prepared.output.ptr();
+        let mut channels = prepared.config.channels as u32;
+        let mut kernel_width = prepared.config.kernel_width as u32;
+        let mut params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut weight as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut state as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut channels as *mut u32).cast::<c_void>(),
+            (&mut kernel_width as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.causal_conv_f16_function,
+                    channels.div_ceil(LINEAR_THREADS_PER_BLOCK),
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "causal-convolution kernel launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "causal-convolution context synchronization",
+            )?;
+        }
+        let mut result = vec![0.0_f32; prepared.config.channels];
+        prepared.output.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA causal convolution produced a non-finite output".into(),
+            ));
+        }
+        prepared.poisoned = false;
+        Ok(result)
+    }
+
+    pub fn prepare_gated_rms_norm_f16(
+        &self,
+        config: CudaGatedRmsNormConfig,
+        weight_f16_le: &[u8],
+    ) -> Result<PreparedCudaGatedRmsNorm> {
+        if config.rows != GATED_RMS_NORM_ROWS
+            || config.columns != GATED_RMS_NORM_COLUMNS
+            || !config.epsilon.is_finite()
+            || config.epsilon <= 0.0
+        {
+            return Err(EngineError::Shape(
+                "CUDA gated RMSNorm requires the exact Qwen3.8-27B 48x128 profile".into(),
+            ));
+        }
+        let weight_bytes = config.columns * std::mem::size_of::<half::f16>();
+        validate_f16_buffer(weight_f16_le, weight_bytes, "gated RMSNorm weight")?;
+        let values = config.rows.checked_mul(config.columns).ok_or_else(|| {
+            EngineError::MemoryBudget("CUDA gated RMSNorm shape overflows".into())
+        })?;
+        let value_bytes = values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA gated RMSNorm values overflow".into())
+            })?;
+        let input = DeviceBuffer::allocate(self, value_bytes)?;
+        let gate = DeviceBuffer::allocate(self, value_bytes)?;
+        let weight = DeviceBuffer::from_bytes(self, weight_f16_le)?;
+        let output = DeviceBuffer::allocate(self, value_bytes)?;
+        input.zero()?;
+        gate.zero()?;
+        output.zero()?;
+        Ok(PreparedCudaGatedRmsNorm {
+            context: Rc::clone(&self.inner),
+            config,
+            input,
+            gate,
+            weight,
+            output,
+            model_bytes: weight_f16_le.len(),
+            transient_bytes: value_bytes * 3,
+        })
+    }
+
+    pub fn dispatch_gated_rms_norm_f16(
+        &self,
+        prepared: &PreparedCudaGatedRmsNorm,
+    ) -> Result<Vec<f32>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA gated RMSNorm belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        let mut input = prepared.input.ptr();
+        let mut gate = prepared.gate.ptr();
+        let mut weight = prepared.weight.ptr();
+        let mut output = prepared.output.ptr();
+        let mut rows = prepared.config.rows as u32;
+        let mut columns = prepared.config.columns as u32;
+        let mut epsilon = prepared.config.epsilon;
+        let mut params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut gate as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut weight as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rows as *mut u32).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+            (&mut epsilon as *mut f32).cast::<c_void>(),
+        ];
+        let rows_per_block = LINEAR_THREADS_PER_BLOCK / WARP_SIZE;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.gated_rms_norm_f16_function,
+                    rows.div_ceil(rows_per_block),
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "gated RMSNorm kernel launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "gated RMSNorm context synchronization",
+            )?;
+        }
+        let mut result = vec![0.0_f32; prepared.config.rows * prepared.config.columns];
+        prepared.output.copy_to(as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA gated RMSNorm produced a non-finite output".into(),
+            ));
+        }
         Ok(result)
     }
 
@@ -1686,6 +1968,73 @@ impl PreparedCudaGatedDelta {
     }
 }
 
+impl PreparedCudaCausalConv {
+    pub fn config(&self) -> CudaCausalConvConfig {
+        self.config
+    }
+
+    pub fn model_bytes(&self) -> usize {
+        self.model_bytes
+    }
+
+    pub fn resident_state_bytes(&self) -> usize {
+        self.resident_state_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        if input.len() != self.config.channels || input.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::Shape(
+                "CUDA convolution input has invalid length or values".into(),
+            ));
+        }
+        self.input.write(as_bytes(input))
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        self.state.zero()?;
+        self.output.zero()?;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn verifier_read_state(&self) -> Result<Vec<half::f16>> {
+        let mut state = vec![half::f16::ZERO; self.resident_state_bytes / 2];
+        self.state.copy_to(as_bytes_mut(&mut state))?;
+        Ok(state)
+    }
+}
+
+impl PreparedCudaGatedRmsNorm {
+    pub fn config(&self) -> CudaGatedRmsNormConfig {
+        self.config
+    }
+
+    pub fn model_bytes(&self) -> usize {
+        self.model_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_inputs(&self, input: &[f32], gate: &[f32]) -> Result<()> {
+        let expected = self.config.rows * self.config.columns;
+        for (name, values) in [("input", input), ("gate", gate)] {
+            if values.len() != expected || values.iter().any(|value| !value.is_finite()) {
+                return Err(EngineError::Shape(format!(
+                    "CUDA gated RMSNorm {name} has invalid length or values"
+                )));
+            }
+        }
+        self.input.write(as_bytes(input))?;
+        self.gate.write(as_bytes(gate))
+    }
+}
+
 impl Drop for CudaContextInner {
     fn drop(&mut self) {
         unsafe {
@@ -1871,6 +2220,24 @@ fn as_bytes<T>(values: &[T]) -> &[u8] {
 
 fn as_bytes_mut<T>(values: &mut [T]) -> &mut [u8] {
     unsafe { slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), size_of_val(values)) }
+}
+
+fn validate_f16_buffer(bytes: &[u8], expected: usize, name: &str) -> Result<()> {
+    if bytes.len() != expected || !bytes.len().is_multiple_of(2) {
+        return Err(EngineError::Shape(format!(
+            "CUDA {name} has {} bytes, expected {expected}",
+            bytes.len()
+        )));
+    }
+    if bytes
+        .chunks_exact(2)
+        .any(|pair| !half::f16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).is_finite())
+    {
+        return Err(EngineError::InvalidArtifact(format!(
+            "CUDA {name} contains a non-finite FP16 value"
+        )));
+    }
+    Ok(())
 }
 
 fn a8_scale_bytes(columns: usize) -> Result<usize> {

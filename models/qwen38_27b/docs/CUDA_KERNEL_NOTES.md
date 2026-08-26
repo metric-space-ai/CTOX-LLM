@@ -57,15 +57,18 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports six explicitly unpromoted
+- The same verifier cubin additionally exports eight explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
-  decoders, and the persistent-state GatedDelta recurrence:
+  decoders, the persistent-state GatedDelta recurrence, causal convolution,
+  and gated RMSNorm:
   - `ctox_quantize_a8_b64_sm86`
   - `ctox_q2_b64_a8_matvec_sm86`
   - `ctox_q4_b64_a8_matvec_sm86`
   - `ctox_q2_b64_recovered_row_sm86`
   - `ctox_q4_b64_recovered_row_sm86`
   - `ctox_gated_delta_recurrent_f16_sm86`
+  - `ctox_causal_conv_silu_f16_sm86`
+  - `ctox_gated_rms_norm_f16_sm86`
   These symbols are intentionally excluded from the production module ABI
   until their quality and complete-graph gates pass.
 - One launch fuses dequant, dot product, `s_in`, `s_out`, bias, and
@@ -103,10 +106,21 @@ add 98,688 reusable transient bytes. One 128-thread block owns one head and
 one thread owns one value column. Decay and update stores round immediately to
 FP16, matching the Rust and Metal oracle. CUDA 12.6 compiled the candidate for
 SM86 with 24 registers, 40 bytes shared memory, and zero stack/spill bytes
-(cubin SHA-256 `172b695ae89306ee4b0c59987c6ddc3c14c3ba6f547c797dc16f1af19ecbd242`).
+(current unified cubin SHA-256
+`e581a5341f52a160364243f6767f9a3bdfb302065f994e445846be901c60fb24`).
 The numerical verifier is built for a later physical-GPU-2 run after the
 teacher/evaluation/activation pipeline releases GPU 1+2; GPU 0 remains
 reserved for Greppy. No numerical or performance promotion is claimed yet.
+
+The same unpromoted token-mixer set now contains exact-profile CUDA
+candidates for the 10,240-channel, width-4 causal convolution with fused SiLU
+and for the 48x128 direct-weight gated RMSNorm. Convolution weight and history
+remain FP16 (81,920 bytes each per layer); the gated-norm weight remains 256
+bytes of FP16. CUDA 12.6 reports 22 and 31 registers respectively, with zero
+stack and spill bytes for both. `qwen38-cuda-linear-ops-verify` checks six
+stateful convolution steps, exact FP16 history, reset, gated-norm output, and
+buffer reclamation against the Rust oracles. Its physical-GPU-2 run is chained
+after the GatedDelta verifier; neither job may use GPU 0.
 
 The first GPU3 run is recorded in
 `benchmarks/cuda/sm86-q2q4-fused-matvec-20260826.json`. It proved both formats
