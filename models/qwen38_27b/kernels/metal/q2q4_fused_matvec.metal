@@ -91,6 +91,13 @@ struct GatedDeltaParams {
     float epsilon;
 };
 
+struct CausalConvParams {
+    uint channels;
+    uint kernel_width;
+    uint reserved0;
+    uint reserved1;
+};
+
 inline float apply_activation(float value, uint activation) {
     if (activation == 1u) {
         // SiLU: x / (1 + exp(-x)), matching the Rust oracle.
@@ -688,4 +695,29 @@ kernel void qwen_gated_delta_recurrent_f16(
             * q_inverse * query_scale;
     }
     output[value_offset] = result;
+}
+
+// Single-token depthwise causal convolution. The complete convolution history
+// stays FP16; the new input is rounded on insertion and the FP16 mmap-backed
+// weight is widened only in registers. SiLU is fused into the output write.
+kernel void qwen_causal_conv_silu_f16(
+    device const float* input [[buffer(0)]],
+    device const half* weight [[buffer(1)]],
+    device half* state [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant CausalConvParams& params [[buffer(4)]],
+    uint channel [[thread_position_in_grid]]) {
+    if (channel >= params.channels) {
+        return;
+    }
+    uint base = channel * params.kernel_width;
+    for (uint index = 0u; index + 1u < params.kernel_width; ++index) {
+        state[base + index] = state[base + index + 1u];
+    }
+    state[base + params.kernel_width - 1u] = half(input[channel]);
+    float sum = 0.0f;
+    for (uint index = 0u; index < params.kernel_width; ++index) {
+        sum += float(state[base + index]) * float(weight[base + index]);
+    }
+    output[channel] = sum / (1.0f + exp(-sum));
 }

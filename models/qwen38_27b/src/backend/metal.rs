@@ -27,6 +27,7 @@ pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
 pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
 pub const PAGED_GQA_DECODE_KERNEL_NAME: &str = "qwen_paged_q2q4_gqa_decode_f32";
 pub const GATED_DELTA_F16_KERNEL_NAME: &str = "qwen_gated_delta_recurrent_f16";
+pub const CAUSAL_CONV_F16_KERNEL_NAME: &str = "qwen_causal_conv_silu_f16";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -102,6 +103,17 @@ impl MetalGatedDeltaBufferAbi {
     pub const STATE: u32 = 5;
     pub const OUTPUT: u32 = 6;
     pub const PARAMS: u32 = 7;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalCausalConvBufferAbi;
+
+impl MetalCausalConvBufferAbi {
+    pub const INPUT: u32 = 0;
+    pub const WEIGHT: u32 = 1;
+    pub const STATE: u32 = 2;
+    pub const OUTPUT: u32 = 3;
+    pub const PARAMS: u32 = 4;
 }
 
 /// Activation codes consumed by `apply_activation` in the MSL source.
@@ -258,6 +270,29 @@ impl MetalGatedDeltaParams {
         ]
         .iter()
         .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalCausalConvParams {
+    pub channels: u32,
+    pub kernel: u32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+}
+
+impl MetalCausalConvParams {
+    pub const BYTE_LEN: usize = 16;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [self.channels, self.kernel, self.reserved0, self.reserved1]
+            .iter()
+            .enumerate()
         {
             encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
@@ -758,6 +793,16 @@ mod tests {
             ],
             [0, 1, 2, 3, 4, 5, 6, 7]
         );
+        assert_eq!(
+            [
+                MetalCausalConvBufferAbi::INPUT,
+                MetalCausalConvBufferAbi::WEIGHT,
+                MetalCausalConvBufferAbi::STATE,
+                MetalCausalConvBufferAbi::OUTPUT,
+                MetalCausalConvBufferAbi::PARAMS,
+            ],
+            [0, 1, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -781,6 +826,7 @@ mod tests {
         assert!(PARTIAL_ROPE_KERNEL_NAME.starts_with("qwen_partial_rope"));
         assert!(PAGED_GQA_DECODE_KERNEL_NAME.contains("paged_q2q4_gqa"));
         assert!(GATED_DELTA_F16_KERNEL_NAME.contains("gated_delta_recurrent_f16"));
+        assert!(CAUSAL_CONV_F16_KERNEL_NAME.contains("causal_conv_silu_f16"));
     }
 
     #[test]
@@ -875,6 +921,20 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![48, 128, 128, 1.0e-6_f32.to_bits()]);
+
+        let convolution = MetalCausalConvParams {
+            channels: 10_240,
+            kernel: 4,
+            reserved0: 0,
+            reserved1: 0,
+        };
+        let encoded = convolution.encode();
+        assert_eq!(encoded.len(), MetalCausalConvParams::BYTE_LEN);
+        let words: Vec<u32> = encoded
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![10_240, 4, 0, 0]);
     }
 
     #[test]
@@ -1099,6 +1159,7 @@ mod tests {
             PARTIAL_ROPE_KERNEL_NAME,
             PAGED_GQA_DECODE_KERNEL_NAME,
             GATED_DELTA_F16_KERNEL_NAME,
+            CAUSAL_CONV_F16_KERNEL_NAME,
         ] {
             assert!(
                 text.contains(&format!("kernel void {name}")),

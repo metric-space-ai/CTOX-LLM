@@ -26,6 +26,7 @@ usage, no scalar fallback.
 | `qwen_partial_rope_f32` | f32 Q/K heads in place | one thread per non-interleaved rotary pair |
 | `qwen_paged_q2q4_gqa_decode_f32` | f32 query/output, packed Q2/Q4 K/V | one 32-wide simdgroup per query head |
 | `qwen_gated_delta_recurrent_f16` | f32 step inputs/output, FP16 recurrent state | one threadgroup per value head |
+| `qwen_causal_conv_silu_f16` | f32 input/output, mmap FP16 weight/state | one thread per channel |
 
 64 values per block, row-major block order, codebook matching
 `src/quant.rs` (Q2: {-1, -1/3, 1/3, 1}; Q4: (code - 7.5) / 7.5). Q3 does not
@@ -160,6 +161,16 @@ block add 98,704 transient bytes per independently prepared layer; complete
 graph scheduling must share those transient buffers instead of multiplying
 them by 48.
 
+The depthwise causal-convolution candidate completes the persistent
+linear-attention state pair. Its FP16 weight remains an offset into the shared
+CTOXQ mmap, its four-token history remains FP16, and input insertion rounds to
+FP16 before the convolution. SiLU is fused into the f32 output write. At the
+frozen 10,240-channel, width-4 geometry, history is 81,920 bytes per layer and
+3,932,160 bytes (3.75 MiB) across 48 layers. Together with the recurrent state,
+all linear-attention state is therefore 75.75 MiB. Independently prepared
+layers use 81,936 transient bytes each; the complete graph must reuse these
+input/output buffers.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -221,6 +232,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   dependent recurrent steps, compares outputs and persistent state with the
   FP16 scalar oracle after every token, rejects invalid geometry, and proves
   reset/reuse without an f32 state shadow.
+- `mapped_causal_conv_f16_matches_oracle_and_reuses_state` executes six
+  dependent steps with a loader-owned FP16 weight, drops the loader before
+  dispatch, compares output and history with the FP16 scalar oracle, proves
+  zero copied model bytes, and rejects copied same-valued weights.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
@@ -266,8 +281,8 @@ dequantization array before this source was accepted.
 - Recovered embedding rows, Qwen RMSNorm, partial RoPE, packed decode GQA, and
   FP16 recurrent GatedDeltaNet exist as verifier candidates. GQA still
   duplicates its packed pages in a CPU correctness mirror; neither attention
-  path has controlled performance evidence. The linear-attention causal
-  convolution, MTP block, sampling, and complete model-graph Metal execution
-  do not exist yet.
+  path has controlled performance evidence. The MTP block, sampling, shared
+  full-graph transient allocation, and complete model-graph Metal execution do
+  not exist yet.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

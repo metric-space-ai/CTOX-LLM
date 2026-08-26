@@ -17,12 +17,13 @@ use sha2::{Digest, Sha256};
 
 use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row, MetalBufferAbi,
-    MetalFusedMatVecParams, MetalGatedDeltaBufferAbi, MetalGatedDeltaParams,
-    MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
-    MetalRmsNormBufferAbi, MetalRmsNormParams, GATED_DELTA_F16_KERNEL_NAME,
-    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
-    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
-    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
+    MetalCausalConvBufferAbi, MetalCausalConvParams, MetalFusedMatVecParams,
+    MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalPagedGqaBufferAbi, MetalPagedGqaParams,
+    MetalPartialRopeBufferAbi, MetalPartialRopeParams, MetalRmsNormBufferAbi, MetalRmsNormParams,
+    CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP,
+    PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
+    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
+    Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
 };
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
@@ -56,6 +57,7 @@ pub struct MetalCandidateRuntime {
     partial_rope_pipeline: ComputePipelineState,
     paged_gqa_decode_pipeline: ComputePipelineState,
     gated_delta_f16_pipeline: ComputePipelineState,
+    causal_conv_f16_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -249,6 +251,22 @@ pub struct PreparedMetalGatedDelta {
     value_buffer: Buffer,
     log_decay_buffer: Buffer,
     beta_buffer: Buffer,
+    state_buffer: Buffer,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    resident_state_bytes: usize,
+    transient_bytes: usize,
+    poisoned: bool,
+}
+
+/// Mmap-backed FP16 convolution weight, persistent FP16 history, and reusable
+/// f32 input/output buffers for one linear-attention layer.
+pub struct PreparedMappedMetalCausalConv {
+    channels: usize,
+    kernel: usize,
+    mapping: MappedMetalArtifact,
+    weight_offset: u64,
+    input_buffer: Buffer,
     state_buffer: Buffer,
     output_buffer: Buffer,
     params_buffer: Buffer,
@@ -709,6 +727,56 @@ impl PreparedMetalGatedDelta {
     }
 }
 
+impl PreparedMappedMetalCausalConv {
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn kernel(&self) -> usize {
+        self.kernel
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.mapping.copied_model_bytes()
+    }
+
+    pub fn resident_state_bytes(&self) -> usize {
+        self.resident_state_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        validate_metal_input(input, self.channels)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                self.input_buffer.contents().cast::<f32>(),
+                input.len(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        zero_buffer(&self.state_buffer, self.resident_state_bytes);
+        zero_buffer(
+            &self.output_buffer,
+            self.channels * std::mem::size_of::<f32>(),
+        );
+        self.poisoned = false;
+    }
+
+    pub fn verifier_read_state(&self) -> Vec<half::f16> {
+        let values = self.resident_state_bytes / std::mem::size_of::<half::f16>();
+        unsafe {
+            slice::from_raw_parts(self.state_buffer.contents().cast::<half::f16>(), values).to_vec()
+        }
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -791,6 +859,13 @@ impl MetalCandidateRuntime {
                     "Metal gated-delta function lookup failed: {message}"
                 ))
             })?;
+        let causal_conv_f16_function = library
+            .get_function(CAUSAL_CONV_F16_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal causal-convolution function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -869,6 +944,13 @@ impl MetalCandidateRuntime {
                     "Metal gated-delta pipeline creation failed: {message}"
                 ))
             })?;
+        let causal_conv_f16_pipeline = device
+            .new_compute_pipeline_state_with_function(&causal_conv_f16_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal causal-convolution pipeline creation failed: {message}"
+                ))
+            })?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -883,6 +965,7 @@ impl MetalCandidateRuntime {
             partial_rope_pipeline,
             paged_gqa_decode_pipeline,
             gated_delta_f16_pipeline,
+            causal_conv_f16_pipeline,
         })
     }
 
@@ -1396,6 +1479,75 @@ impl MetalCandidateRuntime {
             output_buffer,
             params_buffer,
             transient_bytes,
+        })
+    }
+
+    /// Prepare Qwen's depthwise causal convolution with an mmap-backed FP16
+    /// weight and an exclusively FP16 persistent history buffer.
+    pub fn prepare_mapped_causal_conv_f16(
+        &self,
+        mapping: &MappedMetalArtifact,
+        weight: FloatTensorView<'_>,
+        input: &[f32],
+        channels: usize,
+        kernel: usize,
+    ) -> Result<PreparedMappedMetalCausalConv> {
+        if channels == 0 || kernel == 0 || kernel > 32 {
+            return Err(EngineError::Shape(
+                "invalid Metal causal-convolution geometry".into(),
+            ));
+        }
+        validate_metal_input(input, channels)?;
+        let state_values = channels
+            .checked_mul(kernel)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal convolution state overflows".into()))?;
+        let weight_bytes_expected = state_values
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal convolution weight overflows".into())
+            })?;
+        let weight_bytes = match weight {
+            FloatTensorView::F16Le(bytes) if bytes.len() == weight_bytes_expected => bytes,
+            FloatTensorView::F16Le(bytes) => {
+                return Err(EngineError::Shape(format!(
+                    "Metal convolution weight has {} bytes, expected {weight_bytes_expected}",
+                    bytes.len()
+                )))
+            }
+            FloatTensorView::F32Le(_) => {
+                return Err(EngineError::UnsupportedDType(
+                    "Metal convolution weight must remain packed FP16".into(),
+                ))
+            }
+        };
+        let weight_offset = mapping.byte_offset(weight_bytes, "causal-convolution weight")?;
+        let value_bytes = channels
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal convolution values overflow".into()))?;
+        let params = MetalCausalConvParams {
+            channels: usize_to_u32(channels, "Metal convolution channels")?,
+            kernel: usize_to_u32(kernel, "Metal convolution kernel")?,
+            reserved0: 0,
+            reserved1: 0,
+        };
+        let transient_bytes = value_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(MetalCausalConvParams::BYTE_LEN))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal convolution transient bytes overflow".into())
+            })?;
+        Ok(PreparedMappedMetalCausalConv {
+            channels,
+            kernel,
+            mapping: mapping.clone(),
+            weight_offset,
+            input_buffer: buffer_with_data(&self.device, as_bytes(input)),
+            state_buffer: new_zeroed_buffer(&self.device, weight_bytes_expected)?,
+            output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
+            params_buffer: buffer_with_data(&self.device, &params.encode()),
+            resident_state_bytes: weight_bytes_expected,
+            transient_bytes,
+            poisoned: false,
         })
     }
 
@@ -2683,6 +2835,85 @@ impl MetalCandidateRuntime {
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
                 "Metal gated-delta produced a non-finite output".into(),
+            ));
+        }
+        prepared.poisoned = false;
+        Ok(output)
+    }
+
+    /// Execute one depthwise causal-convolution step against mmap-backed FP16
+    /// weights and persistent FP16 history. No CPU or f32-state fallback.
+    pub fn dispatch_mapped_causal_conv_f16(
+        &self,
+        prepared: &mut PreparedMappedMetalCausalConv,
+    ) -> Result<Vec<f32>> {
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "Metal causal-convolution state is poisoned; reset is required".into(),
+            ));
+        }
+        prepared.poisoned = true;
+        let thread_width = dispatch_width(&self.causal_conv_f16_pipeline, DEFAULT_SIMDGROUPS)?;
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-causal-conv-f16-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.causal_conv_f16_pipeline);
+        encoder.set_buffer(
+            MetalCausalConvBufferAbi::INPUT as u64,
+            Some(&prepared.input_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalCausalConvBufferAbi::WEIGHT as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.weight_offset,
+        );
+        encoder.set_buffer(
+            MetalCausalConvBufferAbi::STATE as u64,
+            Some(&prepared.state_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalCausalConvBufferAbi::OUTPUT as u64,
+            Some(&prepared.output_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalCausalConvBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: prepared.channels.div_ceil(thread_width) as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: thread_width as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal causal-convolution command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(
+                prepared.output_buffer.contents().cast::<f32>(),
+                prepared.channels,
+            )
+            .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal causal convolution produced a non-finite output".into(),
             ));
         }
         prepared.poisoned = false;
@@ -4336,5 +4567,110 @@ mod tests {
         ] {
             assert!(runtime.prepare_gated_delta_f16(config).is_err());
         }
+    }
+
+    #[test]
+    fn mapped_causal_conv_f16_matches_oracle_and_reuses_state() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let channels = 48;
+        let kernel = 4;
+        let directory = tempdir().expect("temporary convolution artifact directory");
+        let path = directory.path().join("causal-conv.ctoxq");
+        write_mixed_fixture(&path, 3, 5, channels * kernel);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open convolution mmap fixture");
+        let weight = artifact
+            .float_tensor("matrix.weight.s_in")
+            .expect("resolve mmap-backed convolution weight");
+        let weight_f32 = weight
+            .to_f32_vec()
+            .expect("widen convolution weight for oracle");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import convolution mmap without copy");
+        let initial = vec![0.0; channels];
+        let mut prepared = runtime
+            .prepare_mapped_causal_conv_f16(&mapping, weight, &initial, channels, kernel)
+            .expect("prepare mmap-backed FP16 convolution");
+        assert_eq!(prepared.channels(), channels);
+        assert_eq!(prepared.kernel(), kernel);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert_eq!(prepared.resident_state_bytes(), channels * kernel * 2);
+        assert_eq!(
+            prepared.transient_bytes(),
+            2 * channels * std::mem::size_of::<f32>() + MetalCausalConvParams::BYTE_LEN
+        );
+        let mut expected_state = vec![f16::ZERO; channels * kernel];
+        drop(mapping);
+        drop(artifact);
+
+        for token in 0..6 {
+            let input: Vec<f32> = (0..channels)
+                .map(|channel| ((channel + token * 7) as f32 * 0.031).sin() * 0.65)
+                .collect();
+            let expected = crate::reference::causal_conv_silu_update_f16_state(
+                &input,
+                &mut expected_state,
+                &weight_f32,
+                channels,
+                kernel,
+            )
+            .expect("FP16 convolution scalar oracle");
+            prepared
+                .write_input(&input)
+                .expect("update convolution input");
+            let actual = runtime
+                .dispatch_mapped_causal_conv_f16(&mut prepared)
+                .expect("dispatch mmap-backed convolution");
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 2.0e-5_f32.max(expected.abs() * 4.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "convolution token {token} output {index}: expected {expected}, got {actual}"
+                );
+            }
+            assert_eq!(prepared.verifier_read_state(), expected_state);
+        }
+
+        prepared.reset();
+        assert!(prepared
+            .verifier_read_state()
+            .iter()
+            .all(|value| *value == f16::ZERO));
+        assert!(prepared.write_input(&[0.0; 3]).is_err());
+    }
+
+    #[test]
+    fn mapped_causal_conv_rejects_copied_or_wrong_weight() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let channels = 48;
+        let kernel = 4;
+        let directory = tempdir().expect("temporary convolution contract directory");
+        let path = directory.path().join("causal-conv-contract.ctoxq");
+        write_mixed_fixture(&path, 3, 5, channels * kernel);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open convolution contract fixture");
+        let weight = artifact
+            .float_tensor("matrix.weight.s_in")
+            .expect("resolve convolution contract weight");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import convolution contract mmap");
+        let copied = match weight {
+            FloatTensorView::F16Le(bytes) => bytes.to_vec(),
+            FloatTensorView::F32Le(_) => unreachable!(),
+        };
+        assert!(runtime
+            .prepare_mapped_causal_conv_f16(
+                &mapping,
+                FloatTensorView::F16Le(&copied),
+                &[0.0; 48],
+                channels,
+                kernel,
+            )
+            .is_err());
+        assert!(runtime
+            .prepare_mapped_causal_conv_f16(&mapping, weight, &[0.0; 48], channels, 3)
+            .is_err());
     }
 }
