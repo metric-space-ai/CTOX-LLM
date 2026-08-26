@@ -223,11 +223,13 @@ encoder; the layer-0 causal convolution then updates `LinearQkv` in place in
 that same encoder, then a fused preparation kernel expands Q/K to 48 heads and
 writes `Query`, `Key`, `Value`, `LogDecay`, and `Beta` into their exact arena
 slots. The recurrent GatedDelta kernel consumes those five views, mutates only
-its checkpointed FP16 state, and writes `AttentionOutput` before the final
-wait. `A_log` and `dt_bias` remain mmap-backed FP32.
+its checkpointed FP16 state, and writes `AttentionOutput`; direct-weight gated
+RMSNorm then consumes that view plus `LinearZ` and updates `AttentionOutput`
+in place before the final wait. `A_log`, `dt_bias`, and the FP16 norm weight
+remain mmap-backed.
 These graph preparations retain no operation-local input/output activation
 buffers; separately stored recovery inputs must be byte-identical. The
-remaining 639 schedule steps and the complete executor remain open. A bounded
+remaining 638 schedule steps and the complete executor remain open. A bounded
 f32 checkpoint can now snapshot and restore an
 exact arena slot through a Metal device-to-device blit with no host mirror. It
 is single-use and fail-closed across snapshot/restore/commit, providing the

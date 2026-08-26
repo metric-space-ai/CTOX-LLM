@@ -316,16 +316,16 @@ pub struct PreparedMappedMetalRmsNorm {
 }
 
 /// GatedDeltaNet's direct-weight RMSNorm fused with `SiLU(z)`. The FP16 norm
-/// weight remains an mmap offset; core, gate, and output are reusable f32
-/// graph buffers.
+/// weight remains an mmap offset. Standalone verification may own reusable
+/// f32 I/O, while decode-graph execution binds shared-arena views.
 pub struct PreparedMappedMetalGatedRmsNorm {
     rows: usize,
     columns: usize,
     mapping: MappedMetalArtifact,
     weight_offset: u64,
-    input_buffer: Buffer,
-    gate_buffer: Buffer,
-    output_buffer: Buffer,
+    input_buffer: Option<Buffer>,
+    gate_buffer: Option<Buffer>,
+    output_buffer: Option<Buffer>,
     params_buffer: Buffer,
     transient_bytes: usize,
 }
@@ -1106,21 +1106,35 @@ impl PreparedMappedMetalGatedRmsNorm {
         self.transient_bytes
     }
 
+    pub fn has_owned_io(&self) -> bool {
+        self.input_buffer.is_some() || self.gate_buffer.is_some() || self.output_buffer.is_some()
+    }
+
     pub fn write_inputs(&self, input: &[f32], gate: &[f32]) -> Result<()> {
         let expected = self.rows.checked_mul(self.columns).ok_or_else(|| {
             EngineError::Shape("Metal gated RMSNorm input shape overflows".into())
         })?;
         validate_metal_input(input, expected)?;
         validate_metal_input(gate, expected)?;
+        let input_buffer = self.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph gated RMSNorm has no operation-local input".into(),
+            )
+        })?;
+        let gate_buffer = self.gate_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph gated RMSNorm has no operation-local gate".into(),
+            )
+        })?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 input.as_ptr(),
-                self.input_buffer.contents().cast::<f32>(),
+                input_buffer.contents().cast::<f32>(),
                 input.len(),
             );
             std::ptr::copy_nonoverlapping(
                 gate.as_ptr(),
-                self.gate_buffer.contents().cast::<f32>(),
+                gate_buffer.contents().cast::<f32>(),
                 gate.len(),
             );
         }
@@ -3150,6 +3164,57 @@ impl MetalCandidateRuntime {
         columns: usize,
         epsilon: f32,
     ) -> Result<PreparedMappedMetalGatedRmsNorm> {
+        self.prepare_mapped_rms_norm_gated_internal(
+            mapping, weight, input, gate, rows, columns, epsilon, true,
+        )
+    }
+
+    /// Prepare the exact Qwen GatedDelta output normalization for graph-owned
+    /// shared-arena I/O. Only its packed weight view and 16-byte geometry block
+    /// remain operation-local.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_mapped_rms_norm_gated_graph_io(
+        &self,
+        mapping: &MappedMetalArtifact,
+        weight: FloatTensorView<'_>,
+        validation_input: &[f32],
+        validation_gate: &[f32],
+        rows: usize,
+        columns: usize,
+        epsilon: f32,
+    ) -> Result<PreparedMappedMetalGatedRmsNorm> {
+        if rows != MetalGatedDeltaConfig::QWEN38_27B.heads
+            || columns != MetalGatedDeltaConfig::QWEN38_27B.value_dim
+            || epsilon != MetalGatedDeltaConfig::QWEN38_27B.epsilon
+        {
+            return Err(EngineError::Shape(
+                "Metal graph gated RMSNorm requires the exact Qwen3.8-27B geometry".into(),
+            ));
+        }
+        self.prepare_mapped_rms_norm_gated_internal(
+            mapping,
+            weight,
+            validation_input,
+            validation_gate,
+            rows,
+            columns,
+            epsilon,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_mapped_rms_norm_gated_internal(
+        &self,
+        mapping: &MappedMetalArtifact,
+        weight: FloatTensorView<'_>,
+        input: &[f32],
+        gate: &[f32],
+        rows: usize,
+        columns: usize,
+        epsilon: f32,
+        own_io: bool,
+    ) -> Result<PreparedMappedMetalGatedRmsNorm> {
         let value_count = rows
             .checked_mul(columns)
             .ok_or_else(|| EngineError::Shape("Metal gated RMSNorm shape overflows".into()))?;
@@ -3196,7 +3261,7 @@ impl MetalCandidateRuntime {
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| EngineError::Shape("Metal gated RMSNorm values overflow".into()))?;
         let transient_bytes = value_bytes
-            .checked_mul(3)
+            .checked_mul(if own_io { 3 } else { 0 })
             .and_then(|bytes| bytes.checked_add(MetalRmsNormParams::BYTE_LEN))
             .ok_or_else(|| {
                 EngineError::Shape("Metal gated RMSNorm transient bytes overflow".into())
@@ -3206,9 +3271,13 @@ impl MetalCandidateRuntime {
             columns,
             mapping: mapping.clone(),
             weight_offset,
-            input_buffer: buffer_with_data(&self.device, as_bytes(input)),
-            gate_buffer: buffer_with_data(&self.device, as_bytes(gate)),
-            output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
+            input_buffer: own_io.then(|| buffer_with_data(&self.device, as_bytes(input))),
+            gate_buffer: own_io.then(|| buffer_with_data(&self.device, as_bytes(gate))),
+            output_buffer: if own_io {
+                Some(new_zeroed_buffer(&self.device, value_bytes)?)
+            } else {
+                None
+            },
             params_buffer: buffer_with_data(&self.device, &params.encode()),
             transient_bytes,
         })
@@ -4429,18 +4498,33 @@ impl MetalCandidateRuntime {
         &self,
         prepared: &PreparedMappedMetalGatedRmsNorm,
     ) -> Result<Vec<f32>> {
+        let input_buffer = prepared.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph gated RMSNorm has no operation-local input".into(),
+            )
+        })?;
+        let gate_buffer = prepared.gate_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph gated RMSNorm has no operation-local gate".into(),
+            )
+        })?;
+        let output_buffer = prepared.output_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph gated RMSNorm has no operation-local output".into(),
+            )
+        })?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-gated-rms-norm-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.rms_norm_gated_pipeline);
         encoder.set_buffer(
             MetalGatedRmsNormBufferAbi::INPUT as u64,
-            Some(&prepared.input_buffer),
+            Some(input_buffer),
             0,
         );
         encoder.set_buffer(
             MetalGatedRmsNormBufferAbi::GATE as u64,
-            Some(&prepared.gate_buffer),
+            Some(gate_buffer),
             0,
         );
         encoder.set_buffer(
@@ -4450,7 +4534,7 @@ impl MetalCandidateRuntime {
         );
         encoder.set_buffer(
             MetalGatedRmsNormBufferAbi::OUTPUT as u64,
-            Some(&prepared.output_buffer),
+            Some(output_buffer),
             0,
         );
         encoder.set_buffer(
@@ -4483,8 +4567,7 @@ impl MetalCandidateRuntime {
             EngineError::Shape("Metal gated RMSNorm output shape overflows".into())
         })?;
         let output = unsafe {
-            slice::from_raw_parts(prepared.output_buffer.contents().cast::<f32>(), value_count)
-                .to_vec()
+            slice::from_raw_parts(output_buffer.contents().cast::<f32>(), value_count).to_vec()
         };
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
@@ -5058,6 +5141,58 @@ impl MetalCandidateRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_gated_rms_norm_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalGatedRmsNorm,
+        input_buffer: &Buffer,
+        input_offset: u64,
+        gate_buffer: &Buffer,
+        gate_offset: u64,
+        output_buffer: &Buffer,
+        output_offset: u64,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rms_norm_gated_pipeline);
+        for (binding, buffer, offset) in [
+            (
+                MetalGatedRmsNormBufferAbi::INPUT,
+                input_buffer,
+                input_offset,
+            ),
+            (MetalGatedRmsNormBufferAbi::GATE, gate_buffer, gate_offset),
+            (
+                MetalGatedRmsNormBufferAbi::WEIGHT,
+                &prepared.mapping.inner.buffer,
+                prepared.weight_offset,
+            ),
+            (
+                MetalGatedRmsNormBufferAbi::OUTPUT,
+                output_buffer,
+                output_offset,
+            ),
+        ] {
+            encoder.set_buffer(binding as u64, Some(buffer), offset);
+        }
+        encoder.set_buffer(
+            MetalGatedRmsNormBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: prepared.rows as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn encode_gated_delta_f16_between(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -5432,9 +5567,10 @@ impl MetalCandidateRuntime {
             .collect()
     }
 
-    /// Dispatch up to the exact first six operations of the frozen decode graph:
+    /// Dispatch up to the exact first seven operations of the frozen decode graph:
     /// embedding, layer-0 RMSNorm, four-way linear-attention fan-out, in-place
-    /// convolution, five-output GatedDelta preparation, and recurrent update.
+    /// convolution, five-output GatedDelta preparation, recurrent update, and
+    /// direct-weight gated RMSNorm.
     /// All activations are typed views into one schedule-derived arena. The
     /// prepared graph resources own only immutable parameters and tiny command
     /// metadata; no operation-local input or output activation is allocated.
@@ -5452,6 +5588,10 @@ impl MetalCandidateRuntime {
         )>,
         mut recurrence: Option<(
             &mut PreparedMetalGatedDelta,
+            &PreparedMetalDecodeStepView<'_>,
+        )>,
+        gated_rms_norm: Option<(
+            &PreparedMappedMetalGatedRmsNorm,
             &PreparedMetalDecodeStepView<'_>,
         )>,
         embedding_output: &PreparedMetalDecodeBufferView<'_>,
@@ -5679,6 +5819,51 @@ impl MetalCandidateRuntime {
                 ));
             }
         }
+        if let Some((gated_norm, step)) = gated_rms_norm.as_ref() {
+            let reads = step.reads();
+            let writes = step.writes();
+            let (_, recurrence_step) = recurrence.as_ref().ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal graph gated RMSNorm requires the recurrent update".into(),
+                )
+            })?;
+            let recurrence_output = &recurrence_step.writes()[0];
+            if gated_norm.has_owned_io()
+                || gated_norm.rows != MetalGatedDeltaConfig::QWEN38_27B.heads
+                || gated_norm.columns != MetalGatedDeltaConfig::QWEN38_27B.value_dim
+                || !Rc::ptr_eq(&gated_norm.mapping.inner, &embedding.mapping.inner)
+                || step.step().schedule_index != 6
+                || step.step().layer != Some(0)
+                || step.step().operation != MetalDecodeOperation::GatedRmsNorm
+                || reads.len() != 2
+                || writes.len() != 1
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph gated RMSNorm does not match frozen schedule step 6".into(),
+                ));
+            }
+            let input = &reads[0];
+            let gate = &reads[1];
+            let output = &writes[0];
+            if input.slot() != MetalBufferSlot::AttentionOutput
+                || input.offset() != recurrence_output.offset()
+                || gate.slot() != MetalBufferSlot::LinearZ
+                || gate.offset() != projection_outputs[1].offset()
+                || output.slot() != MetalBufferSlot::AttentionOutput
+                || output.offset() != input.offset()
+                || input.values() != gated_norm.rows * gated_norm.columns
+                || gate.values() != input.values()
+                || output.values() != input.values()
+                || !std::ptr::eq(arena, input.buffer())
+                || !std::ptr::eq(arena, gate.buffer())
+                || !std::ptr::eq(arena, output.buffer())
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph gated RMSNorm views do not match recurrence and LinearZ outputs"
+                        .into(),
+                ));
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-embedding-norm-linear-fanout");
@@ -5749,6 +5934,18 @@ impl MetalCandidateRuntime {
                 output.offset(),
             );
             recurrence.poisoned = true;
+        }
+        if let Some((gated_norm, step)) = gated_rms_norm.as_ref() {
+            self.encode_mapped_gated_rms_norm_between(
+                encoder,
+                gated_norm,
+                arena,
+                step.reads()[0].offset(),
+                arena,
+                step.reads()[1].offset(),
+                arena,
+                step.writes()[0].offset(),
+            );
         }
         encoder.end_encoding();
         command_buffer.commit();
@@ -7902,6 +8099,9 @@ mod tests {
         let dt_bias_values: Vec<f32> = (0..config.linear_num_value_heads)
             .map(|index| -0.2 + index as f32 * 0.002)
             .collect();
+        let gated_norm_values: Vec<f32> = (0..config.linear_value_head_dim)
+            .map(|index| 0.85 + index as f32 * 0.001)
+            .collect();
         for (name, dtype, rows) in projection_specs {
             tensors.extend(repeated_recovered_tensors(
                 name, dtype, rows, columns, &s_in, 1.0625,
@@ -7924,6 +8124,12 @@ mod tests {
             dtype: TensorDType::F32,
             shape: vec![config.linear_num_value_heads as u64],
             bytes: f32_bytes(&dt_bias_values),
+        });
+        tensors.push(PackedTensor {
+            name: "layer0.linear.norm.weight".into(),
+            dtype: TensorDType::F16,
+            shape: vec![config.linear_value_head_dim as u64],
+            bytes: f16_bytes(&gated_norm_values),
         });
         ArtifactBuilder {
             model: "test/qwen38-shared-arena".into(),
@@ -8012,6 +8218,19 @@ mod tests {
         let mut recurrence = runtime
             .prepare_gated_delta_f16_graph_io(recurrence_config)
             .expect("prepare graph recurrence without activation buffers");
+        let gated_norm = runtime
+            .prepare_mapped_rms_norm_gated_graph_io(
+                &mapping,
+                artifact
+                    .float_tensor("layer0.linear.norm.weight")
+                    .expect("resolve graph gated RMSNorm weight"),
+                &vec![0.0; recurrence_config.heads * recurrence_config.value_dim],
+                &vec![0.0; recurrence_config.heads * recurrence_config.value_dim],
+                recurrence_config.heads,
+                recurrence_config.value_dim,
+                recurrence_config.epsilon,
+            )
+            .expect("prepare graph gated RMSNorm without activation buffers");
         assert!(runtime
             .prepare_mapped_gated_delta_prepare_graph_io(
                 &mapping,
@@ -8064,6 +8283,15 @@ mod tests {
             recurrence.transient_bytes(),
             MetalGatedDeltaParams::BYTE_LEN
         );
+        assert_eq!(gated_norm.transient_bytes(), MetalRmsNormParams::BYTE_LEN);
+        assert!(!gated_norm.has_owned_io());
+        assert!(gated_norm
+            .write_inputs(
+                &vec![0.0; recurrence_config.heads * recurrence_config.value_dim],
+                &vec![0.0; recurrence_config.heads * recurrence_config.value_dim],
+            )
+            .is_err());
+        assert!(runtime.dispatch_mapped_rms_norm_gated(&gated_norm).is_err());
         assert!(!recurrence.has_owned_io());
         assert!(recurrence
             .write_step(&[0.0; 1], &[0.0; 1], &[0.0; 1], &[0.0; 1], &[0.0; 1])
@@ -8102,6 +8330,7 @@ mod tests {
             &program.steps()[4].writes()[4],
         ];
         let recurrence_step = &program.steps()[5];
+        let gated_norm_step = &program.steps()[6];
         let projection_refs = [
             &prepared_projections[0],
             &prepared_projections[1],
@@ -8114,6 +8343,7 @@ mod tests {
                 1,
                 &norm,
                 projection_refs,
+                None,
                 None,
                 None,
                 None,
@@ -8145,6 +8375,7 @@ mod tests {
                     ],
                 )),
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8160,6 +8391,7 @@ mod tests {
                 Some(&mut convolution),
                 Some((&delta_prepare, delta_outputs)),
                 Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, recurrence_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8225,11 +8457,12 @@ mod tests {
                 Some(&mut convolution),
                 Some((&delta_prepare, delta_outputs)),
                 Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, gated_norm_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
             )
-            .expect("dispatch first six decode steps through shared arena");
+            .expect("dispatch first seven decode steps through shared arena");
         assert_eq!(
             convolution.verifier_read_state(),
             expected_convolution_state
@@ -8284,16 +8517,27 @@ mod tests {
             recurrence_config.value_dim,
         )
         .expect("execute graph recurrence oracle");
+        let expected_gated_attention = crate::reference::rms_norm_gated(
+            &expected_attention,
+            &expected[1],
+            recurrence_config.heads,
+            recurrence_config.value_dim,
+            &gated_norm_values,
+            recurrence_config.epsilon,
+        )
+        .expect("execute graph gated RMSNorm oracle");
         let actual_attention = workspace
             .read_f32(MetalBufferSlot::AttentionOutput)
-            .expect("read graph recurrence output");
-        for (index, (expected, actual)) in
-            expected_attention.iter().zip(actual_attention).enumerate()
+            .expect("read graph gated RMSNorm output");
+        for (index, (expected, actual)) in expected_gated_attention
+            .iter()
+            .zip(actual_attention)
+            .enumerate()
         {
-            let tolerance = 5.0e-4_f32.max(expected.abs() * 3.0e-4);
+            let tolerance = 6.0e-4_f32.max(expected.abs() * 4.0e-4);
             assert!(
                 (expected - actual).abs() <= tolerance,
-                "graph recurrence output {index}: expected {expected}, got {actual}"
+                "graph gated RMSNorm output {index}: expected {expected}, got {actual}"
             );
         }
         assert_eq!(recurrence.verifier_read_state(), expected_recurrence_state);
