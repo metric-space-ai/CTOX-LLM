@@ -24,6 +24,7 @@ pub const Q4_GATHERED_KERNEL_NAME: &str = "q4_b64_gathered_matvec";
 pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
 pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
 pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
+pub const RMS_NORM_GATED_KERNEL_NAME: &str = "qwen_rms_norm_gated_f32";
 pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
 pub const PAGED_GQA_DECODE_KERNEL_NAME: &str = "qwen_paged_q2q4_gqa_decode_f32";
 pub const GATED_DELTA_F16_KERNEL_NAME: &str = "qwen_gated_delta_recurrent_f16";
@@ -67,6 +68,17 @@ impl MetalRmsNormBufferAbi {
     pub const WEIGHT: u32 = 1;
     pub const OUTPUT: u32 = 2;
     pub const PARAMS: u32 = 3;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGatedRmsNormBufferAbi;
+
+impl MetalGatedRmsNormBufferAbi {
+    pub const INPUT: u32 = 0;
+    pub const GATE: u32 = 1;
+    pub const WEIGHT: u32 = 2;
+    pub const OUTPUT: u32 = 3;
+    pub const PARAMS: u32 = 4;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

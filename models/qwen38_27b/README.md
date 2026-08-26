@@ -182,6 +182,13 @@ and key transforms share one command encoder and one synchronization.
 Complete-graph residency and unload measurements on the 7.8-GiB artifact are
 still required before this changes backend promotion state.
 
+The Metal linear-attention candidate set now also covers FP16 causal-
+convolution history, FP16 recurrent GatedDelta state, and the direct-weight
+gated RMSNorm with fused `SiLU(z)`. Each operation matches its scalar state or
+numerical oracle and keeps immutable float weights mapping-backed. A shared
+full-layer scheduler still has to connect their device buffers without host
+intermediates before the backend can be promoted.
+
 `CpuCorrectnessExecutor` connects that target graph to the stable embeddable
 `ModelExecutor` lifecycle: shared-`Arc<Mmap>` load, warmup, sequential prefill,
 incremental decode, cancellation, reset, allocation reporting, and zero-residue

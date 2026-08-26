@@ -18,12 +18,13 @@ use sha2::{Digest, Sha256};
 use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row, MetalBufferAbi,
     MetalCausalConvBufferAbi, MetalCausalConvParams, MetalFusedMatVecParams,
-    MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalPagedGqaBufferAbi, MetalPagedGqaParams,
-    MetalPartialRopeBufferAbi, MetalPartialRopeParams, MetalRmsNormBufferAbi, MetalRmsNormParams,
-    CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP,
-    PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
-    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
-    Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
+    MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedRmsNormBufferAbi,
+    MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
+    MetalRmsNormBufferAbi, MetalRmsNormParams, CAUSAL_CONV_F16_KERNEL_NAME,
+    GATED_DELTA_F16_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME,
+    PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
+    Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
+    Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
@@ -54,6 +55,7 @@ pub struct MetalCandidateRuntime {
     q2_recovered_row_pipeline: ComputePipelineState,
     q4_recovered_row_pipeline: ComputePipelineState,
     rms_norm_1p_pipeline: ComputePipelineState,
+    rms_norm_gated_pipeline: ComputePipelineState,
     partial_rope_pipeline: ComputePipelineState,
     paged_gqa_decode_pipeline: ComputePipelineState,
     gated_delta_f16_pipeline: ComputePipelineState,
@@ -204,6 +206,21 @@ pub struct PreparedMappedMetalRmsNorm {
     mapping: MappedMetalArtifact,
     weight_offset: u64,
     input_buffer: Buffer,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    transient_bytes: usize,
+}
+
+/// GatedDeltaNet's direct-weight RMSNorm fused with `SiLU(z)`. The FP16 norm
+/// weight remains an mmap offset; core, gate, and output are reusable f32
+/// graph buffers.
+pub struct PreparedMappedMetalGatedRmsNorm {
+    rows: usize,
+    columns: usize,
+    mapping: MappedMetalArtifact,
+    weight_offset: u64,
+    input_buffer: Buffer,
+    gate_buffer: Buffer,
     output_buffer: Buffer,
     params_buffer: Buffer,
     transient_bytes: usize,
@@ -535,6 +552,45 @@ impl PreparedMappedMetalRmsNorm {
     }
 }
 
+impl PreparedMappedMetalGatedRmsNorm {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.mapping.copied_model_bytes()
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    pub fn write_inputs(&self, input: &[f32], gate: &[f32]) -> Result<()> {
+        let expected = self.rows.checked_mul(self.columns).ok_or_else(|| {
+            EngineError::Shape("Metal gated RMSNorm input shape overflows".into())
+        })?;
+        validate_metal_input(input, expected)?;
+        validate_metal_input(gate, expected)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                self.input_buffer.contents().cast::<f32>(),
+                input.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                gate.as_ptr(),
+                self.gate_buffer.contents().cast::<f32>(),
+                gate.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl PreparedMetalPartialRope {
     pub fn heads(&self) -> usize {
         self.heads
@@ -838,6 +894,13 @@ impl MetalCandidateRuntime {
                     "Metal Qwen RMSNorm function lookup failed: {message}"
                 ))
             })?;
+        let rms_norm_gated_function = library
+            .get_function(RMS_NORM_GATED_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Qwen gated RMSNorm function lookup failed: {message}"
+                ))
+            })?;
         let partial_rope_function = library
             .get_function(PARTIAL_ROPE_KERNEL_NAME, None)
             .map_err(|message| {
@@ -917,6 +980,19 @@ impl MetalCandidateRuntime {
                 rms_norm_1p_pipeline.thread_execution_width()
             )));
         }
+        let rms_norm_gated_pipeline = device
+            .new_compute_pipeline_state_with_function(&rms_norm_gated_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Qwen gated RMSNorm pipeline creation failed: {message}"
+                ))
+            })?;
+        if rms_norm_gated_pipeline.thread_execution_width() != 32 {
+            return Err(EngineError::InvalidState(format!(
+                "Metal Qwen gated RMSNorm requires a 32-wide simdgroup, device reports {}",
+                rms_norm_gated_pipeline.thread_execution_width()
+            )));
+        }
         let partial_rope_pipeline = device
             .new_compute_pipeline_state_with_function(&partial_rope_function)
             .map_err(|message| {
@@ -962,6 +1038,7 @@ impl MetalCandidateRuntime {
             q2_recovered_row_pipeline,
             q4_recovered_row_pipeline,
             rms_norm_1p_pipeline,
+            rms_norm_gated_pipeline,
             partial_rope_pipeline,
             paged_gqa_decode_pipeline,
             gated_delta_f16_pipeline,
@@ -1478,6 +1555,83 @@ impl MetalCandidateRuntime {
             input_buffer,
             output_buffer,
             params_buffer,
+            transient_bytes,
+        })
+    }
+
+    /// Prepare GatedDeltaNet's direct-weight RMSNorm fused with `SiLU(gate)`.
+    /// The learned FP16 weight remains inside the shared CTOXQ mapping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_mapped_rms_norm_gated(
+        &self,
+        mapping: &MappedMetalArtifact,
+        weight: FloatTensorView<'_>,
+        input: &[f32],
+        gate: &[f32],
+        rows: usize,
+        columns: usize,
+        epsilon: f32,
+    ) -> Result<PreparedMappedMetalGatedRmsNorm> {
+        let value_count = rows
+            .checked_mul(columns)
+            .ok_or_else(|| EngineError::Shape("Metal gated RMSNorm shape overflows".into()))?;
+        if rows == 0 || columns == 0 {
+            return Err(EngineError::Shape(
+                "Metal gated RMSNorm rows and columns must be positive".into(),
+            ));
+        }
+        validate_metal_input(input, value_count)?;
+        validate_metal_input(gate, value_count)?;
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(EngineError::Shape(
+                "Metal gated RMSNorm epsilon must be finite and positive".into(),
+            ));
+        }
+        let expected_weight_bytes = columns
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| {
+                EngineError::Shape("Metal gated RMSNorm weight bytes overflow".into())
+            })?;
+        let weight_bytes = match weight {
+            FloatTensorView::F16Le(bytes) if bytes.len() == expected_weight_bytes => bytes,
+            FloatTensorView::F16Le(bytes) => {
+                return Err(EngineError::Shape(format!(
+                    "Metal gated RMSNorm weight has {} bytes, expected {}",
+                    bytes.len(),
+                    expected_weight_bytes
+                )))
+            }
+            FloatTensorView::F32Le(_) => {
+                return Err(EngineError::UnsupportedDType(
+                    "Metal gated RMSNorm weight must remain packed FP16".into(),
+                ))
+            }
+        };
+        let weight_offset = mapping.byte_offset(weight_bytes, "gated RMSNorm weight")?;
+        let params = MetalRmsNormParams {
+            rows: usize_to_u32(rows, "Metal gated RMSNorm rows")?,
+            columns: usize_to_u32(columns, "Metal gated RMSNorm columns")?,
+            epsilon,
+            reserved0: 0,
+        };
+        let value_bytes = value_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("Metal gated RMSNorm values overflow".into()))?;
+        let transient_bytes = value_bytes
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(MetalRmsNormParams::BYTE_LEN))
+            .ok_or_else(|| {
+                EngineError::Shape("Metal gated RMSNorm transient bytes overflow".into())
+            })?;
+        Ok(PreparedMappedMetalGatedRmsNorm {
+            rows,
+            columns,
+            mapping: mapping.clone(),
+            weight_offset,
+            input_buffer: buffer_with_data(&self.device, as_bytes(input)),
+            gate_buffer: buffer_with_data(&self.device, as_bytes(gate)),
+            output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
+            params_buffer: buffer_with_data(&self.device, &params.encode()),
             transient_bytes,
         })
     }
@@ -2408,6 +2562,75 @@ impl MetalCandidateRuntime {
         if output.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::InvalidState(
                 "Metal RMSNorm produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    pub fn dispatch_mapped_rms_norm_gated(
+        &self,
+        prepared: &PreparedMappedMetalGatedRmsNorm,
+    ) -> Result<Vec<f32>> {
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mmap-gated-rms-norm-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.rms_norm_gated_pipeline);
+        encoder.set_buffer(
+            MetalGatedRmsNormBufferAbi::INPUT as u64,
+            Some(&prepared.input_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalGatedRmsNormBufferAbi::GATE as u64,
+            Some(&prepared.gate_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalGatedRmsNormBufferAbi::WEIGHT as u64,
+            Some(&prepared.mapping.inner.buffer),
+            prepared.weight_offset,
+        );
+        encoder.set_buffer(
+            MetalGatedRmsNormBufferAbi::OUTPUT as u64,
+            Some(&prepared.output_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalGatedRmsNormBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: prepared.rows as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal gated RMSNorm command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let value_count = prepared.rows.checked_mul(prepared.columns).ok_or_else(|| {
+            EngineError::Shape("Metal gated RMSNorm output shape overflows".into())
+        })?;
+        let output = unsafe {
+            slice::from_raw_parts(prepared.output_buffer.contents().cast::<f32>(), value_count)
+                .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal gated RMSNorm produced a non-finite output".into(),
             ));
         }
         Ok(output)
@@ -4138,6 +4361,93 @@ mod tests {
             .dispatch_mapped_rms_norm_1p(&prepared)
             .expect("dispatch zero RMSNorm input");
         assert!(zero.iter().all(|value| value.abs() <= f32::EPSILON));
+    }
+
+    #[test]
+    fn mapped_gated_rms_norm_matches_oracle_and_reuses_both_inputs() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let rows_q2 = 3;
+        let rows_q4 = 5;
+        let rows = 48;
+        let columns = 2 * BLOCK_LEN;
+        let epsilon = 1.0e-6;
+        let directory = tempdir().expect("temporary gated RMSNorm artifact directory");
+        let path = directory.path().join("gated-rms-norm.ctoxq");
+        write_mixed_fixture(&path, rows_q2, rows_q4, columns);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open gated RMSNorm mmap fixture");
+        let weight = artifact
+            .float_tensor("matrix.weight.s_in")
+            .expect("resolve mmap-backed FP16 gated norm weight");
+        let weight_f32 = weight.to_f32_vec().expect("widen gated norm oracle weight");
+        let input: Vec<f32> = (0..rows * columns)
+            .map(|index| (index as f32 * 0.013).sin() * 0.75 - 0.05)
+            .collect();
+        let gate: Vec<f32> = (0..rows * columns)
+            .map(|index| (index as f32 * 0.019).cos() * 1.2 + 0.1)
+            .collect();
+        let expected =
+            crate::reference::rms_norm_gated(&input, &gate, rows, columns, &weight_f32, epsilon)
+                .expect("gated RMSNorm scalar oracle");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("import gated RMSNorm mmap without copy");
+        let prepared = runtime
+            .prepare_mapped_rms_norm_gated(&mapping, weight, &input, &gate, rows, columns, epsilon)
+            .expect("prepare mmap-backed gated RMSNorm");
+        assert_eq!(prepared.rows(), rows);
+        assert_eq!(prepared.columns(), columns);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert_eq!(
+            prepared.transient_bytes(),
+            3 * size_of_val(input.as_slice()) + MetalRmsNormParams::BYTE_LEN
+        );
+        assert!(runtime
+            .prepare_mapped_rms_norm_gated(
+                &mapping,
+                weight,
+                &input,
+                &gate[..gate.len() - 1],
+                rows,
+                columns,
+                epsilon,
+            )
+            .is_err());
+        assert!(runtime
+            .prepare_mapped_rms_norm_gated(&mapping, weight, &input, &gate, rows, columns, 0.0,)
+            .is_err());
+        let copied_weight = f16_bytes(&vec![1.0; columns]);
+        assert!(runtime
+            .prepare_mapped_rms_norm_gated(
+                &mapping,
+                FloatTensorView::F16Le(&copied_weight),
+                &input,
+                &gate,
+                rows,
+                columns,
+                epsilon,
+            )
+            .is_err());
+        drop(mapping);
+        drop(artifact);
+        let actual = runtime
+            .dispatch_mapped_rms_norm_gated(&prepared)
+            .expect("dispatch gated RMSNorm after loader drop");
+        for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+            let tolerance = 4.0e-5_f32.max(expected.abs() * 5.0e-5);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "gated RMSNorm value {index}: expected {expected}, got {actual}"
+            );
+        }
+        let zero = vec![0.0; rows * columns];
+        prepared
+            .write_inputs(&zero, &gate)
+            .expect("update gated RMSNorm inputs in place");
+        let zero_output = runtime
+            .dispatch_mapped_rms_norm_gated(&prepared)
+            .expect("dispatch zero gated RMSNorm input");
+        assert!(zero_output.iter().all(|value| value.abs() <= f32::EPSILON));
     }
 
     #[test]

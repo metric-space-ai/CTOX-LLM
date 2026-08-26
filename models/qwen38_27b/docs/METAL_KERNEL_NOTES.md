@@ -23,6 +23,7 @@ usage, no scalar fallback.
 | `q2_b64_recovered_row` | Q2_B64 embedding row | one packed byte/four corrected outputs per thread |
 | `q4_b64_recovered_row` | Q4_B64 embedding row | one packed byte/two corrected outputs per thread |
 | `qwen_rms_norm_1p_f32` | FP16 weight, f32 activation | one 32-wide simdgroup per row |
+| `qwen_rms_norm_gated_f32` | FP16 weight, f32 core/gate | one 32-wide simdgroup per value head |
 | `qwen_partial_rope_f32` | f32 Q/K heads in place | one thread per non-interleaved rotary pair |
 | `qwen_paged_q2q4_gqa_decode_f32` | f32 query/output, packed Q2/Q4 K/V | one 32-wide simdgroup per query head |
 | `qwen_gated_delta_recurrent_f16` | f32 step inputs/output, FP16 recurrent state | one threadgroup per value head |
@@ -171,6 +172,15 @@ all linear-attention state is therefore 75.75 MiB. Independently prepared
 layers use 81,936 transient bytes each; the complete graph must reuse these
 input/output buffers.
 
+The GatedDeltaNet output normalization is a separate direct-weight candidate:
+it computes RMSNorm over each 128-wide value head and fuses `SiLU(z)` into the
+same output write. The FP16 norm weight remains an offset into the CTOXQ mmap;
+core, gate, and output use reusable f32 graph buffers. At the frozen
+48-head-by-128 geometry, an independently prepared operation owns 73,744
+transient bytes and zero copied model bytes. Complete graph scheduling must
+bind the recurrence output and `in_proj_z` output directly instead of retaining
+those two standalone input buffers.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -236,6 +246,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   dependent steps with a loader-owned FP16 weight, drops the loader before
   dispatch, compares output and history with the FP16 scalar oracle, proves
   zero copied model bytes, and rejects copied same-valued weights.
+- `mapped_gated_rms_norm_matches_oracle_and_reuses_both_inputs` uses the exact
+  48x128 Qwen geometry, survives loader teardown, matches the direct-weight
+  gated scalar oracle, updates both graph inputs in place, reports zero copied
+  model bytes, and rejects copied weights and malformed contracts.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
@@ -278,8 +292,9 @@ dequantization array before this source was accepted.
   evidence.
 - No controlled size/residue/thermal sweep or hardware-counter roofline
   evidence exists yet.
-- Recovered embedding rows, Qwen RMSNorm, partial RoPE, packed decode GQA, and
-  FP16 recurrent GatedDeltaNet exist as verifier candidates. GQA still
+- Recovered embedding rows, both Qwen RMSNorm variants, partial RoPE, packed
+  decode GQA, causal convolution, and FP16 recurrent GatedDeltaNet exist as
+  verifier candidates. GQA still
   duplicates its packed pages in a CPU correctness mirror; neither attention
   path has controlled performance evidence. The MTP block, sampling, shared
   full-graph transient allocation, and complete model-graph Metal execution do

@@ -534,6 +534,37 @@ kernel void qwen_rms_norm_1p_f32(
     }
 }
 
+// GatedDeltaNet output normalization uses the direct learned weight (without
+// Qwen's residual-norm +1 convention) and fuses SiLU(z). One simdgroup owns
+// one value head; core and gate remain f32 graph activations while the
+// mmap-backed norm weight stays FP16.
+kernel void qwen_rms_norm_gated_f32(
+    device const float* input [[buffer(0)]],
+    device const float* gate [[buffer(1)]],
+    device const half* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant RmsNormParams& params [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= params.rows) {
+        return;
+    }
+    ulong row_offset = ulong(row) * params.columns;
+    float sum_squares = 0.0f;
+    for (uint column = lane; column < params.columns; column += 32u) {
+        float value = input[row_offset + column];
+        sum_squares = fma(value, value, sum_squares);
+    }
+    float variance = simd_sum(sum_squares) / float(params.columns);
+    float inverse = rsqrt(variance + params.epsilon);
+    for (uint column = lane; column < params.columns; column += 32u) {
+        uint index = uint(row_offset) + column;
+        float gate_value = gate[index];
+        float silu_gate = gate_value / (1.0f + exp(-gate_value));
+        output[index] = input[index] * inverse * float(weight[column]) * silu_gate;
+    }
+}
+
 // Qwen uses non-interleaved partial RoPE: the first rotary_dim/2 values are
 // paired with the following rotary_dim/2 values. Dimensions at and above
 // rotary_dim remain byte-identical in this in-place kernel.
