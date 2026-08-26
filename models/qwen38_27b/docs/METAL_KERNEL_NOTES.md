@@ -30,6 +30,10 @@ norms, and the final token barrier. The names and activation-group policy are
 derived from the same tensor contract and fan-out policy as CUDA; Metal may
 change physical layout but may not requantize or alter logical Q2/Q4 codes.
 This remains a binding plan rather than executable graph state.
+Its execution cursor rejects stale/out-of-context token positions and any
+skipped, duplicated, reordered, or wrong-layer dispatch. An incomplete cursor
+cannot advance the committed token count; accelerator-state rollback remains
+an explicit prerequisite for the complete executor.
 
 ## Entry points
 

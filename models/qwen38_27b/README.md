@@ -203,7 +203,9 @@ to the exact backend-neutral ownership set: all 505 non-embedding projections,
 262 recovery activation groups, 48 linear mixers, 17 full-attention owners,
 four regular norms, and 130 residual norms. This closes the logical binding
 contract; it does not yet provide the complete Metal executor or hardware
-promotion evidence.
+promotion evidence. A fail-closed execution cursor admits only the current
+committed token position, records those bound operations in exact order, and
+returns the next committed position only after all 645 steps.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

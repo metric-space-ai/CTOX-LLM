@@ -55,6 +55,19 @@ pub struct MetalDecodeBindingPlan {
     steps: Vec<MetalBoundDecodeStep>,
 }
 
+/// Fail-closed progress tracker for one Metal token command buffer.
+///
+/// The future executor advances this cursor only after an operation has been
+/// encoded successfully. Dropping an incomplete cursor cannot produce a new
+/// committed token position; session-state rollback remains the executor's
+/// responsibility until transactional Metal state owners are implemented.
+#[derive(Debug)]
+pub struct MetalDecodeExecutionCursor<'a> {
+    plan: &'a MetalDecodeBindingPlan,
+    token_position: usize,
+    next_step: usize,
+}
+
 impl MetalProjectionPlan {
     pub fn qwen38(config: &Qwen38Config) -> Result<Self> {
         if config != &Qwen38Config::default() {
@@ -209,6 +222,37 @@ impl MetalDecodeBindingPlan {
         &self.steps
     }
 
+    pub fn execution_cursor(
+        &self,
+        token_position: usize,
+        committed_tokens: usize,
+        admitted_context: usize,
+    ) -> Result<MetalDecodeExecutionCursor<'_>> {
+        if token_position != committed_tokens {
+            return Err(EngineError::InvalidState(format!(
+                "Metal decode position is {token_position}, but {committed_tokens} tokens are committed"
+            )));
+        }
+        if token_position >= admitted_context {
+            return Err(EngineError::MemoryBudget(format!(
+                "Metal decode position {token_position} exceeds admitted context {admitted_context}"
+            )));
+        }
+        if self.steps.last().is_none_or(|step| {
+            step.operation != MetalDecodeOperation::TokenCommandBufferCommit
+                || step.schedule_index + 1 != self.steps.len()
+        }) {
+            return Err(EngineError::InvalidState(
+                "Metal decode binding has no sole final command-buffer commit".into(),
+            ));
+        }
+        Ok(MetalDecodeExecutionCursor {
+            plan: self,
+            token_position,
+            next_step: 0,
+        })
+    }
+
     pub fn resource_count(&self, expected: fn(&MetalPreparedResource) -> bool) -> usize {
         self.steps
             .iter()
@@ -337,6 +381,80 @@ impl MetalDecodeBindingPlan {
             ));
         }
         Ok(())
+    }
+}
+
+impl<'a> MetalDecodeExecutionCursor<'a> {
+    pub fn token_position(&self) -> usize {
+        self.token_position
+    }
+
+    pub fn next_step(&self) -> Option<&'a MetalBoundDecodeStep> {
+        self.plan.steps.get(self.next_step)
+    }
+
+    /// Records the exact operation that the executor successfully encoded.
+    /// An omitted, duplicated, reordered, or wrong-layer dispatch fails before
+    /// a token position can become committed.
+    pub fn advance(
+        &mut self,
+        schedule_index: usize,
+        layer: Option<usize>,
+        operation: MetalDecodeOperation,
+    ) -> Result<()> {
+        if operation == MetalDecodeOperation::TokenCommandBufferCommit {
+            return Err(EngineError::InvalidState(
+                "Metal final commit requires commit_after_completion".into(),
+            ));
+        }
+        let expected = self.next_step().ok_or_else(|| {
+            EngineError::InvalidState("Metal token command buffer is already complete".into())
+        })?;
+        if expected.schedule_index != schedule_index
+            || expected.layer != layer
+            || expected.operation != operation
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal dispatch ({schedule_index}, {layer:?}, {operation:?}) does not match bound step ({}, {:?}, {:?})",
+                expected.schedule_index, expected.layer, expected.operation
+            )));
+        }
+        self.next_step += 1;
+        Ok(())
+    }
+
+    /// Records the sole final barrier only after the caller has committed and
+    /// waited for successful command-buffer completion.
+    pub fn commit_after_completion(&mut self, schedule_index: usize) -> Result<()> {
+        let expected = self.next_step().ok_or_else(|| {
+            EngineError::InvalidState("Metal token command buffer is already complete".into())
+        })?;
+        if expected.schedule_index != schedule_index
+            || expected.layer.is_some()
+            || expected.operation != MetalDecodeOperation::TokenCommandBufferCommit
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal completed command buffer at step {schedule_index} does not match final bound step ({}, {:?}, {:?})",
+                expected.schedule_index, expected.layer, expected.operation
+            )));
+        }
+        self.next_step += 1;
+        Ok(())
+    }
+
+    /// Returns the new committed position only after the final command buffer
+    /// has completed and every bound step has advanced in exact order.
+    pub fn finish(self) -> Result<usize> {
+        if self.next_step != self.plan.steps.len() {
+            return Err(EngineError::InvalidState(format!(
+                "Metal token completed {} of {} bound steps",
+                self.next_step,
+                self.plan.steps.len()
+            )));
+        }
+        self.token_position
+            .checked_add(1)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal token position overflows".into()))
     }
 }
 
@@ -670,5 +788,47 @@ mod tests {
             )),
             130
         );
+    }
+
+    #[test]
+    fn decode_cursor_commits_only_after_all_bound_steps() {
+        let config = Qwen38Config::default();
+        let projections = MetalProjectionPlan::qwen38(&config).unwrap();
+        let schedule = MetalDecodeSchedule::qwen38(&config).unwrap();
+        let bindings = MetalDecodeBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
+
+        let partial = bindings.execution_cursor(17, 17, 128 * 1024).unwrap();
+        assert_eq!(partial.token_position(), 17);
+        assert!(partial.finish().is_err());
+
+        let mut cursor = bindings.execution_cursor(17, 17, 128 * 1024).unwrap();
+        let first = cursor.next_step().unwrap().clone();
+        assert!(cursor
+            .advance(first.schedule_index + 1, first.layer, first.operation)
+            .is_err());
+        assert_eq!(cursor.next_step().unwrap(), &first);
+        while let Some(step) = cursor.next_step().cloned() {
+            if step.operation == MetalDecodeOperation::TokenCommandBufferCommit {
+                assert!(cursor
+                    .advance(step.schedule_index, step.layer, step.operation)
+                    .is_err());
+                cursor.commit_after_completion(step.schedule_index).unwrap();
+            } else {
+                cursor
+                    .advance(step.schedule_index, step.layer, step.operation)
+                    .unwrap();
+            }
+        }
+        assert_eq!(cursor.finish().unwrap(), 18);
+    }
+
+    #[test]
+    fn decode_cursor_rejects_uncommitted_or_out_of_context_positions() {
+        let config = Qwen38Config::default();
+        let projections = MetalProjectionPlan::qwen38(&config).unwrap();
+        let schedule = MetalDecodeSchedule::qwen38(&config).unwrap();
+        let bindings = MetalDecodeBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
+        assert!(bindings.execution_cursor(9, 8, 128).is_err());
+        assert!(bindings.execution_cursor(128, 128, 128).is_err());
     }
 }
