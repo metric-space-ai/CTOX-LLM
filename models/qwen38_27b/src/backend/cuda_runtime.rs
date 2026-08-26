@@ -184,6 +184,62 @@ struct CudaContextInner {
     compute_capability: (u32, u32),
 }
 
+/// Borrowed, context-bound f32 device tensor. The private buffer reference
+/// prevents a raw CUDA pointer from outliving its allocation while allowing
+/// model-specific prepared operators to feed one another without host copies.
+#[derive(Clone, Copy)]
+pub struct CudaDeviceF32View<'a> {
+    context: &'a Rc<CudaContextInner>,
+    buffer: &'a DeviceBuffer,
+    offset_values: usize,
+    values: usize,
+}
+
+impl<'a> CudaDeviceF32View<'a> {
+    pub fn values(&self) -> usize {
+        self.values
+    }
+
+    pub fn slice(&self, offset_values: usize, values: usize) -> Result<Self> {
+        let absolute_offset = self
+            .offset_values
+            .checked_add(offset_values)
+            .ok_or_else(|| EngineError::Shape("CUDA f32 subview offset overflows".into()))?;
+        let end = offset_values
+            .checked_add(values)
+            .ok_or_else(|| EngineError::Shape("CUDA f32 subview shape overflows".into()))?;
+        if values == 0 || end > self.values {
+            return Err(EngineError::Shape(format!(
+                "CUDA f32 subview ends at {end} values, parent has {}",
+                self.values
+            )));
+        }
+        Ok(Self {
+            context: self.context,
+            buffer: self.buffer,
+            offset_values: absolute_offset,
+            values,
+        })
+    }
+
+    fn ptr(&self) -> Result<CuDevicePtr> {
+        device_ptr_offset(
+            self.buffer.ptr(),
+            self.offset_values
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| EngineError::Shape("CUDA f32 view offset overflows".into()))?,
+        )
+    }
+}
+
+/// Explicit host-upload staging used only by CUDA numerical verifiers. The
+/// production graph obtains [`CudaDeviceF32View`] values from prepared model
+/// operators and never constructs this owner.
+pub struct CudaVerifierF32Tensor {
+    buffer: DeviceBuffer,
+    values: usize,
+}
+
 /// Device-resident buffers for one pure Q2 or Q4 projection. Immutable model
 /// and recovery buffers remain allocated across repeated token dispatches.
 pub struct PreparedCudaMatVec {
@@ -740,6 +796,42 @@ impl CudaCandidateRuntime {
             )?;
         }
         Ok((free, total))
+    }
+
+    pub fn prepare_verifier_f32_tensor(&self, values: &[f32]) -> Result<CudaVerifierF32Tensor> {
+        if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::Shape(
+                "CUDA verifier tensor requires finite non-empty f32 values".into(),
+            ));
+        }
+        Ok(CudaVerifierF32Tensor {
+            buffer: DeviceBuffer::from_bytes(self, as_bytes(values))?,
+            values: values.len(),
+        })
+    }
+
+    /// Device-to-host readback is deliberately named and scoped as verifier
+    /// functionality so production graph code cannot mistake it for an
+    /// admitted tensor edge.
+    pub fn verifier_read_f32(&self, view: CudaDeviceF32View<'_>) -> Result<Vec<f32>> {
+        if !Rc::ptr_eq(&self.inner, view.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA verifier read belongs to another context".into(),
+            ));
+        }
+        let offset_bytes = view
+            .offset_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("CUDA verifier offset overflows".into()))?;
+        let mut result = vec![0.0_f32; view.values];
+        view.buffer
+            .copy_range_to(offset_bytes, as_bytes_mut(&mut result))?;
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA verifier read produced a non-finite value".into(),
+            ));
+        }
+        Ok(result)
     }
 
     /// Allocate the exact Qwen3.8-27B persistent FP16 recurrent state and
@@ -1454,21 +1546,86 @@ impl CudaCandidateRuntime {
                 "CUDA paged GQA reached its token capacity".into(),
             ));
         }
+        prepared.query.write(as_bytes(query))?;
+        prepared.key.write(as_bytes(key))?;
+        prepared.value.write(as_bytes(value))?;
+        let query_ptr = prepared.query.ptr();
+        let key_ptr = prepared.key.ptr();
+        let value_ptr = prepared.value.ptr();
         prepared.poisoned = true;
-        let result = self.append_and_dispatch_paged_q2q4_gqa_inner(prepared, query, key, value);
-        if result.is_ok() {
-            prepared.poisoned = false;
+        self.append_and_dispatch_paged_q2q4_gqa_inner(prepared, query_ptr, key_ptr, value_ptr)?;
+        prepared.poisoned = false;
+        match self.read_paged_q2q4_gqa_output(prepared) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                prepared.poisoned = true;
+                Err(error)
+            }
         }
-        result
+    }
+
+    /// Appends one exact Qwen GQA step without copying Q, K, V, or the
+    /// attention result through host memory. Every view is tied to its owning
+    /// allocation and must originate from this CUDA context. This is the
+    /// production graph entry point; the slice-based method above is retained
+    /// only for the standalone numerical verifier.
+    pub fn append_and_dispatch_paged_q2q4_gqa_device<'a>(
+        &self,
+        prepared: &'a mut PreparedCudaPagedGqa,
+        query: CudaDeviceF32View<'_>,
+        key: CudaDeviceF32View<'_>,
+        value: CudaDeviceF32View<'_>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared CUDA paged GQA belongs to another context".into(),
+            ));
+        }
+        if prepared.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA paged GQA state is poisoned; reset is required".into(),
+            ));
+        }
+        let query_values = prepared.config.query_heads * prepared.config.head_dim;
+        let component_values = prepared.config.key_value_heads * prepared.config.head_dim;
+        for (name, view, expected) in [
+            ("query", query, query_values),
+            ("key", key, component_values),
+            ("value", value, component_values),
+        ] {
+            if !Rc::ptr_eq(&self.inner, view.context) {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA paged GQA {name} belongs to another context"
+                )));
+            }
+            if view.values() != expected {
+                return Err(EngineError::Shape(format!(
+                    "CUDA paged GQA {name} has {} values, expected {expected}",
+                    view.values()
+                )));
+            }
+        }
+        if prepared.tokens >= prepared.config.maximum_tokens {
+            return Err(EngineError::MemoryBudget(
+                "CUDA paged GQA reached its token capacity".into(),
+            ));
+        }
+        let query_ptr = query.ptr()?;
+        let key_ptr = key.ptr()?;
+        let value_ptr = value.ptr()?;
+        prepared.poisoned = true;
+        self.append_and_dispatch_paged_q2q4_gqa_inner(prepared, query_ptr, key_ptr, value_ptr)?;
+        prepared.poisoned = false;
+        prepared.output.f32_view(0, query_values)
     }
 
     fn append_and_dispatch_paged_q2q4_gqa_inner(
         &self,
         prepared: &mut PreparedCudaPagedGqa,
-        query: &[f32],
-        key: &[f32],
-        value: &[f32],
-    ) -> Result<Vec<f32>> {
+        mut query_ptr: CuDevicePtr,
+        mut key_ptr: CuDevicePtr,
+        mut value_ptr: CuDevicePtr,
+    ) -> Result<()> {
         self.make_current()?;
         let page_index = prepared.tokens / prepared.config.page_tokens;
         let token_in_page = prepared.tokens % prepared.config.page_tokens;
@@ -1490,11 +1647,7 @@ impl CudaCandidateRuntime {
                 "CUDA current KV page metadata is inconsistent".into(),
             ));
         }
-        prepared.key.write(as_bytes(key))?;
-        prepared.value.write(as_bytes(value))?;
         let mut q4_pages_ptr = prepared.q4_pages.ptr();
-        let mut key_ptr = prepared.key.ptr();
-        let mut value_ptr = prepared.value.ptr();
         let mut physical_slot = cuda_u32(
             prepared.pages[page_index].physical_slot,
             "CUDA Q4 physical slot",
@@ -1615,7 +1768,6 @@ impl CudaCandidateRuntime {
         prepared
             .descriptors
             .write_range(0, as_bytes(&descriptor_words))?;
-        prepared.query.write(as_bytes(query))?;
         let page_count = prepared.pages.len();
         let params_words = [
             cuda_u32(prepared.config.query_heads, "CUDA query heads")?,
@@ -1634,7 +1786,6 @@ impl CudaCandidateRuntime {
         prepared.params.write(as_bytes(&params_words))?;
 
         self.make_current()?;
-        let mut query_ptr = prepared.query.ptr();
         let mut q2_pages = prepared.q2_pages.ptr();
         let mut q4_pages = prepared.q4_pages.ptr();
         let mut descriptors = prepared.descriptors.ptr();
@@ -1670,6 +1821,10 @@ impl CudaCandidateRuntime {
                 "paged Q2/Q4 GQA context synchronization",
             )?;
         }
+        Ok(())
+    }
+
+    fn read_paged_q2q4_gqa_output(&self, prepared: &PreparedCudaPagedGqa) -> Result<Vec<f32>> {
         let mut result = vec![0.0_f32; prepared.config.query_heads * prepared.config.head_dim];
         prepared.output.copy_to(as_bytes_mut(&mut result))?;
         if result.iter().any(|item| !item.is_finite()) {
@@ -2515,6 +2670,10 @@ impl PreparedCudaMatVec {
         self.resident_bytes
     }
 
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.output.f32_view(0, self.rows())
+    }
+
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
         if input.len() != self.columns() {
             return Err(EngineError::Shape(format!(
@@ -2549,6 +2708,10 @@ impl PreparedCudaA8MatVec {
         self.resident_bytes
     }
 
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.base.device_output()
+    }
+
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
         self.base.write_input(input)
     }
@@ -2569,6 +2732,10 @@ impl PreparedCudaMixedA8MatVec {
 
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.output.f32_view(0, self.rows())
     }
 
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
@@ -2629,6 +2796,10 @@ impl PreparedCudaA8Projection {
 
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.output.f32_view(0, self.rows())
     }
 }
 
@@ -2758,6 +2929,11 @@ impl PreparedCudaGatedRmsNorm {
         self.transient_bytes
     }
 
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.output
+            .f32_view(0, self.config.rows * self.config.columns)
+    }
+
     pub fn write_inputs(&self, input: &[f32], gate: &[f32]) -> Result<()> {
         let expected = self.config.rows * self.config.columns;
         for (name, values) in [("input", input), ("gate", gate)] {
@@ -2785,6 +2961,11 @@ impl PreparedCudaRmsNorm {
         self.transient_bytes
     }
 
+    pub fn device_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.output
+            .f32_view(0, self.config.rows * self.config.columns)
+    }
+
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
         let expected = self.config.rows * self.config.columns;
         if input.len() != expected || input.iter().any(|value| !value.is_finite()) {
@@ -2803,6 +2984,11 @@ impl PreparedCudaPartialRope {
 
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
+    }
+
+    pub fn device_values(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.values
+            .f32_view(0, self.config.heads * self.config.head_dim)
     }
 
     pub fn write_values(&self, values: &[f32]) -> Result<()> {
@@ -2886,6 +3072,31 @@ impl PreparedCudaPagedGqa {
         self.params.zero()?;
         self.poisoned = false;
         Ok(())
+    }
+}
+
+impl CudaVerifierF32Tensor {
+    pub fn values(&self) -> usize {
+        self.values
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn write(&self, values: &[f32]) -> Result<()> {
+        if values.len() != self.values || values.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::Shape(format!(
+                "CUDA verifier tensor has {} values, expected finite {} values",
+                values.len(),
+                self.values
+            )));
+        }
+        self.buffer.write(as_bytes(values))
+    }
+
+    pub fn device_view(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.buffer.f32_view(0, self.values)
     }
 }
 
@@ -2990,6 +3201,26 @@ impl DeviceBuffer {
         }
     }
 
+    fn copy_range_to(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| EngineError::Shape("CUDA ranged readback overflows".into()))?;
+        if bytes.is_empty() || end > self.len {
+            return Err(EngineError::Shape(format!(
+                "CUDA ranged readback ends at {end}, buffer has {} bytes",
+                self.len
+            )));
+        }
+        self.context.make_current()?;
+        let source = device_ptr_offset(self.ptr, offset)?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.memcpy_dtoh)(bytes.as_mut_ptr().cast(), source, bytes.len()),
+                "ranged device-to-host copy",
+            )
+        }
+    }
+
     fn zero(&self) -> Result<()> {
         self.context.make_current()?;
         unsafe {
@@ -3002,6 +3233,27 @@ impl DeviceBuffer {
 
     fn ptr(&self) -> CuDevicePtr {
         self.ptr
+    }
+
+    fn f32_view(&self, offset_values: usize, values: usize) -> Result<CudaDeviceF32View<'_>> {
+        let end_values = offset_values
+            .checked_add(values)
+            .ok_or_else(|| EngineError::Shape("CUDA f32 view shape overflows".into()))?;
+        let end_bytes = end_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("CUDA f32 view bytes overflow".into()))?;
+        if values == 0 || end_bytes > self.len {
+            return Err(EngineError::Shape(format!(
+                "CUDA f32 view ends at {end_bytes} bytes, buffer has {}",
+                self.len
+            )));
+        }
+        Ok(CudaDeviceF32View {
+            context: &self.context,
+            buffer: self,
+            offset_values,
+            values,
+        })
     }
 
     fn len(&self) -> usize {
@@ -3266,5 +3518,7 @@ mod tests {
         assert_owned::<PreparedCudaA8Activation>();
         assert_owned::<PreparedCudaA8Projection>();
         assert_owned::<PreparedCudaRecoveredRow>();
+        assert_owned::<PreparedCudaPagedGqa>();
+        assert_owned::<CudaVerifierF32Tensor>();
     }
 }

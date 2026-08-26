@@ -164,9 +164,13 @@ shared memory for GQA; all three have zero stack/spill bytes. GQA's
 Its numerical/demotion/reset/unload verifier is queued on physical GPU 2 after
 the teacher, evaluation, activation and earlier verifier chain; GPU 0 is never
 eligible. The CPU `PagedKvCache` exists only in the separate verifier as an
-oracle. Production graph wiring must bind device-resident Q/K/V projection
-outputs directly instead of using the verifier runtime's host f32 upload, and
-the online-softmax path still needs controlled roofline evidence.
+oracle. The Rust runtime now exposes a lifetime- and context-bound device-view
+entry point: it consumes device-resident Q/K/V pointers, performs append,
+demotion and attention without host copies, and returns a borrowed device view
+of the result. The slice-based upload/readback wrapper remains verifier-only.
+The complete decoder scheduler still has to connect projection, RoPE, GQA,
+gate and output-projection views, and the online-softmax path still needs
+controlled roofline evidence.
 
 The first GPU3 run is recorded in
 `benchmarks/cuda/sm86-q2q4-fused-matvec-20260826.json`. It proved both formats

@@ -37,10 +37,12 @@ struct Report<'a> {
     head_dim: usize,
     packed_device_bytes: usize,
     transient_bytes: usize,
+    verifier_device_staging_bytes: usize,
     verifier_cpu_packed_bytes: usize,
     q4_tokens: usize,
     maximum_absolute_error: f32,
     maximum_relative_error: f32,
+    device_view_path_verified: bool,
     demotion_verified: bool,
     reset_verified: bool,
     driver_free_bytes_before_prepare: usize,
@@ -75,12 +77,29 @@ fn main() -> anyhow::Result<()> {
     let mut maximum_relative_error = 0.0_f32;
     let packed_device_bytes;
     let transient_bytes;
+    let verifier_device_staging_bytes;
     let verifier_cpu_packed_bytes;
     let q4_tokens;
     let free_after_prepare;
     let reset_verified;
     {
         let mut prepared = runtime.prepare_paged_q2q4_gqa(config)?;
+        let query_staging =
+            runtime
+                .prepare_verifier_f32_tensor(&vec![0.0; config.query_heads * config.head_dim])?;
+        let key_staging = runtime.prepare_verifier_f32_tensor(&vec![
+            0.0;
+            config.key_value_heads
+                * config.head_dim
+        ])?;
+        let value_staging = runtime.prepare_verifier_f32_tensor(&vec![
+            0.0;
+            config.key_value_heads
+                * config.head_dim
+        ])?;
+        verifier_device_staging_bytes = query_staging.resident_bytes()
+            + key_staging.resident_bytes()
+            + value_staging.resident_bytes();
         let mut oracle = PagedKvCache::new(
             config.maximum_tokens,
             config.key_value_heads * config.head_dim,
@@ -101,8 +120,16 @@ fn main() -> anyhow::Result<()> {
             let value: Vec<f32> = (0..config.key_value_heads * config.head_dim)
                 .map(|index| ((index + token * 13) as f32 * 0.015).sin() * 0.55)
                 .collect();
-            let actual =
-                runtime.append_and_dispatch_paged_q2q4_gqa(&mut prepared, &query, &key, &value)?;
+            query_staging.write(&query)?;
+            key_staging.write(&key)?;
+            value_staging.write(&value)?;
+            let output = runtime.append_and_dispatch_paged_q2q4_gqa_device(
+                &mut prepared,
+                query_staging.device_view()?,
+                key_staging.device_view()?,
+                value_staging.device_view()?,
+            )?;
+            let actual = runtime.verifier_read_f32(output)?;
             oracle.push(&key, &value)?;
             let cached_key = oracle.flattened_key(config.key_value_heads, config.head_dim)?;
             let cached_value = oracle.flattened_value(config.key_value_heads, config.head_dim)?;
@@ -151,7 +178,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.qwen38.cuda_paged_q2q4_gqa_verification.v1",
+            format: "ctox.qwen38.cuda_paged_q2q4_gqa_verification.v2",
             status: "pass",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -166,17 +193,19 @@ fn main() -> anyhow::Result<()> {
             head_dim: config.head_dim,
             packed_device_bytes,
             transient_bytes,
+            verifier_device_staging_bytes,
             verifier_cpu_packed_bytes,
             q4_tokens,
             maximum_absolute_error,
             maximum_relative_error,
+            device_view_path_verified: true,
             demotion_verified: true,
             reset_verified,
             driver_free_bytes_before_prepare: free_before_prepare,
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
-            note: "The CPU cache exists only as an external verifier oracle; CUDA packs Q4 and demotes Q4-to-Q2 entirely on device with no host packed-cache mirror.",
+            note: "Q/K/V enter the GQA dispatcher as context-bound device views and its output is read back only by the explicit verifier API. The CPU cache exists solely as the external numerical oracle; CUDA packs Q4 and demotes Q4-to-Q2 entirely on device with no host packed-cache mirror.",
         })?
     );
     Ok(())
