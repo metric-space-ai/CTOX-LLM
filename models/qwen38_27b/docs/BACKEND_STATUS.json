@@ -24,17 +24,17 @@
       "production_allowed": false,
       "required_first_profile": "sm86",
       "reference_pin": "../vendor/cuda/UPSTREAM.json",
-      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch", "transient_symmetric_a8_b64", "a8_q2_b64_dp4a_matvec", "a8_q4_b64_dp4a_matvec", "shared_a8_mixed_projection", "recovered_embedding_row", "resident_projection_reuse", "owned_private_context", "immediate_buffer_reclamation"],
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch", "transient_symmetric_a8_b64", "a8_q2_b64_dp4a_matvec", "a8_q4_b64_dp4a_matvec", "shared_a8_mixed_projection", "recovered_embedding_row", "resident_projection_reuse", "complete_645_step_decode_schedule", "paged_q2_q4_gqa", "gated_delta_recurrent_state", "mtp_checkpoint_restore_replay", "gathered_mtp_lm_head", "resident_target_argmax", "bounded_topk_topp_sampling", "thread_owned_executor", "owned_private_context", "immediate_buffer_reclamation"],
       "evidence": ["../benchmarks/cuda/sm86-q2q4-fused-matvec-20260826.json", "../benchmarks/cuda/sm86-a8-dp4a-20260826.json", "../benchmarks/cuda/sm86-recovered-row-20260826.json", "../benchmarks/cuda/sm86-owned-context-unload-20260826.json"],
       "implementation_notes": "CUDA_KERNEL_NOTES.md",
-      "promotion_blocker": "A8 full-model quality gate, controlled roofline sweep, complete graph kernels, complete-graph allocator high-watermark/unload evidence, and full-model golden run"
+      "promotion_blocker": "A8 full-model quality gate, controlled roofline sweep, queued complete-graph hardware verifier, complete-model allocator high-watermark/unload evidence, and full-model golden run"
     },
     "metal": {
       "state": "candidate",
       "production_allowed": false,
-      "operations": ["qwen_rms_norm_1p_f32", "qwen_partial_rope_f32", "rms_norm_to_mixed_projection_one_encoder", "q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch", "resident_projection_reuse", "identity_bound_shared_fanout", "batched_command_encoding", "mmap_no_copy_artifact_import", "shared_artifact_buffer_offsets", "recovered_embedding_row", "restricted_lm_head_gather"],
-      "evidence": ["METAL_KERNEL_NOTES.md", "../benchmarks/metal/apple-m5-shared-fanout-20260826.json"],
-      "promotion_blocker": "complete-graph no-copy ownership/high-watermark/unload evidence, complete graph kernels, controlled roofline/reference evidence, and full-model golden run"
+      "operations": ["qwen_rms_norm_1p_f32", "qwen_rms_norm_gated_f32", "qwen_partial_rope_f32", "rms_norm_to_mixed_projection_one_encoder", "q2_b64_fused_matvec", "q4_b64_fused_matvec", "mixed_q2_q4_b64_row_dispatch", "resident_projection_reuse", "identity_bound_shared_fanout", "batched_command_encoding", "mmap_no_copy_artifact_import", "shared_artifact_buffer_offsets", "recovered_embedding_row", "restricted_mtp_lm_head_gather", "paged_q2_q4_gqa", "gated_delta_recurrent_state", "causal_conv_f16_state", "resident_valid_vocabulary_argmax", "rms_norm_lm_head_argmax_one_encoder"],
+      "evidence": ["METAL_KERNEL_NOTES.md", "../benchmarks/metal/apple-m5-shared-fanout-20260826.json", "../benchmarks/metal/apple-m5-vocabulary-selection-20260826.json"],
+      "promotion_blocker": "complete-graph no-copy ownership/high-watermark/unload evidence, complete target/MTP executor, controlled roofline/reference evidence, and full-model golden run"
     },
     "snapdragon": {
       "state": "contract",
