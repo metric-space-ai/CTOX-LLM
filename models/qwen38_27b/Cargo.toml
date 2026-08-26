@@ -114,3 +114,8 @@ required-features = ["cuda"]
 name = "qwen38-cuda-swiglu-a8-verify"
 path = "src/bin/cuda_swiglu_a8_verify.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "qwen38-cuda-attention-gate-a8-verify"
+path = "src/bin/cuda_attention_gate_a8_verify.rs"
+required-features = ["cuda"]

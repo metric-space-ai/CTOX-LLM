@@ -59,12 +59,13 @@ pin the dp4a/mma techniques and launch geometry, not the block format.
 - Module must export at least:
   - `ctox_q2_b64_fused_matvec_sm86` (18-byte blocks: f16 scale + 16 code bytes)
   - `ctox_q4_b64_fused_matvec_sm86` (34-byte blocks: f16 scale + 32 code bytes)
-- The same verifier cubin additionally exports seventeen explicitly unpromoted
+- The same verifier cubin additionally exports eighteen explicitly unpromoted
   candidates: an A8 quantizer, two A8/dp4a projections, two recovered-row
   decoders, the persistent-state GatedDelta recurrence, causal convolution,
   and gated RMSNorm:
   - `ctox_quantize_a8_b64_sm86`
   - `ctox_quantize_swiglu_a8_b64_sm86`
+  - `ctox_quantize_sigmoid_gate_a8_b64_sm86`
   - `ctox_q2_b64_a8_matvec_sm86`
   - `ctox_q4_b64_a8_matvec_sm86`
   - `ctox_q2_b64_recovered_row_sm86`
@@ -118,9 +119,8 @@ GatedDeltaNet layers, two residual/norm fusions per layer, FFN fan-out/down
 edges, final LM head, MTP draft/target verification, and one final token
 barrier. A dataflow validator rejects reads from unavailable device slots,
 non-frozen topology, missing residual fusions, or any intermediate host
-barrier. The schedule deliberately exposes the still-unimplemented fused
-attention-gate/A8/output-projection edge instead of hiding it behind a CPU or
-unverified fallback.
+barrier. The fused attention-gate/A8/output-projection edge is implemented as
+an unpromoted CUDA candidate rather than hidden behind a CPU fallback.
 
 The recurrent candidate accepts only Qwen3.8-27B's frozen 48-head,
 128-key-dimension, 128-value-dimension profile. Its state is exactly 1,572,864
@@ -170,6 +170,12 @@ The device graph now enqueues this quantizer and its identity-bound Q2/Q4 down
 projection consecutively, synchronizing only once after the projection set.
 The verifier requires both exact A8 codes/scales and a device-resident down
 projection output, so the fused edge is not merely tested in isolation.
+
+Full-attention output uses the parallel fused path: packed GQA output is
+multiplied by `sigmoid(attention_gate)`, corrected by the output projection's
+FP16 `s_in`, and quantized to A8 before the Q2/Q4 projection without a
+6,144-value f32 gated-attention allocation. Its verifier checks every code and
+scale plus the directly chained projection output on the same device.
 
 The general Qwen `(1 + weight)` RMSNorm candidate uses one 256-thread block
 per row and an eight-warp reduction, so hidden width 5,120 does not serialize

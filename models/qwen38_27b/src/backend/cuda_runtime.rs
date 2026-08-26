@@ -26,7 +26,7 @@ use super::cuda::{
     PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
     Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
     Q4_B64_RECOVERED_ROW_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL, QWEN_RMS_NORM_F16_SYMBOL,
-    RESIDUAL_RMS_NORM_F16_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
+    RESIDUAL_RMS_NORM_F16_SYMBOL, SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
 use crate::format::TensorDType;
@@ -171,6 +171,7 @@ struct CudaContextInner {
     q4_function: CuFunction,
     a8_quantize_function: CuFunction,
     swiglu_a8_quantize_function: CuFunction,
+    sigmoid_gate_a8_quantize_function: CuFunction,
     q2_a8_function: CuFunction,
     q4_a8_function: CuFunction,
     q2_recovered_row_function: CuFunction,
@@ -697,6 +698,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let sigmoid_gate_a8_quantize_function =
+            match resolve_function(&driver, module, SIGMOID_GATE_A8_QUANTIZE_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let q2_a8_function = match resolve_function(&driver, module, Q2_B64_A8_MATVEC_SYMBOL) {
             Ok(function) => function,
             Err(error) => {
@@ -869,6 +881,7 @@ impl CudaCandidateRuntime {
                 q4_function,
                 a8_quantize_function,
                 swiglu_a8_quantize_function,
+                sigmoid_gate_a8_quantize_function,
                 q2_a8_function,
                 q4_a8_function,
                 q2_recovered_row_function,
@@ -2945,6 +2958,65 @@ impl CudaCandidateRuntime {
             .collect()
     }
 
+    pub fn quantize_shared_a8_sigmoid_gate_device(
+        &self,
+        prepared: &PreparedCudaA8Activation,
+        attention: CudaDeviceF32View<'_>,
+        gate: CudaDeviceF32View<'_>,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "prepared shared CUDA A8 activation belongs to another context".into(),
+            ));
+        }
+        for (name, view) in [("attention", attention), ("gate", gate)] {
+            if !Rc::ptr_eq(&self.inner, view.context) {
+                return Err(EngineError::InvalidState(format!(
+                    "shared CUDA A8 attention gate {name} belongs to another context"
+                )));
+            }
+            if view.values() != prepared.columns as usize {
+                return Err(EngineError::Shape(format!(
+                    "shared CUDA A8 attention gate {name} has {} values, expected {}",
+                    view.values(),
+                    prepared.columns
+                )));
+            }
+        }
+        self.launch_sigmoid_gate_a8_quantization(
+            attention.ptr()?,
+            gate.ptr()?,
+            prepared.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            prepared.q8_codes.ptr(),
+            prepared.q8_scales.ptr(),
+            prepared.columns,
+        )
+    }
+
+    pub fn dispatch_shared_a8_sigmoid_gate_fanout_device<'a>(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        attention: CudaDeviceF32View<'_>,
+        gate: CudaDeviceF32View<'_>,
+        projections: &[&'a PreparedCudaA8Projection],
+    ) -> Result<Vec<CudaDeviceF32View<'a>>> {
+        self.validate_shared_a8_fanout(activation, projections, 1)?;
+        self.quantize_shared_a8_sigmoid_gate_device(activation, attention, gate)?;
+        for projection in projections {
+            self.launch_shared_a8_projection(activation, projection)?;
+        }
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "shared attention-gate A8 fan-out context synchronization",
+            )?;
+        }
+        projections
+            .iter()
+            .map(|projection| (*projection).device_output())
+            .collect()
+    }
+
     /// Quantizes one corrected activation, launches every byte-identity-bound
     /// projection, synchronizes once, and returns outputs in caller order.
     pub fn dispatch_shared_a8_fanout(
@@ -3200,6 +3272,50 @@ impl CudaCandidateRuntime {
                     ptr::null_mut(),
                 ),
                 "SwiGLU A8 quantization launch",
+            )
+        }
+    }
+
+    fn launch_sigmoid_gate_a8_quantization(
+        &self,
+        attention_ptr: CuDevicePtr,
+        gate_ptr: CuDevicePtr,
+        s_in_ptr: CuDevicePtr,
+        q8_codes_ptr: CuDevicePtr,
+        q8_scales_ptr: CuDevicePtr,
+        column_count: u32,
+    ) -> Result<()> {
+        self.make_current()?;
+        let mut attention = attention_ptr;
+        let mut gate = gate_ptr;
+        let mut s_in = s_in_ptr;
+        let mut q8_codes = q8_codes_ptr;
+        let mut q8_scales = q8_scales_ptr;
+        let mut columns = column_count;
+        let mut params = [
+            (&mut attention as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut gate as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut s_in as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_codes as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q8_scales as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut columns as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.sigmoid_gate_a8_quantize_function,
+                    column_count.div_ceil(64),
+                    1,
+                    1,
+                    64,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "attention-gate A8 quantization launch",
             )
         }
     }

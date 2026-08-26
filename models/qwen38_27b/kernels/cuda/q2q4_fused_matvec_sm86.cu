@@ -281,6 +281,52 @@ void ctox_quantize_swiglu_a8_b64_sm86(
     q8_codes[index] = static_cast<int8_t>(code);
 }
 
+// Qwen full-attention output projection input: fuse the per-channel sigmoid
+// gate, recovery s_in, and symmetric A8 quantization. The 6,144-value gated
+// attention tensor is never materialized.
+// ref: ggml/src/ggml-cuda/vecdotq.cuh:115-137
+extern "C" __global__ __launch_bounds__(64, 4)
+void ctox_quantize_sigmoid_gate_a8_b64_sm86(
+    const float* __restrict__ attention,
+    const float* __restrict__ gate,
+    const __half* __restrict__ s_in,
+    int8_t* __restrict__ q8_codes,
+    float* __restrict__ q8_scales,
+    unsigned columns) {
+    const unsigned local = threadIdx.x;
+    const unsigned block = blockIdx.x;
+    const unsigned index = block * kBlockLen + local;
+    if (local >= kBlockLen || index >= columns) {
+        return;
+    }
+    const float gate_value = 1.0f / (1.0f + expf(-gate[index]));
+    const float value = attention[index] * gate_value
+        * load_optional_f16(s_in, index);
+    float maximum = fabsf(value);
+#pragma unroll
+    for (unsigned offset = 16; offset != 0; offset >>= 1) {
+        maximum = fmaxf(maximum,
+                        __shfl_down_sync(0xffffffffu, maximum, offset));
+    }
+    __shared__ float warp_maximum[2];
+    __shared__ float block_scale;
+    if ((local & 31u) == 0u) {
+        warp_maximum[local / 32u] = maximum;
+    }
+    __syncthreads();
+    if (local == 0u) {
+        block_scale = fmaxf(warp_maximum[0], warp_maximum[1]) * (1.0f / 127.0f);
+        q8_scales[block] = block_scale;
+    }
+    __syncthreads();
+    int code = 0;
+    if (block_scale != 0.0f) {
+        code = __float2int_rn(value / block_scale);
+        code = max(-127, min(127, code));
+    }
+    q8_codes[index] = static_cast<int8_t>(code);
+}
+
 extern "C" __global__ __launch_bounds__(256, 2)
 void ctox_q2_b64_a8_matvec_sm86(const unsigned char* __restrict__ weights,
                                 const int8_t* __restrict__ q8_codes,
