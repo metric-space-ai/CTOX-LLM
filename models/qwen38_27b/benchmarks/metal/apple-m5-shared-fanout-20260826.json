@@ -1,0 +1,40 @@
+{
+  "format": "ctox.metal-shared-fanout-evidence.v1",
+  "captured_at": "2026-08-26",
+  "status": "verifier_only_not_promotion_evidence",
+  "host_profile": "Apple M5",
+  "device": "Apple M5",
+  "shape": {
+    "columns": 5120,
+    "q_proj": { "dtype": "q4_b64", "rows": 12288, "packed_weight_bytes": 33423360 },
+    "k_proj": { "dtype": "q2_b64", "rows": 1024, "packed_weight_bytes": 1474560 },
+    "v_proj": { "dtype": "q2_b64", "rows": 1024, "packed_weight_bytes": 1474560 }
+  },
+  "simdgroups": 2,
+  "warmup_per_run": 3,
+  "iterations_per_run": 50,
+  "packed_weight_bytes_per_pass": 36372480,
+  "isolated_requested_resident_bytes": 36608096,
+  "shared_requested_resident_bytes": 36546656,
+  "requested_resident_bytes_saved": 61440,
+  "mismatched_s_in_rejected": true,
+  "maximum_absolute_error": {
+    "q_proj": 0.000030994415,
+    "k_proj": 0.00003325939,
+    "v_proj": 0.00003504753
+  },
+  "runs": [
+    { "isolated_mean_pass_ms": 2.84336832, "shared_mean_pass_ms": 2.842595, "speedup": 1.0002720472, "shared_packed_weight_gb_per_second": 12.7955195869 },
+    { "isolated_mean_pass_ms": 4.32699334, "shared_mean_pass_ms": 3.05865832, "speedup": 1.4146703840, "shared_packed_weight_gb_per_second": 11.8916453538 },
+    { "isolated_mean_pass_ms": 2.16623332, "shared_mean_pass_ms": 2.35120832, "speedup": 0.9213276857, "shared_packed_weight_gb_per_second": 15.4696968748 },
+    { "isolated_mean_pass_ms": 4.3359175, "shared_mean_pass_ms": 2.68511, "speedup": 1.6148006972, "shared_packed_weight_gb_per_second": 13.5459925292 },
+    { "isolated_mean_pass_ms": 5.2241525, "shared_mean_pass_ms": 1.77234584, "speedup": 2.9475920456, "shared_packed_weight_gb_per_second": 20.5222249400 }
+  ],
+  "medians": {
+    "isolated_mean_pass_ms": 4.32699334,
+    "shared_mean_pass_ms": 2.68511,
+    "speedup": 1.4146703840,
+    "shared_packed_weight_gb_per_second": 13.5459925292
+  },
+  "note": "Exact Qwen Q/K/V shapes. Shared mode owns one input/s_in allocation and one command buffer per fan-out. StorageModeShared output copies, host dispatch, uncontrolled clocks and synthetic weights are included; variance is high and packed-byte GB/s is not hardware-counter roofline evidence."
+}

@@ -4,8 +4,9 @@ Status: **candidate, not promoted**. The backend reports
 `PromotionState::Contract` and its production `fused_matvec` entry point fails
 closed with `EngineError::UnsupportedOperation`. A separately named
 `MetalCandidateRuntime` now performs direct same-device verifier dispatch, but
-it cannot be selected as a production `Backend` until resident-memory and
-benchmark evidence exists. No MLX/MPSGraph usage, no scalar fallback.
+it cannot be selected as a production `Backend` until complete-graph residency,
+quality, unload, and controlled benchmark evidence exists. No MLX/MPSGraph
+usage, no scalar fallback.
 
 ## Files
 
@@ -58,6 +59,15 @@ can separate kernel work from a commit/wait round trip per operation. The
 production graph must generalize this to distinct dependent operations rather
 than repeating one projection.
 
+`PreparedMetalActivation` plus `PreparedMetalProjection` now provide that
+distinct-projection primitive for one fan-out: input and packed FP16 `s_in`
+are allocated once, Q2/Q4 matrices keep only projection-local state, and every
+projection is encoded into one command buffer with one completion wait. The
+dispatcher binds the column count and SHA-256 of the exact `s_in` bytes and
+rejects a mismatched projection before encoding. The existing MSL kernels
+still multiply `input * s_in` inside each projection; this change proves shared
+ownership and scheduling, not a pre-corrected or A8 Metal compute path.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -76,9 +86,21 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
 - `prepared_projection_reuses_resident_buffers_and_updates_only_input` proves
   that a second dispatch changes output after updating only the existing input
   buffer and rejects a mismatched input shape.
+- `shared_fanout_matches_oracles_reuses_residency_and_rejects_other_s_in`
+  executes mixed Q2/Q4 projections in one command buffer, matches both scalar
+  oracles, saves exactly one duplicated input/scale allocation for two
+  projections, accepts in-place input updates, and rejects another `s_in`.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.
+- `qwen38-metal-fanout-bench` uses the exact Qwen Q/K/V shapes: Q4
+  12,288x5,120 plus two Q2 1,024x5,120 matrices. Five uncontrolled 50-pass
+  runs on Apple M5 had median 2.685 ms per shared fan-out versus 4.327 ms for
+  three isolated command buffers (1.415x), while saving 61,440 requested
+  buffer bytes. Maximum scalar-oracle error was `3.51e-5`; variance was high,
+  so this remains verifier evidence, not a roofline or promotion claim. The
+  raw run summary is in
+  `benchmarks/metal/apple-m5-shared-fanout-20260826.json`.
 - The complete suite also covers ABI constants against `src/quant.rs`, invalid
   shape/buffer rejection, dispatch-name checks, and an in-test `xcrun metal`
   compilation of the source.
@@ -89,9 +111,9 @@ dequantization array before this source was accepted.
 
 ## Not yet done (promotion blockers)
 
-- The verifier currently creates shared staging buffers for an isolated
-  operation. It is not evidence for resident model tensors or the required
-  no-duplicate loader ownership contract.
+- The verifier still copies weights from fixture memory into Metal buffers. It
+  is not evidence for zero-copy CTOXQ mappings, complete resident model tensor
+  ownership, allocator high-watermark, or complete unload.
 - Exploratory 17408x5120 FFN measurements with eight dispatches per command
   reached roughly 26.55 GB/s for Q2 (four simdgroups/threadgroup) and
   43.95 GB/s for Q4 (two simdgroups/threadgroup). The earlier CTOX M5 hardware

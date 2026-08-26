@@ -12,6 +12,7 @@ use metal_driver::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
     MTLResourceOptions, MTLSize,
 };
+use sha2::{Digest, Sha256};
 
 use super::metal::{
     validate_operation, MetalBufferAbi, MAX_SIMDGROUPS_PER_THREADGROUP, Q2_KERNEL_NAME,
@@ -57,6 +58,36 @@ pub struct PreparedMetalMatVec {
     resident_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetalCorrectionIdentity {
+    columns: usize,
+    s_in_sha256: [u8; 32],
+}
+
+/// One input/recovery pair shared by a complete model fan-out.
+pub struct PreparedMetalActivation {
+    columns: usize,
+    correction_identity: MetalCorrectionIdentity,
+    input_buffer: Buffer,
+    s_in_buffer: Buffer,
+    resident_bytes: usize,
+}
+
+/// Matrix-local state consuming a separately owned shared activation.
+pub struct PreparedMetalProjection {
+    dtype: TensorDType,
+    rows: usize,
+    columns: usize,
+    thread_width: usize,
+    correction_identity: MetalCorrectionIdentity,
+    weights_buffer: Buffer,
+    s_out_buffer: Buffer,
+    bias_buffer: Buffer,
+    output_buffer: Buffer,
+    params_buffer: Buffer,
+    resident_bytes: usize,
+}
+
 impl PreparedMetalMatVec {
     pub fn dtype(&self) -> TensorDType {
         self.dtype
@@ -80,18 +111,7 @@ impl PreparedMetalMatVec {
     /// Replaces the decode input without reallocating weights, corrections,
     /// output, or parameter buffers.
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
-        if input.len() != self.columns {
-            return Err(EngineError::Shape(format!(
-                "Metal prepared input has {} values, expected {}",
-                input.len(),
-                self.columns
-            )));
-        }
-        if input.iter().any(|value| !value.is_finite()) {
-            return Err(EngineError::InvalidArtifact(
-                "Metal prepared input contains a non-finite value".into(),
-            ));
-        }
+        validate_metal_input(input, self.columns)?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 input.as_ptr(),
@@ -100,6 +120,46 @@ impl PreparedMetalMatVec {
             );
         }
         Ok(())
+    }
+}
+
+impl PreparedMetalActivation {
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn write_input(&self, input: &[f32]) -> Result<()> {
+        validate_metal_input(input, self.columns)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                self.input_buffer.contents().cast::<f32>(),
+                input.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl PreparedMetalProjection {
+    pub fn dtype(&self) -> TensorDType {
+        self.dtype
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
     }
 }
 
@@ -227,6 +287,199 @@ impl MetalCandidateRuntime {
         })
     }
 
+    /// Prepares one input and exact packed FP16 recovery correction without
+    /// retaining any projection-local buffers.
+    pub fn prepare_shared_activation(
+        &self,
+        operation: &FusedMatVec<'_>,
+    ) -> Result<PreparedMetalActivation> {
+        validate_operation(operation)?;
+        let dummy_half = [0_u8; 2];
+        let s_in = fp16_bytes_or_dummy(operation.s_in, &dummy_half);
+        let correction_identity = metal_correction_identity(operation.columns, operation.s_in)?;
+        let input_buffer = buffer_with_data(&self.device, as_bytes(operation.input));
+        let s_in_buffer = buffer_with_data(&self.device, s_in);
+        let resident_bytes = size_of_val(operation.input)
+            .checked_add(s_in.len())
+            .ok_or_else(|| EngineError::Shape("Metal activation byte count overflows".into()))?;
+        Ok(PreparedMetalActivation {
+            columns: operation.columns,
+            correction_identity,
+            input_buffer,
+            s_in_buffer,
+            resident_bytes,
+        })
+    }
+
+    pub fn prepare_shared_projection(
+        &self,
+        operation: &FusedMatVec<'_>,
+    ) -> Result<PreparedMetalProjection> {
+        self.prepare_shared_projection_with_simdgroups(operation, DEFAULT_SIMDGROUPS)
+    }
+
+    pub fn prepare_shared_projection_with_simdgroups(
+        &self,
+        operation: &FusedMatVec<'_>,
+        simdgroups: usize,
+    ) -> Result<PreparedMetalProjection> {
+        let (layout, params) = validate_operation(operation)?;
+        let pipeline = match layout.dtype {
+            TensorDType::Q2B64 => &self.q2_pipeline,
+            TensorDType::Q4B64 => &self.q4_pipeline,
+            _ => unreachable!("Metal validation accepts only Q2/Q4"),
+        };
+        let thread_width = dispatch_width(pipeline, simdgroups)?;
+        let dummy_half = [0_u8; 2];
+        let dummy_float = [0.0_f32];
+        let s_out = fp16_bytes_or_dummy(operation.s_out, &dummy_half);
+        let bias = operation.bias.unwrap_or(&dummy_float);
+        let params = params.encode();
+        let output_bytes = operation
+            .rows
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("Metal output byte size overflows".into()))?;
+        let weights_buffer = buffer_with_data(&self.device, operation.weights);
+        let s_out_buffer = buffer_with_data(&self.device, s_out);
+        let bias_buffer = buffer_with_data(&self.device, as_bytes(bias));
+        let output_buffer = self
+            .device
+            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let params_buffer = buffer_with_data(&self.device, &params);
+        let resident_bytes = operation
+            .weights
+            .len()
+            .checked_add(s_out.len())
+            .and_then(|total| total.checked_add(size_of_val(bias)))
+            .and_then(|total| total.checked_add(output_bytes))
+            .and_then(|total| total.checked_add(params.len()))
+            .ok_or_else(|| EngineError::Shape("Metal projection byte count overflows".into()))?;
+        Ok(PreparedMetalProjection {
+            dtype: layout.dtype,
+            rows: operation.rows,
+            columns: operation.columns,
+            thread_width,
+            correction_identity: metal_correction_identity(operation.columns, operation.s_in)?,
+            weights_buffer,
+            s_out_buffer,
+            bias_buffer,
+            output_buffer,
+            params_buffer,
+            resident_bytes,
+        })
+    }
+
+    /// Encodes all projections into one command buffer and synchronizes once.
+    /// Output order is identical to caller order.
+    pub fn dispatch_shared_fanout(
+        &self,
+        activation: &PreparedMetalActivation,
+        projections: &[&PreparedMetalProjection],
+    ) -> Result<Vec<Vec<f32>>> {
+        if projections.is_empty() {
+            return Err(EngineError::Shape(
+                "Metal fan-out requires at least one projection".into(),
+            ));
+        }
+        for projection in projections {
+            if projection.columns != activation.columns
+                || projection.correction_identity != activation.correction_identity
+            {
+                return Err(EngineError::InvalidArtifact(
+                    "Metal fan-out projection s_in identity differs".into(),
+                ));
+            }
+        }
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-shared-fanout-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        for projection in projections {
+            let pipeline = match projection.dtype {
+                TensorDType::Q2B64 => &self.q2_pipeline,
+                TensorDType::Q4B64 => &self.q4_pipeline,
+                _ => unreachable!("prepared Metal projection is Q2/Q4"),
+            };
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(
+                MetalBufferAbi::WEIGHTS as u64,
+                Some(&projection.weights_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::INPUT as u64,
+                Some(&activation.input_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::S_IN as u64,
+                Some(&activation.s_in_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::S_OUT as u64,
+                Some(&projection.s_out_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::BIAS as u64,
+                Some(&projection.bias_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::OUTPUT as u64,
+                Some(&projection.output_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::PARAMS as u64,
+                Some(&projection.params_buffer),
+                0,
+            );
+            let grid = MTLSize {
+                width: projection
+                    .rows
+                    .div_ceil((projection.thread_width / 32) * ROWS_PER_SIMDGROUP)
+                    as u64,
+                height: 1,
+                depth: 1,
+            };
+            let threads = MTLSize {
+                width: projection.thread_width as u64,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_thread_groups(grid, threads);
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal fan-out command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        projections
+            .iter()
+            .map(|projection| {
+                let output = unsafe {
+                    slice::from_raw_parts(
+                        projection.output_buffer.contents().cast::<f32>(),
+                        projection.rows,
+                    )
+                    .to_vec()
+                };
+                if output.iter().any(|value| !value.is_finite()) {
+                    return Err(EngineError::InvalidState(
+                        "Metal fan-out produced a non-finite output".into(),
+                    ));
+                }
+                Ok(output)
+            })
+            .collect()
+    }
+
     /// Dispatches an already resident projection. Command encoding and
     /// completion remain synchronous so verifier and benchmark callers obtain
     /// an unambiguous interval and completed output.
@@ -327,6 +580,59 @@ impl MetalCandidateRuntime {
         }
         Ok(output)
     }
+}
+
+fn validate_metal_input(input: &[f32], columns: usize) -> Result<()> {
+    if input.len() != columns {
+        return Err(EngineError::Shape(format!(
+            "Metal prepared input has {} values, expected {columns}",
+            input.len()
+        )));
+    }
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(EngineError::InvalidArtifact(
+            "Metal prepared input contains a non-finite value".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn metal_correction_identity(
+    columns: usize,
+    s_in: Option<ScaleSlice<'_>>,
+) -> Result<MetalCorrectionIdentity> {
+    let mut digest = Sha256::new();
+    digest.update(b"ctox.metal.correction-identity.v1\0");
+    digest.update(
+        u64::try_from(columns)
+            .map_err(|_| EngineError::Shape("Metal columns exceed u64".into()))?
+            .to_le_bytes(),
+    );
+    match s_in {
+        None => digest.update([0]),
+        Some(ScaleSlice::F16Le(bytes)) => {
+            let expected = columns
+                .checked_mul(2)
+                .ok_or_else(|| EngineError::Shape("Metal s_in size overflows".into()))?;
+            if bytes.len() != expected {
+                return Err(EngineError::Shape(format!(
+                    "Metal s_in has {} bytes, expected {expected}",
+                    bytes.len()
+                )));
+            }
+            digest.update([1]);
+            digest.update(bytes);
+        }
+        Some(ScaleSlice::F32(_)) => {
+            return Err(EngineError::UnsupportedDType(
+                "Metal correction identity requires packed FP16 s_in".into(),
+            ));
+        }
+    }
+    Ok(MetalCorrectionIdentity {
+        columns,
+        s_in_sha256: digest.finalize().into(),
+    })
 }
 
 fn dispatch_width(pipeline: &ComputePipelineState, simdgroups: usize) -> Result<usize> {
@@ -467,6 +773,107 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shared_fanout_matches_oracles_reuses_residency_and_rejects_other_s_in() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let columns = 2 * BLOCK_LEN;
+        let input: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.017).cos())
+            .collect();
+        let s_in = f16_bytes(&vec![1.125; columns]);
+        let different_s_in = f16_bytes(&vec![0.875; columns]);
+        let q2_rows = 5;
+        let q4_rows = 7;
+        let q2_weights = packed_weights(TensorDType::Q2B64, q2_rows, columns);
+        let q4_weights = packed_weights(TensorDType::Q4B64, q4_rows, columns);
+        let q2_s_out = f16_bytes(&vec![0.9; q2_rows]);
+        let q4_s_out = f16_bytes(&vec![1.1; q4_rows]);
+        let q2 = FusedMatVec {
+            dtype: TensorDType::Q2B64,
+            weights: &q2_weights,
+            segments: &[],
+            rows: q2_rows,
+            columns,
+            input: &input,
+            s_in: Some(ScaleSlice::F16Le(&s_in)),
+            s_out: Some(ScaleSlice::F16Le(&q2_s_out)),
+            bias: None,
+            activation: Activation::Identity,
+        };
+        let q4 = FusedMatVec {
+            dtype: TensorDType::Q4B64,
+            weights: &q4_weights,
+            rows: q4_rows,
+            s_out: Some(ScaleSlice::F16Le(&q4_s_out)),
+            ..q2
+        };
+        let expected = [
+            cpu.fused_matvec(&q2).expect("Q2 oracle"),
+            cpu.fused_matvec(&q4).expect("Q4 oracle"),
+        ];
+        let isolated_bytes = runtime
+            .prepare_fused_matvec(&q2)
+            .expect("isolated Q2")
+            .resident_bytes()
+            + runtime
+                .prepare_fused_matvec(&q4)
+                .expect("isolated Q4")
+                .resident_bytes();
+        let activation = runtime
+            .prepare_shared_activation(&q2)
+            .expect("shared activation");
+        let q2_projection = runtime
+            .prepare_shared_projection(&q2)
+            .expect("shared Q2 projection");
+        let q4_projection = runtime
+            .prepare_shared_projection(&q4)
+            .expect("shared Q4 projection");
+        let shared_bytes = activation.resident_bytes()
+            + q2_projection.resident_bytes()
+            + q4_projection.resident_bytes();
+        assert_eq!(activation.columns(), columns);
+        assert_eq!(q2_projection.dtype(), TensorDType::Q2B64);
+        assert_eq!(q4_projection.rows(), q4_rows);
+        assert_eq!(q4_projection.columns(), columns);
+        assert_eq!(
+            isolated_bytes - shared_bytes,
+            size_of_val(input.as_slice()) + s_in.len()
+        );
+        let actual = runtime
+            .dispatch_shared_fanout(&activation, &[&q2_projection, &q4_projection])
+            .expect("shared Metal fan-out");
+        for (expected, actual) in expected.iter().zip(actual) {
+            for (expected, actual) in expected.iter().zip(actual) {
+                let tolerance = 2.0e-4_f32.max(expected.abs() * 3.0e-5);
+                assert!((expected - actual).abs() <= tolerance);
+            }
+        }
+
+        let mismatched = FusedMatVec {
+            s_in: Some(ScaleSlice::F16Le(&different_s_in)),
+            ..q2
+        };
+        let mismatched_projection = runtime
+            .prepare_shared_projection(&mismatched)
+            .expect("mismatched projection can be prepared independently");
+        assert!(runtime
+            .dispatch_shared_fanout(&activation, &[&mismatched_projection])
+            .is_err());
+        assert!(runtime.dispatch_shared_fanout(&activation, &[]).is_err());
+
+        activation
+            .write_input(&vec![0.0; columns])
+            .expect("shared input update");
+        let zero = runtime
+            .dispatch_shared_fanout(&activation, &[&q2_projection, &q4_projection])
+            .expect("zero shared fan-out");
+        assert!(zero
+            .iter()
+            .flatten()
+            .all(|value| value.abs() <= f32::EPSILON));
     }
 
     #[test]

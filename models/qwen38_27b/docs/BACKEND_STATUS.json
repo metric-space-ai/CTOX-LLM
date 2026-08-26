@@ -32,8 +32,8 @@
     "metal": {
       "state": "candidate",
       "production_allowed": false,
-      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "resident_projection_reuse", "batched_command_encoding"],
-      "evidence": "METAL_KERNEL_NOTES.md",
+      "operations": ["q2_b64_fused_matvec", "q4_b64_fused_matvec", "resident_projection_reuse", "identity_bound_shared_fanout", "batched_command_encoding"],
+      "evidence": ["METAL_KERNEL_NOTES.md", "../benchmarks/metal/apple-m5-shared-fanout-20260826.json"],
       "promotion_blocker": "zero-copy artifact ownership, complete graph kernels, controlled roofline/reference evidence, and full-model golden run"
     },
     "snapdragon": {
