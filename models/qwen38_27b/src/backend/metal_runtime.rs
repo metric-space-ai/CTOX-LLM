@@ -16,15 +16,17 @@ use metal_driver::{
 use sha2::{Digest, Sha256};
 
 use super::metal::{
-    validate_mixed_operation, validate_operation, validate_recovered_row, MetalBufferAbi,
+    validate_mixed_operation, validate_operation, validate_recovered_row,
+    MetalArgMaxFinalBufferAbi, MetalArgMaxParams, MetalArgMaxPartialBufferAbi, MetalBufferAbi,
     MetalCausalConvBufferAbi, MetalCausalConvParams, MetalFusedMatVecParams,
     MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedRmsNormBufferAbi,
     MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
-    MetalRmsNormBufferAbi, MetalRmsNormParams, CAUSAL_CONV_F16_KERNEL_NAME,
-    GATED_DELTA_F16_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME,
-    PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
-    Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
-    Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
+    MetalRmsNormBufferAbi, MetalRmsNormParams, ARGMAX_F32_FINAL_KERNEL_NAME,
+    ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME,
+    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
+    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
+    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
+    RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
@@ -60,6 +62,8 @@ pub struct MetalCandidateRuntime {
     paged_gqa_decode_pipeline: ComputePipelineState,
     gated_delta_f16_pipeline: ComputePipelineState,
     causal_conv_f16_pipeline: ComputePipelineState,
+    argmax_f32_partial_pipeline: ComputePipelineState,
+    argmax_f32_final_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -290,6 +294,49 @@ pub struct PreparedMappedMetalCausalConv {
     resident_state_bytes: usize,
     transient_bytes: usize,
     poisoned: bool,
+}
+
+/// Standalone verifier owner for deterministic device-resident target
+/// selection. Production graph assembly will bind the argmax pipeline directly
+/// to the mapped LM-head output instead of owning this input buffer.
+pub struct PreparedMetalArgMax {
+    values: usize,
+    groups: usize,
+    input_buffer: Buffer,
+    partials_buffer: Buffer,
+    result_buffer: Buffer,
+    params_buffer: Buffer,
+    resident_bytes: usize,
+}
+
+impl PreparedMetalArgMax {
+    pub fn values(&self) -> usize {
+        self.values
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn groups(&self) -> usize {
+        self.groups
+    }
+
+    pub fn write_input(&mut self, input: &[f32]) -> Result<()> {
+        if input.len() != self.values {
+            return Err(EngineError::Shape(format!(
+                "Metal argmax input has {} values, expected {}",
+                input.len(),
+                self.values
+            )));
+        }
+        write_buffer_range(
+            &self.input_buffer,
+            0,
+            as_bytes(input),
+            self.values * std::mem::size_of::<f32>(),
+        )
+    }
 }
 
 /// Decode-only grouped-query attention retaining K/V pages in their packed
@@ -929,6 +976,20 @@ impl MetalCandidateRuntime {
                     "Metal causal-convolution function lookup failed: {message}"
                 ))
             })?;
+        let argmax_f32_partial_function = library
+            .get_function(ARGMAX_F32_PARTIAL_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal partial argmax function lookup failed: {message}"
+                ))
+            })?;
+        let argmax_f32_final_function = library
+            .get_function(ARGMAX_F32_FINAL_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal final argmax function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -1027,6 +1088,29 @@ impl MetalCandidateRuntime {
                     "Metal causal-convolution pipeline creation failed: {message}"
                 ))
             })?;
+        let argmax_f32_partial_pipeline = device
+            .new_compute_pipeline_state_with_function(&argmax_f32_partial_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal partial argmax pipeline creation failed: {message}"
+                ))
+            })?;
+        let argmax_f32_final_pipeline = device
+            .new_compute_pipeline_state_with_function(&argmax_f32_final_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal final argmax pipeline creation failed: {message}"
+                ))
+            })?;
+        if argmax_f32_partial_pipeline.max_total_threads_per_threadgroup() < 256
+            || argmax_f32_final_pipeline.max_total_threads_per_threadgroup() < 256
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal argmax requires 256 threads, device reports partial/final maxima of {}/{}",
+                argmax_f32_partial_pipeline.max_total_threads_per_threadgroup(),
+                argmax_f32_final_pipeline.max_total_threads_per_threadgroup()
+            )));
+        }
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -1043,11 +1127,173 @@ impl MetalCandidateRuntime {
             paged_gqa_decode_pipeline,
             gated_delta_f16_pipeline,
             causal_conv_f16_pipeline,
+            argmax_f32_partial_pipeline,
+            argmax_f32_final_pipeline,
         })
     }
 
     pub fn device_name(&self) -> &str {
         self.device.name()
+    }
+
+    pub fn prepare_argmax_f32(&self, input: &[f32]) -> Result<PreparedMetalArgMax> {
+        self.prepare_argmax_f32_with_groups(input, 32)
+    }
+
+    pub fn prepare_argmax_f32_with_groups(
+        &self,
+        input: &[f32],
+        groups: usize,
+    ) -> Result<PreparedMetalArgMax> {
+        if input.is_empty() {
+            return Err(EngineError::Shape(
+                "Metal argmax input must be non-empty".into(),
+            ));
+        }
+        let values = u32::try_from(input.len())
+            .map_err(|_| EngineError::Shape("Metal argmax input exceeds u32".into()))?;
+        if groups == 0 || groups > 256 || !groups.is_power_of_two() {
+            return Err(EngineError::Shape(format!(
+                "Metal argmax group count must be a power of two from 1 through 256, got {groups}"
+            )));
+        }
+        let threads = 256_u32;
+        let params = MetalArgMaxParams {
+            values,
+            threads,
+            groups: groups as u32,
+            reserved1: 0,
+        };
+        let input_bytes = input
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal argmax input bytes overflow".into()))?;
+        let result_bytes = 2 * std::mem::size_of::<u32>();
+        let partials_bytes = groups * 4 * std::mem::size_of::<u32>();
+        let input_buffer = buffer_with_data(&self.device, as_bytes(input));
+        let partials_buffer = new_zeroed_buffer(&self.device, partials_bytes)?;
+        let result_buffer = new_zeroed_buffer(&self.device, result_bytes)?;
+        let params_buffer = buffer_with_data(&self.device, &params.encode());
+        let resident_bytes = input_bytes
+            .checked_add(result_bytes)
+            .and_then(|bytes| bytes.checked_add(partials_bytes))
+            .and_then(|bytes| bytes.checked_add(MetalArgMaxParams::BYTE_LEN))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal argmax bytes overflow".into()))?;
+        Ok(PreparedMetalArgMax {
+            values: input.len(),
+            groups,
+            input_buffer,
+            partials_buffer,
+            result_buffer,
+            params_buffer,
+            resident_bytes,
+        })
+    }
+
+    pub fn dispatch_argmax_f32(&self, prepared: &PreparedMetalArgMax) -> Result<u32> {
+        self.dispatch_argmax_f32_repeated(prepared, 1)
+    }
+
+    /// Encode repeated resident selections into one command buffer. This is a
+    /// graph-overhead verifier: production uses one selection after a much
+    /// larger decoder graph, so a standalone commit/wait per argmax is not a
+    /// representative kernel-bandwidth measurement.
+    pub fn dispatch_argmax_f32_repeated(
+        &self,
+        prepared: &PreparedMetalArgMax,
+        dispatches: usize,
+    ) -> Result<u32> {
+        if dispatches == 0 {
+            return Err(EngineError::Shape(
+                "Metal argmax dispatch count must be positive".into(),
+            ));
+        }
+        zero_buffer(&prepared.result_buffer, 2 * std::mem::size_of::<u32>());
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-argmax-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        for _ in 0..dispatches {
+            encoder.set_compute_pipeline_state(&self.argmax_f32_partial_pipeline);
+            encoder.set_buffer(
+                MetalArgMaxPartialBufferAbi::INPUT as u64,
+                Some(&prepared.input_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalArgMaxPartialBufferAbi::PARTIALS as u64,
+                Some(&prepared.partials_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalArgMaxPartialBufferAbi::PARAMS as u64,
+                Some(&prepared.params_buffer),
+                0,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: prepared.groups as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.set_compute_pipeline_state(&self.argmax_f32_final_pipeline);
+            encoder.set_buffer(
+                MetalArgMaxFinalBufferAbi::PARTIALS as u64,
+                Some(&prepared.partials_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalArgMaxFinalBufferAbi::RESULT as u64,
+                Some(&prepared.result_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalArgMaxFinalBufferAbi::PARAMS as u64,
+                Some(&prepared.params_buffer),
+                0,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal argmax command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let result =
+            unsafe { slice::from_raw_parts(prepared.result_buffer.contents().cast::<u32>(), 2) };
+        if result[1] != 0 {
+            return Err(EngineError::InvalidArtifact(format!(
+                "Metal argmax rejected {} non-finite logits",
+                result[1]
+            )));
+        }
+        if result[0] as usize >= prepared.values {
+            return Err(EngineError::InvalidState(format!(
+                "Metal argmax selected {}, input has {} values",
+                result[0], prepared.values
+            )));
+        }
+        Ok(result[0])
     }
 
     /// Import the complete immutable CTOXQ mmap once through Metal shared
@@ -3767,6 +4013,55 @@ mod tests {
         file.write_all(&s_out).expect("write s_out");
         file.sync_all().expect("sync mixed artifact");
         segments
+    }
+
+    #[test]
+    fn device_argmax_matches_full_vocab_oracle_reuses_buffers_and_rejects_nonfinite() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let values = crate::tokenizer::TOKENIZER_VOCAB_SIZE;
+        let mut logits = vec![-7.0_f32; values];
+        logits[17] = 9.5;
+        logits[values - 1] = 9.5;
+        let mut prepared = runtime
+            .prepare_argmax_f32(&logits)
+            .expect("prepare full-vocabulary Metal argmax");
+        assert_eq!(prepared.values(), values);
+        assert_eq!(prepared.groups(), 32);
+        assert_eq!(
+            prepared.resident_bytes(),
+            values * std::mem::size_of::<f32>()
+                + 32 * 4 * std::mem::size_of::<u32>()
+                + 2 * std::mem::size_of::<u32>()
+                + MetalArgMaxParams::BYTE_LEN
+        );
+        assert_eq!(
+            runtime
+                .dispatch_argmax_f32(&prepared)
+                .expect("dispatch tied full-vocabulary Metal argmax"),
+            (values - 1) as u32
+        );
+
+        logits.fill(-3.0);
+        logits[123_456] = 4.0;
+        prepared.write_input(&logits).expect("rewrite argmax input");
+        assert_eq!(
+            runtime
+                .dispatch_argmax_f32_repeated(&prepared, 4)
+                .expect("dispatch reused Metal argmax"),
+            123_456
+        );
+        assert!(runtime.dispatch_argmax_f32_repeated(&prepared, 0).is_err());
+
+        logits[88] = f32::NAN;
+        prepared
+            .write_input(&logits)
+            .expect("write non-finite verifier input");
+        assert!(matches!(
+            runtime.dispatch_argmax_f32(&prepared),
+            Err(EngineError::InvalidArtifact(_))
+        ));
+        assert!(prepared.write_input(&[0.0; 3]).is_err());
+        assert!(runtime.prepare_argmax_f32_with_groups(&logits, 3).is_err());
     }
 
     #[test]

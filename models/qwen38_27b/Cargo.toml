@@ -81,6 +81,11 @@ path = "src/bin/metal_row_bench.rs"
 required-features = ["metal"]
 
 [[bin]]
+name = "qwen38-metal-selection-bench"
+path = "src/bin/metal_selection_bench.rs"
+required-features = ["metal"]
+
+[[bin]]
 name = "qwen38-cuda-bench"
 path = "src/bin/cuda_bench.rs"
 required-features = ["cuda"]

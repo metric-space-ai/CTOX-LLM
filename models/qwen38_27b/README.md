@@ -181,6 +181,11 @@ the exact 24-query/4-key-head, 256-wide, 64-rotary-dimension topology. Query
 and key transforms share one command encoder and one synchronization.
 Complete-graph residency and unload measurements on the 7.8-GiB artifact are
 still required before this changes backend promotion state.
+Metal target selection now also has a finite-checking full-vocabulary argmax
+candidate. It returns only the selected token and invalid-count words, matches
+the engine's larger-token tie rule on Apple Silicon, and rejects non-finite
+logits; the complete Metal executor still needs to bind it directly to the
+resident LM-head output.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

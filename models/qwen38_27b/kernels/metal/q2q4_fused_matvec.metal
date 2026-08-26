@@ -98,6 +98,20 @@ struct CausalConvParams {
     uint reserved1;
 };
 
+struct ArgMaxParams {
+    uint values;
+    uint threads;
+    uint groups;
+    uint reserved1;
+};
+
+struct ArgMaxPartial {
+    float value;
+    uint index;
+    uint invalid_count;
+    uint reserved0;
+};
+
 inline float apply_activation(float value, uint activation) {
     if (activation == 1u) {
         // SiLU: x / (1 + exp(-x)), matching the Rust oracle.
@@ -751,4 +765,99 @@ kernel void qwen_causal_conv_silu_f16(
         sum += float(state[base + index]) * float(weight[base + index]);
     }
     output[channel] = sum / (1.0f + exp(-sum));
+}
+
+// Stage one saturates the device with independent 256-thread reductions.
+kernel void qwen_argmax_f32_partial(
+    device const float* input [[buffer(0)]],
+    device ArgMaxPartial* partials [[buffer(1)]],
+    constant ArgMaxParams& params [[buffer(2)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float best_values[256];
+    threadgroup uint best_indices[256];
+    threadgroup uint invalid_counts[256];
+
+    float best = -FLT_MAX;
+    uint best_index = 0u;
+    uint invalid = 0u;
+    uint first = group * params.threads + lane;
+    uint grid_stride = params.groups * params.threads;
+    for (uint index = first; index < params.values; index += grid_stride) {
+        float value = input[index];
+        if (!isfinite(value)) {
+            invalid += 1u;
+            continue;
+        }
+        if (value > best || (value == best && index > best_index)) {
+            best = value;
+            best_index = index;
+        }
+    }
+    best_values[lane] = best;
+    best_indices[lane] = best_index;
+    invalid_counts[lane] = invalid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.threads / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            float other = best_values[lane + stride];
+            uint other_index = best_indices[lane + stride];
+            if (other > best_values[lane]
+                || (other == best_values[lane] && other_index > best_indices[lane])) {
+                best_values[lane] = other;
+                best_indices[lane] = other_index;
+            }
+            invalid_counts[lane] += invalid_counts[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) {
+        partials[group] = ArgMaxPartial {
+            best_values[0], best_indices[0], invalid_counts[0], 0u
+        };
+    }
+}
+
+// Stage two reduces the bounded partial array and returns only
+// {token_id, invalid_count}. Equal logits select the larger token ID, matching
+// Rust's Iterator::max_by.
+kernel void qwen_argmax_f32_final(
+    device const ArgMaxPartial* partials [[buffer(0)]],
+    device uint* result [[buffer(1)]],
+    constant ArgMaxParams& params [[buffer(2)]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float best_values[256];
+    threadgroup uint best_indices[256];
+    threadgroup uint invalid_counts[256];
+
+    if (lane < params.groups) {
+        ArgMaxPartial partial = partials[lane];
+        best_values[lane] = partial.value;
+        best_indices[lane] = partial.index;
+        invalid_counts[lane] = partial.invalid_count;
+    } else {
+        best_values[lane] = -FLT_MAX;
+        best_indices[lane] = 0u;
+        invalid_counts[lane] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.threads / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            float other = best_values[lane + stride];
+            uint other_index = best_indices[lane + stride];
+            if (other > best_values[lane]
+                || (other == best_values[lane] && other_index > best_indices[lane])) {
+                best_values[lane] = other;
+                best_indices[lane] = other_index;
+            }
+            invalid_counts[lane] += invalid_counts[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) {
+        result[0] = best_indices[0];
+        result[1] = invalid_counts[0];
+    }
 }

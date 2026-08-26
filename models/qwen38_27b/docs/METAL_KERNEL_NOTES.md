@@ -28,6 +28,7 @@ usage, no scalar fallback.
 | `qwen_paged_q2q4_gqa_decode_f32` | f32 query/output, packed Q2/Q4 K/V | one 32-wide simdgroup per query head |
 | `qwen_gated_delta_recurrent_f16` | f32 step inputs/output, FP16 recurrent state | one threadgroup per value head |
 | `qwen_causal_conv_silu_f16` | f32 input/output, mmap FP16 weight/state | one thread per channel |
+| `qwen_argmax_f32_partial` / `qwen_argmax_f32_final` | f32 logits, bounded partials, two-u32 result | tuned 32 parallel groups plus one final group |
 
 64 values per block, row-major block order, codebook matching
 `src/quant.rs` (Q2: {-1, -1/3, 1/3, 1}; Q4: (code - 7.5) / 7.5). Q3 does not
@@ -181,6 +182,16 @@ transient bytes and zero copied model bytes. Complete graph scheduling must
 bind the recurrence output and `in_proj_z` output directly instead of retaining
 those two standalone input buffers.
 
+The finite-checking argmax candidate scans all 248,077 valid tokenizer logits
+with 32 parallel threadgroups, reduces their 512-byte partial array in a second
+kernel, and returns only `{token_id, invalid_count}`. The target matrix has
+248,320 padded rows, but padded rows are never selectable. Equal scores select
+the larger valid token ID, matching the pinned Rust sampler. Its reusable
+standalone verifier owns one logit buffer, but complete graph assembly will
+bind the same kernels directly to the mapped LM-head output and retain only
+536 bytes of partial/result/parameter state. Any NaN or infinity fails
+closed.
+
 Q2 decoding uses the exact affine identity `normalized = code * 2/3 - 1`
 instead of a four-way select. Sixteen lanes each load one unique packed byte
 and decode its four adjacent weights, avoiding redundant packed-byte reads.
@@ -250,6 +261,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   48x128 Qwen geometry, survives loader teardown, matches the direct-weight
   gated scalar oracle, updates both graph inputs in place, reports zero copied
   model bytes, and rejects copied weights and malformed contracts.
+- `device_argmax_matches_full_vocab_oracle_reuses_buffers_and_rejects_nonfinite`
+  dispatches the complete 248,077-token vocabulary, proves the larger-token
+  tie rule, reuses the resident buffers for a changed winner, returns only two
+  u32 values, and rejects a device-observed NaN.
 - `qwen38-metal-bench` performs synchronous warmups and repeated dispatches on
   those resident buffers, reports the exact requested buffer bytes, and keeps
   its output marked `verifier_only_not_promotion_evidence`.

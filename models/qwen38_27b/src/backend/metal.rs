@@ -29,6 +29,8 @@ pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
 pub const PAGED_GQA_DECODE_KERNEL_NAME: &str = "qwen_paged_q2q4_gqa_decode_f32";
 pub const GATED_DELTA_F16_KERNEL_NAME: &str = "qwen_gated_delta_recurrent_f16";
 pub const CAUSAL_CONV_F16_KERNEL_NAME: &str = "qwen_causal_conv_silu_f16";
+pub const ARGMAX_F32_PARTIAL_KERNEL_NAME: &str = "qwen_argmax_f32_partial";
+pub const ARGMAX_F32_FINAL_KERNEL_NAME: &str = "qwen_argmax_f32_final";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -126,6 +128,24 @@ impl MetalCausalConvBufferAbi {
     pub const STATE: u32 = 2;
     pub const OUTPUT: u32 = 3;
     pub const PARAMS: u32 = 4;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalArgMaxPartialBufferAbi;
+
+impl MetalArgMaxPartialBufferAbi {
+    pub const INPUT: u32 = 0;
+    pub const PARTIALS: u32 = 1;
+    pub const PARAMS: u32 = 2;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalArgMaxFinalBufferAbi;
+
+impl MetalArgMaxFinalBufferAbi {
+    pub const PARTIALS: u32 = 0;
+    pub const RESULT: u32 = 1;
+    pub const PARAMS: u32 = 2;
 }
 
 /// Activation codes consumed by `apply_activation` in the MSL source.
@@ -303,6 +323,29 @@ impl MetalCausalConvParams {
     pub fn encode(self) -> [u8; Self::BYTE_LEN] {
         let mut encoded = [0_u8; Self::BYTE_LEN];
         for (index, word) in [self.channels, self.kernel, self.reserved0, self.reserved1]
+            .iter()
+            .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalArgMaxParams {
+    pub values: u32,
+    pub threads: u32,
+    pub groups: u32,
+    pub reserved1: u32,
+}
+
+impl MetalArgMaxParams {
+    pub const BYTE_LEN: usize = 16;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [self.values, self.threads, self.groups, self.reserved1]
             .iter()
             .enumerate()
         {
@@ -815,6 +858,22 @@ mod tests {
             ],
             [0, 1, 2, 3, 4]
         );
+        assert_eq!(
+            [
+                MetalArgMaxPartialBufferAbi::INPUT,
+                MetalArgMaxPartialBufferAbi::PARTIALS,
+                MetalArgMaxPartialBufferAbi::PARAMS,
+            ],
+            [0, 1, 2]
+        );
+        assert_eq!(
+            [
+                MetalArgMaxFinalBufferAbi::PARTIALS,
+                MetalArgMaxFinalBufferAbi::RESULT,
+                MetalArgMaxFinalBufferAbi::PARAMS,
+            ],
+            [0, 1, 2]
+        );
     }
 
     #[test]
@@ -839,6 +898,8 @@ mod tests {
         assert!(PAGED_GQA_DECODE_KERNEL_NAME.contains("paged_q2q4_gqa"));
         assert!(GATED_DELTA_F16_KERNEL_NAME.contains("gated_delta_recurrent_f16"));
         assert!(CAUSAL_CONV_F16_KERNEL_NAME.contains("causal_conv_silu_f16"));
+        assert_eq!(ARGMAX_F32_PARTIAL_KERNEL_NAME, "qwen_argmax_f32_partial");
+        assert_eq!(ARGMAX_F32_FINAL_KERNEL_NAME, "qwen_argmax_f32_final");
     }
 
     #[test]
@@ -947,6 +1008,22 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![10_240, 4, 0, 0]);
+    }
+
+    #[test]
+    fn argmax_params_encode_matches_msl_struct() {
+        let encoded = MetalArgMaxParams {
+            values: 248_320,
+            threads: 256,
+            groups: 256,
+            reserved1: 0,
+        }
+        .encode();
+        let words: Vec<u32> = encoded
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![248_320, 256, 256, 0]);
     }
 
     #[test]
@@ -1172,6 +1249,8 @@ mod tests {
             PAGED_GQA_DECODE_KERNEL_NAME,
             GATED_DELTA_F16_KERNEL_NAME,
             CAUSAL_CONV_F16_KERNEL_NAME,
+            ARGMAX_F32_PARTIAL_KERNEL_NAME,
+            ARGMAX_F32_FINAL_KERNEL_NAME,
         ] {
             assert!(
                 text.contains(&format!("kernel void {name}")),
