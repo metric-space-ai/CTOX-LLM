@@ -318,7 +318,13 @@ bit-identical to the established MMQ graph path. A fail-closed execution cursor
 now admits a chunk only at the exact committed position and releases its new
 commit position only after all 645 bound operations and the final barrier have
 completed in order. Kernel dispatch wiring and complete-graph hardware
-verification remain open. A pinned-`get_rows`-structured batched embedding
+verification remain open. The fused FFN SwiGLU/A8 and full-attention sigmoid-
+gate/A8 candidates now use `grid.y` for all 512 prompt rows while retaining the
+single-row decode ABI. On the RTX A4500, selected rows were bit-exact to the
+sequential CUDA path, CPU-equation scale error stayed below `1.12e-8`, and all
+109,051,904 observed bytes were reclaimed. Evidence is in
+`benchmarks/cuda/sm86-batched-fused-a8-512-20260826.json`; graph-wide binding
+remains open. A pinned-`get_rows`-structured batched embedding
 candidate now keeps FP16 `s_in`/`s_out` resident and gathers a whole token-ID
 chunk in at most one launch per canonical Q2/Q4 segment. The final 857-Q2/
 113-Q4 embedding assignment is bit-identical to sequential CUDA row lookup on

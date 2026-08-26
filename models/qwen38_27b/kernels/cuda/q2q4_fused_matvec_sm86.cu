@@ -302,13 +302,17 @@ void ctox_quantize_swiglu_a8_b64_sm86(
     unsigned columns) {
     const unsigned local = threadIdx.x;
     const unsigned block = blockIdx.x;
-    const unsigned index = block * kBlockLen + local;
-    if (local >= kBlockLen || index >= columns) {
+    const unsigned column = block * kBlockLen + local;
+    if (local >= kBlockLen || column >= columns) {
         return;
     }
+    const unsigned batch_row = blockIdx.y;
+    const unsigned long long row_base =
+        static_cast<unsigned long long>(batch_row) * columns;
+    const unsigned long long index = row_base + column;
     const float gate_value = gate[index];
     const float silu = gate_value / (1.0f + expf(-gate_value));
-    const float value = silu * up[index] * load_optional_f16(s_in, index);
+    const float value = silu * up[index] * load_optional_f16(s_in, column);
     float maximum = fabsf(value);
 #pragma unroll
     for (unsigned offset = 16; offset != 0; offset >>= 1) {
@@ -323,7 +327,8 @@ void ctox_quantize_swiglu_a8_b64_sm86(
     __syncthreads();
     if (local == 0u) {
         block_scale = fmaxf(warp_maximum[0], warp_maximum[1]) * (1.0f / 127.0f);
-        q8_scales[block] = block_scale;
+        q8_scales[static_cast<unsigned long long>(batch_row)
+                  * (columns / kBlockLen) + block] = block_scale;
     }
     __syncthreads();
     int code = 0;
@@ -348,13 +353,17 @@ void ctox_quantize_sigmoid_gate_a8_b64_sm86(
     unsigned columns) {
     const unsigned local = threadIdx.x;
     const unsigned block = blockIdx.x;
-    const unsigned index = block * kBlockLen + local;
-    if (local >= kBlockLen || index >= columns) {
+    const unsigned column = block * kBlockLen + local;
+    if (local >= kBlockLen || column >= columns) {
         return;
     }
+    const unsigned batch_row = blockIdx.y;
+    const unsigned long long row_base =
+        static_cast<unsigned long long>(batch_row) * columns;
+    const unsigned long long index = row_base + column;
     const float gate_value = 1.0f / (1.0f + expf(-gate[index]));
     const float value = attention[index] * gate_value
-        * load_optional_f16(s_in, index);
+        * load_optional_f16(s_in, column);
     float maximum = fabsf(value);
 #pragma unroll
     for (unsigned offset = 16; offset != 0; offset >>= 1) {
@@ -369,7 +378,8 @@ void ctox_quantize_sigmoid_gate_a8_b64_sm86(
     __syncthreads();
     if (local == 0u) {
         block_scale = fmaxf(warp_maximum[0], warp_maximum[1]) * (1.0f / 127.0f);
-        q8_scales[block] = block_scale;
+        q8_scales[static_cast<unsigned long long>(batch_row)
+                  * (columns / kBlockLen) + block] = block_scale;
     }
     __syncthreads();
     int code = 0;

@@ -166,6 +166,11 @@ path = "src/bin/cuda_attention_gate_a8_verify.rs"
 required-features = ["cuda"]
 
 [[bin]]
+name = "qwen38-cuda-batched-fused-a8-verify"
+path = "src/bin/cuda_batched_fused_a8_verify.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "qwen38-cuda-graph-load-verify"
 path = "src/bin/cuda_graph_load_verify.rs"
 required-features = ["cuda"]

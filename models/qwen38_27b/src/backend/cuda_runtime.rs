@@ -6600,6 +6600,7 @@ impl CudaCandidateRuntime {
             prepared.q8_codes.ptr(),
             prepared.q8_scales.ptr(),
             prepared.columns,
+            1,
         )
     }
 
@@ -6657,6 +6658,7 @@ impl CudaCandidateRuntime {
             prepared.q8_codes.ptr(),
             prepared.q8_scales.ptr(),
             prepared.columns,
+            1,
         )
     }
 
@@ -6920,6 +6922,199 @@ impl CudaCandidateRuntime {
                 outputs.device_output(*slot, projection.rows(), batch_rows as usize)
             })
             .collect()
+    }
+
+    /// Batches the complete Qwen FFN middle edge over one prompt chunk. The
+    /// existing verifier kernel uses `grid.y` for token rows, while the
+    /// graph-owned A8 and output arenas prevent token-local allocations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_batched_a8_arena_swiglu_fanout_device<'a>(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        workspace: &PreparedCudaBatchedA8Workspace,
+        outputs: &'a PreparedCudaBatchedA8OutputArena,
+        gate: CudaDeviceF32View<'_>,
+        up: CudaDeviceF32View<'_>,
+        batch_rows: usize,
+        projections: &[(&PreparedCudaA8Projection, usize)],
+    ) -> Result<Vec<CudaDeviceF32View<'a>>> {
+        let batch_rows = self.validate_batched_a8_arena_fused_fanout(
+            activation,
+            workspace,
+            outputs,
+            gate,
+            up,
+            batch_rows,
+            projections,
+            "SwiGLU",
+        )?;
+        self.launch_swiglu_a8_quantization(
+            gate.ptr()?,
+            up.ptr()?,
+            activation.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            workspace.q8_codes.ptr(),
+            workspace.q8_scales.ptr(),
+            activation.columns,
+            batch_rows,
+        )?;
+        self.launch_batched_a8_arena_projections(workspace, outputs, batch_rows, projections)?;
+        self.synchronize_after_launch("CUDA batched SwiGLU A8 arena context synchronization")?;
+        projections
+            .iter()
+            .map(|(projection, slot)| {
+                outputs.device_output(*slot, projection.rows(), batch_rows as usize)
+            })
+            .collect()
+    }
+
+    /// Batches full-attention sigmoid gating, recovery input scaling, A8
+    /// quantization, and the output projection without a host token loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_batched_a8_arena_sigmoid_gate_fanout_device<'a>(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        workspace: &PreparedCudaBatchedA8Workspace,
+        outputs: &'a PreparedCudaBatchedA8OutputArena,
+        attention: CudaDeviceF32View<'_>,
+        gate: CudaDeviceF32View<'_>,
+        batch_rows: usize,
+        projections: &[(&PreparedCudaA8Projection, usize)],
+    ) -> Result<Vec<CudaDeviceF32View<'a>>> {
+        let batch_rows = self.validate_batched_a8_arena_fused_fanout(
+            activation,
+            workspace,
+            outputs,
+            attention,
+            gate,
+            batch_rows,
+            projections,
+            "attention gate",
+        )?;
+        self.launch_sigmoid_gate_a8_quantization(
+            attention.ptr()?,
+            gate.ptr()?,
+            activation.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            workspace.q8_codes.ptr(),
+            workspace.q8_scales.ptr(),
+            activation.columns,
+            batch_rows,
+        )?;
+        self.launch_batched_a8_arena_projections(workspace, outputs, batch_rows, projections)?;
+        self.synchronize_after_launch(
+            "CUDA batched attention-gate A8 arena context synchronization",
+        )?;
+        projections
+            .iter()
+            .map(|(projection, slot)| {
+                outputs.device_output(*slot, projection.rows(), batch_rows as usize)
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_batched_a8_arena_fused_fanout(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        workspace: &PreparedCudaBatchedA8Workspace,
+        outputs: &PreparedCudaBatchedA8OutputArena,
+        left: CudaDeviceF32View<'_>,
+        right: CudaDeviceF32View<'_>,
+        batch_rows: usize,
+        projections: &[(&PreparedCudaA8Projection, usize)],
+        edge: &str,
+    ) -> Result<u32> {
+        let batch_rows = validate_a8_batch_capacity(batch_rows)?;
+        if projections.is_empty() {
+            return Err(EngineError::Shape(format!(
+                "CUDA batched {edge} fan-out requires at least one projection"
+            )));
+        }
+        if !Rc::ptr_eq(&self.inner, &activation.context)
+            || !Rc::ptr_eq(&self.inner, &workspace.context)
+            || !Rc::ptr_eq(&self.inner, &outputs.context)
+            || !Rc::ptr_eq(&self.inner, left.context)
+            || !Rc::ptr_eq(&self.inner, right.context)
+        {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA batched {edge} fan-out crosses driver contexts"
+            )));
+        }
+        if batch_rows > workspace.batch_capacity || batch_rows > outputs.batch_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA batched {edge} arenas do not admit {batch_rows} prompt rows"
+            )));
+        }
+        if activation.columns > workspace.column_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA batched {edge} needs {} columns, arena admits {}",
+                activation.columns, workspace.column_capacity
+            )));
+        }
+        let expected_values = (batch_rows as usize)
+            .checked_mul(activation.columns as usize)
+            .ok_or_else(|| EngineError::Shape(format!("CUDA batched {edge} shape overflows")))?;
+        for (name, view) in [("left", left), ("right", right)] {
+            if view.values() != expected_values {
+                return Err(EngineError::Shape(format!(
+                    "CUDA batched {edge} {name} input has {} values, expected {expected_values}",
+                    view.values()
+                )));
+            }
+        }
+        let mut used_slots = [false; 4];
+        for (projection, slot) in projections {
+            if *slot >= outputs.slot_rows.len() || used_slots[*slot] {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA batched {edge} output slot {slot} is invalid or aliased"
+                )));
+            }
+            used_slots[*slot] = true;
+            if !Rc::ptr_eq(&self.inner, &projection.context) {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA batched {edge} projection belongs to another context"
+                )));
+            }
+            if projection.columns != activation.columns
+                || projection.correction_identity != activation.correction_identity
+            {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "CUDA batched {edge} projection s_in identity differs"
+                )));
+            }
+            if projection.rows > outputs.slot_rows[*slot] {
+                return Err(EngineError::MemoryBudget(format!(
+                    "CUDA batched {edge} output slot {slot} is too narrow"
+                )));
+            }
+        }
+        Ok(batch_rows)
+    }
+
+    fn launch_batched_a8_arena_projections(
+        &self,
+        workspace: &PreparedCudaBatchedA8Workspace,
+        outputs: &PreparedCudaBatchedA8OutputArena,
+        batch_rows: u32,
+        projections: &[(&PreparedCudaA8Projection, usize)],
+    ) -> Result<()> {
+        for (projection, slot) in projections {
+            let output_ptr = device_ptr_offset(
+                outputs.output.ptr(),
+                outputs.slot_offsets[*slot]
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| {
+                        EngineError::Shape("CUDA output slot offset overflows".into())
+                    })?,
+            )?;
+            self.launch_batched_a8_projection_buffers(
+                workspace.q8_codes.ptr(),
+                workspace.q8_scales.ptr(),
+                projection,
+                output_ptr,
+                batch_rows,
+            )?;
+        }
+        Ok(())
     }
 
     /// Executes only release-bound LM-head rows for an MTP proposal. The
@@ -7188,6 +7383,7 @@ impl CudaCandidateRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch_swiglu_a8_quantization(
         &self,
         gate_ptr: CuDevicePtr,
@@ -7196,6 +7392,7 @@ impl CudaCandidateRuntime {
         q8_codes_ptr: CuDevicePtr,
         q8_scales_ptr: CuDevicePtr,
         column_count: u32,
+        batch_rows: u32,
     ) -> Result<()> {
         self.make_current()?;
         let mut gate = gate_ptr;
@@ -7217,7 +7414,7 @@ impl CudaCandidateRuntime {
                 (self.inner.driver.launch_kernel)(
                     self.inner.swiglu_a8_quantize_function,
                     column_count.div_ceil(64),
-                    1,
+                    batch_rows,
                     1,
                     64,
                     1,
@@ -7232,6 +7429,7 @@ impl CudaCandidateRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch_sigmoid_gate_a8_quantization(
         &self,
         attention_ptr: CuDevicePtr,
@@ -7240,6 +7438,7 @@ impl CudaCandidateRuntime {
         q8_codes_ptr: CuDevicePtr,
         q8_scales_ptr: CuDevicePtr,
         column_count: u32,
+        batch_rows: u32,
     ) -> Result<()> {
         self.make_current()?;
         let mut attention = attention_ptr;
@@ -7261,7 +7460,7 @@ impl CudaCandidateRuntime {
                 (self.inner.driver.launch_kernel)(
                     self.inner.sigmoid_gate_a8_quantize_function,
                     column_count.div_ceil(64),
-                    1,
+                    batch_rows,
                     1,
                     64,
                     1,
@@ -8196,6 +8395,35 @@ impl PreparedCudaBatchedA8Workspace {
 
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
+    }
+
+    /// Reads the active quantized prefix for a hardware verifier. Production
+    /// graph execution keeps both buffers device-resident.
+    pub fn verifier_read_quantized(
+        &self,
+        batch_rows: usize,
+        columns: usize,
+    ) -> Result<(Vec<i8>, Vec<f32>)> {
+        let batch_rows = validate_a8_batch_capacity(batch_rows)? as usize;
+        if columns == 0
+            || !columns.is_multiple_of(64)
+            || columns > self.column_capacity as usize
+            || batch_rows > self.batch_capacity as usize
+        {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA A8 verifier read does not admit {batch_rows}x{columns}"
+            )));
+        }
+        let mut all_codes = vec![0_i8; self.q8_codes.len()];
+        self.q8_codes.copy_to(as_bytes_mut(&mut all_codes))?;
+        let active_codes = batch_rows
+            .checked_mul(columns)
+            .ok_or_else(|| EngineError::Shape("CUDA A8 verifier code count overflows".into()))?;
+        all_codes.truncate(active_codes);
+        let mut all_scales = vec![0.0_f32; self.q8_scales.len() / std::mem::size_of::<f32>()];
+        self.q8_scales.copy_to(as_bytes_mut(&mut all_scales))?;
+        all_scales.truncate(active_codes / 64);
+        Ok((all_codes, all_scales))
     }
 }
 

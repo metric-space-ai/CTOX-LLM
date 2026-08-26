@@ -1,0 +1,52 @@
+{
+  "format": "ctox.cuda-sm86-batched-fused-a8-verifier.v1",
+  "status": "pass",
+  "device": "NVIDIA RTX A4500",
+  "compute_capability": "8.6",
+  "module_sha256": "aa2ff687f159dad69da7b85086a9b359494b375d25eb0b7b8faed4b8800af3f4",
+  "tokens": 512,
+  "workspace_bytes": 9469952,
+  "output_arena_bytes": 8192,
+  "swiglu": {
+    "columns": 17408,
+    "values": 8912896,
+    "a8_blocks": 139264,
+    "code_sha256": "04868bf239eefdc28faad443e844d00f8da0c9d4316a568ae91abe95f2ddcb47",
+    "scale_sha256": "6c7059dca97da6a61cc195dd41c394c0c76b783ef77cf9a1915e5765a12d089d",
+    "code_mismatches_vs_cpu": 41,
+    "maximum_scale_absolute_error_vs_cpu": 1.1175871e-8,
+    "selected_sequential_rows": [
+      0,
+      1,
+      256,
+      511
+    ],
+    "code_mismatches_vs_sequential_cuda": 0,
+    "maximum_scale_absolute_delta_vs_sequential_cuda": 0.0,
+    "zero_weight_projection_verified": true
+  },
+  "attention_gate": {
+    "columns": 6144,
+    "values": 3145728,
+    "a8_blocks": 49152,
+    "code_sha256": "34b94844a55ec8d475fe72dc5f9ee5b876b271ed92c2152eb2a62233805f3edb",
+    "scale_sha256": "e76fd35ae5cc5edc31f2bcfca3ed5404bc118243b6148697f7d444a74a5acfd2",
+    "code_mismatches_vs_cpu": 11,
+    "maximum_scale_absolute_error_vs_cpu": 2.7939677e-9,
+    "selected_sequential_rows": [
+      0,
+      1,
+      256,
+      511
+    ],
+    "code_mismatches_vs_sequential_cuda": 0,
+    "maximum_scale_absolute_delta_vs_sequential_cuda": 0.0,
+    "zero_weight_projection_verified": true
+  },
+  "driver_free_bytes_before_prepare": 7228424192,
+  "driver_free_bytes_after_prepare": 7119372288,
+  "driver_free_bytes_after_drop": 7228424192,
+  "observed_peak_bytes": 109051904,
+  "observed_reclaimed_bytes": 109051904,
+  "note": "Verifier-only adaptation of the pinned fused A8 candidates. Both 512-row edges use grid.y and graph-owned arenas; production promotion still requires complete-schedule wiring and roofline evidence."
+}

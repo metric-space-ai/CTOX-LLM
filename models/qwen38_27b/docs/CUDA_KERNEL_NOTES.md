@@ -580,6 +580,21 @@ evidence is in
 `benchmarks/cuda/sm86-attention-prefill-512-20260826.json`. The attention
 gate/output projection, graph-wide commit, and complete schedule remain open.
 
+The already pinned SwiGLU/A8 and sigmoid-gate/A8 verifier candidates now map
+prompt rows through `blockIdx.y`, leaving decode as the one-row specialization.
+Both variants keep one recovery-scale vector shared across rows and write
+row-major A8 codes/scales into the graph-owned maximum-width arena before the
+existing batched MMQ projection. CUDA 12.6 compiled SwiGLU with 18 registers
+and the attention gate with 22 registers; both use 12 bytes of shared memory
+and have zero stack/spills. A 512-token A4500 run was bit-exact to sequential
+CUDA on rows 0, 1, 256, and 511; CPU-equation scale errors stayed below
+`1.12e-8`, and zero-weight projection outputs remained exactly zero. All
+109,051,904 observed bytes were reclaimed. Source SHA-256 is
+`9df2d1773e539912e92f1e1a40e3607eea041ae7619b20207530c0a27eaac29a` and
+the unified cubin SHA-256 is
+`aa2ff687f159dad69da7b85086a9b359494b375d25eb0b7b8faed4b8800af3f4`.
+Evidence is in `benchmarks/cuda/sm86-batched-fused-a8-512-20260826.json`.
+
 The direct causal paged-GQA prefill candidate maps one warp to each
 `(query_token, query_head)` pair and scans exactly that position's logical
 prefix from the canonical mixed Q2/Q4 page descriptors. It requires only
