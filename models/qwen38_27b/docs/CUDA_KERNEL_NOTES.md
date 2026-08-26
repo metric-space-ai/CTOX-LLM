@@ -312,7 +312,12 @@ all 134 target/MTP normalization operators: four standalone input norms and
 exactly once. A fail-closed binding plan resolves all 645 frozen decode steps
 to these exact resources and rejects incomplete projection, activation, mixer,
 attention, or norm ownership before hardware dispatch. Actual 645-step
-schedule execution is not yet included.
+execution now has a first target-only device chain covering embedding, all 64
+hybrid layers, final norm, and LM head. `qwen38-cuda-target-token-verify`
+permits exactly one token-boundary logits readback and proves state reset plus
+allocator reclamation. Its SM86 run is pending; the current device entry points
+also synchronize per operation, so this code is not a production or roofline
+claim. MTP draft/verify and sampling remain unbound.
 
 The evidence in
 `benchmarks/cuda/sm86-a8-dp4a-20260826.json` separates two errors that must not

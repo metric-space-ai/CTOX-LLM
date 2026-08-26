@@ -230,7 +230,12 @@ target/MTP normalization operators are also owned by the load graph: four
 standalone input norms and 130 fused residual/RMSNorm edges. The previously
 open full-attention gate edge has a fused sigmoid-gate/recovery/A8/output-
 projection CUDA candidate and dedicated hardware verifier. Dispatching the
-bound 645-step schedule without host intermediates remains open.
+bound schedule has now reached a first complete target-token candidate:
+embedding, all 64 hybrid layers, final normalization, and the LM head pass
+device views directly with no tensor readback before the token boundary. The
+dedicated SM86 verifier is still pending, and the candidate retains per-op
+driver synchronizations that must be removed before performance promotion.
+MTP draft execution and target verification also remain open.
 
 The Metal linear-attention candidate set now also covers FP16 causal-
 convolution history, FP16 recurrent GatedDelta state, and the direct-weight

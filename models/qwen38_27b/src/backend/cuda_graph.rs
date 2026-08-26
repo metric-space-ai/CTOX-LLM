@@ -10,9 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::cuda_runtime::{
-    CudaCandidateRuntime, CudaCausalConvConfig, CudaGatedDeltaConfig, CudaGatedRmsNormConfig,
-    CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig, CudaRmsNormConfig,
-    PreparedCudaA8Activation, PreparedCudaA8Projection, PreparedCudaCausalConv,
+    CudaCandidateRuntime, CudaCausalConvConfig, CudaDeviceF32View, CudaGatedDeltaConfig,
+    CudaGatedRmsNormConfig, CudaPagedGqaConfig, CudaPartialRopeConfig, CudaQueryGateConfig,
+    CudaRmsNormConfig, PreparedCudaA8Activation, PreparedCudaA8Projection, PreparedCudaCausalConv,
     PreparedCudaEmbedding, PreparedCudaGatedDelta, PreparedCudaGatedDeltaInputs,
     PreparedCudaGatedRmsNorm, PreparedCudaPagedGqa, PreparedCudaPartialRope, PreparedCudaQueryGate,
     PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
@@ -624,6 +624,8 @@ pub struct PreparedCudaProjectionGraph {
     model_bytes: u64,
     graph_bytes: u64,
     session_bytes: u64,
+    target_tokens: usize,
+    poisoned: bool,
 }
 
 pub struct PreparedCudaNormGraph {
@@ -706,6 +708,36 @@ impl PreparedCudaFullAttentionLayer {
     pub fn session_bytes(&self) -> u64 {
         self.session_bytes
     }
+
+    pub fn reset(&mut self) -> Result<()> {
+        self.kv.reset()
+    }
+
+    pub fn dispatch_device<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        query_gate_input: CudaDeviceF32View<'_>,
+        key_input: CudaDeviceF32View<'_>,
+        value_input: CudaDeviceF32View<'_>,
+        position: u64,
+    ) -> Result<(CudaDeviceF32View<'a>, CudaDeviceF32View<'a>)> {
+        let Self {
+            query_gate,
+            key_norm,
+            key_rope,
+            kv,
+            ..
+        } = self;
+        query_gate.write_position(position)?;
+        key_rope.write_position(position)?;
+        let (query, gate) =
+            runtime.dispatch_query_gate_norm_rope_device(query_gate, query_gate_input)?;
+        let key = runtime.dispatch_qwen_rms_norm_f16_device(key_norm, key_input)?;
+        let key = runtime.dispatch_partial_rope_f32_device(key_rope, key)?;
+        let attention =
+            runtime.append_and_dispatch_paged_q2q4_gqa_device(kv, query, key, value_input)?;
+        Ok((attention, gate))
+    }
 }
 
 pub struct PreparedCudaLinearMixerLayer {
@@ -750,6 +782,44 @@ impl PreparedCudaLinearMixerLayer {
 
     pub fn norm(&self) -> &PreparedCudaGatedRmsNorm {
         &self.norm
+    }
+
+    pub fn dispatch_device<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        mixed_qkv: CudaDeviceF32View<'_>,
+        gate: CudaDeviceF32View<'_>,
+        raw_a: CudaDeviceF32View<'_>,
+        raw_b: CudaDeviceF32View<'_>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let Self {
+            convolution,
+            inputs,
+            recurrence,
+            norm,
+            ..
+        } = self;
+        let convolved = runtime.dispatch_causal_conv_f16_device(convolution, mixed_qkv)?;
+        let value_width = recurrence
+            .config()
+            .heads
+            .checked_mul(recurrence.config().value_dim)
+            .ok_or_else(|| EngineError::Shape("CUDA linear value width overflows".into()))?;
+        let value_offset = convolved.values().checked_sub(value_width).ok_or_else(|| {
+            EngineError::Shape("CUDA convolved QKV is narrower than its value tail".into())
+        })?;
+        let value = convolved.slice(value_offset, value_width)?;
+        let prepared =
+            runtime.dispatch_gated_delta_inputs_device(inputs, convolved, raw_a, raw_b)?;
+        let mixed = runtime.dispatch_gated_delta_f16_device(
+            recurrence,
+            prepared.query,
+            prepared.key,
+            value,
+            prepared.log_decay,
+            prepared.beta,
+        )?;
+        runtime.dispatch_gated_rms_norm_f16_device(norm, mixed, gate)
     }
 }
 
@@ -1009,6 +1079,8 @@ impl PreparedCudaProjectionGraph {
             model_bytes,
             graph_bytes,
             session_bytes,
+            target_tokens: 0,
+            poisoned: false,
         };
         graph.validate_bound_resources()?;
         Ok(graph)
@@ -1101,6 +1173,199 @@ impl PreparedCudaProjectionGraph {
         self.session_bytes
     }
 
+    pub fn target_tokens(&self) -> usize {
+        self.target_tokens
+    }
+
+    pub fn reset_session(&mut self) -> Result<()> {
+        for mixer in self.linear_mixers.values_mut() {
+            mixer.convolution.reset()?;
+            mixer.recurrence.reset()?;
+        }
+        for attention in self.full_attention.values_mut() {
+            attention.reset()?;
+        }
+        self.target_tokens = 0;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn dispatch_target_token_device<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        config: &Qwen38Config,
+        token_id: usize,
+        position: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if config != &Qwen38Config::default() {
+            return Err(EngineError::Shape(
+                "CUDA target dispatch requires the frozen Qwen3.8-27B topology".into(),
+            ));
+        }
+        if self.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA target session is poisoned; reset is required".into(),
+            ));
+        }
+        if position != self.target_tokens {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA target position {position} does not match committed token count {}",
+                self.target_tokens
+            )));
+        }
+        if token_id >= self.embedding.rows() {
+            return Err(EngineError::Shape(format!(
+                "CUDA token {token_id} exceeds embedding vocabulary {}",
+                self.embedding.rows()
+            )));
+        }
+        let embedding_scale = self.embedding_s_out(token_id)?;
+
+        let Self {
+            plan,
+            embedding,
+            activations,
+            projections,
+            linear_mixers,
+            full_attention,
+            norms,
+            target_tokens,
+            poisoned,
+            ..
+        } = self;
+        *poisoned = true;
+        let embedded =
+            runtime.dispatch_embedding_row_device(embedding, token_id, embedding_scale)?;
+        let mut residual = embedded;
+        let mut normalized = runtime
+            .dispatch_qwen_rms_norm_f16_device(norms.regular("target:initial")?, residual)?;
+
+        for layer in 0..config.num_hidden_layers {
+            let prefix = format!("model.language_model.layers.{layer}");
+            let mixer_output = match config.layer_kind(layer).expect("frozen layer") {
+                LayerKind::FullAttention => {
+                    let [query_gate, key, value] = dispatch_projection_fanout_device(
+                        runtime,
+                        plan,
+                        activations,
+                        projections,
+                        normalized,
+                        [
+                            format!("{prefix}.self_attn.q_proj.weight"),
+                            format!("{prefix}.self_attn.k_proj.weight"),
+                            format!("{prefix}.self_attn.v_proj.weight"),
+                        ],
+                    )?;
+                    let attention = full_attention
+                        .get_mut(&format!("target:{layer}"))
+                        .ok_or_else(|| {
+                            EngineError::InvalidState(format!(
+                                "CUDA full-attention layer {layer} is not resident"
+                            ))
+                        })?;
+                    let (attention_output, gate) = attention.dispatch_device(
+                        runtime,
+                        query_gate,
+                        key,
+                        value,
+                        position as u64,
+                    )?;
+                    dispatch_sigmoid_gate_projection_device(
+                        runtime,
+                        plan,
+                        activations,
+                        projections,
+                        attention_output,
+                        gate,
+                        &format!("{prefix}.self_attn.o_proj.weight"),
+                    )?
+                }
+                LayerKind::LinearAttention => {
+                    let [mixed_qkv, gate, raw_a, raw_b] = dispatch_projection_fanout_device(
+                        runtime,
+                        plan,
+                        activations,
+                        projections,
+                        normalized,
+                        [
+                            format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                            format!("{prefix}.linear_attn.in_proj_z.weight"),
+                            format!("{prefix}.linear_attn.in_proj_a.weight"),
+                            format!("{prefix}.linear_attn.in_proj_b.weight"),
+                        ],
+                    )?;
+                    let mixer = linear_mixers.get_mut(&layer).ok_or_else(|| {
+                        EngineError::InvalidState(format!(
+                            "CUDA linear-attention layer {layer} is not resident"
+                        ))
+                    })?;
+                    let mixed = mixer.dispatch_device(runtime, mixed_qkv, gate, raw_a, raw_b)?;
+                    dispatch_projection_device(
+                        runtime,
+                        plan,
+                        activations,
+                        projections,
+                        mixed,
+                        &format!("{prefix}.linear_attn.out_proj.weight"),
+                    )?
+                }
+            };
+
+            let post_attention_key = format!("target:{layer}:post_attention");
+            let post_attention = norms.residual(&post_attention_key)?;
+            (residual, normalized) = runtime.dispatch_residual_rms_norm_f16_device(
+                post_attention,
+                residual,
+                mixer_output,
+            )?;
+
+            let [gate, up] = dispatch_projection_fanout_device(
+                runtime,
+                plan,
+                activations,
+                projections,
+                normalized,
+                [
+                    format!("{prefix}.mlp.gate_proj.weight"),
+                    format!("{prefix}.mlp.up_proj.weight"),
+                ],
+            )?;
+            let down = dispatch_swiglu_projection_device(
+                runtime,
+                plan,
+                activations,
+                projections,
+                gate,
+                up,
+                &format!("{prefix}.mlp.down_proj.weight"),
+            )?;
+            let post_ffn_key = if layer + 1 == config.num_hidden_layers {
+                format!("target:{layer}:post_ffn:final")
+            } else {
+                format!("target:{layer}:post_ffn:layer_{}", layer + 1)
+            };
+            (residual, normalized) = runtime.dispatch_residual_rms_norm_f16_device(
+                norms.residual(&post_ffn_key)?,
+                residual,
+                down,
+            )?;
+        }
+
+        let logits = dispatch_projection_device(
+            runtime,
+            plan,
+            activations,
+            projections,
+            normalized,
+            "lm_head.weight",
+        )?;
+        *target_tokens = target_tokens
+            .checked_add(1)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA target token count overflows".into()))?;
+        *poisoned = false;
+        Ok(logits)
+    }
+
     pub fn resident_bytes(&self) -> Result<u64> {
         checked_add(
             checked_add(self.model_bytes, self.graph_bytes, "CUDA resident bytes")?,
@@ -1137,6 +1402,109 @@ impl PreparedCudaProjectionGraph {
         }
         Ok(())
     }
+}
+
+fn dispatch_projection_fanout_device<'a, const N: usize>(
+    runtime: &CudaCandidateRuntime,
+    plan: &CudaProjectionPlan,
+    activations: &BTreeMap<String, PreparedCudaA8Activation>,
+    projections: &'a BTreeMap<String, PreparedCudaA8Projection>,
+    input: CudaDeviceF32View<'_>,
+    names: [String; N],
+) -> Result<[CudaDeviceF32View<'a>; N]> {
+    let first = names.first().ok_or_else(|| {
+        EngineError::InvalidState("CUDA projection fan-out cannot be empty".into())
+    })?;
+    let group = plan.group_for_projection(first)?;
+    let activation = activations.get(group).ok_or_else(|| {
+        EngineError::InvalidState(format!("CUDA activation group {group} is not resident"))
+    })?;
+    let mut prepared = Vec::with_capacity(N);
+    for name in &names {
+        if plan.group_for_projection(name)? != group {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA projection fan-out mixes activation groups at {name}"
+            )));
+        }
+        prepared.push(projections.get(name).ok_or_else(|| {
+            EngineError::InvalidState(format!("CUDA projection {name} is not resident"))
+        })?);
+    }
+    runtime
+        .dispatch_shared_a8_fanout_device(activation, input, &prepared)?
+        .try_into()
+        .map_err(|_| EngineError::InvalidState("CUDA fan-out output count changed".into()))
+}
+
+fn dispatch_projection_device<'a>(
+    runtime: &CudaCandidateRuntime,
+    plan: &CudaProjectionPlan,
+    activations: &BTreeMap<String, PreparedCudaA8Activation>,
+    projections: &'a BTreeMap<String, PreparedCudaA8Projection>,
+    input: CudaDeviceF32View<'_>,
+    name: &str,
+) -> Result<CudaDeviceF32View<'a>> {
+    let [output] = dispatch_projection_fanout_device(
+        runtime,
+        plan,
+        activations,
+        projections,
+        input,
+        [name.to_owned()],
+    )?;
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_sigmoid_gate_projection_device<'a>(
+    runtime: &CudaCandidateRuntime,
+    plan: &CudaProjectionPlan,
+    activations: &BTreeMap<String, PreparedCudaA8Activation>,
+    projections: &'a BTreeMap<String, PreparedCudaA8Projection>,
+    attention: CudaDeviceF32View<'_>,
+    gate: CudaDeviceF32View<'_>,
+    name: &str,
+) -> Result<CudaDeviceF32View<'a>> {
+    let group = plan.group_for_projection(name)?;
+    let activation = activations.get(group).ok_or_else(|| {
+        EngineError::InvalidState(format!("CUDA activation group {group} is not resident"))
+    })?;
+    let projection = projections.get(name).ok_or_else(|| {
+        EngineError::InvalidState(format!("CUDA projection {name} is not resident"))
+    })?;
+    let mut outputs = runtime.dispatch_shared_a8_sigmoid_gate_fanout_device(
+        activation,
+        attention,
+        gate,
+        &[projection],
+    )?;
+    outputs
+        .pop()
+        .ok_or_else(|| EngineError::InvalidState("CUDA gate projection has no output".into()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_swiglu_projection_device<'a>(
+    runtime: &CudaCandidateRuntime,
+    plan: &CudaProjectionPlan,
+    activations: &BTreeMap<String, PreparedCudaA8Activation>,
+    projections: &'a BTreeMap<String, PreparedCudaA8Projection>,
+    gate: CudaDeviceF32View<'_>,
+    up: CudaDeviceF32View<'_>,
+    name: &str,
+) -> Result<CudaDeviceF32View<'a>> {
+    let group = plan.group_for_projection(name)?;
+    let activation = activations.get(group).ok_or_else(|| {
+        EngineError::InvalidState(format!("CUDA activation group {group} is not resident"))
+    })?;
+    let projection = projections.get(name).ok_or_else(|| {
+        EngineError::InvalidState(format!("CUDA projection {name} is not resident"))
+    })?;
+    let mut outputs =
+        runtime.dispatch_shared_a8_swiglu_fanout_device(activation, gate, up, &[projection])?;
+    outputs
+        .pop()
+        .ok_or_else(|| EngineError::InvalidState("CUDA SwiGLU projection has no output".into()))
 }
 
 fn prepare_norms(

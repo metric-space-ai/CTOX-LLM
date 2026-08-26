@@ -944,6 +944,37 @@ impl CudaCandidateRuntime {
         Ok((free, total))
     }
 
+    /// Explicit token-boundary readback for verifier binaries. Production
+    /// graph execution keeps intermediate tensors device-resident and may
+    /// expose only sampler-selected results at this boundary.
+    pub fn verifier_read_f32_device(&self, view: CudaDeviceF32View<'_>) -> Result<Vec<f32>> {
+        if !Rc::ptr_eq(&self.inner, view.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA verifier readback belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.ctx_synchronize)(),
+                "verifier token-boundary synchronization",
+            )?;
+        }
+        let mut values = vec![0.0_f32; view.values()];
+        let byte_offset = view
+            .offset_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::Shape("CUDA verifier offset overflows".into()))?;
+        view.buffer
+            .copy_range_to(byte_offset, as_bytes_mut(&mut values))?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "CUDA verifier readback contains non-finite values".into(),
+            ));
+        }
+        Ok(values)
+    }
+
     pub fn prepare_verifier_f32_tensor(&self, values: &[f32]) -> Result<CudaVerifierF32Tensor> {
         if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::Shape(
@@ -4209,6 +4240,16 @@ impl PreparedCudaResidualRmsNorm {
 
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
+    }
+
+    pub fn residual_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.residual_output
+            .f32_view(0, self.config.rows * self.config.columns)
+    }
+
+    pub fn normalized_output(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.normalized_output
+            .f32_view(0, self.config.rows * self.config.columns)
     }
 }
 

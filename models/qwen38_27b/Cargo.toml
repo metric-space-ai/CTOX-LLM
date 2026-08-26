@@ -124,3 +124,8 @@ required-features = ["cuda"]
 name = "qwen38-cuda-graph-load-verify"
 path = "src/bin/cuda_graph_load_verify.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "qwen38-cuda-target-token-verify"
+path = "src/bin/cuda_target_token_verify.rs"
+required-features = ["cuda"]
