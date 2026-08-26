@@ -498,6 +498,16 @@ persists an atomic plan-bound state after each output hash, and resumes recovery
 training only from the highest numbered checkpoint accepted by the trainer's
 exact run-contract check. Existing unrecorded outputs fail closed for manual
 inspection; a stage is never inferred complete from filenames alone.
+`build_release_preparation_plan.py` applies the same immutable executor before
+final admission. It requires a read-only, symlink-free source snapshot, binds
+the complete corpora, plans, provenance, five reused teacher verifications,
+the new batch plan, and every Python implementation by SHA-256, and permits
+only physical GPUs 1 and 2. Teacher and activation batch stages explicitly
+delegate partial-output resume to their own verified batch protocols; all
+other stages reject unrecorded outputs. `run_bound_recovery_smoke.py` hashes
+the cache-set after its producing stage is durably recorded, proves the chosen
+sample is present, and deliberately cannot combine stateful chunk prefill with
+gradient checkpointing.
 The recovery trainer additionally measures its admitted stage reservation at
 optimizer boundaries. If that reservation is exhausted, it writes an exact
 run-contract checkpoint and exits unsuccessfully before emitting final scales

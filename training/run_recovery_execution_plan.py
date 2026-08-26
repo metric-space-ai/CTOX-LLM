@@ -68,6 +68,7 @@ def validate_implementation(document: dict[str, Any]) -> None:
     scripts = implementation.get("scripts")
     if not isinstance(scripts, dict) or not scripts:
         raise ValueError("recovery plan lacks script hashes")
+    bound_paths = set()
     for name, binding in scripts.items():
         if not isinstance(binding, dict):
             raise ValueError(f"invalid script binding for {name}")
@@ -75,6 +76,13 @@ def validate_implementation(document: dict[str, Any]) -> None:
         expected = str(binding.get("sha256", ""))
         if not path.is_file() or sha256_path(path) != expected:
             raise ValueError(f"recovery script changed after admission: {path}")
+        bound_paths.add(path.resolve())
+    for stage in document.get("stages", []):
+        argv = stage.get("argv", [])
+        if len(argv) < 2 or Path(str(argv[1])).resolve() not in bound_paths:
+            raise ValueError(
+                f"recovery stage uses an unbound implementation script: {stage.get('name')}"
+            )
 
 
 def canonical_requirement(requirement: str) -> str | None:
@@ -146,8 +154,15 @@ def validate_stages(document: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(argv, list) or not argv or not all(isinstance(v, str) for v in argv):
             raise ValueError(f"stage {name} has invalid argv")
         outputs = stage.get("outputs")
-        if not isinstance(outputs, list) or not outputs or not all(isinstance(v, str) for v in outputs):
+        if (
+            not isinstance(outputs, list)
+            or not outputs
+            or not all(isinstance(value, str) for value in outputs)
+        ):
             raise ValueError(f"stage {name} has invalid outputs")
+        resume_policy = stage.get("resume_policy", "none")
+        if resume_policy not in {"none", "application"}:
+            raise ValueError(f"stage {name} has invalid resume policy")
         gpu_count = int(stage.get("gpu_count", -1))
         environment = stage.get("environment")
         if not isinstance(environment, dict):
@@ -287,8 +302,10 @@ def run(plan_path: Path, state_path: Path, resume: bool, dry_run: bool) -> None:
             requirement = canonical_requirement(raw)
             if requirement is not None and requirement not in completed_records:
                 raise ValueError(f"stage {name} dependency is not complete: {raw}")
-        existing = [Path(path) for path in stage["outputs"] if Path(path).exists()]
-        if existing:
+        existing = [
+            Path(path) for path in stage["outputs"] if Path(path).exists()
+        ]
+        if existing and stage.get("resume_policy", "none") != "application":
             raise ValueError(
                 f"incomplete stage {name} has existing outputs; inspect before resume: {existing}"
             )
