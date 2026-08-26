@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from ctox_artifact import CtoxArtifact
+from cache_teacher import validate_local_model_provenance
 from end_to_end_recovery import (
-    atomic_json,
     build_packed_student,
     export_scale_tensors,
     immutable_run_contract,
@@ -27,6 +27,7 @@ from end_to_end_recovery import (
     validate_scale_parameter_contract,
 )
 from fanout_recovery import INDEPENDENT_POLICY, POLICIES
+from recovery_io import atomic_json, durable_replace, prepare_output_transaction
 from recovery_training_state import (
     normalize_accumulated_gradients,
     recovery_training_status,
@@ -86,13 +87,16 @@ def write_scales(
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp")
     save_file(tensors, temporary, metadata=metadata)
-    temporary.replace(output)
+    durable_replace(temporary, output)
 
 
 def validate_arguments(args: argparse.Namespace) -> None:
-    for output in (args.output_scales, args.output_report, args.output_evidence):
-        if output.exists():
-            raise ValueError(f"refusing to overwrite {output}")
+    prepare_output_transaction(
+        args.output_scales,
+        args.output_report,
+        args.output_evidence,
+        args.resume_checkpoint,
+    )
     if args.epochs <= 0 or args.gpus <= 0:
         raise ValueError("--epochs and --gpus must be positive")
     positive = (
@@ -126,6 +130,7 @@ def main() -> None:
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--model-source", required=True)
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--local-model-provenance", type=Path, required=True)
     parser.add_argument("--teacher-cache-set", type=Path, required=True)
     parser.add_argument("--teacher-cache-set-sha256", required=True)
     parser.add_argument("--output-scales", type=Path, required=True)
@@ -200,6 +205,19 @@ def main() -> None:
         if not bool(cache.settings["mtp_targets"]):
             raise ValueError("end-to-end recovery requires verified MTP targets")
         artifact_sha256 = sha256_path(args.artifact)
+        _local_provenance, local_model_provenance_sha256 = (
+            validate_local_model_provenance(
+                Path(args.model_source),
+                args.revision,
+                args.local_model_provenance,
+            )
+        )
+        if local_model_provenance_sha256 is None:
+            raise ValueError("recovery requires a verified local BF16 model source")
+        if cache.teacher_provenance_sha256 != local_model_provenance_sha256:
+            raise ValueError(
+                "recovery BF16 model provenance differs from the teacher cache"
+            )
         with CtoxArtifact(args.artifact, verify_tensors=True) as artifact:
             if artifact.manifest.get("revision") != args.revision:
                 raise ValueError("native artifact and requested model revision differ")
@@ -239,6 +257,7 @@ def main() -> None:
                 "format": "ctox.recovery.training-run.v1",
                 "model": artifact.manifest["model"],
                 "revision": args.revision,
+                "local_model_provenance_sha256": local_model_provenance_sha256,
                 "artifact_sha256": artifact_sha256,
                 "teacher_cache_set_sha256": args.teacher_cache_set_sha256,
                 "teacher_artifact_root_sha256": cache.manifest()[
@@ -248,6 +267,7 @@ def main() -> None:
                 "top_k": top_k,
                 "mtp_targets": True,
                 "epochs": args.epochs,
+                "max_optimizer_steps": args.max_optimizer_steps,
                 "sample_limit": args.sample_limit,
                 "sample_ids": sorted(args.sample_ids) if args.sample_ids else None,
                 "max_sequence_tokens": args.max_sequence_tokens,
@@ -261,6 +281,8 @@ def main() -> None:
                 "seed": args.seed,
                 "loss_weights": loss_weights,
                 "gradient_checkpointing": args.gradient_checkpointing,
+                "compute_dtype": args.compute_dtype,
+                "use_fla_kernel": args.use_fla_kernel,
                 "fanout_s_in_policy": args.fanout_s_in_policy,
                 "fanout_group_sha256": fanout_evidence["group_sha256"],
                 "fixed_logical_qcodes": True,
@@ -434,6 +456,27 @@ def main() -> None:
                         if bounded_stop:
                             break
                     cursor.update({"epoch": epoch + 1, "next_position": 0})
+            final_checkpoint = args.checkpoint_dir / (
+                f"recovery-final-step-{cursor['optimizer_steps']:06d}.safetensors"
+            )
+            if final_checkpoint.exists():
+                if (
+                    args.resume_checkpoint is None
+                    or args.resume_checkpoint.resolve() != final_checkpoint.resolve()
+                ):
+                    raise ValueError(
+                        f"refusing to overwrite final checkpoint {final_checkpoint}"
+                    )
+                final_checkpoint_sha256 = sha256_path(final_checkpoint)
+            else:
+                final_checkpoint_sha256 = save_training_checkpoint(
+                    final_checkpoint,
+                    parameters,
+                    optimizer,
+                    cursor,
+                    run_contract_sha256,
+                    torch,
+                )
             scale_tensors = export_scale_tensors(parameters, torch)
             scale_root = scale_tensor_root(scale_tensors)
             status = recovery_training_status(
@@ -454,6 +497,7 @@ def main() -> None:
                     tensor.numel() for tensor in scale_tensors.values()
                 ),
                 "trained_scale_root_sha256": scale_root,
+                "final_checkpoint_sha256": final_checkpoint_sha256,
                 "recent_mean_losses": mean_metrics(recent_metrics),
                 "skipped_oversize_samples": skipped,
                 "base_graph": base_evidence,
@@ -471,11 +515,14 @@ def main() -> None:
                     "status": status,
                     "model": str(artifact.manifest["model"]),
                     "revision": args.revision,
+                    "local_model_provenance_sha256": local_model_provenance_sha256,
                     "plan_sha256": str(recovery["plan_sha256"]),
                     "activation_stats_sha256": str(recovery["activation_stats_sha256"]),
                     "report_sha256": report_sha256,
                     "teacher_cache_set_sha256": args.teacher_cache_set_sha256,
                     "input_artifact_sha256": artifact_sha256,
+                    "run_contract_sha256": run_contract_sha256,
+                    "final_checkpoint_sha256": final_checkpoint_sha256,
                     "fixed_logical_qcodes": "true",
                     "fanout_s_in_policy": args.fanout_s_in_policy,
                     "fanout_group_sha256": str(fanout_evidence["group_sha256"]),
@@ -489,6 +536,7 @@ def main() -> None:
                 "report_sha256": report_sha256,
                 "scales_sha256": sha256_path(args.output_scales),
                 "trained_scale_root_sha256": scale_root,
+                "final_checkpoint_sha256": final_checkpoint_sha256,
                 "cursor": cursor,
                 "skipped_oversize_samples": len(skipped),
                 "fixed_logical_qcodes": True,

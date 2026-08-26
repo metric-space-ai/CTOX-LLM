@@ -59,6 +59,7 @@ from collect_activation_stats import (  # noqa: E402
     save_file_atomic,
 )
 from ctox_artifact import CtoxArtifact, ENDIAN_MARKER, HEADER, MAGIC  # noqa: E402
+from recovery_io import atomic_json, prepare_output_transaction  # noqa: E402
 from materialize_prompts import load_local_materialized, load_manifests  # noqa: E402
 from merge_manifests import merge  # noqa: E402
 from merge_domain_tags import merge_ordered_tags  # noqa: E402
@@ -3010,6 +3011,23 @@ class DatasetPipelineTests(unittest.TestCase):
             source.write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError, "digest mismatch"):
                 verify(manifest)
+
+    def test_recovery_output_transaction_requires_resume_and_evidence_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scales = root / "scales.safetensors"
+            report = root / "report.json"
+            evidence = root / "evidence.json"
+            report.write_text("partial", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "resume from its final checkpoint"):
+                prepare_output_transaction(scales, report, evidence, None)
+            checkpoint = root / "checkpoint.safetensors"
+            checkpoint.write_bytes(b"checkpoint")
+            prepare_output_transaction(scales, report, evidence, checkpoint)
+            self.assertFalse(report.exists())
+            atomic_json(evidence, {"format": "committed"})
+            with self.assertRaisesRegex(ValueError, "refusing to overwrite committed"):
+                prepare_output_transaction(scales, report, evidence, checkpoint)
 
 
 if __name__ == "__main__":

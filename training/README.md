@@ -223,6 +223,13 @@ KL approximation. Cross entropy targets the recorded `p -> token[p+1]`
 positions, while hidden reconstruction is signal-normalized and includes a
 directional penalty. The same sparse KL contract applies to every verifiable
 MTP draft target.
+The trainer requires the exact verified local BF16 provenance used by the
+teacher cache and binds its SHA-256, compute dtype, FLA choice, bounded-step
+limit, and all loss/optimizer settings into the immutable resume contract.
+Every periodic and final checkpoint, scale file, report, and evidence marker is
+fsynced before atomic rename. Evidence is committed last; an interrupted
+report/scale pair can be replaced only while explicitly resuming from the
+durable final checkpoint.
 `end_to_end_recovery_loss` composes six explicit, independently reported
 families: base KL, base CE, multi-layer hidden reconstruction, MTP KL, MTP CE,
 and MTP hidden reconstruction. No aggregate loss may silently omit MTP or

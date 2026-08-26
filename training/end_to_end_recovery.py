@@ -11,6 +11,7 @@ from cache_teacher import transformer_layers
 from fanout_recovery import tie_fanout_s_in, validate_parameter_aliases
 from mtp_teacher import forward_mtp_activations
 from packed_student_model import install_packed_base_model, install_packed_mtp_model
+from recovery_io import atomic_json, durable_replace
 from recovery_modules import (
     compose_recovery_losses,
     normalized_hidden_loss,
@@ -405,18 +406,6 @@ def immutable_run_contract(document: dict[str, Any]) -> tuple[str, str]:
     return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def atomic_json(path: Path, document: dict[str, Any]) -> None:
-    if path.exists():
-        raise ValueError(f"refusing to overwrite {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(document, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
 def sha256_path(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -471,7 +460,7 @@ def save_training_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     save_file(tensors, temporary, metadata=metadata)
-    temporary.replace(path)
+    durable_replace(temporary, path)
     return sha256_path(path)
 
 
