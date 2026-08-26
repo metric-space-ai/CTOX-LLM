@@ -666,12 +666,13 @@ __device__ __forceinline__ float decode_paged_kv(
 
 // Decode-only grouped-query attention over persistent mixed Q2/Q4 pages.
 // One warp owns one query head and decodes packed K/V values directly into
-// registers. This correctness candidate uses three cache scans (max,
-// denominator, value accumulation); promotion requires replacing it with the
-// pinned online-softmax/tiled organization and proving the roofline gate.
+// registers. Milakov-Gimelshein online softmax merges max, denominator and
+// value accumulation in one cache scan, following the pinned FATTN vector
+// organization. Promotion still requires controlled roofline evidence and a
+// device-side page pack/demotion path.
 // ref: ggml/src/ggml-cuda/fattn-vec.cuh:1-611
 // ref: ggml/src/ggml-cuda/fattn-common.cuh:1-1274
-extern "C" __global__ __launch_bounds__(32, 8)
+extern "C" __global__ __launch_bounds__(32, 16)
 void ctox_paged_q2q4_gqa_decode_f32_sm86(
     const float* __restrict__ query,
     const unsigned char* __restrict__ q2_pages,
@@ -693,75 +694,48 @@ void ctox_paged_q2q4_gqa_decode_f32_sm86(
     const unsigned key_base = key_value_head * params.head_dim;
     const unsigned value_base = params.combined_values / 2u + key_base;
 
-    float maximum = -3.402823466e+38f;
-    for (unsigned page = 0u; page < params.page_count; ++page) {
-        const CtoxPagedKvDescriptor descriptor = descriptors[page];
-        for (unsigned token = 0u; token < descriptor.tokens; ++token) {
-            float partial = 0.0f;
+    float query_values[8];
+    float accumulated[8] = {0.0f, 0.0f, 0.0f, 0.0f,
+                            0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-            for (unsigned slot = 0u; slot < 8u; ++slot) {
-                const unsigned dim = lane + slot * kWarpSize;
-                partial = fmaf(query[query_base + dim],
-                               decode_paged_kv(q2_pages, q4_pages, descriptor,
-                                               token, key_base + dim, params),
-                               partial);
-            }
-            const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
-                * params.scale;
-            maximum = fmaxf(maximum, score);
-        }
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        query_values[slot] = query[query_base + lane + slot * kWarpSize];
     }
-
+    float maximum = -3.402823466e+38f;
     float denominator = 0.0f;
     for (unsigned page = 0u; page < params.page_count; ++page) {
         const CtoxPagedKvDescriptor descriptor = descriptors[page];
         for (unsigned token = 0u; token < descriptor.tokens; ++token) {
             float partial = 0.0f;
-#pragma unroll 1
+#pragma unroll
             for (unsigned slot = 0u; slot < 8u; ++slot) {
                 const unsigned dim = lane + slot * kWarpSize;
-                partial = fmaf(query[query_base + dim],
+                partial = fmaf(query_values[slot],
                                decode_paged_kv(q2_pages, q4_pages, descriptor,
                                                token, key_base + dim, params),
                                partial);
             }
             const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
                 * params.scale;
-            denominator += expf(score - maximum);
-        }
-    }
-
-    float accumulated[8] = {0.0f, 0.0f, 0.0f, 0.0f,
-                            0.0f, 0.0f, 0.0f, 0.0f};
-    for (unsigned page = 0u; page < params.page_count; ++page) {
-        const CtoxPagedKvDescriptor descriptor = descriptors[page];
-        for (unsigned token = 0u; token < descriptor.tokens; ++token) {
-            float partial = 0.0f;
-#pragma unroll 1
-            for (unsigned slot = 0u; slot < 8u; ++slot) {
-                const unsigned dim = lane + slot * kWarpSize;
-                partial = fmaf(query[query_base + dim],
-                               decode_paged_kv(q2_pages, q4_pages, descriptor,
-                                               token, key_base + dim, params),
-                               partial);
-            }
-            const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
-                * params.scale;
-            const float probability = expf(score - maximum) / denominator;
-#pragma unroll 1
+            const float next_maximum = fmaxf(maximum, score);
+            const float previous_factor = expf(maximum - next_maximum);
+            const float score_factor = expf(score - next_maximum);
+            denominator = denominator * previous_factor + score_factor;
+#pragma unroll
             for (unsigned slot = 0u; slot < 8u; ++slot) {
                 const unsigned dim = lane + slot * kWarpSize;
                 accumulated[slot] = fmaf(
-                    probability,
+                    score_factor,
                     decode_paged_kv(q2_pages, q4_pages, descriptor,
                                     token, value_base + dim, params),
-                    accumulated[slot]);
+                    accumulated[slot] * previous_factor);
             }
+            maximum = next_maximum;
         }
     }
 #pragma unroll
     for (unsigned slot = 0u; slot < 8u; ++slot) {
         const unsigned dim = lane + slot * kWarpSize;
-        output[query_base + dim] = accumulated[slot];
+        output[query_base + dim] = accumulated[slot] / denominator;
     }
 }

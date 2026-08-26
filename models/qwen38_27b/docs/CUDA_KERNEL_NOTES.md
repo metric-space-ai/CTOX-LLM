@@ -151,11 +151,12 @@ never allocates an expanded FP16/FP32 KV cache. Sink, recent, and current pages
 remain Q4 while completed middle pages are demoted to Q2. A verifier-only CPU
 `PagedKvCache` currently performs append quantization and is therefore an
 explicit production-promotion blocker. The kernel directly decodes packed K/V
-and matches the quantized scalar oracle by construction, but its initial
-three-pass softmax scans the cache three times. CUDA 12.6 reports 116 registers
-and zero stack/spill/shared-memory bytes for the SM86 candidate. The current
-unified cubin SHA-256 is
-`43d2fe525dde15495adf26c33d4f4cd5461a3e06fd1cde3d3f920434edcaca4f`.
+and performs numerically stable online-softmax plus value accumulation in one
+cache scan rather than separate max, denominator and output scans. CUDA 12.6
+reports 128 registers and zero stack/spill/shared-memory bytes for the SM86
+candidate. Its 16-warps-per-SM launch bound is explicit. The current unified
+cubin SHA-256 is
+`e7fcd2a7203467e467d1fbd7e45836759650eebcd60e9749d6911d11f0ac89c5`.
 Its numerical/demotion/reset/unload verifier is queued on physical GPU 2 after
 the teacher, evaluation, activation and earlier verifier chain; GPU 0 is never
 eligible. Promotion requires a device-side page pack/demotion path and an
