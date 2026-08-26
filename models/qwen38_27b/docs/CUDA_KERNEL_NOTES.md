@@ -118,7 +118,7 @@ one thread owns one value column. Decay and update stores round immediately to
 FP16, matching the Rust and Metal oracle. CUDA 12.6 compiled the candidate for
 SM86 with 24 registers, 40 bytes shared memory, and zero stack/spill bytes
 (current unified cubin SHA-256
-`f963daa12772ed2b64ef25da79f6145851a0de368f5cec198b386763b147baf2`).
+`0f8b6ce454fab794f603fdc49683a4f60879302551d6b10a1d8f64bc3588cfac`).
 The numerical verifier is built for a later physical-GPU-2 run after the
 teacher/evaluation/activation pipeline releases GPU 1+2; GPU 0 remains
 reserved for Greppy. No numerical or performance promotion is claimed yet.
@@ -171,6 +171,8 @@ and normalized activation, so the scheduler can preserve the skip connection
 while feeding the next projection without a standalone add kernel or a second
 read of the sum. The expanded linear-op verifier requires an exact residual
 sum plus the existing RMSNorm tolerance before this edge may be promoted.
+CUDA 12.6 reports 16 registers, 36 bytes shared memory, and no stack or spill
+traffic for the fused residual/RMSNorm kernel.
 
 Qwen partial RoPE is implemented as an in-place non-interleaved/NeoX-pairing
 candidate anchored to the newly pinned upstream `rope.cu`/`rope.cuh`. Query
@@ -198,7 +200,7 @@ output scans. CUDA 12.6 reports 15 registers/76 bytes shared memory for Q4
 packing, 16 registers/no shared memory for demotion, and 128 registers/no
 shared memory for GQA; all three have zero stack/spill bytes. GQA's
 16-warps-per-SM launch bound is explicit. The current unified cubin SHA-256 is
-`f963daa12772ed2b64ef25da79f6145851a0de368f5cec198b386763b147baf2`.
+`0f8b6ce454fab794f603fdc49683a4f60879302551d6b10a1d8f64bc3588cfac`.
 Its numerical/demotion/reset/unload verifier is queued on physical GPU 2 after
 the teacher, evaluation, activation and earlier verifier chain; GPU 0 is never
 eligible. The CPU `PagedKvCache` exists only in the separate verifier as an
