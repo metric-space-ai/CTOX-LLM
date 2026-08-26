@@ -1344,6 +1344,21 @@ impl MetalCandidateRuntime {
         &self,
         prepared: &PreparedMappedMetalRecoveredRow,
     ) -> Result<Vec<f32>> {
+        self.dispatch_mapped_recovered_row_repeated(prepared, 1)
+    }
+
+    /// Record repeated resident embedding decodes in one command buffer so
+    /// verifier benchmarks can separate kernel latency from synchronization.
+    pub fn dispatch_mapped_recovered_row_repeated(
+        &self,
+        prepared: &PreparedMappedMetalRecoveredRow,
+        dispatches: usize,
+    ) -> Result<Vec<f32>> {
+        if dispatches == 0 {
+            return Err(EngineError::Shape(
+                "Metal recovered-row dispatch count must be positive".into(),
+            ));
+        }
         let (pipeline, values_per_thread) = match prepared.dtype {
             TensorDType::Q2B64 => (&self.q2_recovered_row_pipeline, 4_usize),
             TensorDType::Q4B64 => (&self.q4_recovered_row_pipeline, 2_usize),
@@ -1389,7 +1404,9 @@ impl MetalCandidateRuntime {
             height: 1,
             depth: 1,
         };
-        encoder.dispatch_thread_groups(grid, threads);
+        for _ in 0..dispatches {
+            encoder.dispatch_thread_groups(grid, threads);
+        }
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -2264,10 +2281,13 @@ mod tests {
         assert!(runtime
             .prepare_mapped_recovered_row(&mapping, matrix, rows_q2 + rows_q4)
             .is_err());
+        assert!(runtime
+            .dispatch_mapped_recovered_row_repeated(&prepared_q2, 0)
+            .is_err());
         drop(mapping);
         drop(artifact);
         let actual_q2 = runtime
-            .dispatch_mapped_recovered_row(&prepared_q2)
+            .dispatch_mapped_recovered_row_repeated(&prepared_q2, 3)
             .expect("dispatch Q2 embedding after loader drop");
         let actual_q4 = runtime
             .dispatch_mapped_recovered_row(&prepared_q4)

@@ -156,6 +156,12 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   so this remains verifier evidence, not a roofline or promotion claim. The
   raw run summary is in
   `benchmarks/metal/apple-m5-shared-fanout-20260826.json`.
+- `qwen38-metal-row-bench --artifact <pack.ctoxq>` opens a checksummed release
+  container, resolves an arbitrary embedding token row, verifies it against
+  the recovered CPU oracle, and reports repeated-command latency, the bound
+  manifest hash, mapped file bytes, transient bytes, and zero copied model
+  bytes. It is ready for the final trained pack; no synthetic result is
+  presented as release evidence.
 - The complete suite also covers ABI constants against `src/quant.rs`, invalid
   shape/buffer rejection, dispatch-name checks, and an in-test `xcrun metal`
   compilation of the source.
