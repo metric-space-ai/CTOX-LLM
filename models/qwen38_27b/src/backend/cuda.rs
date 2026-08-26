@@ -535,6 +535,7 @@ pub const RESIDUAL_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_residual_rms_norm_f16_
 pub const PARTIAL_ROPE_F32_SYMBOL: &str = "ctox_partial_rope_f32_sm86";
 pub const QUERY_GATE_NORM_ROPE_F32_SYMBOL: &str = "ctox_qwen_query_gate_norm_rope_f32_sm86";
 pub const PACK_PAGED_KV_Q4_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_f32_sm86";
+pub const PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_batch_f32_sm86";
 pub const DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL: &str = "ctox_demote_paged_kv_q4_to_q2_sm86";
 pub const PAGED_Q2Q4_GQA_F32_SYMBOL: &str = "ctox_paged_q2q4_gqa_decode_f32_sm86";
 pub const PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL: &str = "ctox_paged_q2q4_gqa_prefill_f32_sm86";
@@ -1654,6 +1655,7 @@ mod tests {
             PARTIAL_ROPE_F32_SYMBOL,
             QUERY_GATE_NORM_ROPE_F32_SYMBOL,
             PACK_PAGED_KV_Q4_F32_SYMBOL,
+            PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL,
             DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
             PAGED_Q2Q4_GQA_F32_SYMBOL,
             PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL,

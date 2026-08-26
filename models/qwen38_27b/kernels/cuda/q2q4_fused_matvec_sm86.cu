@@ -1414,6 +1414,73 @@ void ctox_pack_paged_kv_q4_f32_sm86(
     }
 }
 
+// Pack one contiguous prompt segment into one canonical Q4 page. The Y grid
+// owns tokens and the X grid owns 64-value quantization blocks, so a bounded
+// prefill chunk needs one launch per crossed page rather than one launch per
+// token. Codes and FP16 scales are intentionally identical to the decode
+// append kernel above.
+// ref: ggml/src/ggml-cuda/quantize.cu:86-134
+// ref: ggml/src/ggml-cuda/template-instances/quantize_data.cu:1-8
+extern "C" __global__ __launch_bounds__(64, 8)
+void ctox_pack_paged_kv_q4_batch_f32_sm86(
+    unsigned char* __restrict__ q4_pages,
+    const float* __restrict__ keys,
+    const float* __restrict__ values,
+    unsigned physical_slot,
+    unsigned first_token_in_page,
+    unsigned first_input_token,
+    unsigned token_count,
+    unsigned component_values,
+    unsigned q4_token_bytes,
+    unsigned q4_page_bytes) {
+    const unsigned local_token = blockIdx.y;
+    if (local_token >= token_count) {
+        return;
+    }
+    const unsigned input_token = first_input_token + local_token;
+    const unsigned combined_index = blockIdx.x * kBlockLen + threadIdx.x;
+    const unsigned input_base = input_token * component_values;
+    const float item = combined_index < component_values
+        ? keys[input_base + combined_index]
+        : values[input_base + combined_index - component_values];
+    float maximum = warp_max(fabsf(item));
+    __shared__ float warp_maxima[2];
+    __shared__ float block_maximum;
+    __shared__ unsigned char codes[kBlockLen];
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned warp = threadIdx.x / kWarpSize;
+    if (lane == 0u) {
+        warp_maxima[warp] = maximum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        block_maximum = fmaxf(warp_maxima[0], warp_maxima[1]);
+    }
+    __syncthreads();
+    unsigned code = 0u;
+    if (block_maximum != 0.0f) {
+        const float normalized = fminf(
+            1.0f, fmaxf(-1.0f, __fdiv_rn(item, block_maximum)));
+        const float selector = __fadd_rn(__fmul_rn(normalized, 7.5f), 7.5f);
+        code = static_cast<unsigned>(
+            fminf(15.0f, fmaxf(0.0f, roundf(selector))));
+    }
+    codes[threadIdx.x] = static_cast<unsigned char>(code);
+    __syncthreads();
+    unsigned char* packed = q4_pages
+        + static_cast<unsigned long long>(physical_slot) * q4_page_bytes
+        + static_cast<unsigned long long>(first_token_in_page + local_token)
+            * q4_token_bytes
+        + blockIdx.x * kQ4BlockBytes;
+    if (threadIdx.x == 0u) {
+        *reinterpret_cast<__half*>(packed) = __float2half_rn(block_maximum);
+    }
+    if (threadIdx.x < kBlockLen / 2u) {
+        packed[2u + threadIdx.x] = codes[threadIdx.x * 2u]
+            | static_cast<unsigned char>(codes[threadIdx.x * 2u + 1u] << 4u);
+    }
+}
+
 __device__ __forceinline__ unsigned q4_code_to_q2(unsigned code) {
     return code <= 2u ? 0u : code <= 7u ? 1u : code <= 12u ? 2u : 3u;
 }

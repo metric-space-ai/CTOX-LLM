@@ -37,8 +37,10 @@ struct Report<'a> {
     head_dim: usize,
     all_q4_prefill_decode_exact: bool,
     maximum_all_q4_prefill_decode_absolute_delta: f32,
+    all_q4_batch_page_launches: usize,
     mixed_q2_tokens: usize,
     mixed_q4_tokens: usize,
+    mixed_batch_page_launches: usize,
     maximum_mixed_oracle_absolute_error: f32,
     maximum_mixed_oracle_relative_error: f32,
     verifier_allocated_bytes: usize,
@@ -98,7 +100,12 @@ fn main() -> anyhow::Result<()> {
         )?);
     }
     let mut all_q4_prefill = runtime.prepare_paged_q2q4_gqa(all_q4_config)?;
-    runtime.seed_paged_q2q4_gqa_verifier(&mut all_q4_prefill, &keys, &values)?;
+    let all_q4_batch_page_launches =
+        runtime.seed_paged_q2q4_gqa_batch_verifier(&mut all_q4_prefill, &keys, &values)?;
+    anyhow::ensure!(
+        all_q4_batch_page_launches == args.tokens.div_ceil(all_q4_config.page_tokens),
+        "all-Q4 batch packer did not submit exactly one launch per page"
+    );
     let all_q4_output =
         runtime.prepare_paged_q2q4_gqa_prefill_output(all_q4_config, args.tokens)?;
     let all_q4_view = runtime.dispatch_paged_q2q4_gqa_prefill_device(
@@ -126,7 +133,12 @@ fn main() -> anyhow::Result<()> {
         recent_tokens: 8,
     };
     let mut mixed = runtime.prepare_paged_q2q4_gqa(mixed_config)?;
-    runtime.seed_paged_q2q4_gqa_verifier(&mut mixed, &keys, &values)?;
+    let mixed_batch_page_launches =
+        runtime.seed_paged_q2q4_gqa_batch_verifier(&mut mixed, &keys, &values)?;
+    anyhow::ensure!(
+        mixed_batch_page_launches == args.tokens.div_ceil(mixed_config.page_tokens),
+        "mixed batch packer did not submit exactly one launch per page"
+    );
     anyhow::ensure!(mixed.q2_tokens() > 0, "mixed verifier produced no Q2 pages");
     let mixed_output = runtime.prepare_paged_q2q4_gqa_prefill_output(mixed_config, args.tokens)?;
     let mixed_view = runtime.dispatch_paged_q2q4_gqa_prefill_device(
@@ -226,8 +238,10 @@ fn main() -> anyhow::Result<()> {
             head_dim,
             all_q4_prefill_decode_exact,
             maximum_all_q4_prefill_decode_absolute_delta,
+            all_q4_batch_page_launches,
             mixed_q2_tokens,
             mixed_q4_tokens,
+            mixed_batch_page_launches,
             maximum_mixed_oracle_absolute_error,
             maximum_mixed_oracle_relative_error,
             verifier_allocated_bytes,
@@ -235,7 +249,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes,
-            note: "The unpromoted direct causal prefill kernel consumes token-major queries and the canonical mixed Q2/Q4 cache without per-query host dispatch. KV seeding is verifier-only; a batched production page packer and controlled latency evidence remain required.",
+            note: "The unpromoted direct causal prefill kernel consumes token-major queries and the canonical mixed Q2/Q4 cache without per-query host dispatch. The production-shaped KV packer consumes device K/V views and submits one two-dimensional launch per crossed page, never per token. Controlled latency and complete graph integration remain required.",
         })?
     );
     Ok(())

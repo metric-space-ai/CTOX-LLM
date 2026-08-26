@@ -25,9 +25,9 @@ use super::cuda::{
     GATED_DELTA_PREP_F32_SYMBOL, GATED_DELTA_PREP_SCAN_F32_SYMBOL, GATED_DELTA_SCAN_F16_SYMBOL,
     GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
     GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
-    LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES,
-    PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, PAGED_GQA_SPLIT_SEGMENTS,
-    PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL,
+    LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL, PACK_PAGED_KV_Q4_F32_SYMBOL,
+    PAGED_GQA_DESCRIPTOR_BYTES, PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+    PAGED_GQA_SPLIT_SEGMENTS, PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL,
     PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL,
     PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_BATCHED_MMQ_SYMBOL,
     Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
@@ -238,6 +238,7 @@ struct CudaContextInner {
     partial_rope_f32_function: CuFunction,
     query_gate_norm_rope_f32_function: CuFunction,
     pack_paged_kv_q4_f32_function: CuFunction,
+    pack_paged_kv_q4_batch_f32_function: CuFunction,
     demote_paged_kv_q4_to_q2_function: CuFunction,
     paged_q2q4_gqa_f32_function: CuFunction,
     paged_q2q4_gqa_prefill_f32_function: CuFunction,
@@ -1314,6 +1315,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let pack_paged_kv_q4_batch_f32_function =
+            match resolve_function(&driver, module, PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let demote_paged_kv_q4_to_q2_function =
             match resolve_function(&driver, module, DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL) {
                 Ok(function) => function,
@@ -1423,6 +1435,7 @@ impl CudaCandidateRuntime {
                 partial_rope_f32_function,
                 query_gate_norm_rope_f32_function,
                 pack_paged_kv_q4_f32_function,
+                pack_paged_kv_q4_batch_f32_function,
                 demote_paged_kv_q4_to_q2_function,
                 paged_q2q4_gqa_f32_function,
                 paged_q2q4_gqa_prefill_f32_function,
@@ -3976,7 +3989,144 @@ impl CudaCandidateRuntime {
         }
         prepared.pages[page_index].tokens += 1;
         prepared.tokens += 1;
+        self.demote_stale_paged_q2q4_pages(prepared)?;
+        self.write_paged_q2q4_metadata(prepared)
+    }
 
+    /// Appends a token-major prompt chunk to the canonical persistent cache.
+    /// One two-dimensional pack launch is submitted per crossed page; there
+    /// is no host loop over tokens and no host-staged K/V copy.
+    pub fn append_paged_q2q4_kv_batch_device(
+        &self,
+        prepared: &mut PreparedCudaPagedGqa,
+        keys: CudaDeviceF32View<'_>,
+        values: CudaDeviceF32View<'_>,
+        token_count: usize,
+    ) -> Result<usize> {
+        validate_a8_batch_capacity(token_count)?;
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, keys.context)
+            || !Rc::ptr_eq(&self.inner, values.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA batched paged-KV append crosses driver contexts".into(),
+            ));
+        }
+        if prepared.poisoned || prepared.speculative_checkpoint.is_some() {
+            return Err(EngineError::InvalidState(
+                "CUDA batched paged-KV append requires healthy non-speculative state".into(),
+            ));
+        }
+        let expected_values = token_count
+            .checked_mul(prepared.component_values)
+            .ok_or_else(|| EngineError::Shape("CUDA batched KV shape overflows".into()))?;
+        if keys.values() != expected_values || values.values() != expected_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA batched paged-KV append has K/V {}/{} values, expected {expected_values}",
+                keys.values(),
+                values.values()
+            )));
+        }
+        let final_tokens = prepared
+            .tokens
+            .checked_add(token_count)
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA KV token count overflows".into()))?;
+        if final_tokens > prepared.config.maximum_tokens {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA batched paged-KV append reaches {final_tokens} tokens, capacity is {}",
+                prepared.config.maximum_tokens
+            )));
+        }
+
+        self.make_current()?;
+        prepared.poisoned = true;
+        let result = (|| {
+            let mut input_token = 0_usize;
+            let mut page_launches = 0_usize;
+            while input_token < token_count {
+                let page_index = prepared.tokens / prepared.config.page_tokens;
+                let first_token_in_page = prepared.tokens % prepared.config.page_tokens;
+                if first_token_in_page == 0 {
+                    let slot = prepared.free_q4_slots.pop().ok_or_else(|| {
+                        EngineError::MemoryBudget("CUDA Q4 arena has no free slot".into())
+                    })?;
+                    prepared.pages.push(CudaPagedKvPage {
+                        precision: KvPrecision::Q4,
+                        physical_slot: slot,
+                        tokens: 0,
+                        first_token: prepared.tokens,
+                    });
+                }
+                if page_index + 1 != prepared.pages.len()
+                    || prepared.pages[page_index].precision != KvPrecision::Q4
+                {
+                    return Err(EngineError::InvalidState(
+                        "CUDA current batched KV page metadata is inconsistent".into(),
+                    ));
+                }
+                let page_tokens = (token_count - input_token)
+                    .min(prepared.config.page_tokens - first_token_in_page);
+                let mut q4_pages_ptr = prepared.q4_pages.ptr();
+                let mut keys_ptr = keys.ptr()?;
+                let mut values_ptr = values.ptr()?;
+                let mut physical_slot = cuda_u32(
+                    prepared.pages[page_index].physical_slot,
+                    "CUDA Q4 physical slot",
+                )?;
+                let mut first_token_in_page_u32 =
+                    cuda_u32(first_token_in_page, "CUDA first token in page")?;
+                let mut first_input_token = cuda_u32(input_token, "CUDA first input token")?;
+                let mut page_token_count = cuda_u32(page_tokens, "CUDA batch page tokens")?;
+                let mut component_values = cuda_u32(prepared.component_values, "CUDA KV width")?;
+                let mut q4_token_bytes = cuda_u32(prepared.q4_token_bytes, "CUDA Q4 token bytes")?;
+                let mut q4_page_bytes = cuda_u32(prepared.q4_page_bytes, "CUDA Q4 page bytes")?;
+                let mut pack_params = [
+                    (&mut q4_pages_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut keys_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut values_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut physical_slot as *mut u32).cast::<c_void>(),
+                    (&mut first_token_in_page_u32 as *mut u32).cast::<c_void>(),
+                    (&mut first_input_token as *mut u32).cast::<c_void>(),
+                    (&mut page_token_count as *mut u32).cast::<c_void>(),
+                    (&mut component_values as *mut u32).cast::<c_void>(),
+                    (&mut q4_token_bytes as *mut u32).cast::<c_void>(),
+                    (&mut q4_page_bytes as *mut u32).cast::<c_void>(),
+                ];
+                unsafe {
+                    self.inner.driver.check(
+                        (self.inner.driver.launch_kernel)(
+                            self.inner.pack_paged_kv_q4_batch_f32_function,
+                            cuda_u32(prepared.blocks_per_token, "CUDA KV quant blocks")?,
+                            page_token_count,
+                            1,
+                            64,
+                            1,
+                            1,
+                            0,
+                            ptr::null_mut(),
+                            pack_params.as_mut_ptr(),
+                            ptr::null_mut(),
+                        ),
+                        "batched paged Q4 KV pack kernel launch",
+                    )?;
+                }
+                prepared.pages[page_index].tokens += page_tokens;
+                prepared.tokens += page_tokens;
+                input_token += page_tokens;
+                page_launches += 1;
+                self.demote_stale_paged_q2q4_pages(prepared)?;
+            }
+            self.write_paged_q2q4_metadata(prepared)?;
+            Ok(page_launches)
+        })();
+        if result.is_ok() {
+            debug_assert_eq!(prepared.tokens, final_tokens);
+            prepared.poisoned = false;
+        }
+        result
+    }
+
+    fn demote_stale_paged_q2q4_pages(&self, prepared: &mut PreparedCudaPagedGqa) -> Result<()> {
         let recent_start = prepared
             .tokens
             .saturating_sub(prepared.config.recent_tokens);
@@ -4050,7 +4200,10 @@ impl CudaCandidateRuntime {
             prepared.pages[index].physical_slot = index;
             prepared.free_q4_slots.push(page.physical_slot);
         }
+        Ok(())
+    }
 
+    fn write_paged_q2q4_metadata(&self, prepared: &PreparedCudaPagedGqa) -> Result<()> {
         let mut descriptor_words =
             Vec::with_capacity(prepared.pages.len() * (PAGED_GQA_DESCRIPTOR_BYTES / 4));
         for page in &prepared.pages {
@@ -4311,6 +4464,42 @@ impl CudaCandidateRuntime {
             prepared.poisoned = false;
         }
         result
+    }
+
+    /// Verifier fixture for the production-shaped batched page packer. Host
+    /// inputs are uploaded once into temporary device buffers, then the same
+    /// device-view API consumed by projection outputs is exercised.
+    pub fn seed_paged_q2q4_gqa_batch_verifier(
+        &self,
+        prepared: &mut PreparedCudaPagedGqa,
+        keys: &[f32],
+        values: &[f32],
+    ) -> Result<usize> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA batched paged GQA seed belongs to another context".into(),
+            ));
+        }
+        let component_values = prepared.component_values;
+        if keys.is_empty()
+            || keys.len() != values.len()
+            || !keys.len().is_multiple_of(component_values)
+            || keys.iter().chain(values).any(|item| !item.is_finite())
+        {
+            return Err(EngineError::Shape(
+                "CUDA batched paged GQA seed requires equal finite complete K/V rows".into(),
+            ));
+        }
+        let token_count = keys.len() / component_values;
+        self.make_current()?;
+        let key_staging = DeviceBuffer::from_bytes(self, as_bytes(keys))?;
+        let value_staging = DeviceBuffer::from_bytes(self, as_bytes(values))?;
+        let key_view = key_staging.f32_view(0, keys.len())?;
+        let value_view = value_staging.f32_view(0, values.len())?;
+        let page_launches =
+            self.append_paged_q2q4_kv_batch_device(prepared, key_view, value_view, token_count)?;
+        self.synchronize_after_launch("batched paged GQA verifier seed synchronization")?;
+        Ok(page_launches)
     }
 
     pub fn prepare_paged_q2q4_gqa_split(

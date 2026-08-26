@@ -298,9 +298,14 @@ FP16 recurrent state, while keeping one persistent state owner. Its batched
 Qwen input preparation now expands compact Q/K, copies V, and transforms raw
 A/B in one launch while sharing the immutable A_log/dt_bias allocation. The
 direct causal paged-GQA prefill scan is also exact against sequential all-Q4
-decode and stays within `5.97e-8` of the mixed Q2/Q4 scalar oracle. A batched
-KV page packer and executor replacement of the current sequential loop remain
-open. The schedule now names batched key RoPE and persistent KV append
+decode and stays within `5.97e-8` of the mixed Q2/Q4 scalar oracle. Its new
+production-shaped KV page packer consumes token-major device K/V views and
+submits one two-dimensional launch per crossed page rather than one launch per
+token. On the 40-token SM86 fixture, five page launches produce bit-identical
+all-Q4 attention and the same 24-Q2/16-Q4 mixed cache as the scalar oracle;
+the pack kernel uses 16 registers with no spills. Batched key RoPE and executor
+replacement of the current sequential loop remain open. The schedule names
+batched key RoPE and persistent KV append
 explicitly before every causal GQA scan; these state mutations can no longer
 be hidden by a nominal attention step.
 
