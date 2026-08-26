@@ -111,6 +111,11 @@ path = "src/bin/cuda_gated_delta_verify.rs"
 required-features = ["cuda"]
 
 [[bin]]
+name = "qwen38-cuda-gated-delta-scan-verify"
+path = "src/bin/cuda_gated_delta_scan_verify.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "qwen38-cuda-linear-ops-verify"
 path = "src/bin/cuda_linear_ops_verify.rs"
 required-features = ["cuda"]

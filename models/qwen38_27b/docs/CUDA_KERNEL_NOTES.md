@@ -509,6 +509,21 @@ Evidence is recorded in
 GPU 2 alongside the teacher workload, so it is correctness and lifecycle
 evidence, not controlled latency or roofline evidence.
 
+The matching upstream-structured GatedDelta scan advances token-major
+`[tokens, 48, 128]` Q/K/V and `[tokens, 48]` decay/beta buffers inside one
+launch while retaining the exact decode-owned FP16 `[48, 128, 128]` state.
+CUDA 12.6 compiled it with 27 registers, 40 bytes shared memory, and zero stack
+or spills. On the same RTX A4500, an 11-token scan matched 11 sequential device
+launches bit-for-bit for every output and the final FP16 state. Maximum
+device-vs-scalar-oracle absolute output error was `7.72e-7`; maximum state
+error was `4.58e-5`. All 7,574,400 verifier-owned bytes were reclaimed
+immediately. The module SHA-256 was
+`0d11f68025b89aa5218aec6619da7cf61137525fb0aed7a614500525c342f947`.
+Evidence is recorded in
+`benchmarks/cuda/sm86-gated-delta-scan-20260826.json`. This is correctness and
+lifecycle evidence only; batched Qwen input preparation and controlled
+chunk-size latency remain open before promotion.
+
 The loader-resolved embedding-row candidate decodes one canonical Q2 or Q4 row
 and fuses packed FP16 `s_in` plus scalar `s_out` on device. The production
 owner now keeps the entire pure/mixed table resident and launches directly at

@@ -243,6 +243,7 @@ pub const SIGMOID_GATE_A8_QUANTIZE_PARAM_BYTES: u32 = SWIGLU_A8_QUANTIZE_PARAM_B
 /// passes the scalar-oracle and same-device roofline gates.
 // ref: ggml/src/ggml-cuda/gated_delta_net.cu:1-135
 pub const GATED_DELTA_F16_SYMBOL: &str = "ctox_gated_delta_recurrent_f16_sm86";
+pub const GATED_DELTA_SCAN_F16_SYMBOL: &str = "ctox_gated_delta_recurrent_scan_f16_sm86";
 pub const GATED_DELTA_PREP_F32_SYMBOL: &str = "ctox_qwen_gated_delta_prepare_f32_sm86";
 
 /// Exact recurrent geometry in Qwen3.8-27B. Keeping it explicit prevents a
@@ -316,6 +317,70 @@ pub const GATED_DELTA_F16_PARAMS: &[KernelParam] = &[
     },
 ];
 pub const GATED_DELTA_F16_PARAM_BYTES: u32 = 72;
+
+pub const GATED_DELTA_SCAN_F16_PARAMS: &[KernelParam] = &[
+    KernelParam {
+        name: "query",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 0,
+    },
+    KernelParam {
+        name: "key",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 8,
+    },
+    KernelParam {
+        name: "value",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 16,
+    },
+    KernelParam {
+        name: "log_decay",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 24,
+    },
+    KernelParam {
+        name: "beta",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 32,
+    },
+    KernelParam {
+        name: "state",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 40,
+    },
+    KernelParam {
+        name: "output",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 48,
+    },
+    KernelParam {
+        name: "tokens",
+        size_bytes: 4,
+        offset_bytes: 56,
+    },
+    KernelParam {
+        name: "heads",
+        size_bytes: 4,
+        offset_bytes: 60,
+    },
+    KernelParam {
+        name: "key_dim",
+        size_bytes: 4,
+        offset_bytes: 64,
+    },
+    KernelParam {
+        name: "value_dim",
+        size_bytes: 4,
+        offset_bytes: 68,
+    },
+    KernelParam {
+        name: "epsilon",
+        size_bytes: 4,
+        offset_bytes: 72,
+    },
+];
+pub const GATED_DELTA_SCAN_F16_PARAM_BYTES: u32 = 76;
 
 /// Driver-API layout for the verifier-only Qwen input preparation kernel.
 /// It repeats compact 16-head Q/K activations to 48 recurrence heads and
@@ -1372,6 +1437,9 @@ mod tests {
         assert_eq!(GATED_DELTA_F16_PARAMS[6].offset_bytes, 48);
         assert_eq!(GATED_DELTA_F16_PARAMS[10].offset_bytes, 68);
         assert_eq!(GATED_DELTA_F16_PARAM_BYTES, 72);
+        assert_eq!(GATED_DELTA_SCAN_F16_PARAMS.len(), 12);
+        assert_eq!(GATED_DELTA_SCAN_F16_PARAMS[11].offset_bytes, 72);
+        assert_eq!(GATED_DELTA_SCAN_F16_PARAM_BYTES, 76);
         assert_eq!(GATED_DELTA_PREP_F32_PARAMS.len(), 12);
         assert_eq!(GATED_DELTA_PREP_F32_PARAMS[11].offset_bytes, 80);
         assert_eq!(GATED_DELTA_PREP_F32_PARAM_BYTES, 84);
@@ -1379,6 +1447,10 @@ mod tests {
             .kernels
             .iter()
             .any(|kernel| kernel.symbol == GATED_DELTA_F16_SYMBOL));
+        assert!(!SM86_MODULE_ABI
+            .kernels
+            .iter()
+            .any(|kernel| kernel.symbol == GATED_DELTA_SCAN_F16_SYMBOL));
         assert!(!SM86_MODULE_ABI
             .kernels
             .iter()

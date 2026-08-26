@@ -872,6 +872,102 @@ void ctox_gated_delta_recurrent_f16_sm86(
     output[value_offset] = result;
 }
 
+// Token-major causal scan adapted from the pinned upstream multi-token
+// GatedDeltaNet traversal. One block still owns one value head and each thread
+// one value column; the token loop remains inside the kernel so the persistent
+// FP16 state is advanced in strict prompt order without host launches between
+// tokens. Every state update rounds at the same point as decode.
+// This remains verifier-only until chunk-size latency and full-graph evidence
+// promote it.
+// ref: ggml/src/ggml-cuda/gated_delta_net.cu:1-135
+extern "C" __global__ __launch_bounds__(128, 4)
+void ctox_gated_delta_recurrent_scan_f16_sm86(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ log_decay,
+    const float* __restrict__ beta,
+    __half* __restrict__ state,
+    float* __restrict__ output,
+    unsigned tokens,
+    unsigned heads,
+    unsigned key_dim,
+    unsigned value_dim,
+    float epsilon) {
+    const unsigned head = blockIdx.x;
+    const unsigned value_index = threadIdx.x;
+    if (head >= heads || tokens == 0u || key_dim != 128u || value_dim != 128u) {
+        return;
+    }
+
+    const unsigned lane = value_index & (kWarpSize - 1u);
+    const unsigned warp = value_index / kWarpSize;
+    const unsigned state_head_base = head * key_dim * value_dim;
+    const float query_scale = rsqrtf(static_cast<float>(key_dim));
+    __shared__ float q_warp_norm[4];
+    __shared__ float k_warp_norm[4];
+    __shared__ float q_inverse;
+    __shared__ float k_inverse;
+
+#pragma unroll 1
+    for (unsigned token = 0u; token < tokens; ++token) {
+        const unsigned qk_base = (token * heads + head) * key_dim;
+        const unsigned value_offset = (token * heads + head) * value_dim
+            + value_index;
+        const float q = query[qk_base + value_index];
+        const float k = key[qk_base + value_index];
+        float q_norm = warp_sum(q * q);
+        float k_norm = warp_sum(k * k);
+        if (lane == 0u) {
+            q_warp_norm[warp] = q_norm;
+            k_warp_norm[warp] = k_norm;
+        }
+        __syncthreads();
+        if (warp == 0u) {
+            q_norm = lane < 4u ? q_warp_norm[lane] : 0.0f;
+            k_norm = lane < 4u ? k_warp_norm[lane] : 0.0f;
+            q_norm = warp_sum(q_norm);
+            k_norm = warp_sum(k_norm);
+            if (lane == 0u) {
+                q_inverse = rsqrtf(q_norm + epsilon);
+                k_inverse = rsqrtf(k_norm + epsilon);
+            }
+        }
+        __syncthreads();
+
+        const float decay = expf(log_decay[token * heads + head]);
+        float memory = 0.0f;
+#pragma unroll 1
+        for (unsigned key_index = 0u; key_index < 128u; ++key_index) {
+            const unsigned state_index = state_head_base
+                + key_index * value_dim + value_index;
+            const __half decayed = __float2half_rn(
+                __half2float(state[state_index]) * decay);
+            state[state_index] = decayed;
+            memory = fmaf(__half2float(decayed),
+                          key[qk_base + key_index] * k_inverse,
+                          memory);
+        }
+
+        const float delta = (value[value_offset] - memory)
+            * beta[token * heads + head];
+        float result = 0.0f;
+#pragma unroll 1
+        for (unsigned key_index = 0u; key_index < 128u; ++key_index) {
+            const unsigned state_index = state_head_base
+                + key_index * value_dim + value_index;
+            const __half updated = __float2half_rn(
+                __half2float(state[state_index])
+                + key[qk_base + key_index] * k_inverse * delta);
+            state[state_index] = updated;
+            result = fmaf(__half2float(updated),
+                          query[qk_base + key_index] * q_inverse * query_scale,
+                          result);
+        }
+        output[value_offset] = result;
+    }
+}
+
 // Qwen's width-4 depthwise causal convolution. Each channel owns an
 // independent FP16 history and FP16 weight row; input/output arithmetic and
 // fused SiLU stay f32. The exact frozen production geometry is validated by
