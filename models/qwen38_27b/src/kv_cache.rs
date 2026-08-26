@@ -305,6 +305,15 @@ pub struct KvCacheUpdate {
     pub demoted_pages: Vec<usize>,
 }
 
+/// Constant-size rollback marker for an append-only speculative KV branch.
+/// It is valid only when the branch suppresses page demotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PagedKvAppendCheckpoint {
+    tokens: usize,
+    pages: usize,
+    last_page_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct KvPageView<'a> {
     pub page_index: usize,
@@ -366,6 +375,21 @@ impl PagedKvCache {
     }
 
     pub fn push(&mut self, key: &[f32], value: &[f32]) -> Result<KvCacheUpdate> {
+        self.push_internal(key, value, true)
+    }
+
+    /// Append while retaining all existing Q4 pages. A bounded speculative
+    /// branch uses this so rollback needs only truncate appended bytes and
+    /// metadata; no pre-branch packed page can be demoted or overwritten.
+    pub(crate) fn push_retaining_q4(
+        &mut self,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<KvCacheUpdate> {
+        self.push_internal(key, value, false)
+    }
+
+    fn push_internal(&mut self, key: &[f32], value: &[f32], demote: bool) -> Result<KvCacheUpdate> {
         if self.tokens >= self.maximum_tokens
             || key.len() != self.component_values
             || value.len() != self.component_values
@@ -394,8 +418,42 @@ impl PagedKvCache {
         Ok(KvCacheUpdate {
             page_index,
             token_in_page,
-            demoted_pages: self.demote_old_pages()?,
+            demoted_pages: if demote {
+                self.demote_old_pages()?
+            } else {
+                Vec::new()
+            },
         })
+    }
+
+    pub(crate) fn append_checkpoint(&self) -> PagedKvAppendCheckpoint {
+        PagedKvAppendCheckpoint {
+            tokens: self.tokens,
+            pages: self.pages.len(),
+            last_page_bytes: self.pages.last().map_or(0, |page| page.bytes.len()),
+        }
+    }
+
+    pub(crate) fn restore_append_checkpoint(
+        &mut self,
+        checkpoint: PagedKvAppendCheckpoint,
+    ) -> Result<()> {
+        if checkpoint.tokens > self.tokens
+            || checkpoint.pages > self.pages.len()
+            || (checkpoint.pages == 0 && checkpoint.last_page_bytes != 0)
+            || (checkpoint.pages > 0
+                && checkpoint.last_page_bytes > self.pages[checkpoint.pages - 1].bytes.len())
+        {
+            return Err(EngineError::InvalidState(
+                "paged KV append checkpoint is not a prefix of current state".into(),
+            ));
+        }
+        self.pages.truncate(checkpoint.pages);
+        if let Some(last) = self.pages.last_mut() {
+            last.bytes.truncate(checkpoint.last_page_bytes);
+        }
+        self.tokens = checkpoint.tokens;
+        Ok(())
     }
 
     fn demote_old_pages(&mut self) -> Result<Vec<usize>> {
@@ -473,6 +531,14 @@ impl PagedKvCache {
         self.pages
             .iter()
             .filter(|page| page.precision == KvPrecision::Q4)
+            .map(QuantizedKvPage::tokens)
+            .sum()
+    }
+
+    pub fn q2_tokens(&self) -> usize {
+        self.pages
+            .iter()
+            .filter(|page| page.precision == KvPrecision::Q2)
             .map(QuantizedKvPage::tokens)
             .sum()
     }
@@ -605,6 +671,46 @@ mod tests {
         assert_eq!(cache.tokens(), 0);
         assert_eq!(cache.packed_bytes(), 0);
         assert_eq!(cache.allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn speculative_append_checkpoint_restores_without_page_copy_or_demotion() {
+        let mut cache = PagedKvCache::new(16, 64, 4, 4, 4).unwrap();
+        for token in 0..10 {
+            cache
+                .push(&[token as f32; 64], &[-(token as f32); 64])
+                .unwrap();
+        }
+        let checkpoint = cache.append_checkpoint();
+        let packed_before = cache.packed_bytes();
+        let pages_before = cache
+            .page_views()
+            .map(|page| (page.tokens, page.precision, page.bytes.to_vec()))
+            .collect::<Vec<_>>();
+        for token in 10..14 {
+            let update = cache
+                .push_retaining_q4(&[token as f32; 64], &[-(token as f32); 64])
+                .unwrap();
+            assert!(update.demoted_pages.is_empty());
+        }
+        assert_eq!(cache.tokens(), 14);
+        cache.restore_append_checkpoint(checkpoint).unwrap();
+        assert_eq!(cache.tokens(), 10);
+        assert_eq!(cache.packed_bytes(), packed_before);
+        assert_eq!(
+            cache
+                .page_views()
+                .map(|page| (page.tokens, page.precision, page.bytes.to_vec()))
+                .collect::<Vec<_>>(),
+            pages_before
+        );
+        assert!(cache
+            .restore_append_checkpoint(PagedKvAppendCheckpoint {
+                tokens: 11,
+                pages: 4,
+                last_page_bytes: usize::MAX,
+            })
+            .is_err());
     }
 
     #[test]

@@ -32,7 +32,7 @@ use super::metal_graph::{MetalDecodeBufferBinding, MetalDecodeWorkspacePlan};
 use super::metal_schedule::MetalBufferSlot;
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
-use crate::kv_cache::{KvPrecision, PagedKvCache};
+use crate::kv_cache::{KvPrecision, PagedKvAppendCheckpoint, PagedKvCache};
 use crate::loader::{FloatTensorView, ModelArtifact, RecoveredMatrixView};
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Result};
@@ -438,6 +438,13 @@ pub struct PreparedMetalPagedGqa {
     packed_device_bytes: usize,
     transient_bytes: usize,
     poisoned: bool,
+    speculative_checkpoint: Option<MetalPagedGqaCheckpoint>,
+}
+
+struct MetalPagedGqaCheckpoint {
+    cache: PagedKvAppendCheckpoint,
+    page_to_q4_slot: Vec<Option<usize>>,
+    free_q4_slots: Vec<usize>,
 }
 
 impl PreparedMetalMatVec {
@@ -911,6 +918,56 @@ impl PreparedMetalPagedGqa {
         self.cache.packed_bytes()
     }
 
+    /// Begin an append-only branch without copying the Q2/Q4 device arenas.
+    /// The extra retained Q4 boundary slot guarantees that a four-token MTP
+    /// branch cannot overwrite pre-branch packed pages.
+    pub fn begin_speculative(&mut self) -> Result<()> {
+        if self.poisoned || self.speculative_checkpoint.is_some() {
+            return Err(EngineError::InvalidState(
+                "Metal paged GQA checkpoint requires healthy state without an active branch".into(),
+            ));
+        }
+        if self.free_q4_slots.is_empty() {
+            return Err(EngineError::MemoryBudget(
+                "Metal paged GQA has no retained Q4 boundary slot for speculation".into(),
+            ));
+        }
+        self.speculative_checkpoint = Some(MetalPagedGqaCheckpoint {
+            cache: self.cache.append_checkpoint(),
+            page_to_q4_slot: self.page_to_q4_slot.clone(),
+            free_q4_slots: self.free_q4_slots.clone(),
+        });
+        Ok(())
+    }
+
+    pub fn restore_speculative(&mut self) -> Result<()> {
+        let checkpoint = self.speculative_checkpoint.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("Metal paged GQA has no speculative checkpoint".into())
+        })?;
+        self.cache.restore_append_checkpoint(checkpoint.cache)?;
+        self.page_to_q4_slot = checkpoint.page_to_q4_slot.clone();
+        self.free_q4_slots = checkpoint.free_q4_slots.clone();
+        write_metal_paged_gqa_descriptors(self)?;
+        write_metal_paged_gqa_params(self)?;
+        self.speculative_checkpoint = None;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn commit_speculative(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(EngineError::InvalidState(
+                "Metal paged GQA cannot commit a poisoned speculative branch".into(),
+            ));
+        }
+        if self.speculative_checkpoint.take().is_none() {
+            return Err(EngineError::InvalidState(
+                "Metal paged GQA has no speculative checkpoint".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.cache.reset();
         self.page_to_q4_slot.fill(None);
@@ -931,6 +988,7 @@ impl PreparedMetalPagedGqa {
         );
         zero_buffer(&self.params_buffer, MetalPagedGqaParams::BYTE_LEN);
         self.poisoned = false;
+        self.speculative_checkpoint = None;
     }
 }
 
@@ -986,9 +1044,9 @@ impl PreparedMetalGatedDelta {
     }
 
     pub fn commit_speculative(&mut self) -> Result<()> {
-        if !self.checkpoint_valid {
+        if self.poisoned || !self.checkpoint_valid {
             return Err(EngineError::InvalidState(
-                "Metal gated-delta has no speculative checkpoint".into(),
+                "Metal gated-delta cannot commit a poisoned or absent speculative branch".into(),
             ));
         }
         self.checkpoint_valid = false;
@@ -1119,9 +1177,9 @@ impl PreparedMappedMetalCausalConv {
     }
 
     pub fn commit_speculative(&mut self) -> Result<()> {
-        if !self.checkpoint_valid {
+        if self.poisoned || !self.checkpoint_valid {
             return Err(EngineError::InvalidState(
-                "Metal convolution has no speculative checkpoint".into(),
+                "Metal convolution cannot commit a poisoned or absent speculative branch".into(),
             ));
         }
         self.checkpoint_valid = false;
@@ -2655,6 +2713,7 @@ impl MetalCandidateRuntime {
             packed_device_bytes,
             transient_bytes,
             poisoned: false,
+            speculative_checkpoint: None,
         })
     }
 
@@ -3725,7 +3784,11 @@ impl MetalCandidateRuntime {
         key: &[f32],
         value: &[f32],
     ) -> Result<Vec<f32>> {
-        let update = prepared.cache.push(key, value)?;
+        let update = if prepared.speculative_checkpoint.is_some() {
+            prepared.cache.push_retaining_q4(key, value)?
+        } else {
+            prepared.cache.push(key, value)?
+        };
 
         for page_index in update.demoted_pages {
             let page = metal_kv_page_snapshot(&prepared.cache, page_index)?;
@@ -3782,36 +3845,7 @@ impl MetalCandidateRuntime {
             prepared.q4_arena_bytes(),
         )?;
 
-        let mut descriptor_words = Vec::with_capacity(
-            prepared.cache.page_views().len() * (METAL_PAGED_KV_DESCRIPTOR_BYTES / 4),
-        );
-        for page in prepared.cache.page_views() {
-            let (precision, slot) = match page.precision {
-                KvPrecision::Q2 => (0_u32, page.page_index),
-                KvPrecision::Q4 => (
-                    1_u32,
-                    prepared.page_to_q4_slot[page.page_index].ok_or_else(|| {
-                        EngineError::InvalidState("Metal Q4 page has no arena slot".into())
-                    })?,
-                ),
-            };
-            descriptor_words.extend_from_slice(&[
-                precision,
-                u32::try_from(slot)
-                    .map_err(|_| EngineError::Shape("Metal KV slot exceeds u32".into()))?,
-                u32::try_from(page.tokens)
-                    .map_err(|_| EngineError::Shape("Metal KV page tokens exceed u32".into()))?,
-                u32::try_from(page.first_token)
-                    .map_err(|_| EngineError::Shape("Metal KV token index exceeds u32".into()))?,
-            ]);
-        }
-        let descriptor_bytes = as_bytes(&descriptor_words);
-        write_buffer_range(
-            &prepared.descriptors_buffer,
-            0,
-            descriptor_bytes,
-            prepared.page_to_q4_slot.len() * METAL_PAGED_KV_DESCRIPTOR_BYTES,
-        )?;
+        write_metal_paged_gqa_descriptors(prepared)?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 query.as_ptr(),
@@ -3819,32 +3853,7 @@ impl MetalCandidateRuntime {
                 query.len(),
             );
         }
-        let page_count = prepared.cache.page_views().len();
-        let combined_values = prepared
-            .key_value_heads
-            .checked_mul(prepared.head_dim)
-            .and_then(|values| values.checked_mul(2))
-            .ok_or_else(|| EngineError::Shape("Metal combined KV width overflows".into()))?;
-        let params = MetalPagedGqaParams {
-            query_heads: usize_to_u32(prepared.query_heads, "Metal GQA query heads")?,
-            key_value_heads: usize_to_u32(prepared.key_value_heads, "Metal GQA KV heads")?,
-            head_dim: usize_to_u32(prepared.head_dim, "Metal GQA head dimension")?,
-            tokens: usize_to_u32(prepared.cache.tokens(), "Metal GQA token count")?,
-            page_tokens: usize_to_u32(prepared.page_tokens, "Metal GQA page tokens")?,
-            page_count: usize_to_u32(page_count, "Metal GQA page count")?,
-            combined_values: usize_to_u32(combined_values, "Metal combined KV width")?,
-            q2_token_bytes: usize_to_u32(prepared.q2_token_bytes, "Metal Q2 token bytes")?,
-            q4_token_bytes: usize_to_u32(prepared.q4_token_bytes, "Metal Q4 token bytes")?,
-            q2_page_bytes: usize_to_u32(prepared.q2_page_bytes, "Metal Q2 page bytes")?,
-            q4_page_bytes: usize_to_u32(prepared.q4_page_bytes, "Metal Q4 page bytes")?,
-            scale: 1.0 / (prepared.head_dim as f32).sqrt(),
-        };
-        write_buffer_range(
-            &prepared.params_buffer,
-            0,
-            &params.encode(),
-            MetalPagedGqaParams::BYTE_LEN,
-        )?;
+        write_metal_paged_gqa_params(prepared)?;
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-paged-q2q4-gqa-verifier");
@@ -4679,6 +4688,72 @@ fn buffer_with_data(device: &Device, bytes: &[u8]) -> metal_driver::Buffer {
 struct MetalKvPageSnapshot {
     precision: KvPrecision,
     bytes: Vec<u8>,
+}
+
+fn write_metal_paged_gqa_descriptors(prepared: &PreparedMetalPagedGqa) -> Result<()> {
+    let capacity = prepared
+        .page_to_q4_slot
+        .len()
+        .checked_mul(METAL_PAGED_KV_DESCRIPTOR_BYTES)
+        .ok_or_else(|| EngineError::MemoryBudget("Metal KV descriptors overflow".into()))?;
+    let mut descriptor_words = Vec::with_capacity(
+        prepared.cache.page_views().len() * (METAL_PAGED_KV_DESCRIPTOR_BYTES / 4),
+    );
+    for page in prepared.cache.page_views() {
+        let (precision, slot) = match page.precision {
+            KvPrecision::Q2 => (0_u32, page.page_index),
+            KvPrecision::Q4 => (
+                1_u32,
+                prepared.page_to_q4_slot[page.page_index].ok_or_else(|| {
+                    EngineError::InvalidState("Metal Q4 page has no arena slot".into())
+                })?,
+            ),
+        };
+        descriptor_words.extend_from_slice(&[
+            precision,
+            u32::try_from(slot)
+                .map_err(|_| EngineError::Shape("Metal KV slot exceeds u32".into()))?,
+            u32::try_from(page.tokens)
+                .map_err(|_| EngineError::Shape("Metal KV page tokens exceed u32".into()))?,
+            u32::try_from(page.first_token)
+                .map_err(|_| EngineError::Shape("Metal KV token index exceeds u32".into()))?,
+        ]);
+    }
+    zero_buffer(&prepared.descriptors_buffer, capacity);
+    write_buffer_range(
+        &prepared.descriptors_buffer,
+        0,
+        as_bytes(&descriptor_words),
+        capacity,
+    )
+}
+
+fn write_metal_paged_gqa_params(prepared: &PreparedMetalPagedGqa) -> Result<()> {
+    let combined_values = prepared
+        .key_value_heads
+        .checked_mul(prepared.head_dim)
+        .and_then(|values| values.checked_mul(2))
+        .ok_or_else(|| EngineError::Shape("Metal combined KV width overflows".into()))?;
+    let params = MetalPagedGqaParams {
+        query_heads: usize_to_u32(prepared.query_heads, "Metal GQA query heads")?,
+        key_value_heads: usize_to_u32(prepared.key_value_heads, "Metal GQA KV heads")?,
+        head_dim: usize_to_u32(prepared.head_dim, "Metal GQA head dimension")?,
+        tokens: usize_to_u32(prepared.cache.tokens(), "Metal GQA token count")?,
+        page_tokens: usize_to_u32(prepared.page_tokens, "Metal GQA page tokens")?,
+        page_count: usize_to_u32(prepared.cache.page_views().len(), "Metal GQA page count")?,
+        combined_values: usize_to_u32(combined_values, "Metal combined KV width")?,
+        q2_token_bytes: usize_to_u32(prepared.q2_token_bytes, "Metal Q2 token bytes")?,
+        q4_token_bytes: usize_to_u32(prepared.q4_token_bytes, "Metal Q4 token bytes")?,
+        q2_page_bytes: usize_to_u32(prepared.q2_page_bytes, "Metal Q2 page bytes")?,
+        q4_page_bytes: usize_to_u32(prepared.q4_page_bytes, "Metal Q4 page bytes")?,
+        scale: 1.0 / (prepared.head_dim as f32).sqrt(),
+    };
+    write_buffer_range(
+        &prepared.params_buffer,
+        0,
+        &params.encode(),
+        MetalPagedGqaParams::BYTE_LEN,
+    )
 }
 
 fn metal_kv_page_snapshot(cache: &PagedKvCache, page_index: usize) -> Result<MetalKvPageSnapshot> {
@@ -6248,6 +6323,103 @@ mod tests {
             .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
             .expect("reuse reset paged GQA");
         assert!(output.iter().all(|actual| (*actual - 0.3).abs() < 0.02));
+    }
+
+    #[test]
+    fn paged_gqa_speculative_branch_restores_without_full_arena_copy() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let query_heads = 4;
+        let key_value_heads = 2;
+        let head_dim = 64;
+        let mut prepared = runtime
+            .prepare_paged_gqa_decode(MetalPagedGqaConfig {
+                query_heads,
+                key_value_heads,
+                head_dim,
+                maximum_tokens: 16,
+                page_tokens: 4,
+                sink_tokens: 4,
+                recent_tokens: 4,
+            })
+            .expect("prepare speculative paged GQA");
+
+        for token in 0..8 {
+            let query = vec![0.01 * (token + 1) as f32; query_heads * head_dim];
+            let key = vec![0.02 * (token + 1) as f32; key_value_heads * head_dim];
+            let value = vec![-0.015 * (token + 1) as f32; key_value_heads * head_dim];
+            runtime
+                .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
+                .expect("build committed KV prefix");
+        }
+        assert_eq!(prepared.tokens(), 8);
+        assert_eq!(prepared.free_q4_slots.len(), 1);
+        let committed_pages = prepared
+            .cache
+            .page_views()
+            .map(|page| (page.tokens, page.precision, page.bytes.to_vec()))
+            .collect::<Vec<_>>();
+
+        prepared
+            .begin_speculative()
+            .expect("begin bounded KV branch");
+        assert!(prepared.begin_speculative().is_err());
+        let mut first_branch = Vec::new();
+        for token in 8..12 {
+            let query = vec![0.01 * (token + 1) as f32; query_heads * head_dim];
+            let key = vec![0.02 * (token + 1) as f32; key_value_heads * head_dim];
+            let value = vec![-0.015 * (token + 1) as f32; key_value_heads * head_dim];
+            first_branch.push(
+                runtime
+                    .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
+                    .expect("advance speculative KV branch"),
+            );
+        }
+        assert_eq!(prepared.tokens(), 12);
+        assert_eq!(prepared.free_q4_slots.len(), 0);
+        prepared
+            .restore_speculative()
+            .expect("restore bounded KV metadata");
+        assert_eq!(prepared.tokens(), 8);
+        assert_eq!(prepared.free_q4_slots.len(), 1);
+        assert_eq!(
+            prepared
+                .cache
+                .page_views()
+                .map(|page| (page.tokens, page.precision, page.bytes.to_vec()))
+                .collect::<Vec<_>>(),
+            committed_pages
+        );
+        assert!(prepared.restore_speculative().is_err());
+
+        prepared
+            .begin_speculative()
+            .expect("begin replayed KV branch");
+        let mut replayed_branch = Vec::new();
+        for token in 8..12 {
+            let query = vec![0.01 * (token + 1) as f32; query_heads * head_dim];
+            let key = vec![0.02 * (token + 1) as f32; key_value_heads * head_dim];
+            let value = vec![-0.015 * (token + 1) as f32; key_value_heads * head_dim];
+            replayed_branch.push(
+                runtime
+                    .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
+                    .expect("replay speculative KV branch"),
+            );
+        }
+        assert_eq!(replayed_branch, first_branch);
+        prepared
+            .commit_speculative()
+            .expect("commit replayed KV branch");
+        assert_eq!(prepared.tokens(), 12);
+        assert!(prepared.commit_speculative().is_err());
+
+        let query = vec![0.13; query_heads * head_dim];
+        let key = vec![0.26; key_value_heads * head_dim];
+        let value = vec![-0.195; key_value_heads * head_dim];
+        runtime
+            .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
+            .expect("resume ordinary KV demotion after commit");
+        assert_eq!(prepared.tokens(), 13);
+        assert_eq!(prepared.cache.q2_tokens(), 4);
     }
 
     #[test]

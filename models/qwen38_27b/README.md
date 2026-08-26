@@ -220,8 +220,12 @@ is single-use and fail-closed across snapshot/restore/commit, providing the
 target-hidden primitive needed by MTP replay. FP16 causal-convolution and
 GatedDelta state owners now have the same device-only snapshot/restore/commit
 lifecycle and account one checkpoint equal to their active-state bytes. Paged
-KV rollback and graph-wide all-or-nothing orchestration remain required before
-the complete speculative branch is safe.
+KV now uses a constant-size append marker plus small page-slot metadata: an
+active four-token branch suppresses Q4 demotion and consumes the already
+budgeted boundary slot, so restore never copies the full Q2/Q4 arenas. Metal
+replay reproduces the original branch outputs exactly. Graph-wide all-or-
+nothing orchestration across every attention/linear owner remains required
+before the complete speculative branch is safe.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

@@ -59,12 +59,22 @@ The checkpoint becomes active only after a completed blit, is consumed by
 restore or explicit commit, and rejects width mismatches and repeated lifecycle
 operations. The verifier proves restore and commit semantics on the target
 hidden-width slot. This covers the target-hidden replay primitive only: paged
-KV metadata/pages plus the graph-level transaction still need to be completed
-before speculative MTP can be claimed. Individual FP16 causal-convolution and
-GatedDelta owners now also allocate one same-sized device checkpoint and expose
-fail-closed begin/restore/commit operations. Their Apple-device verifiers prove
-that a speculative state advance restores bit-exactly, while commit preserves
-the advance; no state payload crosses the host.
+KV and the graph-level transaction were still required at that point.
+Individual FP16 causal-convolution and GatedDelta owners now also allocate one
+same-sized device checkpoint and expose fail-closed begin/restore/commit
+operations. Their Apple-device verifiers prove that a speculative state
+advance restores bit-exactly, while commit preserves the advance; no state
+payload crosses the host.
+
+Paged GQA now has a bounded append-only transaction as well. Begin records a
+constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
+active, appends retain all pre-branch Q4 pages and use the memory-plan boundary
+slot, so no referenced packed page is demoted or overwritten. Restore
+truncates appended mirror bytes, restores descriptor/parameter metadata, and
+leaves unreferenced device bytes harmless; it never snapshots the Q2/Q4
+arenas. A four-token branch restores to the exact eight-token prefix and its
+replay produces bit-identical Metal attention outputs. The CPU packed mirror
+is still verifier-only and remains a promotion blocker.
 
 ## Entry points
 
@@ -391,8 +401,8 @@ dequantization array before this source was accepted.
   path has controlled performance evidence. The MTP block and sampling do not
   exist yet. A deterministic shared decode arena and its single Metal buffer
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
-  available, but per-step encoder binding, the prefill arena, transactional KV,
-  graph-wide atomic orchestration, and complete model-graph execution remain
-  unfinished.
+  available together with bounded paged-KV rollback, but per-step encoder
+  binding, the prefill arena, graph-wide atomic orchestration, removal of the
+  verifier CPU KV mirror, and complete model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.
