@@ -31,6 +31,27 @@
     "mmq_maximum_absolute_error": 0.000014305115,
     "baseline_mmq_maximum_absolute_delta": 0.0000038146973
   },
+  "shared_projection_arena": {
+    "commit": "673a7f0",
+    "physical_gpu": 2,
+    "source_sha256": "04642eaa2534b0d735974e2900d2cfb27da909b0aaa648239a500767a2868c9d",
+    "cubin_sha256": "f307b892a38c15724cc03bc702bcce2d2a5772dfd2650fc154c1f6955281afe2",
+    "dtype": "mixed_q2_q4_b64",
+    "rows": 257,
+    "columns": 512,
+    "workspace_column_capacity": 1024,
+    "batch_rows": 17,
+    "arena_workspace_bytes": 36176,
+    "mmq_arena_maximum_absolute_delta": 0.0,
+    "mmq_arena_maximum_relative_delta": 0.0,
+    "allocation_contract": {
+      "qwen_chunk_tokens": 512,
+      "qwen_activation_columns": 17408,
+      "qwen_output_slot_rows": [17408, 17408, 1024, 48],
+      "qwen_projection_arena_bytes": 82968576,
+      "qwen_attention_plus_projection_bytes": 146014208
+    }
+  },
   "representative_qwen_ffn_projection": {
     "rows": 17408,
     "columns": 5120,

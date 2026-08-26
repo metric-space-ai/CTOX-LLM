@@ -297,8 +297,11 @@ owners, so enabling a 512-token chunk does not duplicate model weights. The
 frozen projection arena now proves that all 504 chunk-wide target/MTP matrices
 fit four conflict-free output slots plus one maximum-width A8 encoding slot:
 82,968,576 planned bytes at 512 tokens. The 248,320-row LM head remains outside
-that arena because prefill consumes only its final prompt row. Allocating this
-arena and binding its offset views to the MMQ dispatcher remain open. The
+that arena because prefill consumes only its final prompt row. The graph now
+allocates this arena once and binds compact offset views to the MMQ dispatcher;
+a mixed-Q2/Q4 A4500 run using a workspace twice as wide as the active matrix is
+bit-identical to the established MMQ graph path. Executor schedule wiring
+remains open. The
 standalone MMQ verifier exercises this same graph-facing path and the shared
 two-buffer batched RMSNorm workspace. The first causal-convolution scan now
 matches sequential CUDA output and final FP16 state bit-for-bit across a
