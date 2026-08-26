@@ -289,9 +289,11 @@ two-buffer batched RMSNorm workspace. The first causal-convolution scan now
 matches sequential CUDA output and final FP16 state bit-for-bit across a
 17-token hardware fixture. The upstream-structured GatedDelta scan likewise
 matches 11 sequential CUDA launches bit-for-bit for every output and the final
-FP16 recurrent state, while keeping one persistent state owner. Batched
-GatedDelta input preparation, paged GQA prefill, and executor replacement of
-the current sequential loop remain open.
+FP16 recurrent state, while keeping one persistent state owner. Its batched
+Qwen input preparation now expands compact Q/K, copies V, and transforms raw
+A/B in one launch while sharing the immutable A_log/dt_bias allocation. Paged
+GQA prefill and executor replacement of the current sequential loop remain
+open.
 
 An isolated mixed-Q2/Q4 split-KV attention candidate now covers the five
 causal tail queries used by MTP4 verification. Sixteen KV segments expose

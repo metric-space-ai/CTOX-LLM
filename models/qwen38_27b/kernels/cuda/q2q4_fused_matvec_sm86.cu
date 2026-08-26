@@ -782,6 +782,62 @@ void ctox_qwen_gated_delta_prepare_f32_sm86(
     }
 }
 
+// Token-major form of the exact Qwen preparation above. Immutable A_log and
+// dt_bias remain shared model parameters; only bounded chunk outputs scale
+// with `tokens`. The flattened traversal preserves each single-token formula
+// exactly and removes one host launch per prompt token.
+// This remains verifier-only until the complete prefill graph and latency
+// gates promote it.
+// ref: ggml/src/ggml-cuda/gated_delta_net.cu:36-90
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_qwen_gated_delta_prepare_scan_f32_sm86(
+    const float* __restrict__ convolved_qkv,
+    const float* __restrict__ raw_a,
+    const float* __restrict__ raw_b,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ log_decay,
+    float* __restrict__ beta,
+    unsigned tokens,
+    unsigned key_heads,
+    unsigned value_heads,
+    unsigned key_dim) {
+    const unsigned output_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tokens == 0u || key_heads != 16u || value_heads != 48u
+        || key_dim != 128u) {
+        return;
+    }
+    const unsigned compact_values = key_heads * key_dim;
+    const unsigned qk_values = value_heads * key_dim;
+    const unsigned value_values = value_heads * key_dim;
+    const unsigned convolved_values = compact_values * 2u + value_values;
+    const unsigned total_qk_values = tokens * qk_values;
+    if (output_index < total_qk_values) {
+        const unsigned token = output_index / qk_values;
+        const unsigned local_output = output_index - token * qk_values;
+        const unsigned output_head = local_output / key_dim;
+        const unsigned column = local_output - output_head * key_dim;
+        const unsigned source_head = output_head / (value_heads / key_heads);
+        const unsigned source_index = token * convolved_values
+            + source_head * key_dim + column;
+        query[output_index] = convolved_qkv[source_index];
+        key[output_index] = convolved_qkv[compact_values + source_index];
+        value[output_index] = convolved_qkv[
+            token * convolved_values + compact_values * 2u + local_output];
+    }
+    const unsigned total_head_values = tokens * value_heads;
+    if (output_index < total_head_values) {
+        const unsigned head = output_index % value_heads;
+        const float a = raw_a[output_index] + dt_bias[head];
+        const float softplus = a > 20.0f ? a : log1pf(expf(a));
+        log_decay[output_index] = -expf(a_log[head]) * softplus;
+        beta[output_index] = 1.0f / (1.0f + expf(-raw_b[output_index]));
+    }
+}
+
 // Single-token Qwen GatedDeltaNet recurrence with persistent FP16 state.
 // This verifier candidate preserves the pinned upstream organization (one
 // block per value head, register-local column updates, warp reductions) while

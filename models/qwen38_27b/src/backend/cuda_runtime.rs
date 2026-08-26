@@ -22,13 +22,14 @@ use super::cuda::{
     A8_BATCHED_QUANTIZE_SYMBOL, A8_QUANTIZE_SYMBOL, ARGMAX_F32_SYMBOL, CAUSAL_CONV_F16_SYMBOL,
     CAUSAL_CONV_SCAN_F16_SYMBOL, CUDA_SAMPLER_MAX_TOP_K, DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
     GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS, GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS,
-    GATED_DELTA_PREP_F32_SYMBOL, GATED_DELTA_SCAN_F16_SYMBOL, GATED_DELTA_STATE_BYTES,
-    GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS, GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS,
-    LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH, LINEAR_CONV_STATE_BYTES,
-    PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES, PAGED_GQA_PARAMS_BYTES,
-    PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, PAGED_GQA_SPLIT_SEGMENTS, PAGED_Q2Q4_GQA_F32_SYMBOL,
-    PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL,
-    PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_BATCHED_MMQ_SYMBOL,
+    GATED_DELTA_PREP_F32_SYMBOL, GATED_DELTA_PREP_SCAN_F32_SYMBOL, GATED_DELTA_SCAN_F16_SYMBOL,
+    GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
+    GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
+    LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES,
+    PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, PAGED_GQA_SPLIT_SEGMENTS,
+    PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL,
+    PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL,
+    Q2_B64_A8_BATCHED_MATMUL_SYMBOL, Q2_B64_A8_BATCHED_MMQ_SYMBOL,
     Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL, Q2_B64_FUSED_MATVEC,
     Q2_B64_RECOVERED_ROW_SYMBOL, Q4_B64_A8_BATCHED_MATMUL_SYMBOL, Q4_B64_A8_BATCHED_MMQ_SYMBOL,
     Q4_B64_A8_GATHERED_MATVEC_SYMBOL, Q4_B64_A8_MATVEC_SYMBOL, Q4_B64_FUSED_MATVEC,
@@ -226,6 +227,7 @@ struct CudaContextInner {
     q2_recovered_row_function: CuFunction,
     q4_recovered_row_function: CuFunction,
     gated_delta_prep_f32_function: CuFunction,
+    gated_delta_prep_scan_f32_function: CuFunction,
     gated_delta_f16_function: CuFunction,
     gated_delta_scan_f16_function: CuFunction,
     causal_conv_f16_function: CuFunction,
@@ -668,9 +670,30 @@ pub struct PreparedCudaGatedDeltaInputs {
     transient_bytes: usize,
 }
 
+/// Bounded token-major Q/K and decay/beta workspace sharing the immutable
+/// parameters owned by [`PreparedCudaGatedDeltaInputs`].
+pub struct PreparedCudaGatedDeltaScanInputs {
+    context: Rc<CudaContextInner>,
+    token_capacity: u32,
+    query: DeviceBuffer,
+    key: DeviceBuffer,
+    value: DeviceBuffer,
+    log_decay: DeviceBuffer,
+    beta: DeviceBuffer,
+    transient_bytes: usize,
+}
+
 pub struct CudaGatedDeltaInputViews<'a> {
     pub query: CudaDeviceF32View<'a>,
     pub key: CudaDeviceF32View<'a>,
+    pub log_decay: CudaDeviceF32View<'a>,
+    pub beta: CudaDeviceF32View<'a>,
+}
+
+pub struct CudaGatedDeltaScanInputViews<'a> {
+    pub query: CudaDeviceF32View<'a>,
+    pub key: CudaDeviceF32View<'a>,
+    pub value: CudaDeviceF32View<'a>,
     pub log_decay: CudaDeviceF32View<'a>,
     pub beta: CudaDeviceF32View<'a>,
 }
@@ -1157,6 +1180,17 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let gated_delta_prep_scan_f32_function =
+            match resolve_function(&driver, module, GATED_DELTA_PREP_SCAN_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let gated_delta_f16_function =
             match resolve_function(&driver, module, GATED_DELTA_F16_SYMBOL) {
                 Ok(function) => function,
@@ -1354,6 +1388,7 @@ impl CudaCandidateRuntime {
                 q2_recovered_row_function,
                 q4_recovered_row_function,
                 gated_delta_prep_f32_function,
+                gated_delta_prep_scan_f32_function,
                 gated_delta_f16_function,
                 gated_delta_scan_f16_function,
                 causal_conv_f16_function,
@@ -2005,6 +2040,174 @@ impl CudaCandidateRuntime {
             key: prepared.key.f32_view(0, qk_values)?,
             log_decay: prepared.log_decay.f32_view(0, GATED_DELTA_HEADS)?,
             beta: prepared.beta.f32_view(0, GATED_DELTA_HEADS)?,
+        })
+    }
+
+    pub fn prepare_gated_delta_scan_inputs(
+        &self,
+        token_capacity: usize,
+    ) -> Result<PreparedCudaGatedDeltaScanInputs> {
+        let token_capacity = validate_a8_batch_capacity(token_capacity)?;
+        let qk_values = (token_capacity as usize)
+            .checked_mul(GATED_DELTA_HEADS)
+            .and_then(|values| values.checked_mul(GATED_DELTA_KEY_DIM))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA gated-delta scan Q/K capacity overflows".into())
+            })?;
+        let head_values = (token_capacity as usize)
+            .checked_mul(GATED_DELTA_HEADS)
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA gated-delta scan head capacity overflows".into())
+            })?;
+        let qk_bytes = qk_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA gated-delta scan Q/K bytes overflow".into())
+            })?;
+        let head_bytes = head_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA gated-delta scan head bytes overflow".into())
+            })?;
+        let transient_bytes = qk_bytes
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(head_bytes.checked_mul(2)?))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("CUDA gated-delta scan workspace overflows".into())
+            })?;
+        self.make_current()?;
+        Ok(PreparedCudaGatedDeltaScanInputs {
+            context: Rc::clone(&self.inner),
+            token_capacity,
+            query: DeviceBuffer::allocate(self, qk_bytes)?,
+            key: DeviceBuffer::allocate(self, qk_bytes)?,
+            value: DeviceBuffer::allocate(self, qk_bytes)?,
+            log_decay: DeviceBuffer::allocate(self, head_bytes)?,
+            beta: DeviceBuffer::allocate(self, head_bytes)?,
+            transient_bytes,
+        })
+    }
+
+    /// Prepares all Qwen-specific GatedDelta chunk inputs in one flattened
+    /// device launch while sharing the immutable A_log/dt_bias allocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_gated_delta_scan_inputs_device<'a>(
+        &self,
+        prepared: &PreparedCudaGatedDeltaInputs,
+        workspace: &'a PreparedCudaGatedDeltaScanInputs,
+        convolved_qkv: CudaDeviceF32View<'_>,
+        raw_a: CudaDeviceF32View<'_>,
+        raw_b: CudaDeviceF32View<'_>,
+        tokens: usize,
+    ) -> Result<CudaGatedDeltaScanInputViews<'a>> {
+        let tokens = validate_a8_batch_capacity(tokens)?;
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &workspace.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA gated-delta scan preparation crosses driver contexts".into(),
+            ));
+        }
+        if tokens > workspace.token_capacity {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA gated-delta preparation requests {tokens} tokens, capacity is {}",
+                workspace.token_capacity
+            )));
+        }
+        let convolved_values = (tokens as usize)
+            .checked_mul(LINEAR_CONV_CHANNELS)
+            .ok_or_else(|| {
+                EngineError::Shape("CUDA gated-delta convolved chunk shape overflows".into())
+            })?;
+        let head_values = (tokens as usize)
+            .checked_mul(GATED_DELTA_HEADS)
+            .ok_or_else(|| {
+                EngineError::Shape("CUDA gated-delta head chunk shape overflows".into())
+            })?;
+        for (name, view, expected) in [
+            ("convolved_qkv", convolved_qkv, convolved_values),
+            ("raw_a", raw_a, head_values),
+            ("raw_b", raw_b, head_values),
+        ] {
+            if !Rc::ptr_eq(&self.inner, view.context) {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA gated-delta scan {name} belongs to another context"
+                )));
+            }
+            if view.values() != expected {
+                return Err(EngineError::Shape(format!(
+                    "CUDA gated-delta scan {name} has {} values, expected {expected}",
+                    view.values()
+                )));
+            }
+        }
+
+        self.make_current()?;
+        let mut convolved_qkv_ptr = convolved_qkv.ptr()?;
+        let mut raw_a_ptr = raw_a.ptr()?;
+        let mut raw_b_ptr = raw_b.ptr()?;
+        let mut a_log_ptr = prepared.a_log.ptr();
+        let mut dt_bias_ptr = prepared.dt_bias.ptr();
+        let mut query_ptr = workspace.query.ptr();
+        let mut key_ptr = workspace.key.ptr();
+        let mut value_ptr = workspace.value.ptr();
+        let mut log_decay_ptr = workspace.log_decay.ptr();
+        let mut beta_ptr = workspace.beta.ptr();
+        let mut token_count = tokens;
+        let mut key_heads = GATED_DELTA_KEY_HEADS as u32;
+        let mut value_heads = GATED_DELTA_HEADS as u32;
+        let mut key_dim = GATED_DELTA_KEY_DIM as u32;
+        let mut params = [
+            (&mut convolved_qkv_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut raw_a_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut raw_b_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut a_log_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut dt_bias_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut query_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut key_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut value_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut log_decay_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut beta_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut token_count as *mut u32).cast::<c_void>(),
+            (&mut key_heads as *mut u32).cast::<c_void>(),
+            (&mut value_heads as *mut u32).cast::<c_void>(),
+            (&mut key_dim as *mut u32).cast::<c_void>(),
+        ];
+        let qk_values = (tokens as usize)
+            .checked_mul(GATED_DELTA_HEADS)
+            .and_then(|values| values.checked_mul(GATED_DELTA_KEY_DIM))
+            .ok_or_else(|| {
+                EngineError::Shape("CUDA gated-delta prepared Q/K shape overflows".into())
+            })?;
+        let blocks = u32::try_from(qk_values.div_ceil(LINEAR_THREADS_PER_BLOCK as usize))
+            .map_err(|_| EngineError::Shape("CUDA gated-delta scan prep grid overflows".into()))?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.gated_delta_prep_scan_f32_function,
+                    blocks,
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "gated-delta scan input preparation kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch(
+            "gated-delta scan input preparation context synchronization",
+        )?;
+        Ok(CudaGatedDeltaScanInputViews {
+            query: workspace.query.f32_view(0, qk_values)?,
+            key: workspace.key.f32_view(0, qk_values)?,
+            value: workspace.value.f32_view(0, qk_values)?,
+            log_decay: workspace.log_decay.f32_view(0, head_values)?,
+            beta: workspace.beta.f32_view(0, head_values)?,
         })
     }
 
@@ -6835,6 +7038,16 @@ impl PreparedCudaGatedDeltaScanOutput {
 impl PreparedCudaGatedDeltaInputs {
     pub fn model_bytes(&self) -> usize {
         self.model_bytes
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+}
+
+impl PreparedCudaGatedDeltaScanInputs {
+    pub fn token_capacity(&self) -> usize {
+        self.token_capacity as usize
     }
 
     pub fn transient_bytes(&self) -> usize {

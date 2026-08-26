@@ -245,6 +245,7 @@ pub const SIGMOID_GATE_A8_QUANTIZE_PARAM_BYTES: u32 = SWIGLU_A8_QUANTIZE_PARAM_B
 pub const GATED_DELTA_F16_SYMBOL: &str = "ctox_gated_delta_recurrent_f16_sm86";
 pub const GATED_DELTA_SCAN_F16_SYMBOL: &str = "ctox_gated_delta_recurrent_scan_f16_sm86";
 pub const GATED_DELTA_PREP_F32_SYMBOL: &str = "ctox_qwen_gated_delta_prepare_f32_sm86";
+pub const GATED_DELTA_PREP_SCAN_F32_SYMBOL: &str = "ctox_qwen_gated_delta_prepare_scan_f32_sm86";
 
 /// Exact recurrent geometry in Qwen3.8-27B. Keeping it explicit prevents a
 /// successfully compiled but semantically different dynamic shape from being
@@ -448,6 +449,80 @@ pub const GATED_DELTA_PREP_F32_PARAMS: &[KernelParam] = &[
     },
 ];
 pub const GATED_DELTA_PREP_F32_PARAM_BYTES: u32 = 84;
+
+pub const GATED_DELTA_PREP_SCAN_F32_PARAMS: &[KernelParam] = &[
+    KernelParam {
+        name: "convolved_qkv",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 0,
+    },
+    KernelParam {
+        name: "raw_a",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 8,
+    },
+    KernelParam {
+        name: "raw_b",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 16,
+    },
+    KernelParam {
+        name: "a_log",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 24,
+    },
+    KernelParam {
+        name: "dt_bias",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 32,
+    },
+    KernelParam {
+        name: "query",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 40,
+    },
+    KernelParam {
+        name: "key",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 48,
+    },
+    KernelParam {
+        name: "value",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 56,
+    },
+    KernelParam {
+        name: "log_decay",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 64,
+    },
+    KernelParam {
+        name: "beta",
+        size_bytes: DEVICE_PTR_BYTES,
+        offset_bytes: 72,
+    },
+    KernelParam {
+        name: "tokens",
+        size_bytes: 4,
+        offset_bytes: 80,
+    },
+    KernelParam {
+        name: "key_heads",
+        size_bytes: 4,
+        offset_bytes: 84,
+    },
+    KernelParam {
+        name: "value_heads",
+        size_bytes: 4,
+        offset_bytes: 88,
+    },
+    KernelParam {
+        name: "key_dim",
+        size_bytes: 4,
+        offset_bytes: 92,
+    },
+];
+pub const GATED_DELTA_PREP_SCAN_F32_PARAM_BYTES: u32 = 96;
 
 /// Remaining verifier-only operators in one Qwen linear-attention block.
 // ref: ggml/src/ggml-cuda/ssm-conv.cu:1-95
@@ -1443,6 +1518,9 @@ mod tests {
         assert_eq!(GATED_DELTA_PREP_F32_PARAMS.len(), 12);
         assert_eq!(GATED_DELTA_PREP_F32_PARAMS[11].offset_bytes, 80);
         assert_eq!(GATED_DELTA_PREP_F32_PARAM_BYTES, 84);
+        assert_eq!(GATED_DELTA_PREP_SCAN_F32_PARAMS.len(), 14);
+        assert_eq!(GATED_DELTA_PREP_SCAN_F32_PARAMS[13].offset_bytes, 92);
+        assert_eq!(GATED_DELTA_PREP_SCAN_F32_PARAM_BYTES, 96);
         assert!(!SM86_MODULE_ABI
             .kernels
             .iter()
@@ -1451,6 +1529,10 @@ mod tests {
             .kernels
             .iter()
             .any(|kernel| kernel.symbol == GATED_DELTA_SCAN_F16_SYMBOL));
+        assert!(!SM86_MODULE_ABI
+            .kernels
+            .iter()
+            .any(|kernel| kernel.symbol == GATED_DELTA_PREP_SCAN_F32_SYMBOL));
         assert!(!SM86_MODULE_ABI
             .kernels
             .iter()
