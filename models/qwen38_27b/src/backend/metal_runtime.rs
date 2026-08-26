@@ -380,17 +380,18 @@ pub struct PreparedMetalGatedDelta {
     poisoned: bool,
 }
 
-/// Mmap-backed FP16 convolution weight, persistent FP16 history, and reusable
-/// f32 input/output buffers for one linear-attention layer.
+/// Mmap-backed FP16 convolution weight and persistent FP16 history for one
+/// linear-attention layer. Standalone verification owns reusable f32 I/O;
+/// graph execution binds the in-place `LinearQkv` arena view instead.
 pub struct PreparedMappedMetalCausalConv {
     channels: usize,
     kernel: usize,
     mapping: MappedMetalArtifact,
     weight_offset: u64,
-    input_buffer: Buffer,
+    input_buffer: Option<Buffer>,
     state_buffer: Buffer,
     checkpoint_buffer: Buffer,
-    output_buffer: Buffer,
+    output_buffer: Option<Buffer>,
     params_buffer: Buffer,
     resident_state_bytes: usize,
     transient_bytes: usize,
@@ -1473,10 +1474,15 @@ impl PreparedMappedMetalCausalConv {
 
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
         validate_metal_input(input, self.channels)?;
+        let input_buffer = self.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph convolution has no operation-local input buffer".into(),
+            )
+        })?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 input.as_ptr(),
-                self.input_buffer.contents().cast::<f32>(),
+                input_buffer.contents().cast::<f32>(),
                 input.len(),
             );
         }
@@ -1486,12 +1492,27 @@ impl PreparedMappedMetalCausalConv {
     pub fn reset(&mut self) {
         zero_buffer(&self.state_buffer, self.resident_state_bytes);
         zero_buffer(&self.checkpoint_buffer, self.resident_state_bytes);
-        zero_buffer(
-            &self.output_buffer,
-            self.channels * std::mem::size_of::<f32>(),
-        );
+        if let Some(output_buffer) = &self.output_buffer {
+            zero_buffer(output_buffer, self.channels * std::mem::size_of::<f32>());
+        }
         self.checkpoint_valid = false;
         self.poisoned = false;
+    }
+
+    fn owned_input(&self) -> Result<&Buffer> {
+        self.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph convolution has no operation-local input buffer".into(),
+            )
+        })
+    }
+
+    fn owned_output(&self) -> Result<&Buffer> {
+        self.output_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph convolution has no operation-local output buffer".into(),
+            )
+        })
     }
 
     pub fn verifier_read_state(&self) -> Vec<half::f16> {
@@ -3136,6 +3157,37 @@ impl MetalCandidateRuntime {
         channels: usize,
         kernel: usize,
     ) -> Result<PreparedMappedMetalCausalConv> {
+        self.prepare_mapped_causal_conv_f16_internal(mapping, weight, input, channels, kernel, true)
+    }
+
+    /// Prepare convolution weights/state for graph-owned in-place arena I/O.
+    pub fn prepare_mapped_causal_conv_f16_graph_io(
+        &self,
+        mapping: &MappedMetalArtifact,
+        weight: FloatTensorView<'_>,
+        validation_input: &[f32],
+        channels: usize,
+        kernel: usize,
+    ) -> Result<PreparedMappedMetalCausalConv> {
+        self.prepare_mapped_causal_conv_f16_internal(
+            mapping,
+            weight,
+            validation_input,
+            channels,
+            kernel,
+            false,
+        )
+    }
+
+    fn prepare_mapped_causal_conv_f16_internal(
+        &self,
+        mapping: &MappedMetalArtifact,
+        weight: FloatTensorView<'_>,
+        input: &[f32],
+        channels: usize,
+        kernel: usize,
+        own_io: bool,
+    ) -> Result<PreparedMappedMetalCausalConv> {
         if channels == 0 || kernel == 0 || kernel > 32 {
             return Err(EngineError::Shape(
                 "invalid Metal causal-convolution geometry".into(),
@@ -3175,7 +3227,7 @@ impl MetalCandidateRuntime {
             reserved1: 0,
         };
         let transient_bytes = value_bytes
-            .checked_mul(2)
+            .checked_mul(if own_io { 2 } else { 0 })
             .and_then(|bytes| bytes.checked_add(MetalCausalConvParams::BYTE_LEN))
             .ok_or_else(|| {
                 EngineError::MemoryBudget("Metal convolution transient bytes overflow".into())
@@ -3185,10 +3237,14 @@ impl MetalCandidateRuntime {
             kernel,
             mapping: mapping.clone(),
             weight_offset,
-            input_buffer: buffer_with_data(&self.device, as_bytes(input)),
+            input_buffer: own_io.then(|| buffer_with_data(&self.device, as_bytes(input))),
             state_buffer: new_zeroed_buffer(&self.device, weight_bytes_expected)?,
             checkpoint_buffer: new_zeroed_buffer(&self.device, weight_bytes_expected)?,
-            output_buffer: new_zeroed_buffer(&self.device, value_bytes)?,
+            output_buffer: if own_io {
+                Some(new_zeroed_buffer(&self.device, value_bytes)?)
+            } else {
+                None
+            },
             params_buffer: buffer_with_data(&self.device, &params.encode()),
             resident_state_bytes: weight_bytes_expected,
             transient_bytes,
@@ -4648,16 +4704,63 @@ impl MetalCandidateRuntime {
                 "Metal causal-convolution state is poisoned; reset is required".into(),
             ));
         }
+        if prepared.input_buffer.is_none() || prepared.output_buffer.is_none() {
+            return Err(EngineError::InvalidState(
+                "Metal graph convolution requires an explicit shared-arena dispatch".into(),
+            ));
+        }
         prepared.poisoned = true;
-        let thread_width = dispatch_width(&self.causal_conv_f16_pipeline, DEFAULT_SIMDGROUPS)?;
+        let input_buffer = prepared.owned_input()?;
+        let output_buffer = prepared.owned_output()?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-causal-conv-f16-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_causal_conv_between(
+            encoder,
+            prepared,
+            input_buffer,
+            0,
+            output_buffer,
+            0,
+        )?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal causal-convolution command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(output_buffer.contents().cast::<f32>(), prepared.channels)
+                .to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal causal convolution produced a non-finite output".into(),
+            ));
+        }
+        prepared.poisoned = false;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_causal_conv_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalCausalConv,
+        input_buffer: &Buffer,
+        input_offset: u64,
+        output_buffer: &Buffer,
+        output_offset: u64,
+    ) -> Result<()> {
+        let thread_width = dispatch_width(&self.causal_conv_f16_pipeline, DEFAULT_SIMDGROUPS)?;
         encoder.set_compute_pipeline_state(&self.causal_conv_f16_pipeline);
         encoder.set_buffer(
             MetalCausalConvBufferAbi::INPUT as u64,
-            Some(&prepared.input_buffer),
-            0,
+            Some(input_buffer),
+            input_offset,
         );
         encoder.set_buffer(
             MetalCausalConvBufferAbi::WEIGHT as u64,
@@ -4671,8 +4774,8 @@ impl MetalCandidateRuntime {
         );
         encoder.set_buffer(
             MetalCausalConvBufferAbi::OUTPUT as u64,
-            Some(&prepared.output_buffer),
-            0,
+            Some(output_buffer),
+            output_offset,
         );
         encoder.set_buffer(
             MetalCausalConvBufferAbi::PARAMS as u64,
@@ -4691,29 +4794,7 @@ impl MetalCandidateRuntime {
                 depth: 1,
             },
         );
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        if command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(EngineError::InvalidState(format!(
-                "Metal causal-convolution command ended with {:?}",
-                command_buffer.status()
-            )));
-        }
-        let output = unsafe {
-            slice::from_raw_parts(
-                prepared.output_buffer.contents().cast::<f32>(),
-                prepared.channels,
-            )
-            .to_vec()
-        };
-        if output.iter().any(|value| !value.is_finite()) {
-            return Err(EngineError::InvalidState(
-                "Metal causal convolution produced a non-finite output".into(),
-            ));
-        }
-        prepared.poisoned = false;
-        Ok(output)
+        Ok(())
     }
 
     fn validate_mapped_norm_projection(
@@ -5045,6 +5126,8 @@ impl MetalCandidateRuntime {
 
     /// Dispatch the exact first three operations of the frozen decode graph:
     /// embedding, layer-0 RMSNorm, and the four-way linear-attention fan-out.
+    /// When supplied, the layer-0 convolution is encoded as step four and
+    /// consumes/overwrites the exact `LinearQkv` view in place.
     /// All activations are typed views into one schedule-derived arena. The
     /// prepared graph resources own only immutable parameters and tiny command
     /// metadata; no operation-local input or output activation is allocated.
@@ -5055,6 +5138,7 @@ impl MetalCandidateRuntime {
         token: usize,
         norm: &PreparedMappedMetalRmsNorm,
         projections: [&PreparedMappedMetalMatVec; 4],
+        mut convolution: Option<&mut PreparedMappedMetalCausalConv>,
         embedding_output: &PreparedMetalDecodeBufferView<'_>,
         normalized_output: &PreparedMetalDecodeBufferView<'_>,
         projection_outputs: [&PreparedMetalDecodeBufferView<'_>; 4],
@@ -5171,6 +5255,18 @@ impl MetalCandidateRuntime {
                 "Metal graph chain requires one shared activation arena".into(),
             ));
         }
+        if let Some(convolution) = convolution.as_deref() {
+            if convolution.poisoned
+                || convolution.channels != projections[0].rows
+                || convolution.input_buffer.is_some()
+                || convolution.output_buffer.is_some()
+                || !Rc::ptr_eq(&convolution.mapping.inner, &embedding.mapping.inner)
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph convolution does not match the LinearQkv arena output".into(),
+                ));
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-embedding-norm-linear-fanout");
@@ -5200,6 +5296,17 @@ impl MetalCandidateRuntime {
                 output.offset(),
             )?;
         }
+        if let Some(convolution) = convolution.as_deref_mut() {
+            self.encode_mapped_causal_conv_between(
+                encoder,
+                convolution,
+                arena,
+                projection_outputs[0].offset(),
+                arena,
+                projection_outputs[0].offset(),
+            )?;
+            convolution.poisoned = true;
+        }
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -5210,7 +5317,7 @@ impl MetalCandidateRuntime {
             )));
         }
 
-        projection_outputs
+        let outputs = projection_outputs
             .iter()
             .map(|output| {
                 let offset = usize::try_from(output.offset()).map_err(|_| {
@@ -5230,7 +5337,11 @@ impl MetalCandidateRuntime {
                 }
                 Ok(values)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(convolution) = convolution {
+            convolution.poisoned = false;
+        }
+        Ok(outputs)
     }
 
     /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
@@ -7284,11 +7395,22 @@ mod tests {
                 config.linear_num_value_heads,
             ),
         ];
+        let convolution_channels = projection_specs[0].2;
+        let convolution_kernel = config.linear_conv_kernel_dim;
+        let convolution_weight_values: Vec<f32> = (0..convolution_channels * convolution_kernel)
+            .map(|index| 0.08 + 0.01 * (index % convolution_kernel) as f32)
+            .collect();
         for (name, dtype, rows) in projection_specs {
             tensors.extend(repeated_recovered_tensors(
                 name, dtype, rows, columns, &s_in, 1.0625,
             ));
         }
+        tensors.push(PackedTensor {
+            name: "layer0.linear.conv.weight".into(),
+            dtype: TensorDType::F16,
+            shape: vec![convolution_channels as u64, convolution_kernel as u64],
+            bytes: f16_bytes(&convolution_weight_values),
+        });
         ArtifactBuilder {
             model: "test/qwen38-shared-arena".into(),
             revision: "0123456789abcdef".into(),
@@ -7338,6 +7460,21 @@ mod tests {
                 .prepare_mapped_fused_matvec_graph_io(&mapping, &operation)
                 .expect("prepare graph projection without activation buffers")
         });
+        let convolution_weight = artifact
+            .float_tensor("layer0.linear.conv.weight")
+            .expect("resolve graph convolution weight");
+        let convolution_weight_f32 = convolution_weight
+            .to_f32_vec()
+            .expect("widen graph convolution oracle weight");
+        let mut convolution = runtime
+            .prepare_mapped_causal_conv_f16_graph_io(
+                &mapping,
+                convolution_weight,
+                &vec![0.0; convolution_channels],
+                convolution_channels,
+                convolution_kernel,
+            )
+            .expect("prepare graph convolution without activation buffers");
         assert_eq!(
             embedding.transient_bytes(),
             MetalFusedMatVecParams::BYTE_LEN
@@ -7351,6 +7488,13 @@ mod tests {
             assert!(projection.write_input(&validation_input).is_err());
         }
         assert!(norm.write_input(&validation_input).is_err());
+        assert_eq!(
+            convolution.transient_bytes(),
+            MetalCausalConvParams::BYTE_LEN
+        );
+        assert!(convolution
+            .write_input(&vec![0.0; convolution_channels])
+            .is_err());
         assert!(runtime.dispatch_mapped_embedding(&embedding, 0).is_err());
 
         let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
@@ -7385,6 +7529,7 @@ mod tests {
                 1,
                 &norm,
                 projection_refs,
+                None,
                 embedding_output,
                 normalized_output,
                 [
@@ -7411,7 +7556,7 @@ mod tests {
             .zip(&s_in_values)
             .map(|(value, scale)| value * scale)
             .collect();
-        let expected = projection_matrices
+        let mut expected = projection_matrices
             .iter()
             .map(|matrix| {
                 let row = matrix
@@ -7428,17 +7573,32 @@ mod tests {
                 vec![value; matrix.matrix.rows]
             })
             .collect::<Vec<_>>();
+        let mut expected_convolution_state =
+            vec![f16::ZERO; convolution_channels * convolution_kernel];
+        expected[0] = crate::reference::causal_conv_silu_update_f16_state(
+            &expected[0],
+            &mut expected_convolution_state,
+            &convolution_weight_f32,
+            convolution_channels,
+            convolution_kernel,
+        )
+        .expect("execute graph convolution oracle");
         let actual = runtime
             .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
                 &embedding,
                 1,
                 &norm,
                 projection_refs,
+                Some(&mut convolution),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
             )
-            .expect("dispatch first three decode steps through shared arena");
+            .expect("dispatch first four decode steps through shared arena");
+        assert_eq!(
+            convolution.verifier_read_state(),
+            expected_convolution_state
+        );
         for (branch, (expected, actual)) in expected.iter().zip(actual).enumerate() {
             for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
                 let tolerance = 4.0e-4_f32.max(expected.abs() * 7.0e-5);

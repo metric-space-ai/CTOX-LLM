@@ -227,9 +227,11 @@ frozen decode steps bind `HiddenA`, `Normalized`, `LinearQkv`, `LinearZ`,
 `LinearA`, and `LinearB` directly to typed offsets in the single 1,173,760-byte
 arena. All four Q2/Q4 projections accept distinct artifact offsets only when
 their packed FP16 `s_in` bytes are identical. Slot, size, mapping, arena-owner,
-or correction mismatch fails before submission. The Apple-device Golden test
-executes the three steps with one command encoder and one wait, reading outputs
-only after completion.
+or correction mismatch fails before submission. The following causal
+convolution consumes and overwrites the exact `LinearQkv` view while retaining
+only its mmap-backed FP16 weights, FP16 history/checkpoint, and parameter
+block. The Apple-device Golden test executes steps 0-3 with one command encoder
+and one wait, reading activations only after completion.
 
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
@@ -446,8 +448,8 @@ dequantization array before this source was accepted.
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
   target+MTP state transaction. All 645 steps have real shared-buffer views;
-  exact kernel dispatch now covers steps 0-2 (embedding, layer-0 RMSNorm, and
-  all four linear-attention projections). The remaining 642 schedule steps,
+  exact kernel dispatch now covers steps 0-3 (embedding, layer-0 RMSNorm, all
+  four linear-attention projections, and in-place causal convolution). The remaining 641 schedule steps,
   the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
