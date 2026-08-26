@@ -163,10 +163,13 @@ records the 7.5-MiB causal-convolution state that the earlier calculated Fold
 figures omitted. The subsequent active-MTP correction in
 [`docs/MEMORY_PLAN_CORRECTION_V3.json`](docs/MEMORY_PLAN_CORRECTION_V3.json)
 adds the independent 72.1875-MiB MTP KV cache and speculative target-state
-strategy. Only FP16 state plus replay-on-reject keeps MTP4 below 9.7 GiB, with
-about 18.95 MiB calculated headroom; this profile still requires numerical and
-Android PSS/accelerator-memory evidence. Historical artifact hashes and byte
-counts are unchanged.
+strategy. The paged implementation in
+[`docs/MEMORY_PLAN_CORRECTION_V4.json`](docs/MEMORY_PLAN_CORRECTION_V4.json)
+also attributes page metadata, a worst-case Q4 boundary page, and Q4-to-Q2
+conversion scratch. At the 7.8-GiB weight ceiling, only FP16 state plus
+replay-on-reject keeps MTP4 below 9.7 GiB: 9.68562 GiB with 14.73 MiB calculated
+headroom. This still requires numerical and Android PSS/accelerator-memory
+evidence. Historical artifact hashes and byte counts are unchanged.
 
 [`docs/WIRE_PROTOCOL_V1.md`](docs/WIRE_PROTOCOL_V1.md) defines the matching
 versioned Unix-socket/named-pipe control and token-stream contract. The bring-up

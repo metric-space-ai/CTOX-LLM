@@ -1,0 +1,46 @@
+{
+  "format": "ctox.qwen38.memory-plan-correction.v4",
+  "date": "2026-08-26",
+  "status": "authoritative_calculated_paged_kv_correction",
+  "context_tokens": 131072,
+  "page_layout": {
+    "tokens_per_page": 128,
+    "q4_sink_tokens": 128,
+    "q4_recent_tokens": 256,
+    "maximum_additional_q4_boundary_tokens": 127,
+    "page_metadata_bytes_assumed": 64,
+    "precision_rule": "whole pages are Q2 or Q4; no Q3 path"
+  },
+  "newly_attributed_bytes": {
+    "target_plus_mtp_page_metadata": 1114112,
+    "q4_boundary_page_reserve": 1105408,
+    "single_layer_q4_to_q2_requantization_scratch": 73728,
+    "total": 2293248
+  },
+  "fold_128k_mtp4_f16_replay_at_weight_ceiling": {
+    "weights_bytes": 8375186227,
+    "kv_and_mtp_payload_bytes": 1286799360,
+    "linear_and_speculative_state_bytes": 158859264,
+    "runtime_bytes": 576716800,
+    "paged_kv_overhead_bytes": 2293248,
+    "total_bytes": 10399854899,
+    "total_gib": 9.6856196402,
+    "operating_target_bytes": 10415295693,
+    "headroom_bytes": 15440794,
+    "headroom_mib": 14.7254886627,
+    "hard_limit_bytes": 10737418240
+  },
+  "implementation": {
+    "paged_cache": "src/kv_cache.rs",
+    "memory_accounting": "src/memory.rs",
+    "command": "qwen38-memory-plan --context 131072 --linear-state f16 --mtp-draft-tokens 4 --speculative-state replay-on-reject --json"
+  },
+  "decision": {
+    "calculated_profile": "admitted below the 9.7 GiB operating target",
+    "remaining_gate": "Android PSS, DMA/QNN/Vulkan allocation, thermal, and 30-minute device measurements",
+    "swap_policy": "active weights, KV pages, recurrent state, and workspaces may not depend on zRAM or UFS swap"
+  },
+  "supersedes": [
+    "The v3 18.947-MiB headroom claim, which did not explicitly attribute paged-KV metadata, boundary-page retention, or requantization scratch"
+  ]
+}

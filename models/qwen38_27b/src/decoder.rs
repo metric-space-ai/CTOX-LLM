@@ -15,6 +15,7 @@ use crate::engine::{
     AllocationSnapshot, CancellationToken, DraftDistribution, ExecutorCapabilities, ExecutorStep,
     ModelExecutor,
 };
+use crate::kv_cache::PagedKvCache;
 use crate::loader::ModelArtifact;
 use crate::reference::{
     apply_partial_rope, causal_conv_silu_update, grouped_query_attention,
@@ -65,11 +66,22 @@ fn repeat_heads(
 
 #[derive(Debug, Clone)]
 pub struct FullAttentionState {
-    key_heads: Vec<Vec<f32>>,
-    value_heads: Vec<Vec<f32>>,
+    storage: FullAttentionStorage,
+    key_value_heads: usize,
     head_dim: usize,
     maximum_tokens: usize,
     tokens: usize,
+}
+
+#[derive(Debug, Clone)]
+enum FullAttentionStorage {
+    /// Small non-Qwen geometries remain useful as an exact test oracle.
+    Dense {
+        key_heads: Vec<Vec<f32>>,
+        value_heads: Vec<Vec<f32>>,
+    },
+    /// The real Qwen geometry is always stored as mixed Q2/Q4 pages.
+    Paged(PagedKvCache),
 }
 
 #[derive(Debug, Clone)]
@@ -162,9 +174,23 @@ impl FullAttentionState {
                 "full-attention state dimensions must be non-zero".into(),
             ));
         }
+        let component_values = key_value_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| EngineError::Shape("full-attention KV width overflows".into()))?;
+        let storage = if component_values.is_multiple_of(crate::quant::BLOCK_LEN) {
+            FullAttentionStorage::Paged(PagedKvCache::qwen_default(
+                maximum_tokens,
+                component_values,
+            )?)
+        } else {
+            FullAttentionStorage::Dense {
+                key_heads: (0..key_value_heads).map(|_| Vec::new()).collect(),
+                value_heads: (0..key_value_heads).map(|_| Vec::new()).collect(),
+            }
+        };
         Ok(Self {
-            key_heads: (0..key_value_heads).map(|_| Vec::new()).collect(),
-            value_heads: (0..key_value_heads).map(|_| Vec::new()).collect(),
+            storage,
+            key_value_heads,
             head_dim,
             maximum_tokens,
             tokens: 0,
@@ -176,23 +202,36 @@ impl FullAttentionState {
     }
 
     pub fn reset(&mut self) {
-        self.key_heads.iter_mut().for_each(Vec::clear);
-        self.value_heads.iter_mut().for_each(Vec::clear);
+        match &mut self.storage {
+            FullAttentionStorage::Dense {
+                key_heads,
+                value_heads,
+            } => {
+                key_heads.iter_mut().for_each(Vec::clear);
+                value_heads.iter_mut().for_each(Vec::clear);
+            }
+            FullAttentionStorage::Paged(cache) => cache.reset(),
+        }
         self.tokens = 0;
     }
 
     pub fn allocated_bytes(&self) -> usize {
-        self.key_heads
-            .iter()
-            .chain(&self.value_heads)
-            .map(|head| head.capacity() * std::mem::size_of::<f32>())
-            .sum()
+        match &self.storage {
+            FullAttentionStorage::Dense {
+                key_heads,
+                value_heads,
+            } => key_heads
+                .iter()
+                .chain(value_heads)
+                .map(|head| head.capacity() * std::mem::size_of::<f32>())
+                .sum(),
+            FullAttentionStorage::Paged(cache) => cache.allocated_bytes(),
+        }
     }
 
     fn append(&mut self, position: usize, key: &[f32], value: &[f32]) -> Result<()> {
         let expected = self
-            .key_heads
-            .len()
+            .key_value_heads
             .checked_mul(self.head_dim)
             .ok_or_else(|| EngineError::Shape("full-attention state shape overflows".into()))?;
         if position != self.tokens
@@ -204,21 +243,43 @@ impl FullAttentionState {
                 "full-attention append position or shape differs".into(),
             ));
         }
-        for head in 0..self.key_heads.len() {
-            let start = head * self.head_dim;
-            self.key_heads[head].extend_from_slice(&key[start..start + self.head_dim]);
-            self.value_heads[head].extend_from_slice(&value[start..start + self.head_dim]);
+        match &mut self.storage {
+            FullAttentionStorage::Dense {
+                key_heads,
+                value_heads,
+            } => {
+                for head in 0..key_heads.len() {
+                    let start = head * self.head_dim;
+                    key_heads[head].extend_from_slice(&key[start..start + self.head_dim]);
+                    value_heads[head].extend_from_slice(&value[start..start + self.head_dim]);
+                }
+            }
+            FullAttentionStorage::Paged(cache) => cache.push(key, value)?,
         }
         self.tokens += 1;
         Ok(())
     }
 
-    fn flattened_key(&self) -> Vec<f32> {
-        self.key_heads.iter().flatten().copied().collect()
+    fn flattened_key(&self) -> Result<Vec<f32>> {
+        match &self.storage {
+            FullAttentionStorage::Dense { key_heads, .. } => {
+                Ok(key_heads.iter().flatten().copied().collect())
+            }
+            FullAttentionStorage::Paged(cache) => {
+                cache.flattened_key(self.key_value_heads, self.head_dim)
+            }
+        }
     }
 
-    fn flattened_value(&self) -> Vec<f32> {
-        self.value_heads.iter().flatten().copied().collect()
+    fn flattened_value(&self) -> Result<Vec<f32>> {
+        match &self.storage {
+            FullAttentionStorage::Dense { value_heads, .. } => {
+                Ok(value_heads.iter().flatten().copied().collect())
+            }
+            FullAttentionStorage::Paged(cache) => {
+                cache.flattened_value(self.key_value_heads, self.head_dim)
+            }
+        }
     }
 }
 
@@ -631,7 +692,7 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
         config: &Qwen38Config,
     ) -> Result<Vec<f32>> {
         if hidden.len() != config.hidden_size
-            || state.key_heads.len() != config.num_key_value_heads
+            || state.key_value_heads != config.num_key_value_heads
             || state.head_dim != config.head_dim
         {
             return Err(EngineError::Shape(
@@ -709,8 +770,8 @@ impl<'a, B: Backend> ArtifactDecoder<'a, B> {
             config.rope_theta,
         )?;
         state.append(cache_position, &key, &value)?;
-        let key = state.flattened_key();
-        let value = state.flattened_value();
+        let key = state.flattened_key()?;
+        let value = state.flattened_value()?;
         let mut attention = grouped_query_attention(
             &query,
             &key,

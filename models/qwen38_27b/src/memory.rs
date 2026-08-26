@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::kv_cache::DEFAULT_KV_PAGE_TOKENS;
 use crate::{EngineError, Qwen38Config, Result};
 
 pub const MIB: u64 = 1024 * 1024;
@@ -8,6 +9,7 @@ pub const FOLD_WEIGHT_LIMIT_BYTES: u64 = 8_375_186_227; // 7.8 GiB
 pub const FOLD_TARGET_BYTES: u64 = 10_415_295_693; // 9.7 GiB
 pub const FOLD_HARD_LIMIT_BYTES: u64 = 10 * GIB;
 pub const FOLD_RUNTIME_BUDGET_BYTES: u64 = 550 * MIB;
+const KV_PAGE_METADATA_BYTES: u64 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +117,9 @@ pub struct FoldMemoryPlan {
     pub mtp_kv_scale_bytes: u64,
     pub mtp_kv_q4_recent_and_sink_bytes: u64,
     pub mtp_kv_bytes: u64,
+    pub kv_page_metadata_bytes: u64,
+    pub kv_page_boundary_reserve_bytes: u64,
+    pub kv_requantization_scratch_bytes: u64,
     pub linear_state_dtype: LinearStateDType,
     pub linear_recurrent_state_bytes: u64,
     pub linear_convolution_state_bytes: u64,
@@ -214,6 +219,56 @@ impl FoldMemoryPlan {
             .and_then(|bytes| bytes.checked_add(mtp_kv_q4_recent_and_sink_bytes))
             .ok_or_else(|| EngineError::MemoryBudget("MTP KV bytes overflow".into()))?;
 
+        // Paged storage adds small but real allocations beyond packed tensor
+        // payloads. Count 64 bytes of host/device metadata per 128-token page,
+        // one possible Q4 boundary page, and one temporary Q2 page while an
+        // old Q4 page is converted. The conversion is layer-sequential, so the
+        // temporary page is counted once rather than once per layer.
+        let resident_kv_layers = (config.full_attention_layers() as u64)
+            .checked_add(resident_mtp_layers)
+            .ok_or_else(|| EngineError::MemoryBudget("resident KV layers overflow".into()))?;
+        let pages_per_layer = context_tokens.div_ceil(DEFAULT_KV_PAGE_TOKENS as u64);
+        let kv_page_metadata_bytes = resident_kv_layers
+            .checked_mul(pages_per_layer)
+            .and_then(|pages| pages.checked_mul(KV_PAGE_METADATA_BYTES))
+            .ok_or_else(|| EngineError::MemoryBudget("KV page metadata overflows".into()))?;
+        let boundary_tokens = context_tokens
+            .saturating_sub(q4_tokens)
+            .min(DEFAULT_KV_PAGE_TOKENS.saturating_sub(1) as u64);
+        let kv_page_boundary_reserve_bytes = boundary_tokens
+            .checked_mul(
+                (values_per_token / 4)
+                    .checked_add(mtp_values_per_token / 4)
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget("KV boundary delta overflows".into())
+                    })?,
+            )
+            .ok_or_else(|| EngineError::MemoryBudget("KV boundary reserve overflows".into()))?;
+        let one_layer_values_per_token = (config.num_key_value_heads as u64)
+            .checked_mul(config.head_dim as u64)
+            .and_then(|values| values.checked_mul(2))
+            .ok_or_else(|| EngineError::MemoryBudget("one-layer KV width overflows".into()))?;
+        let one_layer_page_values = one_layer_values_per_token
+            .checked_mul(DEFAULT_KV_PAGE_TOKENS as u64)
+            .ok_or_else(|| EngineError::MemoryBudget("one-layer KV page overflows".into()))?;
+        let kv_requantization_scratch_bytes = if resident_kv_layers == 0 {
+            0
+        } else {
+            one_layer_page_values
+                .div_ceil(4)
+                .checked_add(
+                    one_layer_page_values
+                        .div_ceil(64)
+                        .checked_mul(2)
+                        .ok_or_else(|| {
+                            EngineError::MemoryBudget("KV page scale bytes overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| {
+                    EngineError::MemoryBudget("KV requantization scratch overflows".into())
+                })?
+        };
+
         let linear_layers = config.linear_attention_layers() as u64;
         let linear_recurrent_state_values = linear_layers
             .checked_mul(config.linear_num_value_heads as u64)
@@ -261,6 +316,9 @@ impl FoldMemoryPlan {
             + kv_scale_bytes
             + kv_q4_recent_and_sink_bytes
             + mtp_kv_bytes
+            + kv_page_metadata_bytes
+            + kv_page_boundary_reserve_bytes
+            + kv_requantization_scratch_bytes
             + linear_state_bytes
             + speculative_extra_linear_state_bytes
             + runtime_bytes;
@@ -275,6 +333,9 @@ impl FoldMemoryPlan {
             mtp_kv_scale_bytes,
             mtp_kv_q4_recent_and_sink_bytes,
             mtp_kv_bytes,
+            kv_page_metadata_bytes,
+            kv_page_boundary_reserve_bytes,
+            kv_requantization_scratch_bytes,
             linear_state_dtype,
             linear_recurrent_state_bytes,
             linear_convolution_state_bytes,
@@ -323,6 +384,9 @@ mod tests {
         assert_eq!(plan.kv_raw_q2_bytes, GIB);
         assert_eq!(plan.kv_scale_bytes, 128 * MIB);
         assert_eq!(plan.mtp_kv_bytes, 0);
+        assert_eq!(plan.kv_page_metadata_bytes, MIB);
+        assert_eq!(plan.kv_page_boundary_reserve_bytes, 127 * 8_192);
+        assert_eq!(plan.kv_requantization_scratch_bytes, 72 * 1024);
         assert_eq!(plan.linear_recurrent_state_bytes, 144 * MIB);
         assert_eq!(plan.linear_convolution_state_bytes, 15 * MIB / 2);
         assert_eq!(plan.linear_state_bytes, 303 * MIB / 2);
@@ -347,6 +411,9 @@ mod tests {
         assert_eq!(replay.mtp_kv_scale_bytes, 8 * MIB);
         assert_eq!(replay.mtp_kv_q4_recent_and_sink_bytes, 192 * 1024);
         assert_eq!(replay.mtp_kv_bytes, 72 * MIB + 192 * 1024);
+        assert_eq!(replay.kv_page_metadata_bytes, 1_114_112);
+        assert_eq!(replay.kv_page_boundary_reserve_bytes, 1_105_408);
+        assert_eq!(replay.kv_requantization_scratch_bytes, 72 * 1024);
         assert_eq!(
             replay.speculative_extra_linear_state_bytes,
             replay.linear_state_bytes

@@ -30,11 +30,13 @@ GatedDeltaNet recurrent state and is recorded in
 `models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V2.json`. Active MTP additionally
 requires a 72.1875-MiB independent KV cache and speculative target-state
 storage. The admitted calculated MTP4 profile uses FP16 recurrent state plus
-one replay checkpoint and totals 9.6815 GiB for the initializer, leaving only
-18.95 MiB to the 9.7-GiB target; aligned MTP4 state pages do not fit. This v3
-correction is recorded in
-`models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V3.json`. Likewise, the planned
-9.6976-GiB vision phase is not yet Android device evidence.
+one replay checkpoint. At the 7.8-GiB weight ceiling it totals 9.68562 GiB,
+leaving only 14.73 MiB to the 9.7-GiB target after paged-KV metadata, boundary
+retention, and requantization scratch are counted; aligned MTP4 state pages do
+not fit. The MTP correction is recorded in
+`models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V3.json` and the paged-KV
+correction in `models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V4.json`. Likewise,
+the planned 9.6976-GiB vision phase is not yet Android device evidence.
 
 The five verified release teacher-cache batches currently cover 593 of the
 2,328 final training identities. Their reusable identities are content-bound to
