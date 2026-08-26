@@ -232,8 +232,12 @@ target/MTP attention owners, and all 48 paired causal-convolution/GatedDelta
 owners. Begin prevalidates the entire resource set before changing any owner;
 reject restores state in reverse order, while commit consumes every checkpoint
 as one logical operation. The Apple-device verifier proves both all-owner
-rollback and commit. Per-step encoder binding and the complete target+MTP
-executor remain open.
+rollback and commit. An RAII decode-attempt owner now couples this transaction
+to the exact 645-step execution cursor and real arena-view program: wrong token
+positions fail before snapshot, incomplete or early-commit attempts restore on
+drop, and only the sole completed final barrier returns the next committed
+token position. Kernel encoder dispatch and the complete target+MTP executor
+remain open.
 
 CUDA SM86 now has an isolated exact-Qwen paged-GQA candidate in addition to
 the projection and token-mixer candidates. Q4 append quantization and

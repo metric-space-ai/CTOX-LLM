@@ -94,6 +94,20 @@ mutates all four state classes, proves graph-wide restoration, repeats the same
 branch, and proves graph-wide commit. This closes atomic speculative-state
 orchestration, not per-step encoder binding or the full target+MTP executor.
 
+`PreparedMetalDecodeAttempt` joins the real-buffer program, exact binding-plan
+cursor, and graph-wide state transaction under one lifetime. Admission checks
+the requested token position against the committed/context bounds before
+opening checkpoints. Every successful kernel encoding must advance the exact
+bound `(index, layer, operation)` tuple. Dropping an incomplete attempt, or
+consuming it with an early final-commit request, restores all active state
+owners automatically. Explicit abort reports restore errors; implicit drop
+leaves the coordinator poisoned if restoration fails. Commit first proves that
+the next step is the sole final barrier, then consumes all checkpoints and
+returns the cursor's next committed position. The Apple-device test exercises
+wrong-position rejection, partial-drop rollback, early-commit rollback, and a
+complete 644-operation plus final-barrier commit. Actual kernel dispatch for
+the complete step set remains executor work.
+
 ## Entry points
 
 | Kernel | DType | Block layout |

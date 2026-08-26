@@ -31,9 +31,9 @@ use super::metal::{
 };
 use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
-    MetalDecodeWorkspacePlan,
+    MetalDecodeExecutionCursor, MetalDecodeWorkspacePlan,
 };
-use super::metal_schedule::MetalBufferSlot;
+use super::metal_schedule::{MetalBufferSlot, MetalDecodeOperation};
 use super::{Activation, FusedMatVec, ScaleSlice};
 use crate::format::TensorDType;
 use crate::kv_cache::{KvPrecision, PagedKvAppendCheckpoint, PagedKvCache};
@@ -148,7 +148,24 @@ pub struct PreparedMetalDecodeStepView<'a> {
 
 /// A complete, validated set of real Metal buffer views for one token program.
 pub struct PreparedMetalDecodeProgram<'a> {
+    workspace: &'a PreparedMetalDecodeWorkspace,
+    plan: &'a MetalDecodeBindingPlan,
     steps: Vec<PreparedMetalDecodeStepView<'a>>,
+}
+
+/// RAII owner for one token's exact cursor and speculative target+MTP state.
+/// An incomplete or failed attempt restores every state owner on drop; only a
+/// successful final command-buffer completion can consume the transaction and
+/// return a new committed token position.
+pub struct PreparedMetalDecodeAttempt<'a> {
+    runtime: &'a MetalCandidateRuntime,
+    program: &'a PreparedMetalDecodeProgram<'a>,
+    cursor: Option<MetalDecodeExecutionCursor<'a>>,
+    transaction: &'a mut PreparedMetalSpeculativeTransaction,
+    attentions: &'a mut [PreparedMetalPagedGqa],
+    convolutions: &'a mut [PreparedMappedMetalCausalConv],
+    recurrences: &'a mut [PreparedMetalGatedDelta],
+    finished: bool,
 }
 
 /// Bounded device-only snapshot used to restore one f32 arena slot after a
@@ -588,7 +605,11 @@ impl PreparedMetalDecodeWorkspace {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(PreparedMetalDecodeProgram { steps })
+        Ok(PreparedMetalDecodeProgram {
+            workspace: self,
+            plan,
+            steps,
+        })
     }
 
     fn bind_decode_slots<'a>(
@@ -691,6 +712,82 @@ impl<'a> PreparedMetalDecodeStepView<'a> {
 impl<'a> PreparedMetalDecodeProgram<'a> {
     pub fn steps(&self) -> &[PreparedMetalDecodeStepView<'a>] {
         &self.steps
+    }
+}
+
+impl PreparedMetalDecodeAttempt<'_> {
+    pub fn next_step(&self) -> Option<&PreparedMetalDecodeStepView<'_>> {
+        let schedule_index = self.cursor.as_ref()?.next_step()?.schedule_index;
+        self.program.steps.get(schedule_index)
+    }
+
+    pub fn advance_encoded(
+        &mut self,
+        schedule_index: usize,
+        layer: Option<usize>,
+        operation: MetalDecodeOperation,
+    ) -> Result<()> {
+        self.cursor
+            .as_mut()
+            .ok_or_else(|| EngineError::InvalidState("Metal decode attempt is finished".into()))?
+            .advance(schedule_index, layer, operation)
+    }
+
+    /// Explicitly reject an incomplete token and return any restore failure.
+    pub fn abort(mut self) -> Result<()> {
+        let result = self.runtime.restore_speculative_transaction(
+            self.transaction,
+            self.program.workspace,
+            self.attentions,
+            self.convolutions,
+            self.recurrences,
+        );
+        self.finished = true;
+        result
+    }
+
+    /// Commit only after the sole final Metal command buffer completed.
+    pub fn commit_after_completion(mut self, schedule_index: usize) -> Result<usize> {
+        let expected = self
+            .cursor
+            .as_ref()
+            .and_then(MetalDecodeExecutionCursor::next_step)
+            .ok_or_else(|| EngineError::InvalidState("Metal decode attempt is finished".into()))?;
+        if expected.schedule_index != schedule_index
+            || expected.layer.is_some()
+            || expected.operation != MetalDecodeOperation::TokenCommandBufferCommit
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal decode cannot commit at step {schedule_index}; next bound step is ({}, {:?}, {:?})",
+                expected.schedule_index, expected.layer, expected.operation
+            )));
+        }
+        self.runtime.commit_speculative_transaction(
+            self.transaction,
+            self.program.workspace,
+            self.attentions,
+            self.convolutions,
+            self.recurrences,
+        )?;
+        let mut cursor = self.cursor.take().expect("validated active cursor");
+        cursor.commit_after_completion(schedule_index)?;
+        let committed = cursor.finish()?;
+        self.finished = true;
+        Ok(committed)
+    }
+}
+
+impl Drop for PreparedMetalDecodeAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.finished && self.transaction.is_active() {
+            let _ = self.runtime.restore_speculative_transaction(
+                self.transaction,
+                self.program.workspace,
+                self.attentions,
+                self.convolutions,
+                self.recurrences,
+            );
+        }
     }
 }
 
@@ -1671,6 +1768,41 @@ impl MetalCandidateRuntime {
             target_hidden: self.prepare_f32_checkpoint(config.hidden_size)?,
             active: false,
             poisoned: false,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_decode_attempt<'a>(
+        &'a self,
+        program: &'a PreparedMetalDecodeProgram<'a>,
+        transaction: &'a mut PreparedMetalSpeculativeTransaction,
+        attentions: &'a mut [PreparedMetalPagedGqa],
+        convolutions: &'a mut [PreparedMappedMetalCausalConv],
+        recurrences: &'a mut [PreparedMetalGatedDelta],
+        token_position: usize,
+        committed_tokens: usize,
+        admitted_context: usize,
+    ) -> Result<PreparedMetalDecodeAttempt<'a>> {
+        let cursor =
+            program
+                .plan
+                .execution_cursor(token_position, committed_tokens, admitted_context)?;
+        self.begin_speculative_transaction(
+            transaction,
+            program.workspace,
+            attentions,
+            convolutions,
+            recurrences,
+        )?;
+        Ok(PreparedMetalDecodeAttempt {
+            runtime: self,
+            program,
+            cursor: Some(cursor),
+            transaction,
+            attentions,
+            convolutions,
+            recurrences,
+            finished: false,
         })
     }
 
@@ -5844,6 +5976,108 @@ mod tests {
                 &mut recurrences,
             )
             .is_err());
+
+        let projections = MetalProjectionPlan::qwen38(&config).expect("Metal projection plan");
+        let bindings = MetalDecodeBindingPlan::qwen38(&schedule, &projections, &config)
+            .expect("complete Metal binding plan");
+        let program = workspace
+            .bind_decode_program(&bindings)
+            .expect("bind guarded decode program");
+        assert!(runtime
+            .begin_decode_attempt(
+                &program,
+                &mut transaction,
+                &mut attentions,
+                &mut convolutions,
+                &mut recurrences,
+                2,
+                1,
+                16,
+            )
+            .is_err());
+        assert!(!transaction.is_active());
+
+        {
+            let mut attempt = runtime
+                .begin_decode_attempt(
+                    &program,
+                    &mut transaction,
+                    &mut attentions,
+                    &mut convolutions,
+                    &mut recurrences,
+                    1,
+                    1,
+                    16,
+                )
+                .expect("begin guarded partial token");
+            let first = attempt.next_step().expect("first guarded decode step");
+            let encoded = (
+                first.step().schedule_index,
+                first.step().layer,
+                first.step().operation,
+            );
+            attempt
+                .advance_encoded(encoded.0, encoded.1, encoded.2)
+                .expect("advance one guarded decode step");
+        }
+        assert!(!transaction.is_active());
+        assert!(attentions
+            .iter()
+            .all(|state| state.speculative_checkpoint.is_none()));
+        assert!(convolutions.iter().all(|state| !state.checkpoint_valid));
+        assert!(recurrences.iter().all(|state| !state.checkpoint_valid));
+
+        let early_commit = runtime
+            .begin_decode_attempt(
+                &program,
+                &mut transaction,
+                &mut attentions,
+                &mut convolutions,
+                &mut recurrences,
+                1,
+                1,
+                16,
+            )
+            .expect("begin guarded early-commit token")
+            .commit_after_completion(644);
+        assert!(early_commit.is_err());
+        assert!(!transaction.is_active());
+
+        let mut attempt = runtime
+            .begin_decode_attempt(
+                &program,
+                &mut transaction,
+                &mut attentions,
+                &mut convolutions,
+                &mut recurrences,
+                1,
+                1,
+                16,
+            )
+            .expect("begin complete guarded token");
+        loop {
+            let Some(next) = attempt.next_step() else {
+                panic!("guarded token omitted its final barrier");
+            };
+            let encoded = (
+                next.step().schedule_index,
+                next.step().layer,
+                next.step().operation,
+            );
+            if encoded.2 == MetalDecodeOperation::TokenCommandBufferCommit {
+                break;
+            }
+            attempt
+                .advance_encoded(encoded.0, encoded.1, encoded.2)
+                .expect("advance exact guarded decode step");
+        }
+        assert_eq!(
+            attempt
+                .commit_after_completion(644)
+                .expect("commit guarded token"),
+            2
+        );
+        assert!(!transaction.is_active());
     }
 
     #[test]
