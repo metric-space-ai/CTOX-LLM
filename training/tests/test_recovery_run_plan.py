@@ -183,7 +183,7 @@ class RecoveryRunPlanTests(unittest.TestCase):
                 "oversize_policy": "fail",
                 "gradient_checkpointing": False,
                 "fixed_logical_qcodes": True,
-                "fanout_s_in_policy": "independent",
+                "fanout_s_in_policy": "qwen38_fanout_s_in_v1",
                 "cursor": {"optimizer_steps": 1, "samples_seen": 1},
                 "skipped_oversize_samples": [],
                 "recent_mean_losses": {name: 0.1 for name in REQUIRED_LOSSES},

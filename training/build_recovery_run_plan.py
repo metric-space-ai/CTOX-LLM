@@ -20,7 +20,7 @@ from typing import Any
 from cache_teacher import validate_local_model_provenance
 from ctox_artifact import CtoxArtifact
 from evaluate_recovery import load_indexed_jsonl, require_exact_ids
-from fanout_recovery import INDEPENDENT_POLICY
+from fanout_recovery import QWEN38_FANOUT_POLICY
 from recovery_io import atomic_json
 from run_ledger import total_gpu_hours
 from teacher_cache_dataset import VerifiedTeacherCache
@@ -278,7 +278,7 @@ def validate_smoke(
         "oversize_policy": "fail",
         "gradient_checkpointing": False,
         "fixed_logical_qcodes": True,
-        "fanout_s_in_policy": INDEPENDENT_POLICY,
+        "fanout_s_in_policy": QWEN38_FANOUT_POLICY,
     }
     for key, expected in required.items():
         if report.get(key) != expected:
@@ -538,7 +538,7 @@ def main() -> None:
                 ("--seed", 38),
                 ("--loss-weights", loss_weights),
                 ("--use-fla-kernel", True),
-                ("--fanout-s-in-policy", INDEPENDENT_POLICY),
+                ("--fanout-s-in-policy", QWEN38_FANOUT_POLICY),
             ],
         )
         pack_command = argv(

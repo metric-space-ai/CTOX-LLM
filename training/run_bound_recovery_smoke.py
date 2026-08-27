@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from fanout_recovery import QWEN38_FANOUT_POLICY
 from teacher_cache_dataset import VerifiedTeacherCache
 
 
@@ -74,7 +75,7 @@ def command(args: argparse.Namespace) -> list[str]:
         "1",
         "--use-fla-kernel",
         "--fanout-s-in-policy",
-        "independent",
+        QWEN38_FANOUT_POLICY,
     ]
 
 

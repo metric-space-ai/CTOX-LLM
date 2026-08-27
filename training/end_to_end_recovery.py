@@ -661,18 +661,25 @@ def save_training_checkpoint(
         raise ValueError("recovery checkpoint cursor is invalid")
     tensors: dict[str, Any] = {}
     for name, parameter in parameters.items():
-        tensors[f"parameter/{name}"] = parameter.detach().float().cpu().contiguous()
+        # Logical fan-out scale names may alias one trainable Parameter. The
+        # checkpoint deliberately materializes every logical name so resume
+        # can validate the alias group byte-for-byte. Clone each CPU tensor:
+        # safetensors correctly rejects dictionaries whose different keys
+        # still share storage, including Adam's scalar `step` state.
+        tensors[f"parameter/{name}"] = (
+            parameter.detach().float().cpu().contiguous().clone()
+        )
         state = optimizer.state.get(parameter)
         if not state or not {"step", "exp_avg", "exp_avg_sq"} <= set(state):
             raise ValueError(f"optimizer state is incomplete for {name}")
         tensors[f"optimizer_step/{name}"] = (
-            torch.as_tensor(state["step"]).cpu().reshape(1)
+            torch.as_tensor(state["step"]).cpu().reshape(1).clone()
         )
         tensors[f"optimizer_exp_avg/{name}"] = (
-            state["exp_avg"].detach().cpu().contiguous()
+            state["exp_avg"].detach().cpu().contiguous().clone()
         )
         tensors[f"optimizer_exp_avg_sq/{name}"] = (
-            state["exp_avg_sq"].detach().cpu().contiguous()
+            state["exp_avg_sq"].detach().cpu().contiguous().clone()
         )
     metadata = {
         "format": "ctox.recovery.training-checkpoint.v1",
