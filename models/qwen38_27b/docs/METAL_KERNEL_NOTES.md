@@ -227,8 +227,10 @@ descriptor and parameter buffers. An explicit metadata-binding encoder accepts
 immutable per-step snapshots while retaining the same single Q2/Q4 KV arenas,
 pack parameters, and append plan. The standalone paged-GQA oracle now executes
 through snapshot buffers and still matches the quantized scalar reference
-through page demotion. Multi-command speculative enqueue can therefore retain
-the exact page view and token count for each depth without copying KV payloads.
+through page demotion. The complete target graph and native MTP layer now bind
+the same immutable dispatch plans rather than the owners' mutable metadata
+buffers. A two-depth test proves the first page view and token count survive
+planning the second append without copying KV payloads.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

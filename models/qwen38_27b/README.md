@@ -343,11 +343,12 @@ records on device to the causal accepted-prefix length and selects either the
 first mismatching target token or, after full acceptance, the resident bonus
 target token. Malformed acceptance words, token bounds, or selector status
 fail closed in the same four-word result.
-Paged-GQA encoding can now bind immutable per-dispatch descriptor and parameter
-buffers independently of the persistent KV owner. The standalone quantized
-oracle path exercises that binding while the large Q2/Q4 page arenas remain
-single-copy; this is the metadata boundary required to enqueue successive
-speculative attention steps safely.
+Paged-GQA encoding now binds immutable per-dispatch descriptor and parameter
+buffers independently of the persistent KV owner. Standalone, all 16 target
+full-attention layers, and the MTP layer use the same dispatch-plan boundary
+while the large Q2/Q4 page arenas remain single-copy. A two-depth regression
+retains the first snapshots after the second append is planned; this is the
+metadata boundary required to enqueue successive speculative steps safely.
 Full-artifact same-device evidence, a four-candidate device branch,
 partial-prefix restore/replay, and production executor wiring remain pending.
 Every logical read and write of all 645 bound decode steps now resolves

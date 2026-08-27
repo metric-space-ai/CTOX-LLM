@@ -10990,9 +10990,7 @@ impl MetalCandidateRuntime {
         let validated = self.validate_prepared_mapped_full_attention_layer(steps, prepared)?;
         prepared.attention.poisoned = true;
         let result = (|| {
-            let plan = self.plan_paged_gqa_append(&mut prepared.attention)?;
-            write_metal_paged_gqa_descriptors(&prepared.attention)?;
-            write_metal_paged_gqa_params(&prepared.attention)?;
+            let dispatch = self.plan_paged_gqa_dispatch(&mut prepared.attention)?;
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-shared-arena-full-attention-layer");
             let encoder = command_buffer.new_compute_command_encoder();
@@ -11000,7 +10998,7 @@ impl MetalCandidateRuntime {
                 encoder,
                 steps,
                 prepared,
-                &plan,
+                &dispatch,
                 validated.thread_width,
                 validated.component_values,
             )?;
@@ -11040,7 +11038,7 @@ impl MetalCandidateRuntime {
                 };
                 self.commit_paged_gqa_verifier_append(
                     &mut prepared.attention,
-                    &plan,
+                    &dispatch.append,
                     &key,
                     &value,
                 )?;
@@ -11159,7 +11157,7 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         program: &PreparedMetalDecodeProgram<'_>,
         prepared: &mut PreparedMappedMetalTargetLayers,
-    ) -> Result<Vec<(usize, MetalPagedGqaAppendPlan)>> {
+    ) -> Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> {
         if !prepared.transaction_active {
             return Err(EngineError::InvalidState(
                 "Metal target graph encoding requires an active state transaction".into(),
@@ -11195,18 +11193,16 @@ impl MetalCandidateRuntime {
                     let validated =
                         self.validate_prepared_mapped_full_attention_layer(steps, layer)?;
                     layer.attention.poisoned = true;
-                    let plan = self.plan_paged_gqa_append(&mut layer.attention)?;
-                    write_metal_paged_gqa_descriptors(&layer.attention)?;
-                    write_metal_paged_gqa_params(&layer.attention)?;
+                    let dispatch = self.plan_paged_gqa_dispatch(&mut layer.attention)?;
                     self.encode_prepared_mapped_full_attention_layer(
                         encoder,
                         steps,
                         layer,
-                        &plan,
+                        &dispatch,
                         validated.thread_width,
                         validated.component_values,
                     )?;
-                    full_plans.push((layer_index, plan));
+                    full_plans.push((layer_index, dispatch));
                 }
             }
         }
@@ -11270,7 +11266,7 @@ impl MetalCandidateRuntime {
             }
         }
         #[cfg(test)]
-        for (layer_index, plan) in &full_plans {
+        for (layer_index, dispatch) in &full_plans {
             let PreparedMappedMetalTargetLayer::FullAttention(layer) =
                 &mut prepared.layers[*layer_index]
             else {
@@ -11307,9 +11303,12 @@ impl MetalCandidateRuntime {
                 )
                 .to_vec()
             };
-            if let Err(primary) =
-                self.commit_paged_gqa_verifier_append(&mut layer.attention, plan, &key, &value)
-            {
+            if let Err(primary) = self.commit_paged_gqa_verifier_append(
+                &mut layer.attention,
+                &dispatch.append,
+                &key,
+                &value,
+            ) {
                 return match prepared.restore_speculative(self) {
                     Ok(()) => Err(primary),
                     Err(rollback) => Err(EngineError::InvalidState(format!(
@@ -11393,7 +11392,7 @@ impl MetalCandidateRuntime {
         prepared: &mut PreparedMappedMetalTargetCore,
         initial_norm: &PreparedMetalDecodeStepView<'_>,
         lm_head: &PreparedMetalDecodeStepView<'_>,
-    ) -> Result<Vec<(usize, MetalPagedGqaAppendPlan)>> {
+    ) -> Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> {
         let arena = initial_norm.reads()[0].buffer();
         self.encode_mapped_norm_between(
             encoder,
@@ -11422,7 +11421,7 @@ impl MetalCandidateRuntime {
         program: &PreparedMetalDecodeProgram<'_>,
         prepared: &mut PreparedMappedMetalTargetCore,
         selector: &PreparedMetalArgMaxScratch,
-    ) -> Result<Vec<(usize, MetalPagedGqaAppendPlan)>> {
+    ) -> Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> {
         let [embedding, initial_norm, lm_head] =
             self.validate_prepared_mapped_target_core(program, prepared)?;
         self.encode_mapped_embedding_from_selector_to(
@@ -11520,7 +11519,7 @@ impl MetalCandidateRuntime {
             }
         }
         #[cfg(test)]
-        for (layer_index, plan) in &full_plans {
+        for (layer_index, dispatch) in &full_plans {
             let PreparedMappedMetalTargetLayer::FullAttention(layer) =
                 &mut prepared.layers.layers[*layer_index]
             else {
@@ -11557,9 +11556,12 @@ impl MetalCandidateRuntime {
                 )
                 .to_vec()
             };
-            if let Err(primary) =
-                self.commit_paged_gqa_verifier_append(&mut layer.attention, plan, &key, &value)
-            {
+            if let Err(primary) = self.commit_paged_gqa_verifier_append(
+                &mut layer.attention,
+                &dispatch.append,
+                &key,
+                &value,
+            ) {
                 return match prepared.layers.restore_speculative(self) {
                     Ok(()) => Err(primary),
                     Err(rollback) => Err(EngineError::InvalidState(format!(
@@ -11639,7 +11641,7 @@ impl MetalCandidateRuntime {
     fn validate_completed_mapped_target_core(
         &self,
         prepared: &mut PreparedMappedMetalTargetCore,
-        full_plans: &[(usize, MetalPagedGqaAppendPlan)],
+        full_plans: &[(usize, MetalPagedGqaDispatchPlan)],
     ) -> Result<()> {
         for layer in &mut prepared.layers.layers {
             match layer {
@@ -11655,7 +11657,7 @@ impl MetalCandidateRuntime {
         #[cfg(not(test))]
         let _ = full_plans;
         #[cfg(test)]
-        for (layer_index, plan) in full_plans {
+        for (layer_index, dispatch) in full_plans {
             let PreparedMappedMetalTargetLayer::FullAttention(layer) =
                 &mut prepared.layers.layers[*layer_index]
             else {
@@ -11692,9 +11694,12 @@ impl MetalCandidateRuntime {
                 )
                 .to_vec()
             };
-            if let Err(primary) =
-                self.commit_paged_gqa_verifier_append(&mut layer.attention, plan, &key, &value)
-            {
+            if let Err(primary) = self.commit_paged_gqa_verifier_append(
+                &mut layer.attention,
+                &dispatch.append,
+                &key,
+                &value,
+            ) {
                 return match prepared.layers.restore_speculative(self) {
                     Ok(()) => Err(primary),
                     Err(rollback) => Err(EngineError::InvalidState(format!(
@@ -12125,7 +12130,7 @@ impl MetalCandidateRuntime {
         &self,
         encoder: &ComputeCommandEncoderRef,
         prepared: &PreparedMappedMetalMtpCore,
-        plan: &MetalPagedGqaAppendPlan,
+        dispatch: &MetalPagedGqaDispatchPlan,
         component_values: usize,
         thread_width: usize,
     ) -> Result<()> {
@@ -12225,10 +12230,10 @@ impl MetalCandidateRuntime {
                 },
             );
         }
-        self.encode_paged_gqa_append_and_attention(
+        self.encode_paged_gqa_append_and_attention_with_metadata(
             encoder,
             &prepared.layer.attention,
-            plan,
+            &dispatch.append,
             arena,
             query,
             arena,
@@ -12237,6 +12242,8 @@ impl MetalCandidateRuntime {
             value,
             arena,
             attention_output,
+            &dispatch.descriptors_buffer,
+            &dispatch.params_buffer,
         )?;
         self.encode_mapped_sigmoid_gate_projection_between(
             encoder,
@@ -12300,7 +12307,7 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         step: &PreparedMetalDecodeStepView<'_>,
         prepared: &PreparedMappedMetalMtpCore,
-        plan: &MetalPagedGqaAppendPlan,
+        dispatch: &MetalPagedGqaDispatchPlan,
         component_values: usize,
         thread_width: usize,
     ) -> Result<()> {
@@ -12309,7 +12316,7 @@ impl MetalCandidateRuntime {
             encoder,
             step,
             prepared,
-            plan,
+            dispatch,
             component_values,
             thread_width,
         )
@@ -12320,14 +12327,14 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         step: &PreparedMetalDecodeStepView<'_>,
         prepared: &PreparedMappedMetalMtpCore,
-        plan: &MetalPagedGqaAppendPlan,
+        dispatch: &MetalPagedGqaDispatchPlan,
         component_values: usize,
         thread_width: usize,
     ) -> Result<()> {
         self.encode_prepared_mapped_mtp_layer(
             encoder,
             prepared,
-            plan,
+            dispatch,
             component_values,
             thread_width,
         )?;
@@ -12371,9 +12378,7 @@ impl MetalCandidateRuntime {
         let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(prepared)?;
         prepared.layer.attention.begin_speculative()?;
         let result = (|| {
-            let plan = self.plan_paged_gqa_append(&mut prepared.layer.attention)?;
-            write_metal_paged_gqa_descriptors(&prepared.layer.attention)?;
-            write_metal_paged_gqa_params(&prepared.layer.attention)?;
+            let dispatch = self.plan_paged_gqa_dispatch(&mut prepared.layer.attention)?;
             prepared.layer.attention.poisoned = true;
             zero_buffer(
                 &prepared.target_selector.result_buffer,
@@ -12390,7 +12395,7 @@ impl MetalCandidateRuntime {
                 encoder,
                 step,
                 prepared,
-                &plan,
+                &dispatch,
                 component_values,
                 thread_width,
             );
@@ -12433,7 +12438,7 @@ impl MetalCandidateRuntime {
                 };
                 self.commit_paged_gqa_verifier_append(
                     &mut prepared.layer.attention,
-                    &plan,
+                    &dispatch.append,
                     &key,
                     &value,
                 )?;
@@ -12573,9 +12578,7 @@ impl MetalCandidateRuntime {
         }
 
         let result = (|| {
-            let mtp_plan = self.plan_paged_gqa_append(&mut mtp.layer.attention)?;
-            write_metal_paged_gqa_descriptors(&mtp.layer.attention)?;
-            write_metal_paged_gqa_params(&mtp.layer.attention)?;
+            let mtp_dispatch = self.plan_paged_gqa_dispatch(&mut mtp.layer.attention)?;
             mtp.layer.attention.poisoned = true;
             write_buffer_range(
                 &mtp.target_selector.result_buffer,
@@ -12592,7 +12595,7 @@ impl MetalCandidateRuntime {
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-initial-mtp-target-verifier");
             let encoder = command_buffer.new_compute_command_encoder();
-            let encoded: Result<Vec<(usize, MetalPagedGqaAppendPlan)>> = (|| {
+            let encoded: Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> = (|| {
                 self.encode_prepared_mapped_mtp_frontend_from_selector(
                     encoder,
                     mtp_step,
@@ -12604,7 +12607,7 @@ impl MetalCandidateRuntime {
                     encoder,
                     mtp_step,
                     mtp,
-                    &mtp_plan,
+                    &mtp_dispatch,
                     component_values,
                     thread_width,
                 )?;
@@ -12647,7 +12650,7 @@ impl MetalCandidateRuntime {
                 )));
             }
 
-            self.validate_completed_mapped_mtp_layer(mtp, &mtp_plan, component_values)?;
+            self.validate_completed_mapped_mtp_layer(mtp, &mtp_dispatch.append, component_values)?;
             self.validate_completed_mapped_target_core(target, &target_plans)?;
             let verified = self
                 .read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
@@ -12723,9 +12726,7 @@ impl MetalCandidateRuntime {
         }
 
         let result = (|| {
-            let mtp_plan = self.plan_paged_gqa_append(&mut mtp.layer.attention)?;
-            write_metal_paged_gqa_descriptors(&mtp.layer.attention)?;
-            write_metal_paged_gqa_params(&mtp.layer.attention)?;
+            let mtp_dispatch = self.plan_paged_gqa_dispatch(&mut mtp.layer.attention)?;
             mtp.layer.attention.poisoned = true;
             zero_buffer(
                 &mtp.target_selector.result_buffer,
@@ -12740,12 +12741,12 @@ impl MetalCandidateRuntime {
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-greedy-mtp-target-verifier");
             let encoder = command_buffer.new_compute_command_encoder();
-            let encoded: Result<Vec<(usize, MetalPagedGqaAppendPlan)>> = (|| {
+            let encoded: Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> = (|| {
                 self.encode_prepared_mapped_mtp_draft(
                     encoder,
                     mtp_step,
                     mtp,
-                    &mtp_plan,
+                    &mtp_dispatch,
                     component_values,
                     thread_width,
                 )?;
@@ -12780,7 +12781,7 @@ impl MetalCandidateRuntime {
                 )));
             }
 
-            self.validate_completed_mapped_mtp_layer(mtp, &mtp_plan, component_values)?;
+            self.validate_completed_mapped_mtp_layer(mtp, &mtp_dispatch.append, component_values)?;
             self.validate_completed_mapped_target_core(target, &target_plans)?;
             let verified = self
                 .read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
@@ -12814,7 +12815,7 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         steps: &[PreparedMetalDecodeStepView<'_>],
         prepared: &PreparedMappedMetalFullAttentionLayer,
-        plan: &MetalPagedGqaAppendPlan,
+        dispatch: &MetalPagedGqaDispatchPlan,
         thread_width: usize,
         component_values: usize,
     ) -> Result<()> {
@@ -12900,10 +12901,10 @@ impl MetalCandidateRuntime {
                 },
             );
         }
-        self.encode_paged_gqa_append_and_attention(
+        self.encode_paged_gqa_append_and_attention_with_metadata(
             encoder,
             &prepared.attention,
-            plan,
+            &dispatch.append,
             arena,
             gqa.reads()[0].offset(),
             arena,
@@ -12912,6 +12913,8 @@ impl MetalCandidateRuntime {
             append.reads()[1].offset(),
             arena,
             gqa.writes()[0].offset(),
+            &dispatch.descriptors_buffer,
+            &dispatch.params_buffer,
         )?;
         self.encode_mapped_sigmoid_gate_projection_between(
             encoder,
