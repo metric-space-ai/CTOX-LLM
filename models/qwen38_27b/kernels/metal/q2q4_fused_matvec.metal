@@ -384,6 +384,98 @@ inline void fused_q4_swiglu_rows(device const uchar* weights,
     finish_rows(partial, s_out, bias, output, params, first_row, simd_lane);
 }
 
+inline float sigmoid_gate_value(float attention, float gate) {
+    return attention / (1.0f + exp(-gate));
+}
+
+inline void fused_q2_sigmoid_gate_rows(device const uchar* weights,
+                                       device const float* attention,
+                                       device const float* gate,
+                                       device const half* s_in,
+                                       device const half* s_out,
+                                       device const float* bias,
+                                       device float* output,
+                                       constant FusedMatVecParams& params,
+                                       uint first_row,
+                                       uint simd_lane) {
+    float partial[ROWS_PER_SIMDGROUP] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (simd_lane < 16u) {
+        for (uint block = 0; block < params.blocks_per_row; ++block) {
+            uint column = block * Q2Q4_BLOCK_LEN + simd_lane * 4u;
+            float4 x(sigmoid_gate_value(attention[column], gate[column]),
+                     sigmoid_gate_value(attention[column + 1u], gate[column + 1u]),
+                     sigmoid_gate_value(attention[column + 2u], gate[column + 2u]),
+                     sigmoid_gate_value(attention[column + 3u], gate[column + 3u]));
+            if (params.has_s_in != 0u) {
+                x *= float4(float(s_in[column]), float(s_in[column + 1u]),
+                            float(s_in[column + 2u]), float(s_in[column + 3u]));
+            }
+            for (uint row_offset = 0; row_offset < ROWS_PER_SIMDGROUP; ++row_offset) {
+                uint row = first_row + row_offset;
+                if (row >= params.rows) {
+                    continue;
+                }
+                device const uchar* block_base = weights
+                    + ulong(row) * params.blocks_per_row * Q2_BLOCK_BYTES
+                    + ulong(block) * Q2_BLOCK_BYTES;
+                float scale = read_scale(block_base);
+                uint packed = uint(block_base[2u + simd_lane]);
+                float4 normalized(q2_normalized(packed & 0x3u),
+                                  q2_normalized((packed >> 2u) & 0x3u),
+                                  q2_normalized((packed >> 4u) & 0x3u),
+                                  q2_normalized((packed >> 6u) & 0x3u));
+                partial[row_offset] += scale * dot(normalized, x);
+            }
+        }
+    }
+    finish_rows(partial, s_out, bias, output, params, first_row, simd_lane);
+}
+
+inline void fused_q4_sigmoid_gate_rows(device const uchar* weights,
+                                       device const float* attention,
+                                       device const float* gate,
+                                       device const half* s_in,
+                                       device const half* s_out,
+                                       device const float* bias,
+                                       device float* output,
+                                       constant FusedMatVecParams& params,
+                                       uint first_row,
+                                       uint simd_lane) {
+    float partial[ROWS_PER_SIMDGROUP] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint block = 0; block < params.blocks_per_row; ++block) {
+        uint column_start = block * Q2Q4_BLOCK_LEN;
+        uint column0 = column_start + simd_lane;
+        uint column1 = column0 + 32u;
+        float x0 = sigmoid_gate_value(attention[column0], gate[column0]);
+        float x1 = sigmoid_gate_value(attention[column1], gate[column1]);
+        if (params.has_s_in != 0u) {
+            x0 *= float(s_in[column0]);
+            x1 *= float(s_in[column1]);
+        }
+        for (uint row_offset = 0; row_offset < ROWS_PER_SIMDGROUP; ++row_offset) {
+            uint row = first_row + row_offset;
+            if (row >= params.rows) {
+                continue;
+            }
+            device const uchar* block_base = weights
+                + ulong(row) * params.blocks_per_row * Q4_BLOCK_BYTES
+                + ulong(block) * Q4_BLOCK_BYTES;
+            float scale = read_scale(block_base);
+            device const uchar* codes = block_base + 2;
+            uint byte_index = simd_lane >> 1u;
+            uint shift = (simd_lane & 0x1u) << 2u;
+            uint packed0 = uint(codes[byte_index]);
+            uint packed1 = uint(codes[byte_index + 16u]);
+            uint code0 = (packed0 >> shift) & 0xfu;
+            uint code1 = (packed1 >> shift) & 0xfu;
+            float normalized0 = (float(code0) - 7.5f) * (1.0f / 7.5f);
+            float normalized1 = (float(code1) - 7.5f) * (1.0f / 7.5f);
+            partial[row_offset] += scale * (normalized0 * x0 + normalized1 * x1);
+        }
+    }
+    finish_rows(partial, s_out, bias, output, params, first_row, simd_lane);
+}
+
 inline void finish_gathered_rows(thread float* partial,
                                  device const uint* row_ids,
                                  device const half* s_out,
@@ -586,6 +678,54 @@ kernel void q4_b64_swiglu_matvec(
     }
     fused_q4_swiglu_rows(weights, gate, up, s_in, s_out, bias, output, params,
                          first_row, simd_lane);
+}
+
+// Fused sigmoid gate plus Q2_B64 full-attention output projection. The
+// 6,144-value gated attention vector exists only in registers.
+// ref: kernels/cuda/q2q4_fused_matvec_sm86.cu:342-385
+kernel void q2_b64_sigmoid_gate_matvec(
+    device const uchar* weights [[buffer(0)]],
+    device const float* attention [[buffer(1)]],
+    device const float* gate [[buffer(2)]],
+    device const half* s_in [[buffer(3)]],
+    device const half* s_out [[buffer(4)]],
+    device const float* bias [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant FusedMatVecParams& params [[buffer(7)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lanes_per_group [[threads_per_threadgroup]]) {
+    uint simd_groups = (lanes_per_group + 31u) / 32u;
+    uint first_row = (group_id * simd_groups + simd_group) * ROWS_PER_SIMDGROUP;
+    if (first_row >= params.rows) {
+        return;
+    }
+    fused_q2_sigmoid_gate_rows(weights, attention, gate, s_in, s_out, bias,
+                               output, params, first_row, simd_lane);
+}
+
+// Fused sigmoid gate plus Q4_B64 full-attention output projection.
+kernel void q4_b64_sigmoid_gate_matvec(
+    device const uchar* weights [[buffer(0)]],
+    device const float* attention [[buffer(1)]],
+    device const float* gate [[buffer(2)]],
+    device const half* s_in [[buffer(3)]],
+    device const half* s_out [[buffer(4)]],
+    device const float* bias [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant FusedMatVecParams& params [[buffer(7)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lanes_per_group [[threads_per_threadgroup]]) {
+    uint simd_groups = (lanes_per_group + 31u) / 32u;
+    uint first_row = (group_id * simd_groups + simd_group) * ROWS_PER_SIMDGROUP;
+    if (first_row >= params.rows) {
+        return;
+    }
+    fused_q4_sigmoid_gate_rows(weights, attention, gate, s_in, s_out, bias,
+                               output, params, first_row, simd_lane);
 }
 
 kernel void q2_b64_gathered_matvec(

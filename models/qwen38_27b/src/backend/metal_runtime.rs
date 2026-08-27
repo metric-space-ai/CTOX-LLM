@@ -25,12 +25,13 @@ use super::metal::{
     MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi, MetalPagedGqaParams,
     MetalPartialRopeBufferAbi, MetalPartialRopeParams, MetalQueryGateBufferAbi,
     MetalQueryGateParams, MetalResidualRmsNormBufferAbi, MetalRmsNormBufferAbi, MetalRmsNormParams,
-    MetalSwiGluBufferAbi, ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME,
-    CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME,
-    KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP,
-    PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
-    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
-    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
+    MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi, ARGMAX_F32_FINAL_KERNEL_NAME,
+    ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME,
+    GATED_DELTA_PREP_F32_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME,
+    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
+    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME,
+    Q2_SIGMOID_GATE_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
+    Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
     QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
     RMS_NORM_GATED_KERNEL_NAME,
 };
@@ -68,6 +69,8 @@ pub struct MetalCandidateRuntime {
     q4_pipeline: ComputePipelineState,
     q2_swiglu_pipeline: ComputePipelineState,
     q4_swiglu_pipeline: ComputePipelineState,
+    q2_sigmoid_gate_pipeline: ComputePipelineState,
+    q4_sigmoid_gate_pipeline: ComputePipelineState,
     q2_gathered_pipeline: ComputePipelineState,
     q4_gathered_pipeline: ComputePipelineState,
     q2_recovered_row_pipeline: ComputePipelineState,
@@ -447,6 +450,13 @@ pub struct PreparedMappedMetalCausalConv {
 pub struct PreparedMappedMetalFullAttentionFanout {
     layer: usize,
     projections: [PreparedMappedMetalMatVec; 3],
+}
+
+/// Canonical full-attention sigmoid gate plus recovered output projection.
+/// All activation endpoints remain graph-owned shared-arena views.
+pub struct PreparedMappedMetalAttentionOutput {
+    layer: usize,
+    projection: PreparedMappedMetalMatVec,
 }
 
 /// Mmap-backed query RMSNorm plus reusable partial-RoPE tables for one exact
@@ -2040,6 +2050,20 @@ impl PreparedMappedMetalFullAttentionFanout {
     }
 }
 
+impl PreparedMappedMetalAttentionOutput {
+    pub fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.projection.transient_bytes()
+    }
+}
+
 impl PreparedMappedMetalQueryGate {
     pub fn layer(&self) -> usize {
         self.layer
@@ -2127,6 +2151,20 @@ impl MetalCandidateRuntime {
                         "Metal Q4 SwiGLU function lookup failed: {message}"
                     ))
                 })?;
+        let q2_sigmoid_gate_function = library
+            .get_function(Q2_SIGMOID_GATE_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q2 sigmoid-gate function lookup failed: {message}"
+                ))
+            })?;
+        let q4_sigmoid_gate_function = library
+            .get_function(Q4_SIGMOID_GATE_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 sigmoid-gate function lookup failed: {message}"
+                ))
+            })?;
         let q2_gathered_function = library
             .get_function(Q2_GATHERED_KERNEL_NAME, None)
             .map_err(|message| {
@@ -2278,6 +2316,29 @@ impl MetalCandidateRuntime {
                 "Metal SwiGLU Q2/Q4 kernels require 32-wide simdgroups, device reports {}/{}",
                 q2_swiglu_pipeline.thread_execution_width(),
                 q4_swiglu_pipeline.thread_execution_width()
+            )));
+        }
+        let q2_sigmoid_gate_pipeline = device
+            .new_compute_pipeline_state_with_function(&q2_sigmoid_gate_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q2 sigmoid-gate pipeline creation failed: {message}"
+                ))
+            })?;
+        let q4_sigmoid_gate_pipeline = device
+            .new_compute_pipeline_state_with_function(&q4_sigmoid_gate_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 sigmoid-gate pipeline creation failed: {message}"
+                ))
+            })?;
+        if q2_sigmoid_gate_pipeline.thread_execution_width() != 32
+            || q4_sigmoid_gate_pipeline.thread_execution_width() != 32
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal sigmoid-gate Q2/Q4 kernels require 32-wide simdgroups, device reports {}/{}",
+                q2_sigmoid_gate_pipeline.thread_execution_width(),
+                q4_sigmoid_gate_pipeline.thread_execution_width()
             )));
         }
         let q2_gathered_pipeline = device
@@ -2452,6 +2513,8 @@ impl MetalCandidateRuntime {
             q4_pipeline,
             q2_swiglu_pipeline,
             q4_swiglu_pipeline,
+            q2_sigmoid_gate_pipeline,
+            q4_sigmoid_gate_pipeline,
             q2_gathered_pipeline,
             q4_gathered_pipeline,
             q2_recovered_row_pipeline,
@@ -3285,6 +3348,34 @@ impl MetalCandidateRuntime {
             params_buffer: buffer_with_data(&self.device, &params.encode()),
             transient_bytes,
         })
+    }
+
+    /// Prepare the canonical recovered output projection that consumes the
+    /// full-attention sigmoid gate directly from graph-owned arena views.
+    pub fn prepare_mapped_attention_gate_output_projection(
+        &self,
+        mapping: &MappedMetalArtifact,
+        layer: usize,
+    ) -> Result<PreparedMappedMetalAttentionOutput> {
+        let config = Qwen38Config::default();
+        if config.layer_kind(layer) != Some(LayerKind::FullAttention) {
+            return Err(EngineError::InvalidState(format!(
+                "Metal layer {layer} is not a frozen Qwen full-attention layer"
+            )));
+        }
+        let name = format!("model.language_model.layers.{layer}.self_attn.o_proj.weight");
+        let projection = self.prepare_named_mapped_projection_graph_io(mapping, &name)?;
+        let attention_values = config
+            .num_attention_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal attention width overflows".into()))?;
+        if projection.columns != attention_values || projection.rows != config.hidden_size {
+            return Err(EngineError::InvalidArtifact(format!(
+                "Metal full-attention layer {layer} output projection has {}x{}, expected {}x{}",
+                projection.rows, projection.columns, config.hidden_size, attention_values
+            )));
+        }
+        Ok(PreparedMappedMetalAttentionOutput { layer, projection })
     }
 
     /// Prepare every immutable tensor and persistent state owner for one exact
@@ -7127,6 +7218,98 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_sigmoid_gate_projection_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        projection: &PreparedMappedMetalMatVec,
+        attention_buffer: &Buffer,
+        attention_offset: u64,
+        gate_buffer: &Buffer,
+        gate_offset: u64,
+        output_buffer: &Buffer,
+        output_offset: u64,
+    ) -> Result<()> {
+        encoder.set_buffer(
+            MetalSigmoidGateBufferAbi::ATTENTION as u64,
+            Some(attention_buffer),
+            attention_offset,
+        );
+        encoder.set_buffer(
+            MetalSigmoidGateBufferAbi::GATE as u64,
+            Some(gate_buffer),
+            gate_offset,
+        );
+        encoder.set_buffer(
+            MetalSigmoidGateBufferAbi::S_IN as u64,
+            Some(&projection.mapping.inner.buffer),
+            projection.s_in_offset,
+        );
+        for dispatch in &projection.dispatches {
+            let pipeline = match dispatch.dtype {
+                TensorDType::Q2B64 => &self.q2_sigmoid_gate_pipeline,
+                TensorDType::Q4B64 => &self.q4_sigmoid_gate_pipeline,
+                _ => unreachable!("mapped Metal sigmoid-gate projection is Q2/Q4"),
+            };
+            if dispatch.thread_width > pipeline.max_total_threads_per_threadgroup() as usize {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal sigmoid-gate projection requires {} threads but pipeline admits {}",
+                    dispatch.thread_width,
+                    pipeline.max_total_threads_per_threadgroup()
+                )));
+            }
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(
+                MetalSigmoidGateBufferAbi::WEIGHTS as u64,
+                Some(&projection.mapping.inner.buffer),
+                dispatch.weights_offset,
+            );
+            encoder.set_buffer(
+                MetalSigmoidGateBufferAbi::S_OUT as u64,
+                Some(&projection.mapping.inner.buffer),
+                dispatch.s_out_offset,
+            );
+            encoder.set_buffer(
+                MetalSigmoidGateBufferAbi::BIAS as u64,
+                Some(&projection.bias_buffer),
+                dispatch.bias_offset,
+            );
+            encoder.set_buffer(
+                MetalSigmoidGateBufferAbi::OUTPUT as u64,
+                Some(output_buffer),
+                output_offset
+                    .checked_add(dispatch.output_offset)
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget(
+                            "Metal sigmoid-gate output view offset overflows".into(),
+                        )
+                    })?,
+            );
+            encoder.set_buffer(
+                MetalSigmoidGateBufferAbi::PARAMS as u64,
+                Some(&dispatch.params_buffer),
+                0,
+            );
+            let grid = MTLSize {
+                width: dispatch
+                    .rows
+                    .div_ceil((dispatch.thread_width / 32) * ROWS_PER_SIMDGROUP)
+                    as u64,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_thread_groups(
+                grid,
+                MTLSize {
+                    width: dispatch.thread_width as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Verifier-only wrapper for the fused SwiGLU projection entry points.
     /// Production graph execution binds arena views through the schedule-bound
     /// path instead of allocating these temporary input/output buffers.
@@ -8253,6 +8436,73 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    /// Apply the per-channel sigmoid attention gate, recovery `s_in`, and the
+    /// mixed Q2/Q4 output projection in one kernel family. The gated 6,144-wide
+    /// tensor is never materialized and every activation remains in the shared
+    /// decode arena.
+    pub fn dispatch_mapped_attention_gate_output_projection_view(
+        &self,
+        step: &PreparedMetalDecodeStepView<'_>,
+        prepared: &PreparedMappedMetalAttentionOutput,
+    ) -> Result<()> {
+        let layer = prepared.layer;
+        let projection = &prepared.projection;
+        if step.step().layer != Some(layer)
+            || step.step().operation != MetalDecodeOperation::AttentionGateOutputProjection
+            || step.reads().len() != 2
+            || step.writes().len() != 1
+            || step.reads()[0].slot() != MetalBufferSlot::AttentionOutput
+            || step.reads()[1].slot() != MetalBufferSlot::AttentionGate
+            || step.writes()[0].slot() != MetalBufferSlot::MixerOutput
+            || projection.input_buffer.is_some()
+            || projection.output_buffer.is_some()
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal attention output layer {layer} does not match its frozen schedule view"
+            )));
+        }
+        let attention = &step.reads()[0];
+        let gate = &step.reads()[1];
+        let output = &step.writes()[0];
+        let arena = attention.buffer();
+        let name = format!("model.language_model.layers.{layer}.self_attn.o_proj.weight");
+        if !std::ptr::eq(arena, gate.buffer())
+            || !std::ptr::eq(arena, output.buffer())
+            || attention.values() < projection.columns
+            || gate.values() < projection.columns
+            || output.values() < projection.rows
+            || !projection.matches_recovered_tensor(&name)?
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal attention output layer {layer} has incompatible arena, shape, or projection identity"
+            )));
+        }
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-shared-arena-attention-gate-output");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_sigmoid_gate_projection_between(
+            encoder,
+            projection,
+            arena,
+            attention.offset(),
+            arena,
+            gate.offset(),
+            arena,
+            output.offset(),
+        )?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal attention output layer {layer} ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        Ok(())
+    }
+
     /// Execute one complete frozen linear-attention transformer layer from an
     /// already-normalized shared-arena input. The ten bound schedule views are
     /// reusable for every linear layer; immutable tensors remain mmap-backed,
@@ -9250,6 +9500,16 @@ mod tests {
         rows_q4: usize,
         columns: usize,
     ) -> Vec<QuantSegment> {
+        write_named_mixed_fixture(path, "matrix.weight", rows_q2, rows_q4, columns)
+    }
+
+    fn write_named_mixed_fixture(
+        path: &std::path::Path,
+        name: &str,
+        rows_q2: usize,
+        rows_q4: usize,
+        columns: usize,
+    ) -> Vec<QuantSegment> {
         let q2 = packed_weights(TensorDType::Q2B64, rows_q2, columns);
         let q4 = packed_weights(TensorDType::Q4B64, rows_q4, columns);
         let mut weights = q2.clone();
@@ -9278,7 +9538,7 @@ mod tests {
         ];
         let tensors = vec![
             TensorEntry {
-                name: "matrix.weight".into(),
+                name: name.into(),
                 dtype: TensorDType::MixedQ2Q4B64,
                 shape: vec![(rows_q2 + rows_q4) as u64, columns as u64],
                 offset: 0,
@@ -9287,7 +9547,7 @@ mod tests {
                 segments: segments.clone(),
             },
             TensorEntry {
-                name: "matrix.weight.s_in".into(),
+                name: format!("{name}.s_in"),
                 dtype: TensorDType::F16,
                 shape: vec![columns as u64],
                 offset: s_in_offset as u64,
@@ -9296,7 +9556,7 @@ mod tests {
                 segments: Vec::new(),
             },
             TensorEntry {
-                name: "matrix.weight.s_out".into(),
+                name: format!("{name}.s_out"),
                 dtype: TensorDType::F16,
                 shape: vec![(rows_q2 + rows_q4) as u64],
                 offset: s_out_offset as u64,
@@ -12557,6 +12817,118 @@ mod tests {
             let tolerance = 4.0e-5_f32.max(expected.abs() * 5.0e-5);
             assert!((expected - actual).abs() <= tolerance);
         }
+    }
+
+    #[test]
+    fn attention_sigmoid_gate_projects_mixed_q2_q4_without_product_buffer() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let config = Qwen38Config::default();
+        let columns = config.num_attention_heads * config.head_dim;
+        let rows_q2 = config.hidden_size / 2;
+        let rows_q4 = config.hidden_size - rows_q2;
+        let name = "model.language_model.layers.3.self_attn.o_proj.weight";
+        let directory = tempdir().expect("temporary attention output directory");
+        let path = directory.path().join("attention-output.ctoxq");
+        write_named_mixed_fixture(&path, name, rows_q2, rows_q4, columns);
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open mixed attention output fixture");
+        let matrix = artifact
+            .recovered_matrix(name)
+            .expect("resolve mixed attention output projection");
+        let attention: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.011).sin() * 0.55 - 0.03)
+            .collect();
+        let gate: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.017).cos() * 1.1 + 0.07)
+            .collect();
+        let mut gated = attention.clone();
+        crate::reference::sigmoid_gate(&mut gated, &gate).expect("sigmoid-gate scalar oracle");
+        let expected = cpu
+            .fused_matvec(
+                &matrix
+                    .operation(&gated, Activation::Identity)
+                    .expect("construct mixed attention output oracle"),
+            )
+            .expect("execute mixed attention output oracle");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("map mixed attention output fixture");
+        let prepared = runtime
+            .prepare_mapped_attention_gate_output_projection(&mapping, 3)
+            .expect("prepare mixed attention output projection");
+        assert_eq!(prepared.layer(), 3);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert!(prepared.transient_bytes() > 0);
+        assert!(prepared.projection.input_buffer.is_none());
+        assert!(prepared.projection.output_buffer.is_none());
+        assert_eq!(prepared.projection.dtype, TensorDType::MixedQ2Q4B64);
+        assert!(runtime
+            .prepare_mapped_attention_gate_output_projection(&mapping, 0)
+            .is_err());
+        drop(mapping);
+        drop(artifact);
+
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let projection_plan = MetalProjectionPlan::qwen38(&config).expect("Metal projection plan");
+        let binding_plan = MetalDecodeBindingPlan::qwen38(&schedule, &projection_plan, &config)
+            .expect("complete Metal binding plan");
+        let workspace_plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("decode workspace plan");
+        let mut workspace = runtime
+            .prepare_decode_workspace(&workspace_plan)
+            .expect("allocate shared decode arena");
+        workspace
+            .write_f32(MetalBufferSlot::AttentionOutput, &attention)
+            .expect("seed attention output arena slot");
+        workspace
+            .write_f32(MetalBufferSlot::AttentionGate, &gate)
+            .expect("seed attention gate arena slot");
+        let program = workspace
+            .bind_decode_program(&binding_plan)
+            .expect("bind shared-arena decode program");
+        let layer_three = program
+            .full_attention_layer_steps(3)
+            .expect("bind layer-3 full attention");
+        let wrong_layer = program
+            .full_attention_layer_steps(7)
+            .expect("bind layer-7 full attention");
+        assert!(runtime
+            .dispatch_mapped_attention_gate_output_projection_view(&wrong_layer[5], &prepared)
+            .is_err());
+        runtime
+            .dispatch_mapped_attention_gate_output_projection_view(&layer_three[5], &prepared)
+            .expect("dispatch fused attention output projection in shared arena");
+        drop(program);
+        let actual = workspace
+            .read_f32(MetalBufferSlot::MixerOutput)
+            .expect("read mixed attention projection output");
+        for (row, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+            let tolerance = 5.0e-4_f32.max(expected.abs() * 7.0e-5);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "attention output row {row}: expected {expected}, got {actual}"
+            );
+        }
+
+        workspace
+            .write_f32(MetalBufferSlot::AttentionOutput, &vec![0.0; columns])
+            .expect("zero attention output arena slot");
+        let program = workspace
+            .bind_decode_program(&binding_plan)
+            .expect("rebind shared-arena decode program");
+        let step = &program
+            .full_attention_layer_steps(3)
+            .expect("rebind layer-3 full attention")[5];
+        runtime
+            .dispatch_mapped_attention_gate_output_projection_view(step, &prepared)
+            .expect("reuse fused attention output projection");
+        drop(program);
+        assert!(workspace
+            .read_f32(MetalBufferSlot::MixerOutput)
+            .expect("read zero attention projection")
+            .iter()
+            .all(|value| value.abs() <= f32::EPSILON));
     }
 
     #[test]

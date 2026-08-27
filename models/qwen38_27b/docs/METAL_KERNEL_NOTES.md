@@ -84,6 +84,12 @@ block. The Metal kernel ports the verified CUDA equation: it deinterleaves each
 `(1 + weight)`, rotates the first 64 dimensions, and writes Query plus Gate to
 their exact arena views without a temporary normalized vector.
 
+`PreparedMappedMetalAttentionOutput` closes the full-attention mixer without a
+gated activation allocation. Dedicated Q2/Q4 entry points read
+`AttentionOutput` and `AttentionGate` from their arena views, evaluate the
+sigmoid gate and recovery `s_in` in registers, and write the recovered output
+projection directly to `MixerOutput`.
+
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
 active, appends retain all pre-branch Q4 pages and use the memory-plan boundary
@@ -131,6 +137,8 @@ the complete step set remains executor work.
 | `q4_b64_fused_matvec` | Q4_B64 | 34 bytes: fp16-LE scale + 32 code bytes (2 x 4-bit values per byte) |
 | `q2_b64_swiglu_matvec` | Q2_B64 | fused `SiLU(gate) * up` in registers plus recovered down projection |
 | `q4_b64_swiglu_matvec` | Q4_B64 | fused `SiLU(gate) * up` in registers plus recovered down projection |
+| `q2_b64_sigmoid_gate_matvec` | Q2_B64 | fused `attention * sigmoid(gate)` in registers plus recovered output projection |
+| `q4_b64_sigmoid_gate_matvec` | Q4_B64 | fused `attention * sigmoid(gate)` in registers plus recovered output projection |
 | `q2_b64_recovered_row` | Q2_B64 embedding row | one packed byte/four corrected outputs per thread |
 | `q4_b64_recovered_row` | Q4_B64 embedding row | one packed byte/two corrected outputs per thread |
 | `qwen_rms_norm_1p_f32` | FP16 weight, f32 activation | one 32-wide simdgroup per row |
@@ -469,6 +477,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   6,144 normalized/rotated Query values and all 6,144 untouched Gate values at
   position 12,345, reuses the same owner at position zero, and rejects a
   different layer before encoding.
+- `attention_sigmoid_gate_projects_mixed_q2_q4_without_product_buffer` verifies
+  a mixed Q2/Q4 Layer-3 output projection against the scalar oracle for all
+  5,120 rows, proves the 6,144-value gated tensor is not owned, reuses the same
+  resources for a zero-input dispatch, and rejects Layer-7 views.
 - `paged_q2q4_gqa_decode_matches_quantized_oracle_and_demotes_pages` forces a
   Q4-to-Q2 page transition, compares every decode step with the scalar GQA
   oracle using the identical quantized cache, verifies bounded arena byte
@@ -564,8 +576,9 @@ dequantization array before this source was accepted.
   projection, then fused post-FFN residual-add/next-layer Qwen RMSNorm). The
   complete first linear-attention layer is therefore wired. Full-attention
   schedule slices and the shared-arena Layer-3 fan-out, Query/Gate
-  normalization/RoPE, Key-RoPE, and combined KV-append/paged-GQA edges are also
-  executable. The remaining gated output projection and later schedule steps,
+  normalization/RoPE, Key-RoPE, combined KV-append/paged-GQA, and fused
+  sigmoid-gated mixed-Q2/Q4 output projection edges are also executable. The
+  complete first full-attention mixer is therefore wired. Later schedule steps,
   the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
