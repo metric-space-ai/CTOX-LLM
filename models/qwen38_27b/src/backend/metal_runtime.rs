@@ -745,6 +745,58 @@ impl<'a> PreparedMetalDecodeProgram<'a> {
     pub fn steps(&self) -> &[PreparedMetalDecodeStepView<'a>] {
         &self.steps
     }
+
+    /// Return the exact ten-step slice for one frozen linear-attention layer.
+    /// Every Qwen target layer occupies ten schedule positions; this accessor
+    /// rejects full-attention layers and any reordered or partially bound
+    /// program before a reusable layer encoder can consume its arena views.
+    pub fn linear_attention_layer_steps(
+        &self,
+        layer: usize,
+    ) -> Result<&[PreparedMetalDecodeStepView<'a>]> {
+        const STEPS_PER_LAYER: usize = 10;
+        const OPERATIONS: [MetalDecodeOperation; STEPS_PER_LAYER] = [
+            MetalDecodeOperation::LinearFanout,
+            MetalDecodeOperation::CausalConvolution,
+            MetalDecodeOperation::GatedDeltaPrepare,
+            MetalDecodeOperation::GatedDeltaRecurrent,
+            MetalDecodeOperation::GatedRmsNorm,
+            MetalDecodeOperation::LinearOutputProjection,
+            MetalDecodeOperation::ResidualRmsNorm,
+            MetalDecodeOperation::FfnGateUpFanout,
+            MetalDecodeOperation::SwiGluDownProjection,
+            MetalDecodeOperation::ResidualRmsNorm,
+        ];
+        let start = layer
+            .checked_mul(STEPS_PER_LAYER)
+            .and_then(|offset| offset.checked_add(2))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal layer schedule index overflows".into())
+            })?;
+        let end = start.checked_add(STEPS_PER_LAYER).ok_or_else(|| {
+            EngineError::MemoryBudget("Metal layer schedule range overflows".into())
+        })?;
+        let steps = self.steps.get(start..end).ok_or_else(|| {
+            EngineError::InvalidState(format!(
+                "Metal decode program does not contain complete layer {layer}"
+            ))
+        })?;
+        if steps
+            .iter()
+            .zip(OPERATIONS)
+            .enumerate()
+            .any(|(offset, (step, operation))| {
+                step.step().schedule_index != start + offset
+                    || step.step().layer != Some(layer)
+                    || step.step().operation != operation
+            })
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal decode program layer {layer} is not the frozen linear-attention sequence"
+            )));
+        }
+        Ok(steps)
+    }
 }
 
 impl PreparedMetalDecodeAttempt<'_> {
@@ -7393,6 +7445,16 @@ mod tests {
 
         assert_eq!(program.steps().len(), 645);
         assert_eq!(program.steps().len(), bindings.steps().len());
+        for layer in [0, 1, 2, 4, 62] {
+            let layer_steps = program
+                .linear_attention_layer_steps(layer)
+                .expect("bind reusable linear-attention layer slice");
+            assert_eq!(layer_steps.len(), 10);
+            assert_eq!(layer_steps[0].step().schedule_index, 2 + layer * 10);
+            assert_eq!(layer_steps[9].step().schedule_index, 11 + layer * 10);
+        }
+        assert!(program.linear_attention_layer_steps(3).is_err());
+        assert!(program.linear_attention_layer_steps(64).is_err());
         let expected_views = schedule
             .steps
             .iter()
