@@ -44,6 +44,7 @@ pub const GATED_DELTA_PREP_F32_KERNEL_NAME: &str = "qwen_gated_delta_prepare_f32
 pub const CAUSAL_CONV_F16_KERNEL_NAME: &str = "qwen_causal_conv_silu_f16";
 pub const ARGMAX_F32_PARTIAL_KERNEL_NAME: &str = "qwen_argmax_f32_partial";
 pub const ARGMAX_F32_FINAL_KERNEL_NAME: &str = "qwen_argmax_f32_final";
+pub const ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME: &str = "qwen_argmax_index_to_token";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -260,6 +261,15 @@ impl MetalArgMaxFinalBufferAbi {
     pub const PARAMS: u32 = 2;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalArgMaxMapBufferAbi;
+
+impl MetalArgMaxMapBufferAbi {
+    pub const ROW_IDS: u32 = 0;
+    pub const RESULT: u32 = 1;
+    pub const PARAMS: u32 = 2;
+}
+
 /// Activation codes consumed by `apply_activation` in the MSL source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -288,6 +298,18 @@ pub struct MetalFusedMatVecParams {
     pub has_s_out: u32,
     pub has_bias: u32,
     pub activation: u32,
+    pub reserved0: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGatheredMatVecParams {
+    pub rows: u32,
+    pub columns: u32,
+    pub blocks_per_row: u32,
+    pub has_s_in: u32,
+    pub has_s_out: u32,
+    pub row_start: u32,
+    pub request_start: u32,
     pub reserved0: u32,
 }
 
@@ -653,6 +675,30 @@ impl MetalFusedMatVecParams {
             self.reserved0,
         ];
         for (index, word) in words.iter().enumerate() {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
+}
+
+impl MetalGatheredMatVecParams {
+    pub const BYTE_LEN: usize = 32;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.rows,
+            self.columns,
+            self.blocks_per_row,
+            self.has_s_in,
+            self.has_s_out,
+            self.row_start,
+            self.request_start,
+            self.reserved0,
+        ]
+        .iter()
+        .enumerate()
+        {
             encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         encoded
@@ -1210,6 +1256,14 @@ mod tests {
             ],
             [0, 1, 2]
         );
+        assert_eq!(
+            [
+                MetalArgMaxMapBufferAbi::ROW_IDS,
+                MetalArgMaxMapBufferAbi::RESULT,
+                MetalArgMaxMapBufferAbi::PARAMS,
+            ],
+            [0, 1, 2]
+        );
     }
 
     #[test]
@@ -1244,6 +1298,10 @@ mod tests {
         assert!(CAUSAL_CONV_F16_KERNEL_NAME.contains("causal_conv_silu_f16"));
         assert_eq!(ARGMAX_F32_PARTIAL_KERNEL_NAME, "qwen_argmax_f32_partial");
         assert_eq!(ARGMAX_F32_FINAL_KERNEL_NAME, "qwen_argmax_f32_final");
+        assert_eq!(
+            ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME,
+            "qwen_argmax_index_to_token"
+        );
     }
 
     #[test]
@@ -1286,6 +1344,23 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![3, 128, 2, 1, 1, 1, 1, 0]);
+
+        let gathered = MetalGatheredMatVecParams {
+            rows: 5,
+            columns: 5_120,
+            blocks_per_row: 80,
+            has_s_in: 1,
+            has_s_out: 1,
+            row_start: 123,
+            request_start: 17,
+            reserved0: 0,
+        };
+        let words: Vec<u32> = gathered
+            .encode()
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![5, 5_120, 80, 1, 1, 123, 17, 0]);
 
         let dynamic_embedding = MetalDynamicEmbeddingParams {
             columns: 5_120,

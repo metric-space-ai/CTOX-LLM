@@ -44,6 +44,17 @@ struct FusedMatVecParams {
     uint reserved0;
 };
 
+struct GatheredMatVecParams {
+    uint rows;
+    uint columns;
+    uint blocks_per_row;
+    uint has_s_in;
+    uint has_s_out;
+    uint row_start;
+    uint request_start;
+    uint reserved0;
+};
+
 struct RmsNormParams {
     uint rows;
     uint columns;
@@ -499,7 +510,7 @@ inline void finish_gathered_rows(thread float* partial,
                                  device const half* s_out,
                                  device const float* bias,
                                  device float* output,
-                                 constant FusedMatVecParams& params,
+                                 constant GatheredMatVecParams& params,
                                  uint first_request,
                                  uint simd_lane) {
     for (uint row_offset = 0; row_offset < ROWS_PER_SIMDGROUP; ++row_offset) {
@@ -507,12 +518,11 @@ inline void finish_gathered_rows(thread float* partial,
         if (request >= params.rows) {
             continue;
         }
-        uint row = row_ids[request];
+        uint row = row_ids[params.request_start + request] - params.row_start;
         float total = simd_sum(partial[row_offset]);
         if (simd_lane == 0u) {
-            total += params.has_bias != 0u ? bias[row] : 0.0f;
             total *= params.has_s_out != 0u ? float(s_out[row]) : 1.0f;
-            output[request] = apply_activation(total, params.activation);
+            output[request] = total;
         }
     }
 }
@@ -524,7 +534,7 @@ inline void gathered_q2_rows(device const uchar* weights,
                              device const float* bias,
                              device const uint* row_ids,
                              device float* output,
-                             constant FusedMatVecParams& params,
+                             constant GatheredMatVecParams& params,
                              uint first_request,
                              uint simd_lane) {
     float partial[ROWS_PER_SIMDGROUP] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -542,7 +552,7 @@ inline void gathered_q2_rows(device const uchar* weights,
                 if (request >= params.rows) {
                     continue;
                 }
-                uint row = row_ids[request];
+                uint row = row_ids[params.request_start + request] - params.row_start;
                 device const uchar* block_base = weights
                     + ulong(row) * params.blocks_per_row * Q2_BLOCK_BYTES
                     + ulong(block) * Q2_BLOCK_BYTES;
@@ -567,7 +577,7 @@ inline void gathered_q4_rows(device const uchar* weights,
                              device const float* bias,
                              device const uint* row_ids,
                              device float* output,
-                             constant FusedMatVecParams& params,
+                             constant GatheredMatVecParams& params,
                              uint first_request,
                              uint simd_lane) {
     float partial[ROWS_PER_SIMDGROUP] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -586,7 +596,7 @@ inline void gathered_q4_rows(device const uchar* weights,
             if (request >= params.rows) {
                 continue;
             }
-            uint row = row_ids[request];
+            uint row = row_ids[params.request_start + request] - params.row_start;
             device const uchar* block_base = weights
                 + ulong(row) * params.blocks_per_row * Q4_BLOCK_BYTES
                 + ulong(block) * Q4_BLOCK_BYTES;
@@ -753,7 +763,7 @@ kernel void q2_b64_gathered_matvec(
     device const half* s_out [[buffer(3)]],
     device const float* bias [[buffer(4)]],
     device float* output [[buffer(5)]],
-    constant FusedMatVecParams& params [[buffer(6)]],
+    constant GatheredMatVecParams& params [[buffer(6)]],
     device const uint* row_ids [[buffer(7)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -775,7 +785,7 @@ kernel void q4_b64_gathered_matvec(
     device const half* s_out [[buffer(3)]],
     device const float* bias [[buffer(4)]],
     device float* output [[buffer(5)]],
-    constant FusedMatVecParams& params [[buffer(6)]],
+    constant GatheredMatVecParams& params [[buffer(6)]],
     device const uint* row_ids [[buffer(7)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -1508,4 +1518,23 @@ kernel void qwen_argmax_f32_final(
         result[0] = best_indices[0];
         result[1] = invalid_counts[0];
     }
+}
+
+// Translate the restricted-head local argmax into the canonical vocabulary
+// token without a host readback. `result[1]` preserves the non-finite count;
+// its high bit is reserved for a fail-closed local-index bounds violation.
+kernel void qwen_argmax_index_to_token(
+    device const uint* row_ids [[buffer(0)]],
+    device uint* result [[buffer(1)]],
+    constant ArgMaxParams& params [[buffer(2)]],
+    uint lane [[thread_position_in_grid]]) {
+    if (lane != 0u || result[1] != 0u) {
+        return;
+    }
+    uint local_index = result[0];
+    if (local_index >= params.values) {
+        result[1] = 0x80000000u | local_index;
+        return;
+    }
+    result[0] = row_ids[local_index];
 }

@@ -190,8 +190,11 @@ KV owner, commits only after a completed finite result, and restores cache
 metadata on every failure. A graph-I/O gathered Q2/Q4 head then writes exactly
 the canonical restricted rows into the main arena's `MtpDraft` view in the
 same encoder; its offset Golden proves it allocates no activation input/output.
-Only the verifier waits or reads draft logits. Draft selection, target
-verification, and the joint target transaction remain pending.
+The gathered kernels share one canonical row-ID buffer across mixed Q2/Q4
+segments. A second finite-checking argmax selects the restricted local row and
+`qwen_argmax_index_to_token` maps it in place to the global token through that
+same buffer, without an intermediate host read. Only the verifier reads draft
+logits. Target verification and the joint target transaction remain pending.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

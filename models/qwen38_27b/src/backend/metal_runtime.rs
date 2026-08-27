@@ -18,24 +18,25 @@ use sha2::{Digest, Sha256};
 
 use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row,
-    MetalArgMaxFinalBufferAbi, MetalArgMaxParams, MetalArgMaxPartialBufferAbi, MetalBufferAbi,
-    MetalCausalConvBufferAbi, MetalCausalConvParams, MetalConcatBufferAbi, MetalConcatParams,
-    MetalDynamicEmbeddingParams, MetalFusedMatVecParams, MetalGatedDeltaBufferAbi,
-    MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi, MetalGatedDeltaPrepareParams,
-    MetalGatedRmsNormBufferAbi, MetalKvPackParams, MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi,
-    MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
+    MetalArgMaxFinalBufferAbi, MetalArgMaxMapBufferAbi, MetalArgMaxParams,
+    MetalArgMaxPartialBufferAbi, MetalBufferAbi, MetalCausalConvBufferAbi, MetalCausalConvParams,
+    MetalConcatBufferAbi, MetalConcatParams, MetalDynamicEmbeddingParams, MetalFusedMatVecParams,
+    MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi,
+    MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalGatheredMatVecParams,
+    MetalKvPackParams, MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi,
+    MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
     MetalQueryGateBufferAbi, MetalQueryGateParams, MetalResidualRmsNormBufferAbi,
     MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi,
-    ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME,
-    CONCAT_F32_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME,
-    KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP,
-    PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME, Q2_DYNAMIC_EMBEDDING_KERNEL_NAME,
-    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME,
-    Q2_SIGMOID_GATE_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME, Q4_DYNAMIC_EMBEDDING_KERNEL_NAME,
-    Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME,
-    Q4_SIGMOID_GATE_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME, QUERY_GATE_NORM_ROPE_KERNEL_NAME,
-    RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME,
-    RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
+    ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME,
+    ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, CONCAT_F32_KERNEL_NAME,
+    GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME,
+    KV_Q4_TO_Q2_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME,
+    PARTIAL_ROPE_KERNEL_NAME, Q2_DYNAMIC_EMBEDDING_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
+    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SIGMOID_GATE_KERNEL_NAME,
+    Q2_SWIGLU_KERNEL_NAME, Q4_DYNAMIC_EMBEDDING_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
+    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME,
+    Q4_SWIGLU_KERNEL_NAME, QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
+    RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
@@ -99,6 +100,7 @@ pub struct MetalCandidateRuntime {
     causal_conv_f16_pipeline: ComputePipelineState,
     argmax_f32_partial_pipeline: ComputePipelineState,
     argmax_f32_final_pipeline: ComputePipelineState,
+    argmax_index_to_token_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -280,6 +282,7 @@ pub struct PreparedMappedMetalGatheredMatVec {
     input_buffer: Option<Buffer>,
     bias_buffer: Buffer,
     output_buffer: Option<Buffer>,
+    row_ids_buffer: Buffer,
     dispatches: Vec<MappedMetalGatherDispatch>,
     transient_bytes: usize,
 }
@@ -291,7 +294,6 @@ struct MappedMetalGatherDispatch {
     weights_offset: u64,
     s_out_offset: u64,
     output_offset: u64,
-    row_ids_buffer: Buffer,
     params_buffer: Buffer,
 }
 
@@ -531,6 +533,7 @@ pub struct PreparedMappedMetalTargetCore {
 pub struct PreparedMappedMetalMtpCore {
     embedding: PreparedMappedMetalEmbedding,
     target_selector: PreparedMetalArgMaxScratch,
+    draft_selector: PreparedMetalArgMaxScratch,
     pre_embedding_norm: PreparedMappedMetalRmsNorm,
     pre_hidden_norm: PreparedMappedMetalRmsNorm,
     fc: PreparedMappedMetalMatVec,
@@ -2515,6 +2518,7 @@ impl PreparedMappedMetalMtpCore {
             self.workspace.transient_bytes()?,
             self.embedding.transient_bytes(),
             self.target_selector.transient_bytes(),
+            self.draft_selector.transient_bytes(),
             self.pre_embedding_norm.transient_bytes(),
             self.pre_hidden_norm.transient_bytes(),
             self.fc.transient_bytes(),
@@ -2825,6 +2829,13 @@ impl MetalCandidateRuntime {
                     "Metal final argmax function lookup failed: {message}"
                 ))
             })?;
+        let argmax_index_to_token_function = library
+            .get_function(ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal argmax token-map function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -3078,6 +3089,13 @@ impl MetalCandidateRuntime {
                     "Metal final argmax pipeline creation failed: {message}"
                 ))
             })?;
+        let argmax_index_to_token_pipeline = device
+            .new_compute_pipeline_state_with_function(&argmax_index_to_token_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal argmax token-map pipeline creation failed: {message}"
+                ))
+            })?;
         if argmax_f32_partial_pipeline.max_total_threads_per_threadgroup() < 256
             || argmax_f32_final_pipeline.max_total_threads_per_threadgroup() < 256
         {
@@ -3120,6 +3138,7 @@ impl MetalCandidateRuntime {
             causal_conv_f16_pipeline,
             argmax_f32_partial_pipeline,
             argmax_f32_final_pipeline,
+            argmax_index_to_token_pipeline,
         })
     }
 
@@ -3739,6 +3758,38 @@ impl MetalCandidateRuntime {
         );
     }
 
+    fn encode_argmax_index_to_token(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        row_ids: &Buffer,
+        scratch: &PreparedMetalArgMaxScratch,
+    ) {
+        encoder.set_compute_pipeline_state(&self.argmax_index_to_token_pipeline);
+        encoder.set_buffer(MetalArgMaxMapBufferAbi::ROW_IDS as u64, Some(row_ids), 0);
+        encoder.set_buffer(
+            MetalArgMaxMapBufferAbi::RESULT as u64,
+            Some(&scratch.result_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalArgMaxMapBufferAbi::PARAMS as u64,
+            Some(&scratch.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
     fn read_argmax_result(&self, scratch: &PreparedMetalArgMaxScratch) -> Result<u32> {
         let result =
             unsafe { slice::from_raw_parts(scratch.result_buffer.contents().cast::<u32>(), 2) };
@@ -3752,6 +3803,35 @@ impl MetalCandidateRuntime {
             return Err(EngineError::InvalidState(format!(
                 "Metal argmax selected {}, input has {} values",
                 result[0], scratch.values
+            )));
+        }
+        Ok(result[0])
+    }
+
+    fn read_mapped_argmax_result(
+        &self,
+        scratch: &PreparedMetalArgMaxScratch,
+        vocabulary_rows: usize,
+    ) -> Result<u32> {
+        let result =
+            unsafe { slice::from_raw_parts(scratch.result_buffer.contents().cast::<u32>(), 2) };
+        if result[1] & 0x8000_0000 != 0 {
+            return Err(EngineError::InvalidState(format!(
+                "Metal restricted argmax local index {} exceeds {} rows",
+                result[1] & 0x7fff_ffff,
+                scratch.values
+            )));
+        }
+        if result[1] != 0 {
+            return Err(EngineError::InvalidArtifact(format!(
+                "Metal restricted argmax rejected {} non-finite logits",
+                result[1]
+            )));
+        }
+        if result[0] as usize >= vocabulary_rows {
+            return Err(EngineError::InvalidState(format!(
+                "Metal restricted argmax mapped token {}, vocabulary has {} rows",
+                result[0], vocabulary_rows
             )));
         }
         Ok(result[0])
@@ -4643,6 +4723,7 @@ impl MetalCandidateRuntime {
             draft_token_ids,
         )?;
         let target_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
+        let draft_selector = self.prepare_argmax_f32_scratch(draft_token_ids.len())?;
         let workspace_plan = MetalMtpWorkspacePlan::qwen38(&config)?;
         let workspace = self.prepare_mtp_workspace(&workspace_plan)?;
 
@@ -4658,6 +4739,7 @@ impl MetalCandidateRuntime {
             || embedding.columns != hidden
             || embedding.output_buffer.is_some()
             || target_selector.values != config.vocab_size
+            || draft_selector.values != draft_token_ids.len()
             || pre_embedding_norm.rows != 1
             || pre_embedding_norm.columns != hidden
             || pre_hidden_norm.rows != 1
@@ -4712,6 +4794,7 @@ impl MetalCandidateRuntime {
         Ok(PreparedMappedMetalMtpCore {
             embedding,
             target_selector,
+            draft_selector,
             pre_embedding_norm,
             pre_hidden_norm,
             fc,
@@ -4960,32 +5043,34 @@ impl MetalCandidateRuntime {
             self.device
                 .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
+        let row_ids_buffer = buffer_with_data(&self.device, as_bytes(row_ids));
         let mut dispatches = Vec::new();
         let mut selected_rows = 0_usize;
-        for (dtype, row_start, row_end, weight_offset, mut params) in contracts {
+        for (dtype, row_start, row_end, weight_offset, params) in contracts {
             let request_start = row_ids.partition_point(|row| (*row as usize) < row_start);
             let request_end = row_ids.partition_point(|row| (*row as usize) < row_end);
             if request_start == request_end {
                 continue;
             }
-            let local_ids: Vec<u32> = row_ids[request_start..request_end]
-                .iter()
-                .map(|row| {
-                    row.checked_sub(u32::try_from(row_start).map_err(|_| {
-                        EngineError::Shape("Metal gathered segment row exceeds u32".into())
-                    })?)
-                    .ok_or_else(|| {
-                        EngineError::InvalidArtifact(
-                            "Metal gathered row precedes its segment".into(),
-                        )
-                    })
-                })
-                .collect::<Result<_>>()?;
-            params.rows = u32::try_from(local_ids.len()).map_err(|_| {
+            let requested_rows = request_end - request_start;
+            let requested_rows_u32 = u32::try_from(requested_rows).map_err(|_| {
                 EngineError::Shape("Metal gathered request count exceeds u32".into())
             })?;
-            params.has_bias = 0;
-            params.activation = 0;
+            let row_start_u32 = u32::try_from(row_start)
+                .map_err(|_| EngineError::Shape("Metal gathered segment row exceeds u32".into()))?;
+            let request_start_u32 = u32::try_from(request_start).map_err(|_| {
+                EngineError::Shape("Metal gathered request start exceeds u32".into())
+            })?;
+            let gathered_params = MetalGatheredMatVecParams {
+                rows: requested_rows_u32,
+                columns: params.columns,
+                blocks_per_row: params.blocks_per_row,
+                has_s_in: params.has_s_in,
+                has_s_out: params.has_s_out,
+                row_start: row_start_u32,
+                request_start: request_start_u32,
+                reserved0: 0,
+            };
             let pipeline = match dtype {
                 TensorDType::Q2B64 => &self.q2_gathered_pipeline,
                 TensorDType::Q4B64 => &self.q4_gathered_pipeline,
@@ -5019,17 +5104,16 @@ impl MetalCandidateRuntime {
                     EngineError::Shape("Metal gathered output offset overflows".into())
                 })?;
             selected_rows = selected_rows
-                .checked_add(local_ids.len())
+                .checked_add(requested_rows)
                 .ok_or_else(|| EngineError::Shape("Metal gathered row count overflows".into()))?;
             dispatches.push(MappedMetalGatherDispatch {
                 dtype,
-                requested_rows: local_ids.len(),
+                requested_rows,
                 thread_width: dispatch_width(pipeline, DEFAULT_SIMDGROUPS)?,
                 weights_offset,
                 s_out_offset,
                 output_offset,
-                row_ids_buffer: buffer_with_data(&self.device, as_bytes(&local_ids)),
-                params_buffer: buffer_with_data(&self.device, &params.encode()),
+                params_buffer: buffer_with_data(&self.device, &gathered_params.encode()),
             });
         }
         if selected_rows != row_ids.len() || dispatches.is_empty() {
@@ -5039,7 +5123,7 @@ impl MetalCandidateRuntime {
         }
         let parameter_bytes = dispatches
             .len()
-            .checked_mul(MetalFusedMatVecParams::BYTE_LEN)
+            .checked_mul(MetalGatheredMatVecParams::BYTE_LEN)
             .ok_or_else(|| EngineError::Shape("Metal gathered parameter bytes overflow".into()))?;
         let row_id_bytes = row_ids
             .len()
@@ -5065,6 +5149,7 @@ impl MetalCandidateRuntime {
             input_buffer,
             bias_buffer,
             output_buffer,
+            row_ids_buffer,
             dispatches,
             transient_bytes,
         })
@@ -6555,7 +6640,7 @@ impl MetalCandidateRuntime {
             );
             encoder.set_buffer(
                 MetalBufferAbi::ROW_IDS as u64,
-                Some(&dispatch.row_ids_buffer),
+                Some(&prepared.row_ids_buffer),
                 0,
             );
             let grid = MTLSize {
@@ -11020,6 +11105,7 @@ impl MetalCandidateRuntime {
             || prepared.vocabulary_rows() != config.vocab_size
             || prepared.hidden_size() != config.hidden_size
             || prepared.target_selector.values != config.vocab_size
+            || prepared.draft_selector.values != prepared.draft_vocabulary_rows()
             || !prepared
                 .pre_embedding_norm
                 .matches_weight_tensor("mtp.pre_fc_norm_embedding.weight")?
@@ -11497,13 +11583,14 @@ impl MetalCandidateRuntime {
     /// Bring-up execution of the complete native MTP frontend, one transformer
     /// layer, and canonical restricted LM head. It advances the dedicated MTP
     /// KV state only after a successful finite draft and restores append
-    /// metadata on every failure. Draft sampling/target verification is the
-    /// next boundary.
+    /// metadata on every failure. The restricted-head argmax and canonical
+    /// row-ID mapping remain on device; target verification is the next
+    /// boundary.
     pub fn dispatch_prepared_mapped_mtp_draft_verifier(
         &self,
         program: &PreparedMetalDecodeProgram<'_>,
         prepared: &mut PreparedMappedMetalMtpCore,
-    ) -> Result<(u32, Vec<f32>)> {
+    ) -> Result<(u32, u32, Vec<f32>)> {
         let step = self.validate_prepared_mapped_mtp_frontend(program, prepared)?;
         let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(prepared)?;
         prepared.layer.attention.begin_speculative()?;
@@ -11516,10 +11603,14 @@ impl MetalCandidateRuntime {
                 &prepared.target_selector.result_buffer,
                 2 * std::mem::size_of::<u32>(),
             );
+            zero_buffer(
+                &prepared.draft_selector.result_buffer,
+                2 * std::mem::size_of::<u32>(),
+            );
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-mtp-frontend-layer-verifier");
             let encoder = command_buffer.new_compute_command_encoder();
-            let encoded = (|| {
+            let encoded: Result<()> = (|| {
                 self.encode_prepared_mapped_mtp_frontend(encoder, step, prepared)?;
                 self.encode_prepared_mapped_mtp_layer(
                     encoder,
@@ -11538,7 +11629,19 @@ impl MetalCandidateRuntime {
                     final_normalized.1,
                     step.writes()[0].buffer(),
                     step.writes()[0].offset(),
-                )
+                )?;
+                self.encode_argmax_f32_at(
+                    encoder,
+                    step.writes()[0].buffer(),
+                    step.writes()[0].offset(),
+                    &prepared.draft_selector,
+                );
+                self.encode_argmax_index_to_token(
+                    encoder,
+                    &prepared.lm_head.row_ids_buffer,
+                    &prepared.draft_selector,
+                );
+                Ok(())
             })();
             encoder.end_encoding();
             encoded?;
@@ -11584,7 +11687,9 @@ impl MetalCandidateRuntime {
                     &value,
                 )?;
             }
-            let token = self.read_argmax_result(&prepared.target_selector)?;
+            let target_token = self.read_argmax_result(&prepared.target_selector)?;
+            let draft_token = self
+                .read_mapped_argmax_result(&prepared.draft_selector, prepared.vocabulary_rows())?;
             let output = &step.writes()[0];
             let output_offset = usize::try_from(output.offset()).map_err(|_| {
                 EngineError::MemoryBudget("Metal MTP draft offset exceeds usize".into())
@@ -11607,7 +11712,7 @@ impl MetalCandidateRuntime {
                 ));
             }
             prepared.layer.attention.commit_speculative()?;
-            Ok((token, values))
+            Ok((target_token, draft_token, values))
         })();
         match result {
             Ok(output) => Ok(output),
@@ -13637,6 +13742,34 @@ mod tests {
                 .read_argmax_result(&scratch)
                 .expect("read offset argmax"),
             1_000
+        );
+    }
+
+    #[test]
+    fn restricted_argmax_maps_local_index_to_canonical_token_on_device() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let logits = [-3.0_f32, 1.0, 9.0, 4.0];
+        let row_ids = [7_u32, 101, 9_001, 120_000];
+        let input = buffer_with_data(&runtime.device, as_bytes(&logits));
+        let rows = buffer_with_data(&runtime.device, as_bytes(&row_ids));
+        let scratch = runtime
+            .prepare_argmax_f32_scratch(logits.len())
+            .expect("prepare restricted argmax scratch");
+        zero_buffer(&scratch.result_buffer, 2 * std::mem::size_of::<u32>());
+
+        let command_buffer = runtime.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        runtime.encode_argmax_f32(encoder, &input, &scratch);
+        runtime.encode_argmax_index_to_token(encoder, &rows, &scratch);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        assert_eq!(
+            runtime
+                .read_mapped_argmax_result(&scratch, crate::tokenizer::TOKENIZER_VOCAB_SIZE)
+                .expect("read canonical token"),
+            9_001
         );
     }
 

@@ -282,15 +282,18 @@ and the full recovered target LM head in one compute encoder, one command
 buffer, and one wait. It keeps target logits resident for MTP, never reads the
 vocabulary tensor on the host, and treats all 16 KV caches plus all 48
 convolution/recurrent-state pairs as one rollback unit across encode, GPU, and
-test-verifier failures. The native MTP transition, draft/verify loop, sampling,
-and final barrier remain to be joined before this is a complete token executor.
+test-verifier failures. The native MTP transition and restricted greedy draft
+selection now exist as a separate one-command bring-up chain; target
+verification, multi-draft control, sampling, and the joint final barrier remain
+before this is a complete token executor.
 `PreparedMappedMetalMtpCore` now also closes the MTP load boundary: the shared
 embedding and LM head remain duplicate-free mmap views, while both pre-FC
 norms, `mtp.fc`, the MTP input norm, the complete one-layer full-attention/MLP
-resource set, packed MTP KV state, and resident target-selector scratch are
-constructed atomically from the same artifact identity. Execution is still
-pending, but a missing MTP tensor or incompatible cache geometry can no longer
-leave a partially admitted device graph.
+resource set, packed MTP KV state, and resident target/draft selector scratch
+are constructed atomically from the same artifact identity. The complete
+one-layer bring-up path executes this owner and rolls back its KV append on any
+failure; a missing tensor or incompatible cache geometry cannot leave a
+partially admitted device graph.
 The target-to-MTP token edge is now device-resident as well. Target argmax
 writes one compact result buffer, and paired Q2/Q4 dynamic embedding kernels
 consume that token directly; every mixed-precision segment is dispatched but
@@ -307,8 +310,11 @@ chain. Q/K/V fan-out, normalized/RoPE attention, packed MTP KV append, gated
 output, residuals, and the complete SwiGLU FFN now continue in that same arena
 under fail-closed cache rollback. The canonical strictly increasing draft IDs
 now drive a gathered Q2/Q4 head that writes exactly those rows to `MtpDraft`
-without private activation I/O. Draft selection, target verification, and the
-joint target+MTP transaction are still pending.
+without private activation I/O. A finite-checking restricted argmax selects a
+local row, then `qwen_argmax_index_to_token` maps it through that same
+canonical row-ID buffer to the global vocabulary token in the same encoder.
+Only target verification and the joint target+MTP transaction are still
+pending.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first
