@@ -760,6 +760,12 @@ struct MetalPagedGqaAppendPlan {
     verifier_update: MetalPagedKvUpdate,
 }
 
+struct MetalPagedGqaDispatchPlan {
+    append: MetalPagedGqaAppendPlan,
+    descriptors_buffer: Buffer,
+    params_buffer: Buffer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ValidatedMetalFullAttentionLayer {
     layer: usize,
@@ -8064,6 +8070,20 @@ impl MetalCandidateRuntime {
         })
     }
 
+    fn plan_paged_gqa_dispatch(
+        &self,
+        prepared: &mut PreparedMetalPagedGqa,
+    ) -> Result<MetalPagedGqaDispatchPlan> {
+        let append = self.plan_paged_gqa_append(prepared)?;
+        let descriptors = metal_paged_gqa_descriptor_bytes(prepared)?;
+        let params = metal_paged_gqa_params_bytes(prepared)?;
+        Ok(MetalPagedGqaDispatchPlan {
+            append,
+            descriptors_buffer: buffer_with_data(&self.device, &descriptors),
+            params_buffer: buffer_with_data(&self.device, &params),
+        })
+    }
+
     #[cfg(test)]
     fn commit_paged_gqa_verifier_append(
         &self,
@@ -8433,10 +8453,7 @@ impl MetalCandidateRuntime {
         key: &[f32],
         value: &[f32],
     ) -> Result<Vec<f32>> {
-        let plan = self.plan_paged_gqa_append(prepared)?;
-        write_metal_paged_gqa_descriptors(prepared)?;
-        let descriptor_snapshot =
-            buffer_with_data(&self.device, &metal_paged_gqa_descriptor_bytes(prepared)?);
+        let dispatch = self.plan_paged_gqa_dispatch(prepared)?;
         let query_buffer = prepared.query_buffer.as_ref().ok_or_else(|| {
             EngineError::InvalidState("Metal standalone GQA query buffer is missing".into())
         })?;
@@ -8450,9 +8467,6 @@ impl MetalCandidateRuntime {
                 query.len(),
             );
         }
-        write_metal_paged_gqa_params(prepared)?;
-        let params_snapshot =
-            buffer_with_data(&self.device, &metal_paged_gqa_params_bytes(prepared)?);
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-paged-q2q4-gqa-verifier");
@@ -8462,7 +8476,7 @@ impl MetalCandidateRuntime {
         self.encode_paged_gqa_append_and_attention_with_metadata(
             encoder,
             prepared,
-            &plan,
+            &dispatch.append,
             query_buffer,
             0,
             &key_buffer,
@@ -8471,8 +8485,8 @@ impl MetalCandidateRuntime {
             0,
             output_buffer,
             0,
-            &descriptor_snapshot,
-            &params_snapshot,
+            &dispatch.descriptors_buffer,
+            &dispatch.params_buffer,
         )?;
         encoder.end_encoding();
         command_buffer.commit();
@@ -8496,7 +8510,7 @@ impl MetalCandidateRuntime {
             ));
         }
         #[cfg(test)]
-        self.commit_paged_gqa_verifier_append(prepared, &plan, key, value)?;
+        self.commit_paged_gqa_verifier_append(prepared, &dispatch.append, key, value)?;
         Ok(output)
     }
 
@@ -18681,6 +18695,94 @@ mod tests {
             .append_and_dispatch_paged_gqa(&mut prepared, &query, &key, &value)
             .expect("reuse reset paged GQA");
         assert!(output.iter().all(|actual| (*actual - 0.3).abs() < 0.02));
+    }
+
+    #[test]
+    fn paged_gqa_dispatch_plans_freeze_metadata_for_queued_speculation() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let mut prepared = runtime
+            .prepare_paged_gqa_decode(MetalPagedGqaConfig {
+                query_heads: 4,
+                key_value_heads: 2,
+                head_dim: 64,
+                maximum_tokens: 8,
+                page_tokens: 2,
+                sink_tokens: 2,
+                recent_tokens: 2,
+            })
+            .expect("prepare packed paged GQA");
+
+        let first = runtime
+            .plan_paged_gqa_dispatch(&mut prepared)
+            .expect("plan first queued append");
+        let first_descriptors = unsafe {
+            slice::from_raw_parts(
+                first.descriptors_buffer.contents().cast::<u8>(),
+                first.descriptors_buffer.length() as usize,
+            )
+            .to_vec()
+        };
+        let first_params = unsafe {
+            slice::from_raw_parts(
+                first.params_buffer.contents().cast::<u8>(),
+                first.params_buffer.length() as usize,
+            )
+            .to_vec()
+        };
+        assert_eq!(
+            first_descriptors,
+            metal_paged_gqa_descriptor_bytes(&prepared).unwrap()
+        );
+        assert_eq!(
+            first_params,
+            metal_paged_gqa_params_bytes(&prepared).unwrap()
+        );
+        assert_eq!(first.append.token_in_page, 0);
+
+        let second = runtime
+            .plan_paged_gqa_dispatch(&mut prepared)
+            .expect("plan second queued append");
+        let second_descriptors = unsafe {
+            slice::from_raw_parts(
+                second.descriptors_buffer.contents().cast::<u8>(),
+                second.descriptors_buffer.length() as usize,
+            )
+            .to_vec()
+        };
+        let second_params = unsafe {
+            slice::from_raw_parts(
+                second.params_buffer.contents().cast::<u8>(),
+                second.params_buffer.length() as usize,
+            )
+            .to_vec()
+        };
+        assert_eq!(
+            second_descriptors,
+            metal_paged_gqa_descriptor_bytes(&prepared).unwrap()
+        );
+        assert_eq!(
+            second_params,
+            metal_paged_gqa_params_bytes(&prepared).unwrap()
+        );
+        assert_eq!(second.append.token_in_page, 1);
+        assert_ne!(second_descriptors, first_descriptors);
+        assert_ne!(second_params, first_params);
+
+        let retained_first_descriptors = unsafe {
+            slice::from_raw_parts(
+                first.descriptors_buffer.contents().cast::<u8>(),
+                first.descriptors_buffer.length() as usize,
+            )
+        };
+        let retained_first_params = unsafe {
+            slice::from_raw_parts(
+                first.params_buffer.contents().cast::<u8>(),
+                first.params_buffer.length() as usize,
+            )
+        };
+        assert_eq!(retained_first_descriptors, first_descriptors);
+        assert_eq!(retained_first_params, first_params);
+        assert_eq!(prepared.tokens(), 2);
     }
 
     #[test]
