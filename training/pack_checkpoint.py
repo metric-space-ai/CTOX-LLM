@@ -65,13 +65,29 @@ def validate_recovery_source(
     plan: dict[str, Any],
     plan_sha256: str,
     recovery: Any,
+    *,
+    allow_bounded_verifier: bool = False,
 ) -> dict[str, Any]:
-    """Validate a complete trained scale file before expensive model packing."""
+    """Validate trained scales before expensive model packing.
+
+    Complete recovery produces a release-eligible ``trained`` descriptor. A
+    bounded run is accepted only behind the explicit verifier switch and is
+    encoded as ``verifier`` so native release validation cannot promote it.
+    """
 
     metadata = recovery.metadata() or {}
+    status = metadata.get("status")
+    if status == "complete":
+        recovery_mode = "trained"
+    elif status == "bounded_run_complete" and allow_bounded_verifier:
+        recovery_mode = "verifier"
+    else:
+        expected = "'complete' or explicitly admitted 'bounded_run_complete'"
+        raise RuntimeError(
+            f"recovery metadata status is {status!r}, expected {expected}"
+        )
     required_metadata = {
         "format": "ctox.recovery.channel-scales.v2",
-        "status": "complete",
         "model": plan["model"],
         "revision": plan["revision"],
         "plan_sha256": plan_sha256,
@@ -104,7 +120,7 @@ def validate_recovery_source(
             raise RuntimeError(f"recovery tensor {name} must be FP16")
 
     descriptor = {
-        "mode": "trained",
+        "mode": recovery_mode,
         "format": metadata["format"],
         "plan_sha256": metadata["plan_sha256"],
         "activation_stats_sha256": metadata.get("activation_stats_sha256", ""),
@@ -331,6 +347,14 @@ def main() -> None:
         type=Path,
         help="complete plan-bound FP16 s_in/s_out safetensors; omission creates an identity baseline",
     )
+    parser.add_argument(
+        "--allow-bounded-verifier-recovery",
+        action="store_true",
+        help=(
+            "pack bounded recovery only as a native verifier artifact; the "
+            "manifest mode remains release-ineligible"
+        ),
+    )
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--reserved-gpu-hours", type=float, required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -400,7 +424,12 @@ def main() -> None:
                 "fixed_logical_qcodes": True,
             }
         else:
-            recovery_descriptor = validate_recovery_source(plan, plan_digest, recovery)
+            recovery_descriptor = validate_recovery_source(
+                plan,
+                plan_digest,
+                recovery,
+                allow_bounded_verifier=args.allow_bounded_verifier_recovery,
+            )
             recovery_descriptor["artifact_sha256"] = sha256_path(args.recovery_scales)
         data_path = Path(temporary) / "tensor-data.bin"
         tensor_hashes: dict[str, str] = {}

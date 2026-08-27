@@ -81,6 +81,7 @@ pub struct TensorEntry {
 pub enum RecoveryMode {
     Identity,
     Trained,
+    Verifier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,7 +129,7 @@ impl RecoveryProvenance {
                     ));
                 }
             }
-            RecoveryMode::Trained => {
+            RecoveryMode::Trained | RecoveryMode::Verifier => {
                 if self.format != "ctox.recovery.channel-scales.v2"
                     || !self.artifact_sha256.as_deref().is_some_and(valid_sha256)
                     || !self
@@ -138,7 +139,7 @@ impl RecoveryProvenance {
                     || !self.report_sha256.as_deref().is_some_and(valid_sha256)
                 {
                     return Err(EngineError::InvalidArtifact(
-                        "trained recovery provenance is incomplete or invalid".into(),
+                        "trained/verifier recovery provenance is incomplete or invalid".into(),
                     ));
                 }
                 self.validate_fanout()?;
@@ -671,6 +672,31 @@ mod tests {
         assert!(manifest
             .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
             .is_err());
+    }
+
+    #[test]
+    fn bounded_verifier_recovery_is_valid_but_distinct_from_trained() {
+        let mut manifest = mixed_manifest();
+        manifest.recovery = Some(RecoveryProvenance {
+            mode: RecoveryMode::Verifier,
+            format: "ctox.recovery.channel-scales.v2".into(),
+            plan_sha256: "a".repeat(64),
+            fixed_logical_qcodes: true,
+            artifact_sha256: Some("b".repeat(64)),
+            activation_stats_sha256: Some("c".repeat(64)),
+            report_sha256: Some("d".repeat(64)),
+            fanout_s_in_policy: None,
+            fanout_group_sha256: None,
+            fanout_group_count: None,
+            fanout_logical_s_in_tensors: None,
+        });
+        assert!(manifest
+            .validate((Q2_BLOCK_BYTES + Q4_BLOCK_BYTES) as u64)
+            .is_ok());
+        assert_ne!(
+            manifest.recovery.as_ref().unwrap().mode,
+            RecoveryMode::Trained
+        );
     }
 
     #[test]

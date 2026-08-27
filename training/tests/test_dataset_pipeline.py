@@ -3254,6 +3254,21 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(descriptor["mode"], "trained")
         self.assertEqual(descriptor["activation_stats_sha256"], "c" * 64)
 
+        bounded_metadata = dict(metadata, status="bounded_run_complete")
+        with self.assertRaisesRegex(RuntimeError, "explicitly admitted"):
+            validate_recovery_source(
+                plan,
+                plan_hash,
+                self.FakeRecovery(bounded_metadata, tensors),
+            )
+        bounded = validate_recovery_source(
+            plan,
+            plan_hash,
+            self.FakeRecovery(bounded_metadata, tensors),
+            allow_bounded_verifier=True,
+        )
+        self.assertEqual(bounded["mode"], "verifier")
+
         fanout_metadata = dict(
             metadata,
             fanout_s_in_policy=INDEPENDENT_POLICY,
