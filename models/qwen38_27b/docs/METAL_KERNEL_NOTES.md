@@ -200,15 +200,21 @@ The gathered kernels share one canonical row-ID buffer across mixed Q2/Q4
 segments. A second finite-checking argmax selects the restricted local row and
 `qwen_argmax_index_to_token` maps it in place to the global token through that
 same buffer, without an intermediate host read. Only the verifier reads draft
-logits. The greedy one-draft verifier now appends a selector-driven complete
-target transition and its second full-vocabulary argmax to the same encoder.
-It requires target state to enter exactly one token ahead of MTP, checks that
-the relation is restored after both transitions, and commits both checkpoint
-sets only after `qwen_greedy_mtp_verify` has written a four-u32
-target/draft/accept/status record and the single completion wait validates it.
-The host no longer reads or compares separate selector buffers. Encoding, GPU,
-non-finite, alignment, and verifier failures restore both branches. Chained
-MTP4, partial-prefix replay, full-artifact device evidence, and production
+logits. `dispatch_prepared_mapped_initial_mtp_target_verifier` supplies the
+causal first pair: MTP and target advance from the same real input token, and
+MTP consumes the retained pre-target hidden state before the target core
+overwrites that arena slot. A selector-driven complete target transition and
+its full-vocabulary argmax share the encoder with the MTP draft. The
+accepted-only `dispatch_prepared_mapped_greedy_mtp_target_verifier` then
+permits another pair only when the previous compact verification record has
+`accepted=true`. Both paths require target state to enter exactly one token
+ahead of MTP, check that the relation is restored after both transitions, and
+commit both checkpoint sets only after `qwen_greedy_mtp_verify` has written a
+four-u32 target/draft/accept/status record and the single completion wait
+validates it. The host no longer reads or compares separate selector buffers.
+Encoding, GPU, non-finite, alignment, and verifier failures restore both
+branches. This is one completion wait per pair; a four-candidate device branch,
+partial-prefix restore/replay, full-artifact device evidence, and production
 executor integration remain pending.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a

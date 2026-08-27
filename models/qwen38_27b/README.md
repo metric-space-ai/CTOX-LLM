@@ -308,9 +308,11 @@ direction: a resident full-vocabulary selector can drive target embedding,
 initial norm, all 64 layers, and the LM head without materializing its token as
 a host embedding request. Validation is shared with the ordinary host-token
 entry point, and state commits only after GPU completion plus compact selector
-status validation. This is the target-transition primitive required to verify
-the first MTP draft. The greedy one-draft verifier now assembles it with the
-MTP path below; chained MTP4 remains separate work.
+status validation. `dispatch_prepared_mapped_initial_mtp_target_verifier`
+forms the causally aligned first speculative pair: MTP and target both consume
+the same real input token, while MTP reads the retained pre-target hidden state
+before the target transition overwrites the main arena. Chained MTP4 remains
+separate work.
 A native f32 concatenate kernel now also joins the normalized selected-token
 embedding and retained target hidden state directly in caller-owned Metal
 storage. A dedicated liveness-derived MTP arena backs the complete frontend in
@@ -324,15 +326,18 @@ now drive a gathered Q2/Q4 head that writes exactly those rows to `MtpDraft`
 without private activation I/O. A finite-checking restricted argmax selects a
 local row, then `qwen_argmax_index_to_token` maps it through that same
 canonical row-ID buffer to the global vocabulary token in the same encoder.
-`dispatch_prepared_mapped_greedy_mtp_target_verifier` now continues in that
-same command buffer: the full target graph consumes the resident selected
-token, produces fresh full-vocabulary logits, and runs the second target
-argmax. `qwen_greedy_mtp_verify` compares the two compact device results and
-writes one four-word target/draft/accept/status record before the sole wait;
-both state graphs commit only if that record and the restored
-target-one-token-ahead contract validate, otherwise both roll back.
-Full-artifact same-device evidence, chained MTP4, replay-on-reject, and
-production executor wiring remain pending.
+For an accepted pair,
+`dispatch_prepared_mapped_greedy_mtp_target_verifier` can continue in one
+command buffer: the full target graph consumes the resident selected token,
+produces fresh full-vocabulary logits, and runs the next target argmax. Entry
+now fails closed unless the previous compact verification record says the
+draft was accepted. `qwen_greedy_mtp_verify` compares the two new compact
+device results and writes one four-word target/draft/accept/status record
+before the sole wait; both state graphs commit only if that record and the
+restored target-one-token-ahead contract validate, otherwise both roll back.
+This is still one completion wait per pair, not the final MTP4 speedup.
+Full-artifact same-device evidence, a four-candidate device branch,
+partial-prefix restore/replay, and production executor wiring remain pending.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

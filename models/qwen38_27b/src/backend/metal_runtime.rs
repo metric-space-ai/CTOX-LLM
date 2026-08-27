@@ -11550,6 +11550,23 @@ impl MetalCandidateRuntime {
         step: &PreparedMetalDecodeStepView<'_>,
         prepared: &PreparedMappedMetalMtpCore,
     ) -> Result<()> {
+        self.encode_prepared_mapped_mtp_frontend_from_selector(
+            encoder,
+            step,
+            prepared,
+            &prepared.target_selector,
+            true,
+        )
+    }
+
+    fn encode_prepared_mapped_mtp_frontend_from_selector(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        step: &PreparedMetalDecodeStepView<'_>,
+        prepared: &PreparedMappedMetalMtpCore,
+        selector: &PreparedMetalArgMaxScratch,
+        select_from_target_logits: bool,
+    ) -> Result<()> {
         let scratch = &prepared.workspace.buffer;
         let offset = |slot| {
             prepared.workspace.binding(slot).and_then(|binding| {
@@ -11565,16 +11582,18 @@ impl MetalCandidateRuntime {
         let hidden = offset(MetalMtpBufferSlot::HiddenA)?;
         let normalized = offset(MetalMtpBufferSlot::Normalized)?;
 
-        self.encode_argmax_f32_at(
-            encoder,
-            step.reads()[1].buffer(),
-            step.reads()[1].offset(),
-            &prepared.target_selector,
-        );
+        if select_from_target_logits {
+            self.encode_argmax_f32_at(
+                encoder,
+                step.reads()[1].buffer(),
+                step.reads()[1].offset(),
+                selector,
+            );
+        }
         self.encode_mapped_embedding_from_selector_to(
             encoder,
             &prepared.embedding,
-            &prepared.target_selector,
+            selector,
             scratch,
             selected_embedding,
         )?;
@@ -11982,6 +12001,25 @@ impl MetalCandidateRuntime {
         thread_width: usize,
     ) -> Result<()> {
         self.encode_prepared_mapped_mtp_frontend(encoder, step, prepared)?;
+        self.encode_prepared_mapped_mtp_layer_and_draft(
+            encoder,
+            step,
+            prepared,
+            plan,
+            component_values,
+            thread_width,
+        )
+    }
+
+    fn encode_prepared_mapped_mtp_layer_and_draft(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        step: &PreparedMetalDecodeStepView<'_>,
+        prepared: &PreparedMappedMetalMtpCore,
+        plan: &MetalPagedGqaAppendPlan,
+        component_values: usize,
+        thread_width: usize,
+    ) -> Result<()> {
         self.encode_prepared_mapped_mtp_layer(
             encoder,
             prepared,
@@ -12134,12 +12172,159 @@ impl MetalCandidateRuntime {
         }
     }
 
-    /// Execute one greedy MTP proposal and its full target verification in a
-    /// single Metal command buffer. The entry contract is the canonical
-    /// target-one-token-ahead state. MTP consumes the resident target-selected
-    /// token, the target graph consumes that same device selector, and the
-    /// resulting full-vocabulary target argmax is compared with the mapped
-    /// restricted draft only after the sole completion wait.
+    /// Advance MTP and target from the same real input token, producing the
+    /// first causally aligned draft/target pair for a speculative block. MTP
+    /// reads the retained pre-target hidden state before the target transition
+    /// overwrites the main arena, and neither graph commits unless the
+    /// target-one-token-ahead relation is restored after the sole wait.
+    pub fn dispatch_prepared_mapped_initial_mtp_target_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+        token: u32,
+    ) -> Result<MetalGreedyMtpVerification> {
+        let mtp_step = self.validate_prepared_mapped_mtp_frontend(program, mtp)?;
+        let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(mtp)?;
+        let [embedding, initial_norm, target_lm_head] =
+            self.validate_prepared_mapped_target_core(program, target)?;
+        let target_tokens = target.cached_tokens()?;
+        let mtp_tokens = mtp.cached_tokens();
+        if token as usize >= target.vocabulary_rows()
+            || target_tokens == 0
+            || target_tokens != mtp_tokens.saturating_add(1)
+            || !Rc::ptr_eq(
+                &target.embedding.mapping.inner,
+                &mtp.embedding.mapping.inner,
+            )
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal initial MTP/target step requires a canonical in-range token and target-one-ahead state, observed token {token} and target/MTP tokens {target_tokens}/{mtp_tokens}"
+            )));
+        }
+
+        target.layers.begin_speculative(self)?;
+        if let Err(primary) = mtp.layer.attention.begin_speculative() {
+            return match self.restore_mapped_greedy_mtp_target(target, mtp) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal initial target/MTP checkpoint failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            };
+        }
+
+        let result = (|| {
+            let mtp_plan = self.plan_paged_gqa_append(&mut mtp.layer.attention)?;
+            write_metal_paged_gqa_descriptors(&mtp.layer.attention)?;
+            write_metal_paged_gqa_params(&mtp.layer.attention)?;
+            mtp.layer.attention.poisoned = true;
+            write_buffer_range(
+                &mtp.target_selector.result_buffer,
+                0,
+                as_bytes(&[token, 0]),
+                2 * std::mem::size_of::<u32>(),
+            )?;
+            zero_buffer(
+                &mtp.draft_selector.result_buffer,
+                2 * std::mem::size_of::<u32>(),
+            );
+            zero_buffer(&mtp.verification_buffer, 4 * std::mem::size_of::<u32>());
+
+            let command_buffer = self.queue.new_command_buffer();
+            command_buffer.set_label("ctox-qwen38-initial-mtp-target-verifier");
+            let encoder = command_buffer.new_compute_command_encoder();
+            let encoded: Result<Vec<(usize, MetalPagedGqaAppendPlan)>> = (|| {
+                self.encode_prepared_mapped_mtp_frontend_from_selector(
+                    encoder,
+                    mtp_step,
+                    mtp,
+                    &mtp.target_selector,
+                    false,
+                )?;
+                self.encode_prepared_mapped_mtp_layer_and_draft(
+                    encoder,
+                    mtp_step,
+                    mtp,
+                    &mtp_plan,
+                    component_values,
+                    thread_width,
+                )?;
+                self.encode_mapped_embedding_to(
+                    encoder,
+                    &target.embedding,
+                    token as usize,
+                    embedding.writes()[0].buffer(),
+                    embedding.writes()[0].offset(),
+                )?;
+                let target_plans = self.encode_prepared_mapped_target_core_after_embedding(
+                    encoder,
+                    program,
+                    target,
+                    initial_norm,
+                    target_lm_head,
+                )?;
+                self.encode_argmax_f32_at(
+                    encoder,
+                    target_lm_head.writes()[0].buffer(),
+                    target_lm_head.writes()[0].offset(),
+                    &mtp.target_selector,
+                );
+                self.encode_greedy_mtp_verify(
+                    encoder,
+                    &mtp.target_selector,
+                    &mtp.draft_selector,
+                    &mtp.verification_buffer,
+                );
+                Ok(target_plans)
+            })();
+            encoder.end_encoding();
+            let target_plans = encoded?;
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal initial target/MTP command ended with {:?}",
+                    command_buffer.status()
+                )));
+            }
+
+            self.validate_completed_mapped_mtp_layer(mtp, &mtp_plan, component_values)?;
+            self.validate_completed_mapped_target_core(target, &target_plans)?;
+            let verified = self
+                .read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
+            if target.cached_tokens()? != mtp.cached_tokens().saturating_add(1)
+                || !target.layers.commit_ready()
+                || mtp.layer.attention.poisoned
+                || mtp.layer.attention.speculative_checkpoint.is_none()
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal initial target/MTP completion broke one-ahead or commit readiness"
+                        .into(),
+                ));
+            }
+            target.layers.commit_speculative()?;
+            mtp.layer.attention.commit_speculative()?;
+            Ok(verified)
+        })();
+
+        match result {
+            Ok(verified) => Ok(verified),
+            Err(primary) => match self.restore_mapped_greedy_mtp_target(target, mtp) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal initial target/MTP verification failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            },
+        }
+    }
+
+    /// Continue after an accepted greedy MTP pair and perform the next proposal
+    /// plus full target verification in one Metal command buffer. The entry
+    /// contract is canonical target-one-token-ahead state plus an accepted
+    /// compact verification record. MTP and target consume the same resident
+    /// selected token, and the resulting full-vocabulary target argmax is
+    /// compared with the mapped restricted draft after the sole completion
+    /// wait.
     pub fn dispatch_prepared_mapped_greedy_mtp_target_verifier(
         &self,
         program: &PreparedMetalDecodeProgram<'_>,
@@ -12151,8 +12336,11 @@ impl MetalCandidateRuntime {
         let target_lm_head = self.validate_prepared_mapped_target_core(program, target)?[2];
         let target_tokens = target.cached_tokens()?;
         let mtp_tokens = mtp.cached_tokens();
+        let previous =
+            self.read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
         if target_tokens == 0
             || target_tokens != mtp_tokens.saturating_add(1)
+            || !previous.accepted
             || mtp.target_selector.values != target.vocabulary_rows()
             || !Rc::ptr_eq(
                 &target.embedding.mapping.inner,
@@ -12160,7 +12348,8 @@ impl MetalCandidateRuntime {
             )
         {
             return Err(EngineError::InvalidState(format!(
-                "Metal greedy MTP verification requires one canonical target-one-ahead graph, observed target/MTP tokens {target_tokens}/{mtp_tokens}"
+                "Metal greedy MTP continuation requires one accepted canonical target-one-ahead graph, observed accepted={} and target/MTP tokens {target_tokens}/{mtp_tokens}",
+                previous.accepted
             )));
         }
 
