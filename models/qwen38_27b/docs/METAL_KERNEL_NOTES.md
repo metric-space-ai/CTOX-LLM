@@ -96,6 +96,9 @@ residual norms, three FFN matrices, and one packed KV owner to one canonical
 mmap identity. Its staged executor keeps all activations in the shared arena;
 KV descriptor planning is still a bounded command boundary, while the complete
 residual/FFN tail is encoded together.
+The all-layer entry point constructs exactly 16 such owners in frozen topology
+order and returns no partial vector if any tensor, cache geometry, or mapping
+identity fails validation.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

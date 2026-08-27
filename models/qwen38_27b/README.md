@@ -241,6 +241,8 @@ KV state and the common residual/FFN tail. Its exact-Qwen Layer-3 Golden reaches
 the Layer-4 normalized arena view and rejects a Layer-7 schedule before cache
 mutation. KV metadata currently imposes a bounded command boundary; eliminating
 that boundary remains part of the final one-command-buffer executor work.
+The corresponding all-layer loader admits exactly the 16 frozen full-attention
+layers in canonical order or drops the partial allocation on the first error.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

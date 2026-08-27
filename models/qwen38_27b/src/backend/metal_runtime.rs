@@ -3501,6 +3501,34 @@ impl MetalCandidateRuntime {
         })
     }
 
+    /// Prepare all 16 target full-attention layers in canonical model order.
+    /// A failure drops every already prepared cache and immutable resource;
+    /// callers can never observe a partially admitted attention graph.
+    pub fn prepare_all_mapped_full_attention_layers(
+        &self,
+        mapping: &MappedMetalArtifact,
+        position: u64,
+        cache: MetalPagedGqaConfig,
+    ) -> Result<Vec<PreparedMappedMetalFullAttentionLayer>> {
+        let config = Qwen38Config::default();
+        let mut layers = Vec::with_capacity(config.full_attention_layers());
+        for layer in 0..config.num_hidden_layers {
+            if config.layer_kind(layer) == Some(LayerKind::FullAttention) {
+                layers.push(
+                    self.prepare_mapped_full_attention_layer(mapping, layer, position, cache)?,
+                );
+            }
+        }
+        if layers.len() != config.full_attention_layers() {
+            return Err(EngineError::InvalidState(format!(
+                "Metal prepared {} full-attention layers, expected {}",
+                layers.len(),
+                config.full_attention_layers()
+            )));
+        }
+        Ok(layers)
+    }
+
     /// Prepare every immutable tensor and persistent state owner for one exact
     /// target linear-attention layer. This is the model-specific resource
     /// loader used by the reusable ten-step layer encoder.
@@ -13476,6 +13504,9 @@ mod tests {
                     ..cache
                 },
             )
+            .is_err());
+        assert!(runtime
+            .prepare_all_mapped_full_attention_layers(&mapping, 0, cache)
             .is_err());
 
         let residual_input: Vec<f32> = (0..hidden)
