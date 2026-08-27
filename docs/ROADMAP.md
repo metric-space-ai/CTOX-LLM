@@ -317,7 +317,7 @@ wire contract is implemented, and the bring-up server rejects inference until
 it can own a promoted executor.
 
 Metal parallel bring-up has now replaced operation-local activations for the
-first exact decode chain. Frozen steps 0-10 dispatch embedding, layer-0 RMSNorm,
+first exact decode chain. Frozen steps 0-11 dispatch embedding, layer-0 RMSNorm,
 and all four linear-attention projections directly through typed views of the
 single 1,173,760-byte arena, then update `LinearQkv` in place through the
 stateful causal convolution, prepare expanded Q/K/V plus LogDecay/Beta arena
@@ -327,8 +327,10 @@ view through the recovered Q2/Q4 linear output matrix into `MixerOutput`, with
 one fused residual-add/Qwen-RMSNorm dispatch writing `HiddenB` and the next
 `Normalized` view, then project that view through the mixed-Q2/Q4 FFN gate/up
 fan-out, then fuse SwiGLU directly into the Q2/Q4 down projection without a
-materialized product vector, all in one command encoder/wait. This is verified
-on Apple Silicon but is not backend promotion: the remaining 634 steps, complete
+materialized product vector, then fuse the post-FFN residual add and next-layer
+Qwen RMSNorm. The complete first linear-attention transformer layer now runs in
+one command encoder/wait. This is verified on Apple Silicon but is not backend
+promotion: the remaining 633 steps, complete
 target+MTP execution, prefill arena, lifecycle measurements, and Golden suite
 remain open.
 

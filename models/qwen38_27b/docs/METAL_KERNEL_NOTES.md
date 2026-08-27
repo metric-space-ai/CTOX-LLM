@@ -258,9 +258,13 @@ norm weight, writes the exact `HiddenB` residual, and writes the next
 Golden test then executes the mixed-Q2/Q4 FFN gate/up fan-out from that exact
 view into `FfnGate` and `FfnUp`, followed by a fused Q2/Q4 SwiGLU-down
 projection into `FfnDown`. Steps 0-10 use one command encoder and one wait;
-failure leaves state poisoned and recoverable through the active device
-checkpoint. Because the arena intentionally aliases dead slots, the verifier
-uses checkpointed reruns when inspecting earlier and final views.
+the same fused residual/Qwen-RMSNorm kernel then combines `HiddenB` and
+`FfnDown`, writes the complete layer result to `HiddenA`, and writes the next
+layer input to `Normalized`. Steps 0-11 therefore execute the complete first
+linear-attention transformer layer in one command encoder and one wait; failure
+leaves state poisoned and recoverable through the active device checkpoint.
+Because the arena intentionally aliases dead slots, the verifier uses
+checkpointed reruns when inspecting earlier and final views.
 
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
@@ -482,13 +486,15 @@ dequantization array before this source was accepted.
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
   target+MTP state transaction. All 645 steps have real shared-buffer views;
-  exact kernel dispatch now covers steps 0-10 (embedding, layer-0 RMSNorm, all
+  exact kernel dispatch now covers steps 0-11 (embedding, layer-0 RMSNorm, all
   four linear-attention projections, in-place causal convolution, and the
   five-output GatedDelta preparation, recurrent FP16-state update, and in-place
   direct-weight gated RMSNorm followed by the recovered Q2/Q4 linear output
   projection, then fused residual-add/Qwen RMSNorm into `HiddenB` and the next
   `Normalized` view, then mixed-Q2/Q4 FFN gate/up fan-out and fused SwiGLU-down
-  projection). The remaining 634 schedule steps,
+  projection, then fused post-FFN residual-add/next-layer Qwen RMSNorm). The
+  complete first linear-attention layer is therefore wired. The remaining 633
+  schedule steps,
   the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;

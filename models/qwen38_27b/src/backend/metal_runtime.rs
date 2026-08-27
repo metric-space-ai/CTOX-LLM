@@ -5848,13 +5848,14 @@ impl MetalCandidateRuntime {
             .collect()
     }
 
-    /// Dispatch up to the exact first eleven operations of the frozen decode graph:
+    /// Dispatch up to the exact first twelve operations of the frozen decode graph:
     /// embedding, layer-0 RMSNorm, four-way linear-attention fan-out, in-place
     /// convolution, five-output GatedDelta preparation, recurrent update, and
     /// direct-weight gated RMSNorm, the recovered linear output projection, and
     /// fused residual-add plus Qwen RMSNorm into the next hidden/normalized views,
     /// the mixed-Q2/Q4 two-way FFN gate/up fan-out, and fused SwiGLU down
-    /// projection without a materialized SwiGLU activation.
+    /// projection without a materialized SwiGLU activation, followed by the
+    /// fused post-FFN residual-add and next-layer Qwen RMSNorm.
     /// All activations are typed views into one schedule-derived arena. The
     /// prepared graph resources own only immutable parameters and tiny command
     /// metadata; no operation-local input or output activation is allocated.
@@ -5891,6 +5892,10 @@ impl MetalCandidateRuntime {
             &PreparedMetalDecodeStepView<'_>,
         )>,
         swiglu_down: Option<(&PreparedMappedMetalMatVec, &PreparedMetalDecodeStepView<'_>)>,
+        post_ffn_residual_rms_norm: Option<(
+            &PreparedMappedMetalRmsNorm,
+            &PreparedMetalDecodeStepView<'_>,
+        )>,
         embedding_output: &PreparedMetalDecodeBufferView<'_>,
         normalized_output: &PreparedMetalDecodeBufferView<'_>,
         projection_outputs: [&PreparedMetalDecodeBufferView<'_>; 4],
@@ -6326,6 +6331,50 @@ impl MetalCandidateRuntime {
                 ));
             }
         }
+        if let Some((residual_norm, step)) = post_ffn_residual_rms_norm.as_ref() {
+            let reads = step.reads();
+            let writes = step.writes();
+            let (_, attention_residual_step) = residual_rms_norm.as_ref().ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal graph post-FFN residual RMSNorm requires attention residual RMSNorm"
+                        .into(),
+                )
+            })?;
+            let (_, swiglu_step) = swiglu_down.as_ref().ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal graph post-FFN residual RMSNorm requires fused SwiGLU down projection"
+                        .into(),
+                )
+            })?;
+            if step.step().schedule_index != 11
+                || step.step().layer != Some(0)
+                || step.step().operation != MetalDecodeOperation::ResidualRmsNorm
+                || reads.len() != 2
+                || writes.len() != 2
+                || reads[0].slot() != MetalBufferSlot::HiddenB
+                || reads[0].offset() != attention_residual_step.writes()[0].offset()
+                || reads[1].slot() != MetalBufferSlot::FfnDown
+                || reads[1].offset() != swiglu_step.writes()[0].offset()
+                || writes[0].slot() != MetalBufferSlot::HiddenA
+                || writes[1].slot() != MetalBufferSlot::Normalized
+                || residual_norm.input_buffer.is_some()
+                || residual_norm.output_buffer.is_some()
+                || !Rc::ptr_eq(&residual_norm.mapping.inner, &embedding.mapping.inner)
+                || residual_norm.rows != 1
+                || residual_norm.columns != embedding.columns
+                || [&reads[0], &reads[1], &writes[0], &writes[1]]
+                    .iter()
+                    .any(|view| {
+                        view.values() != residual_norm.columns
+                            || !std::ptr::eq(arena, view.buffer())
+                    })
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph post-FFN residual RMSNorm does not match frozen schedule step 11"
+                        .into(),
+                ));
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-decode-prefix");
@@ -6456,6 +6505,20 @@ impl MetalCandidateRuntime {
                 arena,
                 step.writes()[0].offset(),
             )?;
+        }
+        if let Some((residual_norm, step)) = post_ffn_residual_rms_norm.as_ref() {
+            self.encode_mapped_residual_rms_norm_between(
+                encoder,
+                residual_norm,
+                arena,
+                step.reads()[0].offset(),
+                arena,
+                step.reads()[1].offset(),
+                arena,
+                step.writes()[0].offset(),
+                arena,
+                step.writes()[1].offset(),
+            );
         }
         encoder.end_encoding();
         command_buffer.commit();
@@ -8642,6 +8705,9 @@ mod tests {
         let post_attention_norm_values: Vec<f32> = (0..columns)
             .map(|index| 0.025 * (index % 13) as f32 - 0.15)
             .collect();
+        let next_layer_norm_values: Vec<f32> = (0..columns)
+            .map(|index| 0.01875 * (index % 17) as f32 - 0.125)
+            .collect();
         let directory = tempdir().expect("temporary shared-arena graph directory");
         let path = directory.path().join("shared-arena-graph.ctoxq");
         let mut tensors = repeated_recovered_tensors(
@@ -8663,6 +8729,12 @@ mod tests {
             dtype: TensorDType::F16,
             shape: vec![columns as u64],
             bytes: f16_bytes(&post_attention_norm_values),
+        });
+        tensors.push(PackedTensor {
+            name: "layer1.input_norm.weight".into(),
+            dtype: TensorDType::F16,
+            shape: vec![columns as u64],
+            bytes: f16_bytes(&next_layer_norm_values),
         });
         let projection_specs = [
             (
@@ -8811,6 +8883,18 @@ mod tests {
                 epsilon,
             )
             .expect("prepare graph residual RMSNorm without activation buffers");
+        let post_ffn_residual_norm = runtime
+            .prepare_mapped_rms_norm_1p_graph_io(
+                &mapping,
+                artifact
+                    .float_tensor("layer1.input_norm.weight")
+                    .expect("resolve graph next-layer RMSNorm"),
+                &validation_input,
+                1,
+                columns,
+                epsilon,
+            )
+            .expect("prepare graph post-FFN residual RMSNorm without activation buffers");
         let projection_matrices = projection_specs.map(|(name, _, _)| {
             artifact
                 .recovered_matrix(name)
@@ -8947,6 +9031,10 @@ mod tests {
             residual_norm.transient_bytes(),
             MetalRmsNormParams::BYTE_LEN
         );
+        assert_eq!(
+            post_ffn_residual_norm.transient_bytes(),
+            MetalRmsNormParams::BYTE_LEN
+        );
         for projection in &prepared_projections {
             assert_eq!(
                 projection.transient_bytes(),
@@ -9041,6 +9129,7 @@ mod tests {
         let residual_norm_step = &program.steps()[8];
         let ffn_gate_up_step = &program.steps()[9];
         let swiglu_down_step = &program.steps()[10];
+        let post_ffn_residual_step = &program.steps()[11];
         let projection_refs = [
             &prepared_projections[0],
             &prepared_projections[1],
@@ -9054,6 +9143,7 @@ mod tests {
                 1,
                 &norm,
                 projection_refs,
+                None,
                 None,
                 None,
                 None,
@@ -9095,6 +9185,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -9111,6 +9202,7 @@ mod tests {
                 Some((&delta_prepare, delta_outputs)),
                 Some((&mut recurrence, recurrence_step)),
                 Some((&gated_norm, recurrence_step)),
+                None,
                 None,
                 None,
                 None,
@@ -9136,6 +9228,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -9155,6 +9248,7 @@ mod tests {
                 Some((&gated_norm, gated_norm_step)),
                 Some((&linear_output_projection, linear_output_step)),
                 Some((&residual_norm, linear_output_step)),
+                None,
                 None,
                 None,
                 embedding_output,
@@ -9178,6 +9272,7 @@ mod tests {
                 Some((&residual_norm, residual_norm_step)),
                 Some((ffn_projection_refs, residual_norm_step)),
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -9199,6 +9294,29 @@ mod tests {
                 Some((&residual_norm, residual_norm_step)),
                 Some((ffn_projection_refs, ffn_gate_up_step)),
                 Some((&ffn_down_projection, ffn_gate_up_step)),
+                None,
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .is_err());
+        assert!(!convolution.poisoned);
+        assert!(!recurrence.poisoned);
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, gated_norm_step)),
+                Some((&linear_output_projection, linear_output_step)),
+                Some((&residual_norm, residual_norm_step)),
+                Some((ffn_projection_refs, ffn_gate_up_step)),
+                Some((&ffn_down_projection, swiglu_down_step)),
+                Some((&post_ffn_residual_norm, swiglu_down_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -9267,6 +9385,7 @@ mod tests {
                 Some((&gated_norm, gated_norm_step)),
                 Some((&linear_output_projection, linear_output_step)),
                 Some((&residual_norm, residual_norm_step)),
+                None,
                 None,
                 None,
                 embedding_output,
@@ -9402,7 +9521,7 @@ mod tests {
         for (index, ((expected_residual, actual_residual), (expected_norm, actual_norm))) in
             expected_residual
                 .iter()
-                .zip(actual_residual)
+                .zip(&actual_residual)
                 .zip(
                     expected_post_attention_norm
                         .iter()
@@ -9456,6 +9575,7 @@ mod tests {
                 Some((&linear_output_projection, linear_output_step)),
                 Some((&residual_norm, residual_norm_step)),
                 Some((ffn_projection_refs, ffn_gate_up_step)),
+                None,
                 None,
                 embedding_output,
                 normalized_output,
@@ -9525,6 +9645,7 @@ mod tests {
                 Some((&residual_norm, residual_norm_step)),
                 Some((ffn_projection_refs, ffn_gate_up_step)),
                 Some((&ffn_down_projection, swiglu_down_step)),
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -9533,7 +9654,7 @@ mod tests {
         let actual_down = workspace
             .read_f32(MetalBufferSlot::FfnDown)
             .expect("read graph fused SwiGLU down projection");
-        for (row, (expected, actual)) in expected_down.iter().zip(actual_down).enumerate() {
+        for (row, (expected, actual)) in expected_down.iter().zip(&actual_down).enumerate() {
             let tolerance = 1.2e-3_f32.max(expected.abs() * 8.0e-4);
             assert!(
                 (expected - actual).abs() <= tolerance,
@@ -9546,6 +9667,76 @@ mod tests {
         convolution
             .restore_speculative(&runtime)
             .expect("restore graph convolution after SwiGLU prefix");
+
+        let expected_post_ffn_residual: Vec<f32> = actual_residual
+            .iter()
+            .zip(&actual_down)
+            .map(|(residual, update)| residual + update)
+            .collect();
+        let expected_next_norm = crate::reference::rms_norm_1p_weight(
+            &expected_post_ffn_residual,
+            1,
+            columns,
+            &next_layer_norm_values,
+            epsilon,
+        )
+        .expect("execute graph post-FFN residual RMSNorm oracle");
+        convolution
+            .begin_speculative(&runtime)
+            .expect("snapshot graph convolution state for complete layer");
+        recurrence
+            .begin_speculative(&runtime)
+            .expect("snapshot graph recurrence state for complete layer");
+        runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, gated_norm_step)),
+                Some((&linear_output_projection, linear_output_step)),
+                Some((&residual_norm, residual_norm_step)),
+                Some((ffn_projection_refs, ffn_gate_up_step)),
+                Some((&ffn_down_projection, swiglu_down_step)),
+                Some((&post_ffn_residual_norm, post_ffn_residual_step)),
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .expect("dispatch complete first transformer layer through shared arena");
+        let actual_post_ffn_residual = workspace
+            .read_f32(MetalBufferSlot::HiddenA)
+            .expect("read graph post-FFN residual output");
+        let actual_next_norm = workspace
+            .read_f32(MetalBufferSlot::Normalized)
+            .expect("read graph next-layer normalized output");
+        for (index, ((expected_residual, actual_residual), (expected_norm, actual_norm))) in
+            expected_post_ffn_residual
+                .iter()
+                .zip(actual_post_ffn_residual)
+                .zip(expected_next_norm.iter().zip(actual_next_norm))
+                .enumerate()
+        {
+            let residual_tolerance = 8.0e-5_f32.max(expected_residual.abs() * 2.0e-6);
+            let norm_tolerance = 8.0e-4_f32.max(expected_norm.abs() * 5.0e-4);
+            assert!(
+                (expected_residual - actual_residual).abs() <= residual_tolerance,
+                "graph post-FFN residual {index}: expected {expected_residual}, got {actual_residual}"
+            );
+            assert!(
+                (expected_norm - actual_norm).abs() <= norm_tolerance,
+                "graph next-layer norm {index}: expected {expected_norm}, got {actual_norm}"
+            );
+        }
+        recurrence
+            .restore_speculative(&runtime)
+            .expect("restore graph recurrence after complete layer");
+        convolution
+            .restore_speculative(&runtime)
+            .expect("restore graph convolution after complete layer");
     }
 
     #[test]
