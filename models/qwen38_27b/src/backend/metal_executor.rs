@@ -6,6 +6,9 @@
 //! stochastic resident sampling are promoted, prefill is deliberately serial
 //! and target selection is greedy-only.
 
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::{self, JoinHandle};
+
 use crate::backend::metal_graph::{
     MetalDecodeBindingPlan, MetalDecodeWorkspacePlan, MetalMtpWorkspacePlan, MetalProjectionPlan,
     METAL_MTP4_RECORDS,
@@ -50,6 +53,62 @@ pub struct MetalModelExecutor {
     pending_ack: Option<PendingMetalSpeculativeAck>,
     last_target_token: Option<u32>,
     warmed: bool,
+    allocations: AllocationSnapshot,
+}
+
+enum MetalWorkerCommand {
+    Load {
+        artifact: Box<ModelArtifact>,
+        profile: Box<MemoryProfile>,
+        mtp_draft_token_ids: Vec<u32>,
+        reply: SyncSender<Result<()>>,
+    },
+    Warmup {
+        reply: SyncSender<Result<()>>,
+    },
+    Prefill {
+        tokens: Vec<u32>,
+        mtp_enabled: bool,
+        cancellation: CancellationToken,
+        reply: SyncSender<Result<ExecutorStep>>,
+    },
+    Decode {
+        token: u32,
+        mtp_enabled: bool,
+        cancellation: CancellationToken,
+        reply: SyncSender<Result<ExecutorStep>>,
+    },
+    SelectTarget {
+        sampling: SamplerConfig,
+        draw: f32,
+        reply: SyncSender<Result<Option<u32>>>,
+    },
+    CommitSpeculative {
+        accepted_drafts: u32,
+        cancellation: CancellationToken,
+        reply: SyncSender<Result<()>>,
+    },
+    ResetSession {
+        reply: SyncSender<Result<()>>,
+    },
+    Unload {
+        reply: SyncSender<Result<()>>,
+    },
+    Allocations {
+        reply: SyncSender<Result<AllocationSnapshot>>,
+    },
+    Shutdown {
+        reply: SyncSender<Result<()>>,
+    },
+}
+
+/// Sendable LocalTransport adapter. All Objective-C/Metal owners are created,
+/// used, and destroyed on one dedicated worker thread; no unsafe `Send`
+/// implementation is used to move driver objects across threads.
+pub struct ThreadedMetalModelExecutor {
+    hardware_profile: String,
+    sender: Option<mpsc::Sender<MetalWorkerCommand>>,
+    worker: Option<JoinHandle<()>>,
     allocations: AllocationSnapshot,
 }
 
@@ -186,6 +245,194 @@ impl MetalModelExecutor {
 
     fn accepted_prefix(records: &[MetalGreedyMtpVerification]) -> usize {
         records.iter().take_while(|record| record.accepted).count()
+    }
+}
+
+impl ThreadedMetalModelExecutor {
+    pub fn new_for_profile(hardware_profile: impl Into<String>) -> Result<Self> {
+        let hardware_profile = hardware_profile.into();
+        if hardware_profile.trim().is_empty() {
+            return Err(EngineError::InvalidArtifact(
+                "threaded Metal executor hardware profile must not be empty".into(),
+            ));
+        }
+        let worker_profile = hardware_profile.clone();
+        let (sender, receiver) = mpsc::channel();
+        let (initialized_tx, initialized_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("qwen38-metal-executor".into())
+            .spawn(move || {
+                let initialized = MetalModelExecutor::new_for_profile(worker_profile);
+                match initialized {
+                    Ok(executor) => {
+                        if initialized_tx.send(Ok(())).is_ok() {
+                            run_metal_worker(executor, receiver);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = initialized_tx.send(Err(error));
+                    }
+                }
+            })
+            .map_err(|error| {
+                EngineError::InvalidState(format!("failed to start Metal executor worker: {error}"))
+            })?;
+        match initialized_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                hardware_profile,
+                sender: Some(sender),
+                worker: Some(worker),
+                allocations: AllocationSnapshot::default(),
+            }),
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(error) => {
+                let _ = worker.join();
+                Err(EngineError::InvalidState(format!(
+                    "Metal executor worker exited during initialization: {error}"
+                )))
+            }
+        }
+    }
+
+    fn request<T>(
+        &self,
+        operation: &'static str,
+        command: impl FnOnce(SyncSender<Result<T>>) -> MetalWorkerCommand,
+    ) -> Result<T> {
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(format!(
+                "Metal executor {operation} requested after shutdown"
+            ))
+        })?;
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        sender.send(command(reply_tx)).map_err(|_| {
+            EngineError::InvalidState(format!(
+                "Metal executor worker is unavailable during {operation}"
+            ))
+        })?;
+        reply_rx.recv().map_err(|_| {
+            EngineError::InvalidState(format!(
+                "Metal executor worker returned no result for {operation}"
+            ))
+        })?
+    }
+
+    fn refresh_allocations(&mut self) -> Result<()> {
+        self.allocations = self.request("allocation query", |reply| {
+            MetalWorkerCommand::Allocations { reply }
+        })?;
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        let Some(sender) = self.sender.take() else {
+            return Ok(());
+        };
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let requested = sender
+            .send(MetalWorkerCommand::Shutdown { reply: reply_tx })
+            .is_ok();
+        drop(sender);
+        let result = if requested {
+            reply_rx.recv().map_err(|_| {
+                EngineError::InvalidState("Metal worker returned no shutdown result".into())
+            })?
+        } else {
+            Err(EngineError::InvalidState(
+                "Metal executor worker exited before shutdown".into(),
+            ))
+        };
+        let joined = self
+            .worker
+            .take()
+            .expect("live Metal sender has a worker")
+            .join();
+        self.allocations = AllocationSnapshot::default();
+        if joined.is_err() {
+            return Err(EngineError::InvalidState(
+                "Metal executor worker panicked during shutdown".into(),
+            ));
+        }
+        result
+    }
+}
+
+impl Drop for ThreadedMetalModelExecutor {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn run_metal_worker(
+    mut executor: MetalModelExecutor,
+    receiver: mpsc::Receiver<MetalWorkerCommand>,
+) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            MetalWorkerCommand::Load {
+                artifact,
+                profile,
+                mtp_draft_token_ids,
+                reply,
+            } => {
+                let _ = reply.send(executor.load(
+                    artifact.as_ref(),
+                    profile.as_ref(),
+                    &mtp_draft_token_ids,
+                ));
+            }
+            MetalWorkerCommand::Warmup { reply } => {
+                let _ = reply.send(executor.warmup());
+            }
+            MetalWorkerCommand::Prefill {
+                tokens,
+                mtp_enabled,
+                cancellation,
+                reply,
+            } => {
+                let _ = reply.send(executor.prefill(&tokens, mtp_enabled, &cancellation));
+            }
+            MetalWorkerCommand::Decode {
+                token,
+                mtp_enabled,
+                cancellation,
+                reply,
+            } => {
+                let _ = reply.send(executor.decode(token, mtp_enabled, &cancellation));
+            }
+            MetalWorkerCommand::SelectTarget {
+                sampling,
+                draw,
+                reply,
+            } => {
+                let _ = reply.send(executor.select_target_token(sampling, draw));
+            }
+            MetalWorkerCommand::CommitSpeculative {
+                accepted_drafts,
+                cancellation,
+                reply,
+            } => {
+                let _ = reply.send(executor.commit_speculative(accepted_drafts, &cancellation));
+            }
+            MetalWorkerCommand::ResetSession { reply } => {
+                let _ = reply.send(executor.reset_session());
+            }
+            MetalWorkerCommand::Unload { reply } => {
+                let _ = reply.send(executor.unload());
+            }
+            MetalWorkerCommand::Allocations { reply } => {
+                let _ = reply.send(Ok(executor.allocations()));
+            }
+            MetalWorkerCommand::Shutdown { reply } => {
+                let reset = executor.reset_session();
+                let unload = executor.unload();
+                let _ = reply.send(reset.and(unload));
+                break;
+            }
+        }
     }
 }
 
@@ -614,6 +861,122 @@ impl ModelExecutor for MetalModelExecutor {
     }
 }
 
+impl ModelExecutor for ThreadedMetalModelExecutor {
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Metal
+    }
+
+    fn hardware_profile(&self) -> &str {
+        &self.hardware_profile
+    }
+
+    fn promotion_state(&self) -> PromotionState {
+        PromotionState::Verifier
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        let config = Qwen38Config::default();
+        ExecutorCapabilities {
+            vocab_size: TOKENIZER_VOCAB_SIZE,
+            maximum_context_tokens: config.max_position_embeddings as u64,
+            mtp: config.mtp_num_hidden_layers == 1,
+            maximum_draft_tokens: METAL_MTP4_RECORDS as u32,
+            compact_greedy_mtp_verification: true,
+            resident_target_selection: true,
+            cancellation: true,
+            session_reset: true,
+            no_hidden_fallbacks: true,
+        }
+    }
+
+    fn load(
+        &mut self,
+        artifact: &ModelArtifact,
+        profile: &MemoryProfile,
+        mtp_draft_token_ids: &[u32],
+    ) -> Result<()> {
+        self.request("load", |reply| MetalWorkerCommand::Load {
+            artifact: Box::new(artifact.clone()),
+            profile: Box::new(profile.clone()),
+            mtp_draft_token_ids: mtp_draft_token_ids.to_vec(),
+            reply,
+        })?;
+        self.refresh_allocations()
+    }
+
+    fn warmup(&mut self) -> Result<()> {
+        self.request("warmup", |reply| MetalWorkerCommand::Warmup { reply })
+    }
+
+    fn prefill(
+        &mut self,
+        tokens: &[u32],
+        mtp_enabled: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutorStep> {
+        self.request("prefill", |reply| MetalWorkerCommand::Prefill {
+            tokens: tokens.to_vec(),
+            mtp_enabled,
+            cancellation: cancellation.clone(),
+            reply,
+        })
+    }
+
+    fn decode(
+        &mut self,
+        token: u32,
+        mtp_enabled: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutorStep> {
+        self.request("decode", |reply| MetalWorkerCommand::Decode {
+            token,
+            mtp_enabled,
+            cancellation: cancellation.clone(),
+            reply,
+        })
+    }
+
+    fn select_target_token(&mut self, sampling: SamplerConfig, draw: f32) -> Result<Option<u32>> {
+        self.request("target selection", |reply| {
+            MetalWorkerCommand::SelectTarget {
+                sampling,
+                draw,
+                reply,
+            }
+        })
+    }
+
+    fn commit_speculative(
+        &mut self,
+        accepted_drafts: u32,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.request("speculative commit", |reply| {
+            MetalWorkerCommand::CommitSpeculative {
+                accepted_drafts,
+                cancellation: cancellation.clone(),
+                reply,
+            }
+        })
+    }
+
+    fn reset_session(&mut self) -> Result<()> {
+        self.request("session reset", |reply| MetalWorkerCommand::ResetSession {
+            reply,
+        })
+    }
+
+    fn unload(&mut self) -> Result<()> {
+        let result = self.request("unload", |reply| MetalWorkerCommand::Unload { reply });
+        let allocation_result = self.refresh_allocations();
+        result.and(allocation_result)
+    }
+
+    fn allocations(&self) -> AllocationSnapshot {
+        self.allocations
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +1046,11 @@ mod tests {
             .err()
             .expect("empty profile must fail");
         assert!(matches!(error, EngineError::InvalidArtifact(_)));
+    }
+
+    #[test]
+    fn threaded_adapter_is_send_without_moving_metal_owners() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ThreadedMetalModelExecutor>();
     }
 }

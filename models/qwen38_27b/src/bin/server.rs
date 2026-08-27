@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 #[cfg(feature = "cuda")]
 use ctox_qwen38_27b::backend::cuda_executor::ThreadedCudaModelExecutor;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use ctox_qwen38_27b::backend::metal_executor::ThreadedMetalModelExecutor;
 use ctox_qwen38_27b::backend::ExecutionPolicy;
 use ctox_qwen38_27b::decoder::CpuCorrectnessExecutor;
 use ctox_qwen38_27b::engine::LoadProgress;
@@ -19,23 +21,30 @@ struct Args {
     /// Start the artifact-inspection bring-up service. It cannot generate.
     #[arg(
         long,
-        conflicts_with_all = ["verification_cpu", "verification_cuda"]
+        conflicts_with_all = ["verification_cpu", "verification_cuda", "verification_metal"]
     )]
     artifact: Option<PathBuf>,
     /// Start the scalar/SIMD CPU correctness executor under verifier policy.
     /// This mode is never admitted as a production backend.
     #[arg(
         long,
-        conflicts_with_all = ["artifact", "verification_cuda"]
+        conflicts_with_all = ["artifact", "verification_cuda", "verification_metal"]
     )]
     verification_cpu: bool,
     /// Start the thread-affine CUDA SM86 executor under verifier policy. This
     /// mode remains fail-closed for production until its promotion gates pass.
     #[arg(
         long,
-        conflicts_with_all = ["artifact", "verification_cpu"]
+        conflicts_with_all = ["artifact", "verification_cpu", "verification_metal"]
     )]
     verification_cuda: bool,
+    /// Start the thread-affine Apple-Silicon Metal executor under verifier
+    /// policy, bound to the exact hardware profile in the signed pack.
+    #[arg(
+        long,
+        conflicts_with_all = ["artifact", "verification_cpu", "verification_cuda"]
+    )]
+    verification_metal: bool,
     #[arg(long)]
     release_root: Option<PathBuf>,
     #[arg(long)]
@@ -54,14 +63,14 @@ struct Args {
     #[arg(
         long,
         requires = "verification_cuda",
-        conflicts_with_all = ["artifact", "verification_cpu"]
+        conflicts_with_all = ["artifact", "verification_cpu", "verification_metal"]
     )]
     cuda_module: Option<PathBuf>,
     /// CUDA Driver API ordinal after any process-level device visibility mask.
     #[arg(
         long,
         requires = "verification_cuda",
-        conflicts_with_all = ["artifact", "verification_cpu"]
+        conflicts_with_all = ["artifact", "verification_cpu", "verification_metal"]
     )]
     cuda_device: Option<i32>,
 }
@@ -72,22 +81,62 @@ fn main() -> anyhow::Result<()> {
         &args.artifact,
         args.verification_cpu,
         args.verification_cuda,
+        args.verification_metal,
     ) {
-        (Some(artifact), false, false) => {
+        (Some(artifact), false, false, false) => {
             let state = ServerState::load(artifact)?;
             run_unix(args.socket, &state)?;
         }
-        (None, true, false) => run_cpu_verifier(args)?,
-        (None, false, true) => run_cuda_verifier(args)?,
+        (None, true, false, false) => run_cpu_verifier(args)?,
+        (None, false, true, false) => run_cuda_verifier(args)?,
+        (None, false, false, true) => run_metal_verifier(args)?,
         _ => {
             return Err(EngineError::InvalidArtifact(
-                "select exactly one of --artifact, --verification-cpu, or --verification-cuda"
-                    .into(),
+                "select exactly one of --artifact, --verification-cpu, --verification-cuda, or --verification-metal".into(),
             )
             .into())
         }
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn run_metal_verifier(args: Args) -> anyhow::Result<()> {
+    let release_root = required(args.release_root, "--release-root")?;
+    let manifest_path = required(args.release_manifest, "--release-manifest")?;
+    let pack_id = required(args.pack_id, "--pack-id")?;
+    let memory_profile_id = required(args.memory_profile_id, "--memory-profile-id")?;
+    let expected_key_id = required(args.expected_key_id, "--expected-key-id")?;
+    let trusted_key_path = required(args.trusted_public_key, "--trusted-public-key")?;
+
+    let release: ReleaseManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let trusted_public_key = read_public_key(&trusted_key_path)?;
+    release.verify_signature(&expected_key_id, &trusted_public_key)?;
+    let hardware_profile = release.backend_pack(&pack_id)?.hardware_profile.clone();
+    let executor = ThreadedMetalModelExecutor::new_for_profile(hardware_profile)?;
+    let state = EngineServer::load_signed(
+        release_root,
+        &release,
+        &pack_id,
+        &memory_profile_id,
+        &expected_key_id,
+        &trusted_public_key,
+        ExecutionPolicy::Verifier,
+        executor,
+        report_load_progress,
+    )?;
+    run_unix(args.socket, &state)?;
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+fn run_metal_verifier(_args: Args) -> anyhow::Result<()> {
+    Err(EngineError::UnsupportedOperation {
+        backend: "metal",
+        operation: "verification server",
+        reason: "qwen38-server requires macOS and the metal feature".into(),
+    }
+    .into())
 }
 
 #[cfg(feature = "cuda")]
@@ -212,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_verifier_mode_is_explicit_and_does_not_leak_into_other_modes() {
+    fn accelerator_verifier_modes_are_explicit_and_mutually_exclusive() {
         assert!(Args::try_parse_from([
             "qwen38-server",
             "--socket",
@@ -241,5 +290,23 @@ mod tests {
         .unwrap();
         assert!(cuda.verification_cuda);
         assert_eq!(cuda.cuda_device, None);
+
+        let metal = Args::try_parse_from([
+            "qwen38-server",
+            "--socket",
+            "/tmp/qwen.sock",
+            "--verification-metal",
+        ])
+        .unwrap();
+        assert!(metal.verification_metal);
+        assert!(Args::try_parse_from([
+            "qwen38-server",
+            "--socket",
+            "/tmp/qwen.sock",
+            "--verification-metal",
+            "--cuda-module",
+            "/tmp/qwen.cubin",
+        ])
+        .is_err());
     }
 }

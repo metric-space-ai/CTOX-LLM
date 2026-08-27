@@ -377,7 +377,11 @@ last normalized target hidden vector on device, so partial rollback restores
 KV, convolution, GatedDelta, and the MTP frontend boundary together. This is a
 verifier lifecycle, not yet the threaded server adapter, chunked prefill,
 stochastic Metal sampler, full-artifact Golden, allocator high-watermark proof,
-or production promotion.
+or production promotion. `ThreadedMetalModelExecutor` keeps every Metal owner
+on one dedicated driver thread without an unsafe `Send` escape, and
+`qwen38-server --verification-metal` now loads the exact signed pack profile
+through the same Unix-socket Responses ABI as CPU and CUDA. The server mode
+remains verifier-only until the full-artifact and performance gates pass.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those
