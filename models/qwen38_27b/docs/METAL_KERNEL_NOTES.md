@@ -175,7 +175,15 @@ Golden crosses the Q2/Q4 boundary and matches loader-resolved static rows.
 the normalized selected-token embedding and retained target hidden state into
 one caller-owned device view, with a fixed 16-byte ABI and no host staging.
 The standalone verifier checks exact ordering and fails closed on empty or
-non-finite inputs; graph-owned scratch and the full MTP encoder remain pending.
+non-finite inputs. `MetalMtpWorkspacePlan` expands the single scheduled MTP
+operation into 20 typed scratch values and aliases only disjoint live
+intervals: one 180,224-byte, 256-byte-aligned allocation replaces 536,576 bytes
+of independent buffers while remaining physically separate from live target
+logits and the final draft. The prepared frontend now encodes offset-aware
+target argmax, dynamic Q2/Q4 embedding, both pre-FC norms, concatenate,
+`mtp.fc`, and the MTP input norm in one encoder. Only the bring-up verifier
+waits or reads its normalized hidden result; the MTP transformer layer,
+restricted head, and joint target transaction remain pending.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

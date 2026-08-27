@@ -80,6 +80,51 @@ pub struct MetalDecodeWorkspacePlan {
     mtp_draft_vocabulary_rows: usize,
 }
 
+/// Private activation slots used while expanding the single scheduled MTP
+/// operation into its native frontend, transformer layer, and final norm.
+/// Target logits and the final restricted draft remain in the decode arena;
+/// this arena exists so neither live tensor can be aliased by MTP scratch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MetalMtpBufferSlot {
+    SelectedEmbedding,
+    NormalizedEmbedding,
+    NormalizedTargetHidden,
+    Concatenated,
+    HiddenA,
+    Normalized,
+    QueryGate,
+    Query,
+    Key,
+    Value,
+    AttentionGate,
+    AttentionOutput,
+    MixerOutput,
+    ResidualHidden,
+    ResidualNormalized,
+    FfnGate,
+    FfnUp,
+    FfnDown,
+    FinalHidden,
+    FinalNormalized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalMtpBufferBinding {
+    pub slot: MetalMtpBufferSlot,
+    pub values: usize,
+    pub offset: usize,
+    pub bytes: usize,
+}
+
+/// Alias-safe workspace for the native one-token MTP subgraph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetalMtpWorkspacePlan {
+    bindings: BTreeMap<MetalMtpBufferSlot, MetalMtpBufferBinding>,
+    total_bytes: usize,
+    independent_bytes: usize,
+    alignment: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LiveInterval {
     start: usize,
@@ -407,6 +452,232 @@ impl MetalDecodeWorkspacePlan {
         }
         Ok(())
     }
+}
+
+impl MetalMtpWorkspacePlan {
+    pub const ALIGNMENT: usize = MetalDecodeWorkspacePlan::ALIGNMENT;
+
+    pub fn qwen38(config: &Qwen38Config) -> Result<Self> {
+        if config != &Qwen38Config::default() {
+            return Err(EngineError::Shape(
+                "Metal MTP workspace requires the frozen Qwen3.8-27B topology".into(),
+            ));
+        }
+        let widths = mtp_slot_widths(config)?;
+        let intervals = mtp_live_intervals();
+        if widths.keys().copied().collect::<BTreeSet<_>>()
+            != intervals.keys().copied().collect::<BTreeSet<_>>()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal MTP workspace widths or liveness omit a scratch slot".into(),
+            ));
+        }
+
+        let mut ordered = widths
+            .iter()
+            .map(|(&slot, &values)| {
+                let bytes = values
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget(format!(
+                            "Metal MTP workspace byte count overflows for {slot:?}"
+                        ))
+                    })?;
+                Ok((slot, values, bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ordered.sort_by_key(|(slot, _values, bytes)| (std::cmp::Reverse(*bytes), *slot));
+
+        let mut bindings = BTreeMap::new();
+        for (slot, values, bytes) in ordered {
+            let mut offset = 0_usize;
+            loop {
+                offset = align_up(offset, Self::ALIGNMENT)?;
+                let end = offset.checked_add(bytes).ok_or_else(|| {
+                    EngineError::MemoryBudget("Metal MTP workspace range overflows".into())
+                })?;
+                let mut conflict_end = None;
+                for (&other_slot, other) in &bindings {
+                    let other: &MetalMtpBufferBinding = other;
+                    let other_end = other.offset.checked_add(other.bytes).ok_or_else(|| {
+                        EngineError::MemoryBudget(
+                            "Metal MTP workspace binding end overflows".into(),
+                        )
+                    })?;
+                    if intervals_overlap(&intervals[&slot], &intervals[&other_slot])
+                        && byte_ranges_overlap(offset, end, other.offset, other_end)
+                    {
+                        conflict_end = Some(conflict_end.unwrap_or(0_usize).max(other_end));
+                    }
+                }
+                if let Some(next) = conflict_end {
+                    offset = next;
+                    continue;
+                }
+                bindings.insert(
+                    slot,
+                    MetalMtpBufferBinding {
+                        slot,
+                        values,
+                        offset,
+                        bytes,
+                    },
+                );
+                break;
+            }
+        }
+        let total_bytes = bindings.values().try_fold(0_usize, |maximum, binding| {
+            binding
+                .offset
+                .checked_add(binding.bytes)
+                .map(|end| maximum.max(end))
+                .ok_or_else(|| {
+                    EngineError::MemoryBudget("Metal MTP workspace end overflows".into())
+                })
+        })?;
+        let total_bytes = align_up(total_bytes, Self::ALIGNMENT)?;
+        let independent_bytes = bindings.values().try_fold(0_usize, |total, binding| {
+            total.checked_add(binding.bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("Metal independent MTP workspace bytes overflow".into())
+            })
+        })?;
+        let plan = Self {
+            bindings,
+            total_bytes,
+            independent_bytes,
+            alignment: Self::ALIGNMENT,
+        };
+        plan.validate(&intervals)?;
+        Ok(plan)
+    }
+
+    pub fn binding(&self, slot: MetalMtpBufferSlot) -> Result<MetalMtpBufferBinding> {
+        self.bindings.get(&slot).copied().ok_or_else(|| {
+            EngineError::InvalidState(format!("Metal MTP workspace does not bind {slot:?}"))
+        })
+    }
+
+    pub fn bindings(&self) -> impl Iterator<Item = MetalMtpBufferBinding> + '_ {
+        self.bindings.values().copied()
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn independent_bytes(&self) -> usize {
+        self.independent_bytes
+    }
+
+    pub fn alignment(&self) -> usize {
+        self.alignment
+    }
+
+    fn validate(&self, intervals: &BTreeMap<MetalMtpBufferSlot, Vec<LiveInterval>>) -> Result<()> {
+        if self.bindings.len() != 20
+            || self.total_bytes == 0
+            || !self.total_bytes.is_multiple_of(self.alignment)
+            || self.total_bytes > self.independent_bytes
+        {
+            return Err(EngineError::MemoryBudget(
+                "Metal shared MTP workspace has an invalid geometry".into(),
+            ));
+        }
+        let bindings: Vec<_> = self.bindings.values().collect();
+        for (index, left) in bindings.iter().enumerate() {
+            let left_end = left.offset.checked_add(left.bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("Metal MTP workspace binding end overflows".into())
+            })?;
+            if left.bytes == 0
+                || !left.offset.is_multiple_of(self.alignment)
+                || left_end > self.total_bytes
+            {
+                return Err(EngineError::MemoryBudget(format!(
+                    "Metal MTP workspace binding {:?} is invalid",
+                    left.slot
+                )));
+            }
+            for right in &bindings[index + 1..] {
+                let right_end = right.offset.checked_add(right.bytes).ok_or_else(|| {
+                    EngineError::MemoryBudget("Metal MTP workspace binding end overflows".into())
+                })?;
+                if intervals_overlap(&intervals[&left.slot], &intervals[&right.slot])
+                    && byte_ranges_overlap(left.offset, left_end, right.offset, right_end)
+                {
+                    return Err(EngineError::InvalidState(format!(
+                        "live Metal MTP slots {:?} and {:?} alias",
+                        left.slot, right.slot
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn mtp_slot_widths(config: &Qwen38Config) -> Result<BTreeMap<MetalMtpBufferSlot, usize>> {
+    let checked = |left: usize, right: usize, label: &str| {
+        left.checked_mul(right)
+            .ok_or_else(|| EngineError::MemoryBudget(format!("Metal MTP {label} overflows")))
+    };
+    let hidden = config.hidden_size;
+    let query = checked(config.num_attention_heads, config.head_dim, "query width")?;
+    let query_gate = checked(query, 2, "query/gate width")?;
+    let key_value = checked(config.num_key_value_heads, config.head_dim, "K/V width")?;
+    Ok(BTreeMap::from([
+        (MetalMtpBufferSlot::SelectedEmbedding, hidden),
+        (MetalMtpBufferSlot::NormalizedEmbedding, hidden),
+        (MetalMtpBufferSlot::NormalizedTargetHidden, hidden),
+        (
+            MetalMtpBufferSlot::Concatenated,
+            checked(hidden, 2, "concat width")?,
+        ),
+        (MetalMtpBufferSlot::HiddenA, hidden),
+        (MetalMtpBufferSlot::Normalized, hidden),
+        (MetalMtpBufferSlot::QueryGate, query_gate),
+        (MetalMtpBufferSlot::Query, query),
+        (MetalMtpBufferSlot::Key, key_value),
+        (MetalMtpBufferSlot::Value, key_value),
+        (MetalMtpBufferSlot::AttentionGate, query),
+        (MetalMtpBufferSlot::AttentionOutput, query),
+        (MetalMtpBufferSlot::MixerOutput, hidden),
+        (MetalMtpBufferSlot::ResidualHidden, hidden),
+        (MetalMtpBufferSlot::ResidualNormalized, hidden),
+        (MetalMtpBufferSlot::FfnGate, config.intermediate_size),
+        (MetalMtpBufferSlot::FfnUp, config.intermediate_size),
+        (MetalMtpBufferSlot::FfnDown, hidden),
+        (MetalMtpBufferSlot::FinalHidden, hidden),
+        (MetalMtpBufferSlot::FinalNormalized, hidden),
+    ]))
+}
+
+fn mtp_live_intervals() -> BTreeMap<MetalMtpBufferSlot, Vec<LiveInterval>> {
+    use MetalMtpBufferSlot::*;
+    BTreeMap::from([
+        (SelectedEmbedding, vec![LiveInterval { start: 0, end: 1 }]),
+        (NormalizedEmbedding, vec![LiveInterval { start: 1, end: 2 }]),
+        (
+            NormalizedTargetHidden,
+            vec![LiveInterval { start: 1, end: 2 }],
+        ),
+        (Concatenated, vec![LiveInterval { start: 2, end: 3 }]),
+        (HiddenA, vec![LiveInterval { start: 3, end: 9 }]),
+        (Normalized, vec![LiveInterval { start: 4, end: 5 }]),
+        (QueryGate, vec![LiveInterval { start: 5, end: 6 }]),
+        (Query, vec![LiveInterval { start: 6, end: 7 }]),
+        (Key, vec![LiveInterval { start: 5, end: 7 }]),
+        (Value, vec![LiveInterval { start: 5, end: 7 }]),
+        (AttentionGate, vec![LiveInterval { start: 6, end: 8 }]),
+        (AttentionOutput, vec![LiveInterval { start: 7, end: 8 }]),
+        (MixerOutput, vec![LiveInterval { start: 8, end: 9 }]),
+        (ResidualHidden, vec![LiveInterval { start: 9, end: 12 }]),
+        (ResidualNormalized, vec![LiveInterval { start: 9, end: 10 }]),
+        (FfnGate, vec![LiveInterval { start: 10, end: 11 }]),
+        (FfnUp, vec![LiveInterval { start: 10, end: 11 }]),
+        (FfnDown, vec![LiveInterval { start: 11, end: 12 }]),
+        (FinalHidden, vec![LiveInterval { start: 12, end: 13 }]),
+        (FinalNormalized, vec![LiveInterval { start: 12, end: 13 }]),
+    ])
 }
 
 fn decode_slot_widths(
@@ -1194,6 +1465,38 @@ mod tests {
         assert!(MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 0).is_err());
         assert!(
             MetalDecodeWorkspacePlan::qwen38(&schedule, &config, config.vocab_size + 1).is_err()
+        );
+    }
+
+    #[test]
+    fn mtp_workspace_is_separate_compact_and_alias_safe() {
+        let config = Qwen38Config::default();
+        let workspace = MetalMtpWorkspacePlan::qwen38(&config).unwrap();
+        assert_eq!(workspace.bindings().count(), 20);
+        assert_eq!(workspace.alignment(), 256);
+        assert_eq!(workspace.total_bytes(), 180_224);
+        assert_eq!(workspace.independent_bytes(), 536_576);
+        assert!(workspace.total_bytes() < workspace.independent_bytes() / 2);
+        assert_eq!(
+            workspace
+                .binding(MetalMtpBufferSlot::Concatenated)
+                .unwrap()
+                .values,
+            config.hidden_size * 2
+        );
+        assert_eq!(
+            workspace
+                .binding(MetalMtpBufferSlot::FfnGate)
+                .unwrap()
+                .values,
+            config.intermediate_size
+        );
+        assert_ne!(
+            workspace
+                .binding(MetalMtpBufferSlot::FfnGate)
+                .unwrap()
+                .offset,
+            workspace.binding(MetalMtpBufferSlot::FfnUp).unwrap().offset
         );
     }
 }

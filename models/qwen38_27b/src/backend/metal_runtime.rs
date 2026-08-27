@@ -39,7 +39,8 @@ use super::metal::{
 };
 use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
-    MetalDecodeExecutionCursor, MetalDecodeWorkspacePlan,
+    MetalDecodeExecutionCursor, MetalDecodeWorkspacePlan, MetalMtpBufferBinding,
+    MetalMtpBufferSlot, MetalMtpWorkspacePlan,
 };
 use super::metal_schedule::{MetalBufferSlot, MetalDecodeOperation};
 use super::{Activation, FusedMatVec, ScaleSlice};
@@ -156,6 +157,15 @@ pub struct PreparedMetalProjection {
 pub struct PreparedMetalDecodeWorkspace {
     plan: MetalDecodeWorkspacePlan,
     buffer: Buffer,
+}
+
+/// One compact allocation for all private activations inside the scheduled
+/// MTP operation. The main decode arena continues to own live target logits
+/// and the final draft tensor.
+pub struct PreparedMetalMtpWorkspace {
+    plan: MetalMtpWorkspacePlan,
+    buffer: Buffer,
+    concat_params: Buffer,
 }
 
 /// One exact read or write view into the shared decode arena.
@@ -527,6 +537,7 @@ pub struct PreparedMappedMetalMtpCore {
     input_norm: PreparedMappedMetalRmsNorm,
     layer: PreparedMappedMetalFullAttentionLayer,
     lm_head: PreparedMappedMetalMatVec,
+    workspace: PreparedMetalMtpWorkspace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1006,6 +1017,29 @@ impl PreparedMetalDecodeWorkspace {
             )
         };
         Ok(values.to_vec())
+    }
+}
+
+impl PreparedMetalMtpWorkspace {
+    pub fn total_bytes(&self) -> usize {
+        self.plan.total_bytes()
+    }
+
+    pub fn binding(&self, slot: MetalMtpBufferSlot) -> Result<MetalMtpBufferBinding> {
+        self.plan.binding(slot)
+    }
+
+    pub fn buffer_and_offset(&self, slot: MetalMtpBufferSlot) -> Result<(&Buffer, u64)> {
+        let binding = self.binding(slot)?;
+        let offset = u64::try_from(binding.offset)
+            .map_err(|_| EngineError::MemoryBudget("Metal MTP slot offset exceeds u64".into()))?;
+        Ok((&self.buffer, offset))
+    }
+
+    pub fn transient_bytes(&self) -> Result<usize> {
+        self.total_bytes()
+            .checked_add(MetalConcatParams::BYTE_LEN)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP workspace bytes overflow".into()))
     }
 }
 
@@ -2457,6 +2491,7 @@ impl PreparedMappedMetalMtpCore {
 
     pub fn transient_bytes(&self) -> Result<usize> {
         [
+            self.workspace.transient_bytes()?,
             self.embedding.transient_bytes(),
             self.target_selector.transient_bytes(),
             self.pre_embedding_norm.transient_bytes(),
@@ -2500,6 +2535,10 @@ impl PreparedMappedMetalMtpCore {
     pub fn hidden_size(&self) -> usize {
         debug_assert_eq!(self.embedding.columns, self.pre_embedding_norm.columns);
         self.embedding.columns
+    }
+
+    pub fn scratch_bytes(&self) -> usize {
+        self.workspace.total_bytes()
     }
 }
 
@@ -3077,6 +3116,36 @@ impl MetalCandidateRuntime {
         })
     }
 
+    pub fn prepare_mtp_workspace(
+        &self,
+        plan: &MetalMtpWorkspacePlan,
+    ) -> Result<PreparedMetalMtpWorkspace> {
+        let first = plan.binding(MetalMtpBufferSlot::NormalizedEmbedding)?;
+        let second = plan.binding(MetalMtpBufferSlot::NormalizedTargetHidden)?;
+        let concatenated = plan.binding(MetalMtpBufferSlot::Concatenated)?;
+        if first.values != second.values
+            || concatenated.values
+                != first.values.checked_add(second.values).ok_or_else(|| {
+                    EngineError::MemoryBudget("Metal MTP concat width overflows".into())
+                })?
+        {
+            return Err(EngineError::InvalidState(
+                "Metal MTP workspace concat bindings are incompatible".into(),
+            ));
+        }
+        let concat_params = MetalConcatParams {
+            first_values: usize_to_u32(first.values, "Metal MTP first concat width")?,
+            second_values: usize_to_u32(second.values, "Metal MTP second concat width")?,
+            reserved0: 0,
+            reserved1: 0,
+        };
+        Ok(PreparedMetalMtpWorkspace {
+            plan: plan.clone(),
+            buffer: new_zeroed_buffer(&self.device, plan.total_bytes())?,
+            concat_params: buffer_with_data(&self.device, &concat_params.encode()),
+        })
+    }
+
     pub fn prepare_f32_checkpoint(&self, values: usize) -> Result<PreparedMetalF32Checkpoint> {
         let bytes = values
             .checked_mul(std::mem::size_of::<f32>())
@@ -3578,8 +3647,22 @@ impl MetalCandidateRuntime {
         input: &Buffer,
         scratch: &PreparedMetalArgMaxScratch,
     ) {
+        self.encode_argmax_f32_at(encoder, input, 0, scratch);
+    }
+
+    fn encode_argmax_f32_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input: &Buffer,
+        input_offset: u64,
+        scratch: &PreparedMetalArgMaxScratch,
+    ) {
         encoder.set_compute_pipeline_state(&self.argmax_f32_partial_pipeline);
-        encoder.set_buffer(MetalArgMaxPartialBufferAbi::INPUT as u64, Some(input), 0);
+        encoder.set_buffer(
+            MetalArgMaxPartialBufferAbi::INPUT as u64,
+            Some(input),
+            input_offset,
+        );
         encoder.set_buffer(
             MetalArgMaxPartialBufferAbi::PARTIALS as u64,
             Some(&scratch.partials_buffer),
@@ -4530,6 +4613,8 @@ impl MetalCandidateRuntime {
         };
         let lm_head = self.prepare_named_mapped_projection_graph_io(mapping, "lm_head.weight")?;
         let target_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
+        let workspace_plan = MetalMtpWorkspacePlan::qwen38(&config)?;
+        let workspace = self.prepare_mtp_workspace(&workspace_plan)?;
 
         let canonical = &mapping.inner;
         let mut layer_mappings = layer
@@ -4602,6 +4687,7 @@ impl MetalCandidateRuntime {
             input_norm,
             layer,
             lm_head,
+            workspace,
         })
     }
 
@@ -10831,6 +10917,208 @@ impl MetalCandidateRuntime {
         prepared.layers.commit_speculative()
     }
 
+    fn validate_prepared_mapped_mtp_frontend<'program, 'arena>(
+        &self,
+        program: &'program PreparedMetalDecodeProgram<'arena>,
+        prepared: &PreparedMappedMetalMtpCore,
+    ) -> Result<&'program PreparedMetalDecodeStepView<'arena>> {
+        let config = Qwen38Config::default();
+        let step = program.steps.get(643).ok_or_else(|| {
+            EngineError::InvalidState("Metal decode program has no MTP step".into())
+        })?;
+        if step.step().schedule_index != 643
+            || step.step().layer.is_some()
+            || step.step().operation != MetalDecodeOperation::MtpDraftAndTargetVerify
+            || step.reads().len() != 2
+            || step.writes().len() != 1
+            || step.reads()[0].slot() != MetalBufferSlot::Normalized
+            || step.reads()[0].values() != config.hidden_size
+            || step.reads()[1].slot() != MetalBufferSlot::TargetLogits
+            || step.reads()[1].values() != config.vocab_size
+            || step.writes()[0].slot() != MetalBufferSlot::MtpDraft
+            || prepared.copied_model_bytes() != 0
+            || prepared.vocabulary_rows() != config.vocab_size
+            || prepared.hidden_size() != config.hidden_size
+            || prepared.target_selector.values != config.vocab_size
+            || !prepared
+                .pre_embedding_norm
+                .matches_weight_tensor("mtp.pre_fc_norm_embedding.weight")?
+            || !prepared
+                .pre_hidden_norm
+                .matches_weight_tensor("mtp.pre_fc_norm_hidden.weight")?
+            || !prepared.fc.matches_recovered_tensor("mtp.fc.weight")?
+            || !prepared
+                .input_norm
+                .matches_weight_tensor("mtp.layers.0.input_layernorm.weight")?
+        {
+            return Err(EngineError::InvalidState(
+                "Metal MTP frontend diverges from the frozen graph or tensor identity".into(),
+            ));
+        }
+        let main_arena = step.reads()[0].buffer();
+        if step
+            .reads()
+            .iter()
+            .chain(step.writes())
+            .any(|view| !std::ptr::eq(view.buffer(), main_arena))
+        {
+            return Err(EngineError::InvalidState(
+                "Metal MTP step does not share the canonical decode arena".into(),
+            ));
+        }
+        for (slot, values) in [
+            (MetalMtpBufferSlot::SelectedEmbedding, config.hidden_size),
+            (MetalMtpBufferSlot::NormalizedEmbedding, config.hidden_size),
+            (
+                MetalMtpBufferSlot::NormalizedTargetHidden,
+                config.hidden_size,
+            ),
+            (MetalMtpBufferSlot::Concatenated, config.hidden_size * 2),
+            (MetalMtpBufferSlot::HiddenA, config.hidden_size),
+            (MetalMtpBufferSlot::Normalized, config.hidden_size),
+        ] {
+            if prepared.workspace.binding(slot)?.values != values {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal MTP frontend scratch slot {slot:?} has the wrong width"
+                )));
+            }
+        }
+        Ok(step)
+    }
+
+    fn encode_prepared_mapped_mtp_frontend(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        step: &PreparedMetalDecodeStepView<'_>,
+        prepared: &PreparedMappedMetalMtpCore,
+    ) -> Result<()> {
+        let scratch = &prepared.workspace.buffer;
+        let offset = |slot| {
+            prepared.workspace.binding(slot).and_then(|binding| {
+                u64::try_from(binding.offset).map_err(|_| {
+                    EngineError::MemoryBudget("Metal MTP scratch offset exceeds u64".into())
+                })
+            })
+        };
+        let selected_embedding = offset(MetalMtpBufferSlot::SelectedEmbedding)?;
+        let normalized_embedding = offset(MetalMtpBufferSlot::NormalizedEmbedding)?;
+        let normalized_target = offset(MetalMtpBufferSlot::NormalizedTargetHidden)?;
+        let concatenated = offset(MetalMtpBufferSlot::Concatenated)?;
+        let hidden = offset(MetalMtpBufferSlot::HiddenA)?;
+        let normalized = offset(MetalMtpBufferSlot::Normalized)?;
+
+        self.encode_argmax_f32_at(
+            encoder,
+            step.reads()[1].buffer(),
+            step.reads()[1].offset(),
+            &prepared.target_selector,
+        );
+        self.encode_mapped_embedding_from_selector_to(
+            encoder,
+            &prepared.embedding,
+            &prepared.target_selector,
+            scratch,
+            selected_embedding,
+        )?;
+        self.encode_mapped_norm_between(
+            encoder,
+            &prepared.pre_embedding_norm,
+            scratch,
+            selected_embedding,
+            scratch,
+            normalized_embedding,
+        );
+        self.encode_mapped_norm_between(
+            encoder,
+            &prepared.pre_hidden_norm,
+            step.reads()[0].buffer(),
+            step.reads()[0].offset(),
+            scratch,
+            normalized_target,
+        );
+        self.encode_concat_f32_between(
+            encoder,
+            scratch,
+            normalized_embedding,
+            scratch,
+            normalized_target,
+            scratch,
+            concatenated,
+            &prepared.workspace.concat_params,
+            prepared
+                .workspace
+                .binding(MetalMtpBufferSlot::Concatenated)?
+                .values,
+        );
+        self.encode_mapped_projection_between(
+            encoder,
+            &prepared.fc,
+            scratch,
+            concatenated,
+            scratch,
+            hidden,
+        )?;
+        self.encode_mapped_norm_between(
+            encoder,
+            &prepared.input_norm,
+            scratch,
+            hidden,
+            scratch,
+            normalized,
+        );
+        Ok(())
+    }
+
+    /// Test/bring-up boundary for the native MTP frontend. Production will
+    /// call the same encoder from the single target+MTP command buffer; only
+    /// this verifier waits and reads the compact selected token and normalized
+    /// MTP hidden state back to the host.
+    pub fn dispatch_prepared_mapped_mtp_frontend_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &PreparedMappedMetalMtpCore,
+    ) -> Result<(u32, Vec<f32>)> {
+        let step = self.validate_prepared_mapped_mtp_frontend(program, prepared)?;
+        zero_buffer(
+            &prepared.target_selector.result_buffer,
+            2 * std::mem::size_of::<u32>(),
+        );
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-mtp-frontend-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_prepared_mapped_mtp_frontend(encoder, step, prepared)?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal MTP frontend ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let token = self.read_argmax_result(&prepared.target_selector)?;
+        let normalized = prepared.workspace.binding(MetalMtpBufferSlot::Normalized)?;
+        let values = unsafe {
+            slice::from_raw_parts(
+                prepared
+                    .workspace
+                    .buffer
+                    .contents()
+                    .cast::<u8>()
+                    .add(normalized.offset)
+                    .cast::<f32>(),
+                normalized.values,
+            )
+            .to_vec()
+        };
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal MTP frontend produced a non-finite hidden state".into(),
+            ));
+        }
+        Ok((token, values))
+    }
+
     fn encode_prepared_mapped_full_attention_layer(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -12231,6 +12519,34 @@ mod tests {
     }
 
     #[test]
+    fn mtp_workspace_materializes_one_independent_compact_buffer() {
+        let config = Qwen38Config::default();
+        let plan = MetalMtpWorkspacePlan::qwen38(&config).expect("MTP workspace plan");
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let workspace = runtime
+            .prepare_mtp_workspace(&plan)
+            .expect("allocate one MTP scratch arena");
+        assert_eq!(workspace.total_bytes(), 180_224);
+
+        let gate = workspace
+            .binding(MetalMtpBufferSlot::FfnGate)
+            .expect("MTP FFN gate binding");
+        let up = workspace
+            .binding(MetalMtpBufferSlot::FfnUp)
+            .expect("MTP FFN up binding");
+        let (gate_buffer, gate_offset) = workspace
+            .buffer_and_offset(MetalMtpBufferSlot::FfnGate)
+            .expect("MTP FFN gate view");
+        let (up_buffer, up_offset) = workspace
+            .buffer_and_offset(MetalMtpBufferSlot::FfnUp)
+            .expect("MTP FFN up view");
+        assert!(std::ptr::eq(gate_buffer, up_buffer));
+        assert_eq!(gate_offset, gate.offset as u64);
+        assert_eq!(up_offset, up.offset as u64);
+        assert_ne!(gate_offset, up_offset);
+    }
+
+    #[test]
     fn decode_program_binds_all_645_steps_to_one_real_metal_buffer() {
         let config = Qwen38Config::default();
         let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
@@ -12791,6 +13107,36 @@ mod tests {
         ));
         assert!(prepared.write_input(&[0.0; 3]).is_err());
         assert!(runtime.prepare_argmax_f32_with_groups(&logits, 3).is_err());
+    }
+
+    #[test]
+    fn device_argmax_honors_shared_arena_input_offset() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let values = 1_024;
+        let offset = 256_usize;
+        let mut logits = vec![-4.0_f32; values];
+        logits[1_000] = 12.0;
+        let total_bytes = offset + logits.len() * std::mem::size_of::<f32>();
+        let input = new_zeroed_buffer(&runtime.device, total_bytes).expect("offset argmax input");
+        write_buffer_range(&input, offset, as_bytes(&logits), total_bytes)
+            .expect("write offset logits");
+        let scratch = runtime
+            .prepare_argmax_f32_scratch(values)
+            .expect("prepare offset argmax scratch");
+        zero_buffer(&scratch.result_buffer, 2 * std::mem::size_of::<u32>());
+        let command_buffer = runtime.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        runtime.encode_argmax_f32_at(encoder, &input, offset as u64, &scratch);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        assert_eq!(
+            runtime
+                .read_argmax_result(&scratch)
+                .expect("read offset argmax"),
+            1_000
+        );
     }
 
     #[test]

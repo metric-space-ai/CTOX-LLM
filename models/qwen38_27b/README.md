@@ -299,8 +299,12 @@ selects rows on both sides of a Q2/Q4 boundary and matches the static CPU
 oracle without a token readback or an embedding-table repack.
 A native f32 concatenate kernel now also joins the normalized selected-token
 embedding and retained target hidden state directly in caller-owned Metal
-storage. Its fixed ABI and exact-order Golden close the standalone primitive;
-the graph-owned MTP scratch arena and chained frontend execution are next.
+storage. A dedicated liveness-derived MTP arena backs the complete frontend in
+180,224 bytes rather than 536,576 independent bytes and never aliases live
+target logits or the final draft. Offset-aware argmax, dynamic embedding, both
+pre-FC norms, concatenate, `mtp.fc`, and input norm are now one native encoder
+chain; the transformer layer, restricted draft head, and joint transaction are
+still pending.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first
