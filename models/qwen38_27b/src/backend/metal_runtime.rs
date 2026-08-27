@@ -2895,6 +2895,25 @@ impl PreparedMappedMetalQueryGate {
 }
 
 impl MetalCandidateRuntime {
+    /// Process-visible Metal bytes before constructing the model runtime. A
+    /// dedicated verifier records this as its external allocator baseline.
+    pub fn process_allocated_size() -> Result<u64> {
+        let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
+            backend: "metal",
+            operation: "query allocator baseline",
+            reason: "no system Metal device is available".into(),
+        })?;
+        Ok(device.current_allocated_size())
+    }
+
+    pub fn current_allocated_size(&self) -> u64 {
+        self.device.current_allocated_size()
+    }
+
+    pub fn allocator_device(&self) -> Device {
+        self.device.to_owned()
+    }
+
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
             backend: "metal",

@@ -61,6 +61,11 @@ struct Report {
     requested_session_bytes: u64,
     requested_total_bytes: u64,
     hard_limit_bytes: u64,
+    allocator_process_baseline_bytes: u64,
+    allocator_peak_bytes: u64,
+    allocator_after_unload_bytes: u64,
+    allocator_reclaimed_bytes: u64,
+    allocator_residual_bytes: u64,
     load_milliseconds: f64,
     prefill_milliseconds: f64,
     decode_milliseconds: f64,
@@ -197,10 +202,11 @@ fn main() -> anyhow::Result<()> {
     let unload_started = Instant::now();
     executor.unload()?;
     let unload_milliseconds = unload_started.elapsed().as_secs_f64() * 1.0e3;
+    let allocator_stats = executor.allocator_stats()?;
     let allocations_zero_after_unload = executor.allocations().is_zero();
     anyhow::ensure!(
-        allocations_zero_after_unload,
-        "Metal executor retained accounted allocations after unload"
+        allocations_zero_after_unload && allocator_stats.residual_bytes == 0,
+        "Metal executor retained accounted or process-visible allocations after unload"
     );
 
     println!(
@@ -227,6 +233,11 @@ fn main() -> anyhow::Result<()> {
             requested_session_bytes: allocations.session_bytes,
             requested_total_bytes,
             hard_limit_bytes: args.hard_limit_bytes,
+            allocator_process_baseline_bytes: allocator_stats.process_baseline_bytes,
+            allocator_peak_bytes: allocator_stats.peak_bytes,
+            allocator_after_unload_bytes: allocator_stats.after_unload_bytes,
+            allocator_reclaimed_bytes: allocator_stats.reclaimed_bytes,
+            allocator_residual_bytes: allocator_stats.residual_bytes,
             load_milliseconds,
             prefill_milliseconds,
             decode_milliseconds,

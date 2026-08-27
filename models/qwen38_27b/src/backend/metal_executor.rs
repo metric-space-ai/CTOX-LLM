@@ -39,6 +39,15 @@ struct PendingMetalSpeculativeAck {
     accepted_drafts: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetalAllocatorStats {
+    pub process_baseline_bytes: u64,
+    pub peak_bytes: u64,
+    pub after_unload_bytes: u64,
+    pub reclaimed_bytes: u64,
+    pub residual_bytes: u64,
+}
+
 pub struct MetalModelExecutor {
     hardware_profile: String,
     config: Qwen38Config,
@@ -54,6 +63,8 @@ pub struct MetalModelExecutor {
     last_target_token: Option<u32>,
     warmed: bool,
     allocations: AllocationSnapshot,
+    allocator_stats: MetalAllocatorStats,
+    allocator_measurement_active: bool,
 }
 
 enum MetalWorkerCommand {
@@ -100,6 +111,9 @@ enum MetalWorkerCommand {
     SessionTokenCounters {
         reply: SyncSender<Result<(usize, usize)>>,
     },
+    AllocatorStats {
+        reply: SyncSender<Result<MetalAllocatorStats>>,
+    },
     Shutdown {
         reply: SyncSender<Result<()>>,
     },
@@ -131,10 +145,13 @@ impl MetalModelExecutor {
                 "Metal executor hardware profile must not be empty".into(),
             ));
         }
+        let process_baseline_bytes = MetalCandidateRuntime::process_allocated_size()?;
+        let runtime = MetalCandidateRuntime::new()?;
+        let runtime_bytes = runtime.current_allocated_size();
         Ok(Self {
             hardware_profile,
             config: Qwen38Config::default(),
-            runtime: Some(MetalCandidateRuntime::new()?),
+            runtime: Some(runtime),
             mapping: None,
             binding_plan: None,
             workspace: None,
@@ -146,6 +163,12 @@ impl MetalModelExecutor {
             last_target_token: None,
             warmed: false,
             allocations: AllocationSnapshot::default(),
+            allocator_stats: MetalAllocatorStats {
+                process_baseline_bytes,
+                peak_bytes: runtime_bytes,
+                ..MetalAllocatorStats::default()
+            },
+            allocator_measurement_active: false,
         })
     }
 
@@ -264,6 +287,10 @@ impl MetalModelExecutor {
             .ok_or_else(|| EngineError::InvalidState("Metal MTP is not loaded".into()))?;
         Ok((target.cached_tokens()?, mtp.cached_tokens()))
     }
+
+    pub fn allocator_stats(&self) -> MetalAllocatorStats {
+        self.allocator_stats
+    }
 }
 
 impl ThreadedMetalModelExecutor {
@@ -348,6 +375,12 @@ impl ThreadedMetalModelExecutor {
     pub fn session_token_counters(&self) -> Result<(usize, usize)> {
         self.request("session token counters", |reply| {
             MetalWorkerCommand::SessionTokenCounters { reply }
+        })
+    }
+
+    pub fn allocator_stats(&self) -> Result<MetalAllocatorStats> {
+        self.request("allocator statistics", |reply| {
+            MetalWorkerCommand::AllocatorStats { reply }
         })
     }
 
@@ -452,6 +485,9 @@ fn run_metal_worker(
             }
             MetalWorkerCommand::SessionTokenCounters { reply } => {
                 let _ = reply.send(executor.session_token_counters());
+            }
+            MetalWorkerCommand::AllocatorStats { reply } => {
+                let _ = reply.send(Ok(executor.allocator_stats()));
             }
             MetalWorkerCommand::Shutdown { reply } => {
                 let reset = executor.reset_session();
@@ -569,12 +605,17 @@ impl ModelExecutor for MetalModelExecutor {
         .map_err(|_| EngineError::MemoryBudget("Metal session bytes exceed u64".into()))?
         .checked_add(profile.speculative_linear_state_bytes_per_session)
         .ok_or_else(|| EngineError::MemoryBudget("Metal checkpoint bytes overflow".into()))?;
-        let allocations = AllocationSnapshot {
+        let mut allocations = AllocationSnapshot {
             model_bytes: mapping.mapped_file_bytes(),
             graph_bytes,
             session_bytes,
             ..AllocationSnapshot::default()
         };
+        let current_allocated = runtime.current_allocated_size();
+        let observed_executor_bytes =
+            current_allocated.saturating_sub(self.allocator_stats.process_baseline_bytes);
+        allocations.global_cache_bytes =
+            observed_executor_bytes.saturating_sub(allocations.total_bytes()?);
         if allocations.total_bytes()? > profile.hard_limit_bytes {
             return Err(EngineError::MemoryBudget(format!(
                 "Metal prepared residency {} exceeds hard limit {}",
@@ -591,6 +632,8 @@ impl ModelExecutor for MetalModelExecutor {
         self.admitted_context = admitted_context;
         self.admitted_draft_tokens = profile.mtp_draft_tokens as usize;
         self.allocations = allocations;
+        self.allocator_stats.peak_bytes = self.allocator_stats.peak_bytes.max(current_allocated);
+        self.allocator_measurement_active = true;
         Ok(())
     }
 
@@ -865,6 +908,11 @@ impl ModelExecutor for MetalModelExecutor {
     }
 
     fn unload(&mut self) -> Result<()> {
+        let allocator_device = self
+            .runtime
+            .as_ref()
+            .map(MetalCandidateRuntime::allocator_device);
+        let allocator_measurement_active = self.allocator_measurement_active;
         if self.is_loaded() {
             self.reset_loaded_state()?;
         }
@@ -879,6 +927,27 @@ impl ModelExecutor for MetalModelExecutor {
         drop(self.binding_plan.take());
         drop(self.mapping.take());
         drop(self.runtime.take());
+        self.allocator_measurement_active = false;
+        if allocator_measurement_active {
+            let after_unload = allocator_device
+                .expect("active allocator measurement has a Metal device")
+                .current_allocated_size();
+            self.allocator_stats.after_unload_bytes = after_unload;
+            self.allocator_stats.reclaimed_bytes =
+                self.allocator_stats.peak_bytes.saturating_sub(after_unload);
+            self.allocator_stats.residual_bytes =
+                after_unload.saturating_sub(self.allocator_stats.process_baseline_bytes);
+            if self.allocator_stats.residual_bytes != 0 {
+                self.allocations = AllocationSnapshot {
+                    global_cache_bytes: self.allocator_stats.residual_bytes,
+                    ..AllocationSnapshot::default()
+                };
+                return Err(EngineError::MemoryBudget(format!(
+                    "Metal executor retained {} process-visible allocator bytes after unload",
+                    self.allocator_stats.residual_bytes
+                )));
+            }
+        }
         self.allocations = AllocationSnapshot::default();
         Ok(())
     }

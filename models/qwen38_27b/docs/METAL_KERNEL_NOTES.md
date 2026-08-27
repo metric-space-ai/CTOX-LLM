@@ -754,10 +754,12 @@ dequantization array before this source was accepted.
   on one driver thread and is reachable through the signed-profile Unix-socket
   verifier server. `qwen38-metal-executor-verify` binds an exact artifact and
   draft-vocabulary hash and records load/prefill/decode/commit/reset/cancel/
-  unload timings, target/MTP counters, and accounted residency. It is ready to
-  run when the final trained pack exists; no synthetic output is release
-  evidence. External allocator high-watermark and post-process residue still
-  need measurement on that final 7.8-GiB pack.
+unload timings, target/MTP counters, and accounted residency. It is ready to
+run when the final trained pack exists. The runner also captures Metal's
+process-visible allocator before runtime creation, at peak residency, and after
+runtime drop; any nonzero residual is a hard unload failure. No synthetic
+output is release evidence, and the measurement still has to be executed on
+the final 7.8-GiB pack.
 - Exploratory 17408x5120 FFN measurements with eight dispatches per command
   reached roughly 26.55 GB/s for Q2 (four simdgroups/threadgroup) and
   43.95 GB/s for Q4 (two simdgroups/threadgroup). The earlier CTOX M5 hardware

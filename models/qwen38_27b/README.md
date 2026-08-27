@@ -386,7 +386,10 @@ remains verifier-only until the full-artifact and performance gates pass.
 runner: it rehashes the complete artifact and restricted MTP vocabulary, checks
 the hard resident-byte ceiling, executes prefill plus MTP4, validates committed
 target/MTP counters, cancellation and reset, and requires zero accounted bytes
-after unload.
+after unload. It also samples Metal's process-visible allocator before runtime
+construction, at the loaded high-watermark, and after dropping the runtime;
+any residual byte leaves the executor in `unload_failed` instead of being
+hidden by a zeroed logical counter.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those
