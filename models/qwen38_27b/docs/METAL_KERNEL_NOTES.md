@@ -325,6 +325,15 @@ resident page byte against the independent CPU oracle. The CPU packed mirror
 exists only in test builds and drives reference policy/quality checks; release
 builds cannot allocate it.
 
+`prepare_paged_gqa_decode_graph` additionally omits the reusable standalone
+query/output buffers and binds one cache owner to its canonical full-attention
+layer. `append_and_dispatch_paged_gqa_views` validates the exact `PagedKvAppend`
+and `PagedGqa` schedule pair, then packs `Key`/`Value`, performs any Q4-to-Q2
+demotions, reads `Query`, and writes `AttentionOutput` using offsets in the one
+shared decode arena. Release builds do not upload or read back an activation on
+this edge. The same private encoder helper serves the standalone verifier and
+graph path, preventing their quantization or attention dispatches from drifting.
+
 For the frozen 24-query-head/4-KV-head/256-wide topology, a token contains
 2,048 combined K/V values: 576 Q2 bytes or 1,088 Q4 bytes. A 128K layer with
 128-token pages, 128 sink tokens, and 256 recent tokens reserves 75,497,472
@@ -441,6 +450,12 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   Q4-to-Q2 page transition, compares every decode step with the scalar GQA
   oracle using the identical quantized cache, verifies bounded arena byte
   counts, and proves reset/reuse without an f32 device cache.
+- `paged_gqa_consumes_full_attention_shared_arena_without_owned_io` runs seven
+  exact-Qwen Layer-3 tokens from shared `Query`/`Key`/`Value` views through the
+  persistent packed cache into shared `AttentionOutput`, covers Q4-to-Q2 page
+  demotion, compares every output with the quantized scalar oracle, proves the
+  graph owner has no local activation buffers, and rejects Layer-7 views before
+  mutating cache state.
 - `gated_delta_f16_matches_recurrent_oracle_and_reuses_state` executes six
   dependent recurrent steps, compares outputs and persistent state with the
   FP16 scalar oracle after every token, rejects invalid geometry, and proves
@@ -525,9 +540,9 @@ dequantization array before this source was accepted.
   `Normalized` view, then mixed-Q2/Q4 FFN gate/up fan-out and fused SwiGLU-down
   projection, then fused post-FFN residual-add/next-layer Qwen RMSNorm). The
   complete first linear-attention layer is therefore wired. Full-attention
-  schedule slices and the Layer-3 key-RoPE arena edge are also executable. The
-  remaining Full-Attention fan-out, query/gate normalization, shared-arena KV
-  append input, paged-GQA arena edge, gated output projection, and later schedule
+  schedule slices, the Layer-3 key-RoPE arena edge, and the combined
+  shared-arena KV-append/paged-GQA edge are also executable. The remaining
+  Full-Attention fan-out, query/gate normalization, gated output projection, and later schedule
   steps, the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;

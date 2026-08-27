@@ -250,7 +250,7 @@ and mutable state of a layer; its all-layer entry point admits exactly the 48
 linear layers in canonical order or drops the partial load on the first error.
 These graph preparations retain no operation-local input/output activation
 buffers; separately stored recovery inputs must be byte-identical. The
-remaining 633 schedule steps and the complete executor remain open. A bounded
+remaining 630 schedule steps and the complete executor remain open. A bounded
 f32 checkpoint can now snapshot and restore an
 exact arena slot through a Metal device-to-device blit with no host mirror. It
 is single-use and fail-closed across snapshot/restore/commit, providing the
@@ -263,8 +263,13 @@ budgeted boundary slot, so restore never copies the full Q2/Q4 arenas. Metal
 packs new K/V tokens to Q4 and demotes complete pages to Q2 directly between
 device buffers. Release builds retain only page metadata and the packed Metal
 arenas; the full CPU byte mirror exists exclusively in tests as an independent
-oracle. Replay reproduces the original branch outputs exactly. A graph-wide Metal
-transaction now coordinates the final normalized target hidden, all 17
+oracle. The graph-owned Layer-3 path now consumes `Query`, `Key`, and `Value`
+directly at their shared-arena offsets, writes `AttentionOutput` back into that
+same arena, and owns neither local Query/output buffers nor a host activation
+copy. Its Golden test runs seven persistent tokens through a real Q4-to-Q2 page
+transition and rejects a different layer's otherwise shape-compatible views
+before cache mutation. Replay reproduces the original branch outputs exactly.
+A graph-wide Metal transaction now coordinates the final normalized target hidden, all 17
 target/MTP attention owners, and all 48 paired causal-convolution/GatedDelta
 owners. Begin prevalidates the entire resource set before changing any owner;
 reject restores state in reverse order, while commit consumes every checkpoint
