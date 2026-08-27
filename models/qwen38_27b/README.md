@@ -303,8 +303,10 @@ storage. A dedicated liveness-derived MTP arena backs the complete frontend in
 180,224 bytes rather than 536,576 independent bytes and never aliases live
 target logits or the final draft. Offset-aware argmax, dynamic embedding, both
 pre-FC norms, concatenate, `mtp.fc`, and input norm are now one native encoder
-chain; the transformer layer, restricted draft head, and joint transaction are
-still pending.
+chain. Q/K/V fan-out, normalized/RoPE attention, packed MTP KV append, gated
+output, residuals, and the complete SwiGLU FFN now continue in that same arena
+under fail-closed cache rollback. The restricted draft head and joint
+target+MTP transaction are still pending.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

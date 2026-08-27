@@ -11119,6 +11119,411 @@ impl MetalCandidateRuntime {
         Ok((token, values))
     }
 
+    fn validate_prepared_mapped_mtp_layer(
+        &self,
+        prepared: &PreparedMappedMetalMtpCore,
+    ) -> Result<(usize, usize)> {
+        let config = Qwen38Config::default();
+        let layer = &prepared.layer;
+        let query_values = config
+            .num_attention_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP query width overflows".into()))?;
+        let component_values = config
+            .num_key_value_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP KV width overflows".into()))?;
+        let expected_slots = [
+            (MetalMtpBufferSlot::Normalized, config.hidden_size),
+            (MetalMtpBufferSlot::QueryGate, query_values * 2),
+            (MetalMtpBufferSlot::Query, query_values),
+            (MetalMtpBufferSlot::Key, component_values),
+            (MetalMtpBufferSlot::Value, component_values),
+            (MetalMtpBufferSlot::AttentionGate, query_values),
+            (MetalMtpBufferSlot::AttentionOutput, query_values),
+            (MetalMtpBufferSlot::MixerOutput, config.hidden_size),
+            (MetalMtpBufferSlot::HiddenA, config.hidden_size),
+            (MetalMtpBufferSlot::ResidualHidden, config.hidden_size),
+            (MetalMtpBufferSlot::ResidualNormalized, config.hidden_size),
+            (MetalMtpBufferSlot::FfnGate, config.intermediate_size),
+            (MetalMtpBufferSlot::FfnUp, config.intermediate_size),
+            (MetalMtpBufferSlot::FfnDown, config.hidden_size),
+            (MetalMtpBufferSlot::FinalHidden, config.hidden_size),
+            (MetalMtpBufferSlot::FinalNormalized, config.hidden_size),
+        ];
+        if expected_slots.into_iter().any(|(slot, values)| {
+            prepared
+                .workspace
+                .binding(slot)
+                .map_or(true, |v| v.values != values)
+        }) || layer.layer != config.num_hidden_layers
+            || layer.fanout.layer != config.num_hidden_layers
+            || layer.query_gate.layer != config.num_hidden_layers
+            || layer.attention.owner_layer != Some(config.num_hidden_layers)
+            || layer.attention.poisoned
+            || layer.attention.speculative_checkpoint.is_some()
+            || layer.fanout.projections[0].rows != query_values * 2
+            || layer.fanout.projections[1].rows != component_values
+            || layer.fanout.projections[2].rows != component_values
+            || layer
+                .fanout
+                .projections
+                .iter()
+                .any(|projection| projection.columns != config.hidden_size)
+            || layer.attention_output.projection.columns != query_values
+            || layer.attention_output.projection.rows != config.hidden_size
+            || layer.key_norm.rows != config.num_key_value_heads
+            || layer.key_norm.columns != config.head_dim
+            || layer.residual_rms_norm.columns != config.hidden_size
+            || layer.post_ffn_residual_rms_norm.columns != config.hidden_size
+            || layer.ffn_gate_up.iter().any(|projection| {
+                projection.columns != config.hidden_size
+                    || projection.rows != config.intermediate_size
+            })
+            || layer.swiglu_down.columns != config.intermediate_size
+            || layer.swiglu_down.rows != config.hidden_size
+        {
+            return Err(EngineError::InvalidState(
+                "Metal MTP transformer resources or scratch views are incompatible".into(),
+            ));
+        }
+        for (projection, name) in layer.fanout.projections.iter().zip([
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.self_attn.k_proj.weight",
+            "mtp.layers.0.self_attn.v_proj.weight",
+        ]) {
+            if !projection.matches_recovered_tensor(name)? {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal MTP fan-out projection does not match {name}"
+                )));
+            }
+        }
+        for (projection, name) in [
+            (
+                &layer.attention_output.projection,
+                "mtp.layers.0.self_attn.o_proj.weight",
+            ),
+            (&layer.ffn_gate_up[0], "mtp.layers.0.mlp.gate_proj.weight"),
+            (&layer.ffn_gate_up[1], "mtp.layers.0.mlp.up_proj.weight"),
+            (&layer.swiglu_down, "mtp.layers.0.mlp.down_proj.weight"),
+        ] {
+            if !projection.matches_recovered_tensor(name)? {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal MTP projection does not match {name}"
+                )));
+            }
+        }
+        if !layer
+            .query_gate
+            .matches_weight_tensor("mtp.layers.0.self_attn.q_norm.weight")?
+            || !layer
+                .key_norm
+                .matches_weight_tensor("mtp.layers.0.self_attn.k_norm.weight")?
+            || !layer
+                .residual_rms_norm
+                .matches_weight_tensor("mtp.layers.0.post_attention_layernorm.weight")?
+            || !layer
+                .post_ffn_residual_rms_norm
+                .matches_weight_tensor("mtp.norm.weight")?
+        {
+            return Err(EngineError::InvalidState(
+                "Metal MTP norm resources have the wrong tensor identity".into(),
+            ));
+        }
+        Ok((
+            component_values,
+            dispatch_width(&self.partial_rope_pipeline, DEFAULT_SIMDGROUPS)?,
+        ))
+    }
+
+    fn encode_prepared_mapped_mtp_layer(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalMtpCore,
+        plan: &MetalPagedGqaAppendPlan,
+        component_values: usize,
+        thread_width: usize,
+    ) -> Result<()> {
+        #[cfg(not(test))]
+        let _ = component_values;
+        let arena = &prepared.workspace.buffer;
+        let offset = |slot| {
+            prepared.workspace.binding(slot).and_then(|binding| {
+                u64::try_from(binding.offset).map_err(|_| {
+                    EngineError::MemoryBudget("Metal MTP layer offset exceeds u64".into())
+                })
+            })
+        };
+        let normalized = offset(MetalMtpBufferSlot::Normalized)?;
+        let query_gate = offset(MetalMtpBufferSlot::QueryGate)?;
+        let query = offset(MetalMtpBufferSlot::Query)?;
+        let key = offset(MetalMtpBufferSlot::Key)?;
+        let value = offset(MetalMtpBufferSlot::Value)?;
+        let attention_gate = offset(MetalMtpBufferSlot::AttentionGate)?;
+        let attention_output = offset(MetalMtpBufferSlot::AttentionOutput)?;
+        let mixer_output = offset(MetalMtpBufferSlot::MixerOutput)?;
+        let hidden = offset(MetalMtpBufferSlot::HiddenA)?;
+        let residual_hidden = offset(MetalMtpBufferSlot::ResidualHidden)?;
+        let residual_normalized = offset(MetalMtpBufferSlot::ResidualNormalized)?;
+        let ffn_gate = offset(MetalMtpBufferSlot::FfnGate)?;
+        let ffn_up = offset(MetalMtpBufferSlot::FfnUp)?;
+        let ffn_down = offset(MetalMtpBufferSlot::FfnDown)?;
+        let final_hidden = offset(MetalMtpBufferSlot::FinalHidden)?;
+        let final_normalized = offset(MetalMtpBufferSlot::FinalNormalized)?;
+
+        for (projection, output) in prepared
+            .layer
+            .fanout
+            .projections
+            .iter()
+            .zip([query_gate, key, value])
+        {
+            self.encode_mapped_projection_between(
+                encoder, projection, arena, normalized, arena, output,
+            )?;
+        }
+        self.encode_mapped_query_gate_norm_rope_between(
+            encoder,
+            &prepared.layer.query_gate,
+            arena,
+            query_gate,
+            arena,
+            query,
+            arena,
+            attention_gate,
+        );
+        self.encode_mapped_head256_norm_in_place(encoder, &prepared.layer.key_norm, arena, key)?;
+        self.encode_partial_rope_between(
+            encoder,
+            &prepared.layer.key_rope,
+            arena,
+            key,
+            thread_width,
+        )?;
+        #[cfg(test)]
+        {
+            encoder.set_compute_pipeline_state(&self.copy_f32_pipeline);
+            encoder.set_buffer(0, Some(arena), key);
+            encoder.set_buffer(
+                1,
+                Some(&prepared.layer.attention.verifier_key_snapshot_buffer),
+                0,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: component_values as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.set_buffer(0, Some(arena), value);
+            encoder.set_buffer(
+                1,
+                Some(&prepared.layer.attention.verifier_value_snapshot_buffer),
+                0,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: component_values as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        self.encode_paged_gqa_append_and_attention(
+            encoder,
+            &prepared.layer.attention,
+            plan,
+            arena,
+            query,
+            arena,
+            key,
+            arena,
+            value,
+            arena,
+            attention_output,
+        )?;
+        self.encode_mapped_sigmoid_gate_projection_between(
+            encoder,
+            &prepared.layer.attention_output.projection,
+            arena,
+            attention_output,
+            arena,
+            attention_gate,
+            arena,
+            mixer_output,
+        )?;
+        self.encode_mapped_residual_rms_norm_between(
+            encoder,
+            &prepared.layer.residual_rms_norm,
+            arena,
+            hidden,
+            arena,
+            mixer_output,
+            arena,
+            residual_hidden,
+            arena,
+            residual_normalized,
+        );
+        for (projection, output) in prepared.layer.ffn_gate_up.iter().zip([ffn_gate, ffn_up]) {
+            self.encode_mapped_projection_between(
+                encoder,
+                projection,
+                arena,
+                residual_normalized,
+                arena,
+                output,
+            )?;
+        }
+        self.encode_mapped_swiglu_projection_between(
+            encoder,
+            &prepared.layer.swiglu_down,
+            arena,
+            ffn_gate,
+            arena,
+            ffn_up,
+            arena,
+            ffn_down,
+        )?;
+        self.encode_mapped_residual_rms_norm_between(
+            encoder,
+            &prepared.layer.post_ffn_residual_rms_norm,
+            arena,
+            residual_hidden,
+            arena,
+            ffn_down,
+            arena,
+            final_hidden,
+            arena,
+            final_normalized,
+        );
+        Ok(())
+    }
+
+    /// Bring-up execution of the complete native MTP frontend plus its one
+    /// transformer layer. It advances the dedicated MTP KV state only after a
+    /// successful command and restores the append metadata on every failure.
+    /// The restricted LM head remains the next boundary.
+    pub fn dispatch_prepared_mapped_mtp_layer_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalMtpCore,
+    ) -> Result<(u32, Vec<f32>)> {
+        let step = self.validate_prepared_mapped_mtp_frontend(program, prepared)?;
+        let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(prepared)?;
+        prepared.layer.attention.begin_speculative()?;
+        let result = (|| {
+            let plan = self.plan_paged_gqa_append(&mut prepared.layer.attention)?;
+            write_metal_paged_gqa_descriptors(&prepared.layer.attention)?;
+            write_metal_paged_gqa_params(&prepared.layer.attention)?;
+            prepared.layer.attention.poisoned = true;
+            zero_buffer(
+                &prepared.target_selector.result_buffer,
+                2 * std::mem::size_of::<u32>(),
+            );
+            let command_buffer = self.queue.new_command_buffer();
+            command_buffer.set_label("ctox-qwen38-mtp-frontend-layer-verifier");
+            let encoder = command_buffer.new_compute_command_encoder();
+            let encoded = (|| {
+                self.encode_prepared_mapped_mtp_frontend(encoder, step, prepared)?;
+                self.encode_prepared_mapped_mtp_layer(
+                    encoder,
+                    prepared,
+                    &plan,
+                    component_values,
+                    thread_width,
+                )
+            })();
+            encoder.end_encoding();
+            encoded?;
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal MTP frontend/layer ended with {:?}",
+                    command_buffer.status()
+                )));
+            }
+            prepared.layer.attention.poisoned = false;
+            #[cfg(test)]
+            {
+                let key = unsafe {
+                    slice::from_raw_parts(
+                        prepared
+                            .layer
+                            .attention
+                            .verifier_key_snapshot_buffer
+                            .contents()
+                            .cast::<f32>(),
+                        component_values,
+                    )
+                    .to_vec()
+                };
+                let value = unsafe {
+                    slice::from_raw_parts(
+                        prepared
+                            .layer
+                            .attention
+                            .verifier_value_snapshot_buffer
+                            .contents()
+                            .cast::<f32>(),
+                        component_values,
+                    )
+                    .to_vec()
+                };
+                self.commit_paged_gqa_verifier_append(
+                    &mut prepared.layer.attention,
+                    &plan,
+                    &key,
+                    &value,
+                )?;
+            }
+            let token = self.read_argmax_result(&prepared.target_selector)?;
+            let output = prepared
+                .workspace
+                .binding(MetalMtpBufferSlot::FinalNormalized)?;
+            let values = unsafe {
+                slice::from_raw_parts(
+                    prepared
+                        .workspace
+                        .buffer
+                        .contents()
+                        .cast::<u8>()
+                        .add(output.offset)
+                        .cast::<f32>(),
+                    output.values,
+                )
+                .to_vec()
+            };
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(EngineError::InvalidState(
+                    "Metal MTP transformer produced a non-finite hidden state".into(),
+                ));
+            }
+            prepared.layer.attention.commit_speculative()?;
+            Ok((token, values))
+        })();
+        match result {
+            Ok(output) => Ok(output),
+            Err(primary) => match prepared.layer.attention.restore_speculative() {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal MTP layer failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            },
+        }
+    }
+
     fn encode_prepared_mapped_full_attention_layer(
         &self,
         encoder: &ComputeCommandEncoderRef,

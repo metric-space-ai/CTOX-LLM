@@ -181,9 +181,14 @@ intervals: one 180,224-byte, 256-byte-aligned allocation replaces 536,576 bytes
 of independent buffers while remaining physically separate from live target
 logits and the final draft. The prepared frontend now encodes offset-aware
 target argmax, dynamic Q2/Q4 embedding, both pre-FC norms, concatenate,
-`mtp.fc`, and the MTP input norm in one encoder. Only the bring-up verifier
-waits or reads its normalized hidden result; the MTP transformer layer,
-restricted head, and joint target transaction remain pending.
+`mtp.fc`, and the MTP input norm in one encoder. The same arena now carries the
+complete native MTP transformer layer as well: Q/K/V fan-out, Q/K norms and
+RoPE, packed paged-GQA append, gated output projection, both residual norms,
+and the Q2/Q4 SwiGLU FFN. Its bring-up boundary checkpoints the independent MTP
+KV owner, commits only after a completed finite result, and restores cache
+metadata on every failure. Only the verifier waits or reads the final
+normalized hidden state; the restricted head and joint target transaction
+remain pending.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
