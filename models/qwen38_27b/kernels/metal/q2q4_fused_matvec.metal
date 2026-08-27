@@ -555,6 +555,39 @@ kernel void qwen_rms_norm_1p_f32(
     }
 }
 
+// Fuse the transformer residual edge with the following Qwen RMSNorm. The
+// summed residual is retained for the next sublayer while the normalized view
+// feeds the next projection without a host-visible vector-add pass.
+// ref: ggml/src/ggml-metal/ggml-metal.metal:4255-4316
+kernel void qwen_residual_rms_norm_1p_f32(
+    device const float* residual [[buffer(0)]],
+    device const float* update [[buffer(1)]],
+    device const half* weight [[buffer(2)]],
+    device float* residual_output [[buffer(3)]],
+    device float* normalized_output [[buffer(4)]],
+    constant RmsNormParams& params [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= params.rows) {
+        return;
+    }
+    ulong row_offset = ulong(row) * params.columns;
+    float sum_squares = 0.0f;
+    for (uint column = lane; column < params.columns; column += 32u) {
+        ulong index = row_offset + column;
+        float sum = residual[index] + update[index];
+        residual_output[index] = sum;
+        sum_squares = fma(sum, sum, sum_squares);
+    }
+    float variance = simd_sum(sum_squares) / float(params.columns);
+    float inverse = rsqrt(variance + params.epsilon);
+    for (uint column = lane; column < params.columns; column += 32u) {
+        ulong index = row_offset + column;
+        normalized_output[index] = residual_output[index] * inverse
+            * (1.0f + float(weight[column]));
+    }
+}
+
 // GatedDeltaNet output normalization uses the direct learned weight (without
 // Qwen's residual-norm +1 convention) and fuses SiLU(z). One simdgroup owns
 // one value head; core and gate remain f32 graph activations while the

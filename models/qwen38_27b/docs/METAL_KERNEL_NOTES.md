@@ -117,6 +117,7 @@ the complete step set remains executor work.
 | `q2_b64_recovered_row` | Q2_B64 embedding row | one packed byte/four corrected outputs per thread |
 | `q4_b64_recovered_row` | Q4_B64 embedding row | one packed byte/two corrected outputs per thread |
 | `qwen_rms_norm_1p_f32` | FP16 weight, f32 activation | one 32-wide simdgroup per row |
+| `qwen_residual_rms_norm_1p_f32` | FP16 weight, two f32 inputs/two f32 outputs | fused residual add plus Qwen RMSNorm, one 32-wide simdgroup per row |
 | `qwen_rms_norm_gated_f32` | FP16 weight, f32 core/gate | one 32-wide simdgroup per value head |
 | `qwen_partial_rope_f32` | f32 Q/K heads in place | one thread per non-interleaved rotary pair |
 | `qwen_paged_q2q4_gqa_decode_f32` | f32 query/output, packed Q2/Q4 K/V | one 32-wide simdgroup per query head |
@@ -242,9 +243,12 @@ Direct-weight gated RMSNorm then consumes `AttentionOutput` plus `LinearZ` and
 updates `AttentionOutput` in place. Its graph preparation retains only the
 mmap-backed FP16 weight and a 16-byte parameter block. The recovered Q2/Q4
 linear output projection consumes that exact view and writes `MixerOutput`
-without owning either activation endpoint. The Apple-device Golden test
-executes steps 0-7 with one command encoder and one wait; failure leaves state
-poisoned and recoverable through the active device checkpoint.
+without owning either activation endpoint. A fused residual-add/Qwen-RMSNorm
+kernel consumes `HiddenA`, `MixerOutput`, and the mmap-backed post-attention
+norm weight, writes the exact `HiddenB` residual, and writes the next
+`Normalized` view without allocating activation endpoints. The Apple-device
+Golden test executes steps 0-8 with one command encoder and one wait; failure
+leaves state poisoned and recoverable through the active device checkpoint.
 
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
@@ -461,11 +465,12 @@ dequantization array before this source was accepted.
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
   target+MTP state transaction. All 645 steps have real shared-buffer views;
-  exact kernel dispatch now covers steps 0-7 (embedding, layer-0 RMSNorm, all
+  exact kernel dispatch now covers steps 0-8 (embedding, layer-0 RMSNorm, all
   four linear-attention projections, in-place causal convolution, and the
   five-output GatedDelta preparation, recurrent FP16-state update, and in-place
   direct-weight gated RMSNorm followed by the recovered Q2/Q4 linear output
-  projection). The remaining 637 schedule steps,
+  projection, then fused residual-add/Qwen RMSNorm into `HiddenB` and the next
+  `Normalized` view). The remaining 636 schedule steps,
   the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;

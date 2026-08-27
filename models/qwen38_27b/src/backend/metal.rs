@@ -24,6 +24,7 @@ pub const Q4_GATHERED_KERNEL_NAME: &str = "q4_b64_gathered_matvec";
 pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
 pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
 pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
+pub const RESIDUAL_RMS_NORM_1P_KERNEL_NAME: &str = "qwen_residual_rms_norm_1p_f32";
 pub const RMS_NORM_GATED_KERNEL_NAME: &str = "qwen_rms_norm_gated_f32";
 pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
 pub const PAGED_GQA_DECODE_KERNEL_NAME: &str = "qwen_paged_q2q4_gqa_decode_f32";
@@ -82,6 +83,18 @@ impl MetalGatedRmsNormBufferAbi {
     pub const WEIGHT: u32 = 2;
     pub const OUTPUT: u32 = 3;
     pub const PARAMS: u32 = 4;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalResidualRmsNormBufferAbi;
+
+impl MetalResidualRmsNormBufferAbi {
+    pub const RESIDUAL: u32 = 0;
+    pub const UPDATE: u32 = 1;
+    pub const WEIGHT: u32 = 2;
+    pub const RESIDUAL_OUTPUT: u32 = 3;
+    pub const NORMALIZED_OUTPUT: u32 = 4;
+    pub const PARAMS: u32 = 5;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -912,6 +925,17 @@ mod tests {
         );
         assert_eq!(
             [
+                MetalResidualRmsNormBufferAbi::RESIDUAL,
+                MetalResidualRmsNormBufferAbi::UPDATE,
+                MetalResidualRmsNormBufferAbi::WEIGHT,
+                MetalResidualRmsNormBufferAbi::RESIDUAL_OUTPUT,
+                MetalResidualRmsNormBufferAbi::NORMALIZED_OUTPUT,
+                MetalResidualRmsNormBufferAbi::PARAMS,
+            ],
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            [
                 MetalCausalConvBufferAbi::INPUT,
                 MetalCausalConvBufferAbi::WEIGHT,
                 MetalCausalConvBufferAbi::STATE,
@@ -1325,6 +1349,7 @@ mod tests {
             Q2_RECOVERED_ROW_KERNEL_NAME,
             Q4_RECOVERED_ROW_KERNEL_NAME,
             RMS_NORM_1P_KERNEL_NAME,
+            RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
             PARTIAL_ROPE_KERNEL_NAME,
             PAGED_GQA_DECODE_KERNEL_NAME,
             GATED_DELTA_F16_KERNEL_NAME,

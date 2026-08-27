@@ -226,11 +226,13 @@ slots. The recurrent GatedDelta kernel consumes those five views, mutates only
 its checkpointed FP16 state, and writes `AttentionOutput`; direct-weight gated
 RMSNorm then consumes that view plus `LinearZ` and updates `AttentionOutput`
 in place. The recovered Q2/Q4 linear output projection consumes that exact view
-and writes `MixerOutput` before the final wait. `A_log`, `dt_bias`, and the FP16
-norm weight remain mmap-backed.
+and writes `MixerOutput`; a fused residual-add/Qwen-RMSNorm kernel then combines
+that view with `HiddenA`, writes the exact `HiddenB` residual, and writes the
+next `Normalized` view before the final wait. `A_log`, `dt_bias`, and the FP16
+norm weights remain mmap-backed.
 These graph preparations retain no operation-local input/output activation
 buffers; separately stored recovery inputs must be byte-identical. The
-remaining 637 schedule steps and the complete executor remain open. A bounded
+remaining 636 schedule steps and the complete executor remain open. A bounded
 f32 checkpoint can now snapshot and restore an
 exact arena slot through a Metal device-to-device blit with no host mirror. It
 is single-use and fail-closed across snapshot/restore/commit, providing the

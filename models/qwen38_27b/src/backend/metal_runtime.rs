@@ -22,12 +22,13 @@ use super::metal::{
     MetalCausalConvBufferAbi, MetalCausalConvParams, MetalFusedMatVecParams,
     MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi,
     MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalPagedGqaBufferAbi,
-    MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams, MetalRmsNormBufferAbi,
-    MetalRmsNormParams, ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME,
-    CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME,
-    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
-    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
-    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
+    MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
+    MetalResidualRmsNormBufferAbi, MetalRmsNormBufferAbi, MetalRmsNormParams,
+    ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME,
+    GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP,
+    PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
+    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
+    Q4_RECOVERED_ROW_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
     RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::metal_graph::{
@@ -64,6 +65,7 @@ pub struct MetalCandidateRuntime {
     q2_recovered_row_pipeline: ComputePipelineState,
     q4_recovered_row_pipeline: ComputePipelineState,
     rms_norm_1p_pipeline: ComputePipelineState,
+    residual_rms_norm_1p_pipeline: ComputePipelineState,
     rms_norm_gated_pipeline: ComputePipelineState,
     partial_rope_pipeline: ComputePipelineState,
     paged_gqa_decode_pipeline: ComputePipelineState,
@@ -1650,6 +1652,13 @@ impl MetalCandidateRuntime {
                     "Metal Qwen RMSNorm function lookup failed: {message}"
                 ))
             })?;
+        let residual_rms_norm_1p_function = library
+            .get_function(RESIDUAL_RMS_NORM_1P_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Qwen residual RMSNorm function lookup failed: {message}"
+                ))
+            })?;
         let rms_norm_gated_function = library
             .get_function(RMS_NORM_GATED_KERNEL_NAME, None)
             .map_err(|message| {
@@ -1757,6 +1766,19 @@ impl MetalCandidateRuntime {
                 rms_norm_1p_pipeline.thread_execution_width()
             )));
         }
+        let residual_rms_norm_1p_pipeline = device
+            .new_compute_pipeline_state_with_function(&residual_rms_norm_1p_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Qwen residual RMSNorm pipeline creation failed: {message}"
+                ))
+            })?;
+        if residual_rms_norm_1p_pipeline.thread_execution_width() != 32 {
+            return Err(EngineError::InvalidState(format!(
+                "Metal Qwen residual RMSNorm requires a 32-wide simdgroup, device reports {}",
+                residual_rms_norm_1p_pipeline.thread_execution_width()
+            )));
+        }
         let rms_norm_gated_pipeline = device
             .new_compute_pipeline_state_with_function(&rms_norm_gated_function)
             .map_err(|message| {
@@ -1845,6 +1867,7 @@ impl MetalCandidateRuntime {
             q2_recovered_row_pipeline,
             q4_recovered_row_pipeline,
             rms_norm_1p_pipeline,
+            residual_rms_norm_1p_pipeline,
             rms_norm_gated_pipeline,
             partial_rope_pipeline,
             paged_gqa_decode_pipeline,
@@ -5350,6 +5373,69 @@ impl MetalCandidateRuntime {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_residual_rms_norm_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        norm: &PreparedMappedMetalRmsNorm,
+        residual_buffer: &Buffer,
+        residual_offset: u64,
+        update_buffer: &Buffer,
+        update_offset: u64,
+        residual_output_buffer: &Buffer,
+        residual_output_offset: u64,
+        normalized_output_buffer: &Buffer,
+        normalized_output_offset: u64,
+    ) {
+        encoder.set_compute_pipeline_state(&self.residual_rms_norm_1p_pipeline);
+        for (binding, buffer, offset) in [
+            (
+                MetalResidualRmsNormBufferAbi::RESIDUAL,
+                residual_buffer,
+                residual_offset,
+            ),
+            (
+                MetalResidualRmsNormBufferAbi::UPDATE,
+                update_buffer,
+                update_offset,
+            ),
+            (
+                MetalResidualRmsNormBufferAbi::WEIGHT,
+                &norm.mapping.inner.buffer,
+                norm.weight_offset,
+            ),
+            (
+                MetalResidualRmsNormBufferAbi::RESIDUAL_OUTPUT,
+                residual_output_buffer,
+                residual_output_offset,
+            ),
+            (
+                MetalResidualRmsNormBufferAbi::NORMALIZED_OUTPUT,
+                normalized_output_buffer,
+                normalized_output_offset,
+            ),
+        ] {
+            encoder.set_buffer(binding as u64, Some(buffer), offset);
+        }
+        encoder.set_buffer(
+            MetalResidualRmsNormBufferAbi::PARAMS as u64,
+            Some(&norm.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: norm.rows as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
     fn encode_mapped_projection_with_input(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -5567,10 +5653,11 @@ impl MetalCandidateRuntime {
             .collect()
     }
 
-    /// Dispatch up to the exact first eight operations of the frozen decode graph:
+    /// Dispatch up to the exact first nine operations of the frozen decode graph:
     /// embedding, layer-0 RMSNorm, four-way linear-attention fan-out, in-place
     /// convolution, five-output GatedDelta preparation, recurrent update, and
-    /// direct-weight gated RMSNorm, and the recovered linear output projection.
+    /// direct-weight gated RMSNorm, the recovered linear output projection, and
+    /// fused residual-add plus Qwen RMSNorm into the next hidden/normalized views.
     /// All activations are typed views into one schedule-derived arena. The
     /// prepared graph resources own only immutable parameters and tiny command
     /// metadata; no operation-local input or output activation is allocated.
@@ -5596,6 +5683,10 @@ impl MetalCandidateRuntime {
         )>,
         linear_output_projection: Option<(
             &PreparedMappedMetalMatVec,
+            &PreparedMetalDecodeStepView<'_>,
+        )>,
+        residual_rms_norm: Option<(
+            &PreparedMappedMetalRmsNorm,
             &PreparedMetalDecodeStepView<'_>,
         )>,
         embedding_output: &PreparedMetalDecodeBufferView<'_>,
@@ -5909,6 +6000,54 @@ impl MetalCandidateRuntime {
                 ));
             }
         }
+        if let Some((residual_norm, step)) = residual_rms_norm.as_ref() {
+            let reads = step.reads();
+            let writes = step.writes();
+            let (_, output_projection_step) =
+                linear_output_projection.as_ref().ok_or_else(|| {
+                    EngineError::InvalidState(
+                        "Metal graph residual RMSNorm requires linear output projection".into(),
+                    )
+                })?;
+            let mixer_output = &output_projection_step.writes()[0];
+            if residual_norm.input_buffer.is_some()
+                || residual_norm.output_buffer.is_some()
+                || !Rc::ptr_eq(&residual_norm.mapping.inner, &embedding.mapping.inner)
+                || residual_norm.rows != 1
+                || residual_norm.columns != embedding.columns
+                || step.step().schedule_index != 8
+                || step.step().layer != Some(0)
+                || step.step().operation != MetalDecodeOperation::ResidualRmsNorm
+                || reads.len() != 2
+                || writes.len() != 2
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph residual RMSNorm does not match frozen schedule step 8".into(),
+                ));
+            }
+            let residual = &reads[0];
+            let update = &reads[1];
+            let residual_output = &writes[0];
+            let normalized = &writes[1];
+            if residual.slot() != MetalBufferSlot::HiddenA
+                || residual.offset() != embedding_output.offset()
+                || update.slot() != MetalBufferSlot::MixerOutput
+                || update.offset() != mixer_output.offset()
+                || residual_output.slot() != MetalBufferSlot::HiddenB
+                || normalized.slot() != MetalBufferSlot::Normalized
+                || [residual, update, residual_output, normalized]
+                    .iter()
+                    .any(|view| {
+                        view.values() != residual_norm.columns
+                            || !std::ptr::eq(arena, view.buffer())
+                    })
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph residual RMSNorm views do not match HiddenA/MixerOutput to HiddenB/Normalized"
+                        .into(),
+                ));
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-embedding-norm-linear-fanout");
@@ -6001,6 +6140,20 @@ impl MetalCandidateRuntime {
                 arena,
                 step.writes()[0].offset(),
             )?;
+        }
+        if let Some((residual_norm, step)) = residual_rms_norm.as_ref() {
+            self.encode_mapped_residual_rms_norm_between(
+                encoder,
+                residual_norm,
+                arena,
+                step.reads()[0].offset(),
+                arena,
+                step.reads()[1].offset(),
+                arena,
+                step.writes()[0].offset(),
+                arena,
+                step.writes()[1].offset(),
+            );
         }
         encoder.end_encoding();
         command_buffer.commit();
@@ -8104,6 +8257,9 @@ mod tests {
         let norm_values: Vec<f32> = (0..columns)
             .map(|index| 0.05 * (index % 11) as f32 - 0.2)
             .collect();
+        let post_attention_norm_values: Vec<f32> = (0..columns)
+            .map(|index| 0.025 * (index % 13) as f32 - 0.15)
+            .collect();
         let directory = tempdir().expect("temporary shared-arena graph directory");
         let path = directory.path().join("shared-arena-graph.ctoxq");
         let mut tensors = repeated_recovered_tensors(
@@ -8119,6 +8275,12 @@ mod tests {
             dtype: TensorDType::F16,
             shape: vec![columns as u64],
             bytes: f16_bytes(&norm_values),
+        });
+        tensors.push(PackedTensor {
+            name: "layer0.post_attention_norm.weight".into(),
+            dtype: TensorDType::F16,
+            shape: vec![columns as u64],
+            bytes: f16_bytes(&post_attention_norm_values),
         });
         let projection_specs = [
             (
@@ -8231,6 +8393,18 @@ mod tests {
                 epsilon,
             )
             .expect("prepare graph RMSNorm without activation buffers");
+        let residual_norm = runtime
+            .prepare_mapped_rms_norm_1p_graph_io(
+                &mapping,
+                artifact
+                    .float_tensor("layer0.post_attention_norm.weight")
+                    .expect("resolve graph post-attention RMSNorm"),
+                &validation_input,
+                1,
+                columns,
+                epsilon,
+            )
+            .expect("prepare graph residual RMSNorm without activation buffers");
         let projection_matrices = projection_specs.map(|(name, _, _)| {
             artifact
                 .recovered_matrix(name)
@@ -8338,6 +8512,10 @@ mod tests {
             MetalFusedMatVecParams::BYTE_LEN
         );
         assert_eq!(norm.transient_bytes(), MetalRmsNormParams::BYTE_LEN);
+        assert_eq!(
+            residual_norm.transient_bytes(),
+            MetalRmsNormParams::BYTE_LEN
+        );
         for projection in &prepared_projections {
             assert_eq!(
                 projection.transient_bytes(),
@@ -8415,6 +8593,7 @@ mod tests {
         let recurrence_step = &program.steps()[5];
         let gated_norm_step = &program.steps()[6];
         let linear_output_step = &program.steps()[7];
+        let residual_norm_step = &program.steps()[8];
         let projection_refs = [
             &prepared_projections[0],
             &prepared_projections[1],
@@ -8427,6 +8606,7 @@ mod tests {
                 1,
                 &norm,
                 projection_refs,
+                None,
                 None,
                 None,
                 None,
@@ -8462,6 +8642,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8478,6 +8659,7 @@ mod tests {
                 Some((&delta_prepare, delta_outputs)),
                 Some((&mut recurrence, recurrence_step)),
                 Some((&gated_norm, recurrence_step)),
+                None,
                 None,
                 embedding_output,
                 normalized_output,
@@ -8497,6 +8679,26 @@ mod tests {
                 Some((&mut recurrence, recurrence_step)),
                 Some((&gated_norm, gated_norm_step)),
                 Some((&linear_output_projection, gated_norm_step)),
+                None,
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .is_err());
+        assert!(!convolution.poisoned);
+        assert!(!recurrence.poisoned);
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, gated_norm_step)),
+                Some((&linear_output_projection, linear_output_step)),
+                Some((&residual_norm, linear_output_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8564,11 +8766,12 @@ mod tests {
                 Some((&mut recurrence, recurrence_step)),
                 Some((&gated_norm, gated_norm_step)),
                 Some((&linear_output_projection, linear_output_step)),
+                Some((&residual_norm, residual_norm_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
             )
-            .expect("dispatch first eight decode steps through shared arena");
+            .expect("dispatch first nine decode steps through shared arena");
         assert_eq!(
             convolution.verifier_read_state(),
             expected_convolution_state
@@ -8665,11 +8868,55 @@ mod tests {
         let actual_mixer = workspace
             .read_f32(MetalBufferSlot::MixerOutput)
             .expect("read graph linear output projection");
-        for (index, actual) in actual_mixer.into_iter().enumerate() {
+        for (index, actual) in actual_mixer.iter().enumerate() {
             let tolerance = 6.0e-4_f32.max(expected_linear_output_row.abs() * 4.0e-4);
             assert!(
-                (expected_linear_output_row - actual).abs() <= tolerance,
+                (expected_linear_output_row - *actual).abs() <= tolerance,
                 "graph linear output projection {index}: expected {expected_linear_output_row}, got {actual}"
+            );
+        }
+        let actual_hidden = workspace
+            .read_f32(MetalBufferSlot::HiddenA)
+            .expect("read graph residual input");
+        let actual_residual = workspace
+            .read_f32(MetalBufferSlot::HiddenB)
+            .expect("read graph residual output");
+        let actual_post_attention_norm = workspace
+            .read_f32(MetalBufferSlot::Normalized)
+            .expect("read graph post-attention normalized output");
+        let expected_residual: Vec<f32> = actual_hidden
+            .iter()
+            .zip(&actual_mixer)
+            .map(|(residual, update)| residual + update)
+            .collect();
+        let expected_post_attention_norm = crate::reference::rms_norm_1p_weight(
+            &expected_residual,
+            1,
+            columns,
+            &post_attention_norm_values,
+            epsilon,
+        )
+        .expect("execute graph post-attention residual RMSNorm oracle");
+        for (index, ((expected_residual, actual_residual), (expected_norm, actual_norm))) in
+            expected_residual
+                .iter()
+                .zip(actual_residual)
+                .zip(
+                    expected_post_attention_norm
+                        .iter()
+                        .zip(actual_post_attention_norm),
+                )
+                .enumerate()
+        {
+            let residual_tolerance = 5.0e-5_f32.max(expected_residual.abs() * 1.0e-6);
+            let norm_tolerance = 6.0e-4_f32.max(expected_norm.abs() * 4.0e-4);
+            assert!(
+                (expected_residual - actual_residual).abs() <= residual_tolerance,
+                "graph residual output {index}: expected {expected_residual}, got {actual_residual}"
+            );
+            assert!(
+                (expected_norm - actual_norm).abs() <= norm_tolerance,
+                "graph post-attention norm {index}: expected {expected_norm}, got {actual_norm}"
             );
         }
         assert_eq!(recurrence.verifier_read_state(), expected_recurrence_state);
