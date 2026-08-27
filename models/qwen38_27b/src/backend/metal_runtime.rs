@@ -478,6 +478,22 @@ pub struct PreparedMappedMetalFullAttentionLayer {
     post_ffn_residual_rms_norm: PreparedMappedMetalRmsNorm,
 }
 
+/// One exact target transformer layer in frozen model order. The enum keeps
+/// the persistent state and immutable mmap-backed resources coupled to the
+/// topology decision, so a caller cannot substitute a same-shape attention
+/// implementation at dispatch time.
+pub enum PreparedMappedMetalTargetLayer {
+    LinearAttention(PreparedMappedMetalLinearAttentionLayer),
+    FullAttention(PreparedMappedMetalFullAttentionLayer),
+}
+
+/// Atomic owner for all 64 target transformer layers. Construction returns
+/// only after every tensor identity and persistent state allocation succeeds;
+/// an error drops the partial vector and exposes no incomplete target graph.
+pub struct PreparedMappedMetalTargetLayers {
+    layers: Vec<PreparedMappedMetalTargetLayer>,
+}
+
 /// Mmap-backed query RMSNorm plus reusable partial-RoPE tables for one exact
 /// full-attention layer. QueryGate/Query/AttentionGate remain arena views.
 pub struct PreparedMappedMetalQueryGate {
@@ -2112,6 +2128,81 @@ impl PreparedMappedMetalFullAttentionLayer {
     }
 }
 
+impl PreparedMappedMetalTargetLayer {
+    pub fn layer(&self) -> usize {
+        match self {
+            Self::LinearAttention(layer) => layer.layer(),
+            Self::FullAttention(layer) => layer.layer(),
+        }
+    }
+
+    pub fn kind(&self) -> LayerKind {
+        match self {
+            Self::LinearAttention(_) => LayerKind::LinearAttention,
+            Self::FullAttention(_) => LayerKind::FullAttention,
+        }
+    }
+
+    pub fn resident_state_bytes(&self) -> usize {
+        match self {
+            Self::LinearAttention(layer) => layer.resident_state_bytes(),
+            Self::FullAttention(layer) => layer.resident_state_bytes(),
+        }
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        match self {
+            Self::LinearAttention(_) => Ok(()),
+            Self::FullAttention(layer) => layer.write_position(position),
+        }
+    }
+}
+
+impl PreparedMappedMetalTargetLayers {
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+
+    pub fn layers(&self) -> &[PreparedMappedMetalTargetLayer] {
+        &self.layers
+    }
+
+    pub fn layers_mut(&mut self) -> &mut [PreparedMappedMetalTargetLayer] {
+        &mut self.layers
+    }
+
+    pub fn resident_state_bytes(&self) -> Result<usize> {
+        self.layers.iter().try_fold(0_usize, |total, layer| {
+            total
+                .checked_add(layer.resident_state_bytes())
+                .ok_or_else(|| {
+                    EngineError::MemoryBudget(
+                        "Metal target-layer persistent state bytes overflow".into(),
+                    )
+                })
+        })
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        for layer in &self.layers {
+            layer.write_position(position)?;
+        }
+        Ok(())
+    }
+}
+
 impl PreparedMappedMetalQueryGate {
     pub fn layer(&self) -> usize {
         self.layer
@@ -3716,6 +3807,56 @@ impl MetalCandidateRuntime {
             )));
         }
         Ok(layers)
+    }
+
+    /// Prepare all 64 target layers as one topology-ordered, all-or-nothing
+    /// resource set. This is the model-level ownership boundary consumed by
+    /// the forthcoming complete token encoder; separate 48/16 vectors are
+    /// retained only as focused verifier entry points.
+    pub fn prepare_all_mapped_target_layers(
+        &self,
+        mapping: &MappedMetalArtifact,
+        position: u64,
+        cache: MetalPagedGqaConfig,
+    ) -> Result<PreparedMappedMetalTargetLayers> {
+        let config = Qwen38Config::default();
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for layer in 0..config.num_hidden_layers {
+            let expected_kind = config.layer_kind(layer).ok_or_else(|| {
+                EngineError::InvalidState(format!("Metal target topology omits layer {layer}"))
+            })?;
+            let prepared = match expected_kind {
+                LayerKind::LinearAttention => PreparedMappedMetalTargetLayer::LinearAttention(
+                    self.prepare_mapped_linear_attention_layer(mapping, layer)?,
+                ),
+                LayerKind::FullAttention => PreparedMappedMetalTargetLayer::FullAttention(
+                    self.prepare_mapped_full_attention_layer(mapping, layer, position, cache)?,
+                ),
+            };
+            if prepared.layer() != layer || prepared.kind() != expected_kind {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal target layer {layer} was prepared with the wrong identity"
+                )));
+            }
+            layers.push(prepared);
+        }
+        if layers.len() != config.num_hidden_layers
+            || layers
+                .iter()
+                .filter(|layer| layer.kind() == LayerKind::LinearAttention)
+                .count()
+                != config.linear_attention_layers()
+            || layers
+                .iter()
+                .filter(|layer| layer.kind() == LayerKind::FullAttention)
+                .count()
+                != config.full_attention_layers()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target-layer resource set does not match the frozen 48/16 topology".into(),
+            ));
+        }
+        Ok(PreparedMappedMetalTargetLayers { layers })
     }
 
     pub fn prepare_mapped_fused_matvec_with_simdgroups(
@@ -11963,6 +12104,21 @@ mod tests {
             .is_err());
         assert!(runtime
             .prepare_all_mapped_linear_attention_layers(&mapping)
+            .is_err());
+        assert!(runtime
+            .prepare_all_mapped_target_layers(
+                &mapping,
+                0,
+                MetalPagedGqaConfig {
+                    query_heads: config.num_attention_heads,
+                    key_value_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                    maximum_tokens: 8,
+                    page_tokens: 2,
+                    sink_tokens: 2,
+                    recent_tokens: 2,
+                },
+            )
             .is_err());
         let embedding_matrix = artifact
             .recovered_matrix("embedding.weight")

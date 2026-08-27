@@ -246,6 +246,11 @@ device snapshots after successful completion; release builds retain no CPU
 tensor mirror and introduce no KV metadata command boundary.
 The corresponding all-layer loader admits exactly the 16 frozen full-attention
 layers in canonical order or drops the partial allocation on the first error.
+The model-level target owner now merges those resources with all 48 prepared
+linear-attention layers into one ordered 64-layer enum. It validates the exact
+48/16 topology, reports aggregate persistent state without counting mmap-backed
+weights as copied bytes, updates every Full-Attention RoPE position together,
+and exposes no partial graph when any tensor or allocation fails.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

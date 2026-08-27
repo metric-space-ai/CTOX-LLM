@@ -102,6 +102,12 @@ only after successful completion. That verifier path is absent from releases.
 The all-layer entry point constructs exactly 16 such owners in frozen topology
 order and returns no partial vector if any tensor, cache geometry, or mapping
 identity fails validation.
+`PreparedMappedMetalTargetLayers` is the next ownership boundary: it constructs
+all 64 target layers in model order as an exact 48-linear/16-full enum, rejects
+any identity or topology drift, aggregates persistent state with checked
+arithmetic, and updates all Full-Attention position tables without exposing a
+partially admitted graph. The weights in every variant remain views of the same
+canonical no-copy artifact mapping.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
