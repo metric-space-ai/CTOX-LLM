@@ -5567,10 +5567,10 @@ impl MetalCandidateRuntime {
             .collect()
     }
 
-    /// Dispatch up to the exact first seven operations of the frozen decode graph:
+    /// Dispatch up to the exact first eight operations of the frozen decode graph:
     /// embedding, layer-0 RMSNorm, four-way linear-attention fan-out, in-place
     /// convolution, five-output GatedDelta preparation, recurrent update, and
-    /// direct-weight gated RMSNorm.
+    /// direct-weight gated RMSNorm, and the recovered linear output projection.
     /// All activations are typed views into one schedule-derived arena. The
     /// prepared graph resources own only immutable parameters and tiny command
     /// metadata; no operation-local input or output activation is allocated.
@@ -5592,6 +5592,10 @@ impl MetalCandidateRuntime {
         )>,
         gated_rms_norm: Option<(
             &PreparedMappedMetalGatedRmsNorm,
+            &PreparedMetalDecodeStepView<'_>,
+        )>,
+        linear_output_projection: Option<(
+            &PreparedMappedMetalMatVec,
             &PreparedMetalDecodeStepView<'_>,
         )>,
         embedding_output: &PreparedMetalDecodeBufferView<'_>,
@@ -5864,6 +5868,47 @@ impl MetalCandidateRuntime {
                 ));
             }
         }
+        if let Some((projection, step)) = linear_output_projection.as_ref() {
+            let reads = step.reads();
+            let writes = step.writes();
+            let (_, gated_norm_step) = gated_rms_norm.as_ref().ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal graph linear output projection requires gated RMSNorm".into(),
+                )
+            })?;
+            let gated_norm_output = &gated_norm_step.writes()[0];
+            if projection.input_buffer.is_some()
+                || projection.output_buffer.is_some()
+                || !Rc::ptr_eq(&projection.mapping.inner, &embedding.mapping.inner)
+                || projection.columns != gated_norm_output.values()
+                || projection.rows != embedding.columns
+                || step.step().schedule_index != 7
+                || step.step().layer != Some(0)
+                || step.step().operation != MetalDecodeOperation::LinearOutputProjection
+                || reads.len() != 1
+                || writes.len() != 1
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph linear output projection does not match frozen schedule step 7"
+                        .into(),
+                ));
+            }
+            let input = &reads[0];
+            let output = &writes[0];
+            if input.slot() != MetalBufferSlot::AttentionOutput
+                || input.offset() != gated_norm_output.offset()
+                || input.values() != projection.columns
+                || output.slot() != MetalBufferSlot::MixerOutput
+                || output.values() != projection.rows
+                || !std::ptr::eq(arena, input.buffer())
+                || !std::ptr::eq(arena, output.buffer())
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph linear output projection views do not match gated RMSNorm and MixerOutput"
+                        .into(),
+                ));
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-embedding-norm-linear-fanout");
@@ -5946,6 +5991,16 @@ impl MetalCandidateRuntime {
                 arena,
                 step.writes()[0].offset(),
             );
+        }
+        if let Some((projection, step)) = linear_output_projection.as_ref() {
+            self.encode_mapped_projection_between(
+                encoder,
+                projection,
+                arena,
+                step.reads()[0].offset(),
+                arena,
+                step.writes()[0].offset(),
+            )?;
         }
         encoder.end_encoding();
         command_buffer.commit();
@@ -8102,6 +8157,9 @@ mod tests {
         let gated_norm_values: Vec<f32> = (0..config.linear_value_head_dim)
             .map(|index| 0.85 + index as f32 * 0.001)
             .collect();
+        let linear_output_columns = config.linear_num_value_heads * config.linear_value_head_dim;
+        let linear_output_s_in_values = vec![0.96875_f32; linear_output_columns];
+        let linear_output_s_in = f16_bytes(&linear_output_s_in_values);
         for (name, dtype, rows) in projection_specs {
             tensors.extend(repeated_recovered_tensors(
                 name, dtype, rows, columns, &s_in, 1.0625,
@@ -8131,6 +8189,14 @@ mod tests {
             shape: vec![config.linear_value_head_dim as u64],
             bytes: f16_bytes(&gated_norm_values),
         });
+        tensors.extend(repeated_recovered_tensors(
+            "layer0.linear.out.weight",
+            TensorDType::Q2B64,
+            columns,
+            linear_output_columns,
+            &linear_output_s_in,
+            1.03125,
+        ));
         ArtifactBuilder {
             model: "test/qwen38-shared-arena".into(),
             revision: "0123456789abcdef".into(),
@@ -8231,6 +8297,16 @@ mod tests {
                 recurrence_config.epsilon,
             )
             .expect("prepare graph gated RMSNorm without activation buffers");
+        let linear_output_matrix = artifact
+            .recovered_matrix("layer0.linear.out.weight")
+            .expect("resolve graph linear output projection");
+        let linear_output_validation = vec![0.0_f32; linear_output_columns];
+        let linear_output_operation = linear_output_matrix
+            .operation(&linear_output_validation, Activation::Identity)
+            .expect("build graph linear output projection contract");
+        let linear_output_projection = runtime
+            .prepare_mapped_fused_matvec_graph_io(&mapping, &linear_output_operation)
+            .expect("prepare graph linear output projection without activation buffers");
         assert!(runtime
             .prepare_mapped_gated_delta_prepare_graph_io(
                 &mapping,
@@ -8284,6 +8360,13 @@ mod tests {
             MetalGatedDeltaParams::BYTE_LEN
         );
         assert_eq!(gated_norm.transient_bytes(), MetalRmsNormParams::BYTE_LEN);
+        assert_eq!(
+            linear_output_projection.transient_bytes(),
+            std::mem::size_of::<f32>() + MetalFusedMatVecParams::BYTE_LEN
+        );
+        assert!(linear_output_projection
+            .write_input(&linear_output_validation)
+            .is_err());
         assert!(!gated_norm.has_owned_io());
         assert!(gated_norm
             .write_inputs(
@@ -8331,6 +8414,7 @@ mod tests {
         ];
         let recurrence_step = &program.steps()[5];
         let gated_norm_step = &program.steps()[6];
+        let linear_output_step = &program.steps()[7];
         let projection_refs = [
             &prepared_projections[0],
             &prepared_projections[1],
@@ -8343,6 +8427,7 @@ mod tests {
                 1,
                 &norm,
                 projection_refs,
+                None,
                 None,
                 None,
                 None,
@@ -8376,6 +8461,7 @@ mod tests {
                 )),
                 None,
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8392,6 +8478,25 @@ mod tests {
                 Some((&delta_prepare, delta_outputs)),
                 Some((&mut recurrence, recurrence_step)),
                 Some((&gated_norm, recurrence_step)),
+                None,
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .is_err());
+        assert!(!convolution.poisoned);
+        assert!(!recurrence.poisoned);
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, gated_norm_step)),
+                Some((&linear_output_projection, gated_norm_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8458,11 +8563,12 @@ mod tests {
                 Some((&delta_prepare, delta_outputs)),
                 Some((&mut recurrence, recurrence_step)),
                 Some((&gated_norm, gated_norm_step)),
+                Some((&linear_output_projection, linear_output_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
             )
-            .expect("dispatch first seven decode steps through shared arena");
+            .expect("dispatch first eight decode steps through shared arena");
         assert_eq!(
             convolution.verifier_read_state(),
             expected_convolution_state
@@ -8526,6 +8632,22 @@ mod tests {
             recurrence_config.epsilon,
         )
         .expect("execute graph gated RMSNorm oracle");
+        let corrected_linear_output: Vec<f32> = expected_gated_attention
+            .iter()
+            .zip(&linear_output_s_in_values)
+            .map(|(value, scale)| value * scale)
+            .collect();
+        let linear_output_row = linear_output_matrix
+            .row_operation(0)
+            .expect("resolve graph linear output row");
+        let expected_linear_output_row = cpu
+            .recovered_row_matvec(&RecoveredRowMatVec {
+                dtype: linear_output_row.dtype,
+                weights: linear_output_row.weights,
+                corrected_input: &corrected_linear_output,
+                s_out: linear_output_row.s_out,
+            })
+            .expect("execute graph linear output projection oracle");
         let actual_attention = workspace
             .read_f32(MetalBufferSlot::AttentionOutput)
             .expect("read graph gated RMSNorm output");
@@ -8538,6 +8660,16 @@ mod tests {
             assert!(
                 (expected - actual).abs() <= tolerance,
                 "graph gated RMSNorm output {index}: expected {expected}, got {actual}"
+            );
+        }
+        let actual_mixer = workspace
+            .read_f32(MetalBufferSlot::MixerOutput)
+            .expect("read graph linear output projection");
+        for (index, actual) in actual_mixer.into_iter().enumerate() {
+            let tolerance = 6.0e-4_f32.max(expected_linear_output_row.abs() * 4.0e-4);
+            assert!(
+                (expected_linear_output_row - actual).abs() <= tolerance,
+                "graph linear output projection {index}: expected {expected_linear_output_row}, got {actual}"
             );
         }
         assert_eq!(recurrence.verifier_read_state(), expected_recurrence_state);

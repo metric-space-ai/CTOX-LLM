@@ -240,9 +240,11 @@ checkpointed 1,572,864-byte FP16 state, and writes the 6,144-value
 an equally sized rollback checkpoint, and a 16-byte parameter block.
 Direct-weight gated RMSNorm then consumes `AttentionOutput` plus `LinearZ` and
 updates `AttentionOutput` in place. Its graph preparation retains only the
-mmap-backed FP16 weight and a 16-byte parameter block. The Apple-device Golden
-test executes steps 0-6 with one command encoder and one wait; failure leaves
-state poisoned and recoverable through the active device checkpoint.
+mmap-backed FP16 weight and a 16-byte parameter block. The recovered Q2/Q4
+linear output projection consumes that exact view and writes `MixerOutput`
+without owning either activation endpoint. The Apple-device Golden test
+executes steps 0-7 with one command encoder and one wait; failure leaves state
+poisoned and recoverable through the active device checkpoint.
 
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
@@ -459,10 +461,11 @@ dequantization array before this source was accepted.
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
   target+MTP state transaction. All 645 steps have real shared-buffer views;
-  exact kernel dispatch now covers steps 0-6 (embedding, layer-0 RMSNorm, all
+  exact kernel dispatch now covers steps 0-7 (embedding, layer-0 RMSNorm, all
   four linear-attention projections, in-place causal convolution, and the
   five-output GatedDelta preparation, recurrent FP16-state update, and in-place
-  direct-weight gated RMSNorm). The remaining 638 schedule steps,
+  direct-weight gated RMSNorm followed by the recovered Q2/Q4 linear output
+  projection). The remaining 637 schedule steps,
   the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
