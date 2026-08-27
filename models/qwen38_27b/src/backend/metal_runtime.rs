@@ -13206,11 +13206,66 @@ impl MetalCandidateRuntime {
         target: &mut PreparedMappedMetalTargetCore,
         mtp: &mut PreparedMappedMetalMtpCore,
     ) -> Result<MetalGreedyMtpVerification> {
+        self.dispatch_prepared_mapped_greedy_mtp_target(program, target, mtp, None)
+            .map(|(verification, _)| verification)
+    }
+
+    /// Cursor-bound continuation for one accepted MTP transition. As with the
+    /// initial complete-token entry point, the scheduler-visible position is
+    /// returned only after all 645 logical steps and the completed Metal
+    /// command-buffer barrier have been consumed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_prepared_mapped_complete_mtp_target_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+        token_position: usize,
+        committed_tokens: usize,
+        admitted_context: usize,
+    ) -> Result<MetalCompletedToken> {
+        let (verification, next_position) = self.dispatch_prepared_mapped_greedy_mtp_target(
+            program,
+            target,
+            mtp,
+            Some((token_position, committed_tokens, admitted_context)),
+        )?;
+        Ok(MetalCompletedToken {
+            verification,
+            committed_tokens: next_position.ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal complete MTP continuation omitted its execution cursor".into(),
+                )
+            })?,
+        })
+    }
+
+    fn dispatch_prepared_mapped_greedy_mtp_target(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+        cursor_contract: Option<(usize, usize, usize)>,
+    ) -> Result<(MetalGreedyMtpVerification, Option<usize>)> {
         let mtp_step = self.validate_prepared_mapped_mtp_frontend(program, mtp)?;
         let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(mtp)?;
         let target_lm_head = self.validate_prepared_mapped_target_core(program, target)?[2];
         let target_tokens = target.cached_tokens()?;
         let mtp_tokens = mtp.cached_tokens();
+        let mut execution_cursor = cursor_contract
+            .map(|(token_position, committed_tokens, admitted_context)| {
+                if committed_tokens != target_tokens {
+                    return Err(EngineError::InvalidState(format!(
+                        "Metal complete MTP cursor reports {committed_tokens} committed tokens but target state contains {target_tokens}"
+                    )));
+                }
+                program.plan.execution_cursor(
+                    token_position,
+                    committed_tokens,
+                    admitted_context,
+                )
+            })
+            .transpose()?;
         let previous =
             self.read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
         if target_tokens == 0
@@ -13291,6 +13346,10 @@ impl MetalCandidateRuntime {
             })();
             encoder.end_encoding();
             let target_plans = encoded?;
+            let final_schedule_index = execution_cursor
+                .as_mut()
+                .map(record_complete_encoded_token)
+                .transpose()?;
             command_buffer.commit();
             command_buffer.wait_until_completed();
             if command_buffer.status() != MTLCommandBufferStatus::Completed {
@@ -13299,6 +13358,19 @@ impl MetalCandidateRuntime {
                     command_buffer.status()
                 )));
             }
+
+            let next_position = match (execution_cursor.take(), final_schedule_index) {
+                (Some(mut cursor), Some(schedule_index)) => {
+                    cursor.commit_after_completion(schedule_index)?;
+                    Some(cursor.finish()?)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(EngineError::InvalidState(
+                        "Metal complete MTP cursor lost its final barrier".into(),
+                    ));
+                }
+            };
 
             self.validate_completed_mapped_mtp_layer(mtp, &mtp_dispatch, component_values)?;
             self.validate_completed_mapped_target_core(target, &target_plans)?;
@@ -13315,11 +13387,11 @@ impl MetalCandidateRuntime {
             }
             target.layers.commit_speculative()?;
             mtp.layer.attention.commit_speculative()?;
-            Ok(verified)
+            Ok((verified, next_position))
         })();
 
         match result {
-            Ok(verified) => Ok(verified),
+            Ok(completed) => Ok(completed),
             Err(primary) => match self.restore_mapped_greedy_mtp_target(target, mtp) {
                 Ok(()) => Err(primary),
                 Err(rollback) => Err(EngineError::InvalidState(format!(

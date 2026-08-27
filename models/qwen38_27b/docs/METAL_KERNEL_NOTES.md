@@ -243,8 +243,13 @@ only then is the next scheduler-visible token position returned. Cursor,
 encoding, GPU, and compact-verifier failures use the same joint target/MTP
 rollback. The corresponding regression proves that a partial cursor is
 rejected and that no new position can be published before the final barrier.
-This is the complete single-token boundary; the fused MTP4 branch still needs
-multi-position executor integration and full-artifact device evidence.
+`dispatch_prepared_mapped_complete_mtp_target_verifier` applies the same
+contract to every accepted continuation replay: it rejects a caller position
+that differs from resident target KV, records steps 0..643 only after the
+continuation encoder exists, and publishes its next position only after the
+sole completed step-644 barrier. These are the complete one-record boundaries;
+the fused MTP4 branch still needs a block-level cursor that can publish the
+accepted multi-position prefix and full-artifact device evidence.
 
 The continuation path now preserves each canonical mapped draft in a distinct
 full-vocabulary candidate selector with a two-word device copy before the

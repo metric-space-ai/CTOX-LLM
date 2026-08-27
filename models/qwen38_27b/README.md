@@ -355,8 +355,11 @@ logical compute steps only after their encoder was built, and consumes the sole
 step-644 barrier only after the Metal command buffer completed. It returns the
 next publishable position together with the compact target/MTP verification;
 an encoding, cursor, GPU, or verification failure retains the existing joint
-state rollback. This closes the single-token cursor boundary, not the MTP4,
-prefill, full-artifact Golden, or production promotion gates.
+state rollback. The accepted continuation/replay path now exposes the same
+cursor-bound complete-token entry point, so it also cannot advance the
+scheduler before its final GPU barrier. This closes both one-record cursor
+boundaries, not the block-level MTP4 cursor, prefill, full-artifact Golden, or
+production promotion gates.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those
