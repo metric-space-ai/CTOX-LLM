@@ -114,6 +114,8 @@ the complete step set remains executor work.
 |---|---|---|
 | `q2_b64_fused_matvec` | Q2_B64 | 18 bytes: fp16-LE scale + 16 code bytes (4 x 2-bit values per byte) |
 | `q4_b64_fused_matvec` | Q4_B64 | 34 bytes: fp16-LE scale + 32 code bytes (2 x 4-bit values per byte) |
+| `q2_b64_swiglu_matvec` | Q2_B64 | fused `SiLU(gate) * up` in registers plus recovered down projection |
+| `q4_b64_swiglu_matvec` | Q4_B64 | fused `SiLU(gate) * up` in registers plus recovered down projection |
 | `q2_b64_recovered_row` | Q2_B64 embedding row | one packed byte/four corrected outputs per thread |
 | `q4_b64_recovered_row` | Q4_B64 embedding row | one packed byte/two corrected outputs per thread |
 | `qwen_rms_norm_1p_f32` | FP16 weight, f32 activation | one 32-wide simdgroup per row |
@@ -135,6 +137,9 @@ exist in this format.
   (`half`), 4 bias (`float`), 5 output (`float`), 6 params
   (`FusedMatVecParams`, eight LE u32 words, 32 bytes: rows, columns,
   blocks_per_row, has_s_in, has_s_out, has_bias, activation, reserved).
+- Fused SwiGLU buffers: 0 weights, 1 gate, 2 up, 3 s_in, 4 s_out,
+  5 bias, 6 output, 7 the same `FusedMatVecParams`. The gate/up product is
+  never written to memory.
 - No threadgroup scratch allocation: every output row is reduced wholly inside
   one simdgroup.
 - Fused semantics identical to the CPU oracle:
@@ -143,6 +148,9 @@ exist in this format.
 - `s_in` and `s_out` stay byte-identical to the FP16 CTOXQ recovery tensors;
   kernels widen individual values in registers. No startup expansion to f32
   or duplicate scale allocation is permitted.
+- SwiGLU-down buffers are 0 weights, 1 gate, 2 up, 3 `s_in`, 4 `s_out`, 5
+  bias, 6 output, and 7 params. The intermediate `SiLU(gate) * up` values are
+  formed only in registers and never occupy another arena slot.
 
 ## Organization
 
@@ -248,10 +256,11 @@ kernel consumes `HiddenA`, `MixerOutput`, and the mmap-backed post-attention
 norm weight, writes the exact `HiddenB` residual, and writes the next
 `Normalized` view without allocating activation endpoints. The Apple-device
 Golden test then executes the mixed-Q2/Q4 FFN gate/up fan-out from that exact
-view into `FfnGate` and `FfnUp`. Steps 0-9 use one command encoder and one wait;
+view into `FfnGate` and `FfnUp`, followed by a fused Q2/Q4 SwiGLU-down
+projection into `FfnDown`. Steps 0-10 use one command encoder and one wait;
 failure leaves state poisoned and recoverable through the active device
 checkpoint. Because the arena intentionally aliases dead slots, the verifier
-uses a second checkpointed run when inspecting both earlier and final views.
+uses checkpointed reruns when inspecting earlier and final views.
 
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
@@ -409,6 +418,11 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   48x128 Qwen geometry, survives loader teardown, matches the direct-weight
   gated scalar oracle, updates both graph inputs in place, reports zero copied
   model bytes, and rejects copied weights and malformed contracts.
+- `mapped_q2_q4_swiglu_down_matches_scalar_oracle_without_product_buffer`
+  verifies both fused Q2 and fused Q4 entry points against scalar
+  `SiLU(gate) * up` plus recovered-matvec oracles and rejects malformed input
+  widths; the product vector exists only in the verifier oracle, never in the
+  Metal dispatch.
 - `device_argmax_matches_full_vocab_oracle_reuses_buffers_and_rejects_nonfinite`
   dispatches the complete 248,077-token vocabulary, proves the larger-token
   tie rule, reuses the resident buffers for a changed winner, returns only two
@@ -468,13 +482,13 @@ dequantization array before this source was accepted.
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
   target+MTP state transaction. All 645 steps have real shared-buffer views;
-  exact kernel dispatch now covers steps 0-9 (embedding, layer-0 RMSNorm, all
+  exact kernel dispatch now covers steps 0-10 (embedding, layer-0 RMSNorm, all
   four linear-attention projections, in-place causal convolution, and the
   five-output GatedDelta preparation, recurrent FP16-state update, and in-place
   direct-weight gated RMSNorm followed by the recovered Q2/Q4 linear output
   projection, then fused residual-add/Qwen RMSNorm into `HiddenB` and the next
-  `Normalized` view, then mixed-Q2/Q4 FFN gate/up fan-out). The remaining 635
-  schedule steps,
+  `Normalized` view, then mixed-Q2/Q4 FFN gate/up fan-out and fused SwiGLU-down
+  projection). The remaining 634 schedule steps,
   the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;

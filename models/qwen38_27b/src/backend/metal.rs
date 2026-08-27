@@ -19,6 +19,8 @@ pub struct MetalBackend;
 pub const Q2_KERNEL_NAME: &str = "q2_b64_fused_matvec";
 /// Metal CSL entry point for the Q4_B64 candidate kernel.
 pub const Q4_KERNEL_NAME: &str = "q4_b64_fused_matvec";
+pub const Q2_SWIGLU_KERNEL_NAME: &str = "q2_b64_swiglu_matvec";
+pub const Q4_SWIGLU_KERNEL_NAME: &str = "q4_b64_swiglu_matvec";
 pub const Q2_GATHERED_KERNEL_NAME: &str = "q2_b64_gathered_matvec";
 pub const Q4_GATHERED_KERNEL_NAME: &str = "q4_b64_gathered_matvec";
 pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
@@ -62,6 +64,20 @@ impl MetalBufferAbi {
     pub const OUTPUT: u32 = 5;
     pub const PARAMS: u32 = 6;
     pub const ROW_IDS: u32 = 7;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalSwiGluBufferAbi;
+
+impl MetalSwiGluBufferAbi {
+    pub const WEIGHTS: u32 = 0;
+    pub const GATE: u32 = 1;
+    pub const UP: u32 = 2;
+    pub const S_IN: u32 = 3;
+    pub const S_OUT: u32 = 4;
+    pub const BIAS: u32 = 5;
+    pub const OUTPUT: u32 = 6;
+    pub const PARAMS: u32 = 7;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -885,6 +901,19 @@ mod tests {
         }
         assert_eq!(
             [
+                MetalSwiGluBufferAbi::WEIGHTS,
+                MetalSwiGluBufferAbi::GATE,
+                MetalSwiGluBufferAbi::UP,
+                MetalSwiGluBufferAbi::S_IN,
+                MetalSwiGluBufferAbi::S_OUT,
+                MetalSwiGluBufferAbi::BIAS,
+                MetalSwiGluBufferAbi::OUTPUT,
+                MetalSwiGluBufferAbi::PARAMS,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(
+            [
                 MetalPagedGqaBufferAbi::QUERY,
                 MetalPagedGqaBufferAbi::Q2_PAGES,
                 MetalPagedGqaBufferAbi::Q4_PAGES,
@@ -1344,6 +1373,8 @@ mod tests {
         for name in [
             Q2_KERNEL_NAME,
             Q4_KERNEL_NAME,
+            Q2_SWIGLU_KERNEL_NAME,
+            Q4_SWIGLU_KERNEL_NAME,
             Q2_GATHERED_KERNEL_NAME,
             Q4_GATHERED_KERNEL_NAME,
             Q2_RECOVERED_ROW_KERNEL_NAME,

@@ -229,11 +229,13 @@ in place. The recovered Q2/Q4 linear output projection consumes that exact view
 and writes `MixerOutput`; a fused residual-add/Qwen-RMSNorm kernel then combines
 that view with `HiddenA`, writes the exact `HiddenB` residual, and writes the
 next `Normalized` view; the mixed-Q2/Q4 FFN gate/up fan-out consumes that view
-and writes `FfnGate` plus `FfnUp` before the final wait. `A_log`, `dt_bias`, and
-the FP16 norm weights remain mmap-backed.
+and writes `FfnGate` plus `FfnUp`; a fused Q2/Q4 SwiGLU-down kernel consumes
+both views and writes `FfnDown` without allocating a 17,408-value SwiGLU
+product before the final wait. `A_log`, `dt_bias`, and the FP16 norm weights
+remain mmap-backed.
 These graph preparations retain no operation-local input/output activation
 buffers; separately stored recovery inputs must be byte-identical. The
-remaining 635 schedule steps and the complete executor remain open. A bounded
+remaining 634 schedule steps and the complete executor remain open. A bounded
 f32 checkpoint can now snapshot and restore an
 exact arena slot through a Metal device-to-device blit with no host mirror. It
 is single-use and fail-closed across snapshot/restore/commit, providing the

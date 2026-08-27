@@ -23,13 +23,13 @@ use super::metal::{
     MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi,
     MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalPagedGqaBufferAbi,
     MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
-    MetalResidualRmsNormBufferAbi, MetalRmsNormBufferAbi, MetalRmsNormParams,
+    MetalResidualRmsNormBufferAbi, MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSwiGluBufferAbi,
     ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME,
     GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP,
     PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
-    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
-    Q4_RECOVERED_ROW_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
-    RMS_NORM_GATED_KERNEL_NAME,
+    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
+    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
+    RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
@@ -60,6 +60,8 @@ pub struct MetalCandidateRuntime {
     queue: CommandQueue,
     q2_pipeline: ComputePipelineState,
     q4_pipeline: ComputePipelineState,
+    q2_swiglu_pipeline: ComputePipelineState,
+    q4_swiglu_pipeline: ComputePipelineState,
     q2_gathered_pipeline: ComputePipelineState,
     q4_gathered_pipeline: ComputePipelineState,
     q2_recovered_row_pipeline: ComputePipelineState,
@@ -1617,6 +1619,22 @@ impl MetalCandidateRuntime {
             .map_err(|message| {
                 EngineError::InvalidState(format!("Metal Q4 function lookup failed: {message}"))
             })?;
+        let q2_swiglu_function =
+            library
+                .get_function(Q2_SWIGLU_KERNEL_NAME, None)
+                .map_err(|message| {
+                    EngineError::InvalidState(format!(
+                        "Metal Q2 SwiGLU function lookup failed: {message}"
+                    ))
+                })?;
+        let q4_swiglu_function =
+            library
+                .get_function(Q4_SWIGLU_KERNEL_NAME, None)
+                .map_err(|message| {
+                    EngineError::InvalidState(format!(
+                        "Metal Q4 SwiGLU function lookup failed: {message}"
+                    ))
+                })?;
         let q2_gathered_function = library
             .get_function(Q2_GATHERED_KERNEL_NAME, None)
             .map_err(|message| {
@@ -1725,6 +1743,29 @@ impl MetalCandidateRuntime {
             .map_err(|message| {
                 EngineError::InvalidState(format!("Metal Q4 pipeline creation failed: {message}"))
             })?;
+        let q2_swiglu_pipeline = device
+            .new_compute_pipeline_state_with_function(&q2_swiglu_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q2 SwiGLU pipeline creation failed: {message}"
+                ))
+            })?;
+        let q4_swiglu_pipeline = device
+            .new_compute_pipeline_state_with_function(&q4_swiglu_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 SwiGLU pipeline creation failed: {message}"
+                ))
+            })?;
+        if q2_swiglu_pipeline.thread_execution_width() != 32
+            || q4_swiglu_pipeline.thread_execution_width() != 32
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal SwiGLU Q2/Q4 kernels require 32-wide simdgroups, device reports {}/{}",
+                q2_swiglu_pipeline.thread_execution_width(),
+                q4_swiglu_pipeline.thread_execution_width()
+            )));
+        }
         let q2_gathered_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_gathered_function)
             .map_err(|message| {
@@ -1862,6 +1903,8 @@ impl MetalCandidateRuntime {
             queue,
             q2_pipeline,
             q4_pipeline,
+            q2_swiglu_pipeline,
+            q4_swiglu_pipeline,
             q2_gathered_pipeline,
             q4_gathered_pipeline,
             q2_recovered_row_pipeline,
@@ -5529,6 +5572,158 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_swiglu_projection_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        projection: &PreparedMappedMetalMatVec,
+        gate_buffer: &Buffer,
+        gate_offset: u64,
+        up_buffer: &Buffer,
+        up_offset: u64,
+        output_buffer: &Buffer,
+        output_offset: u64,
+    ) -> Result<()> {
+        encoder.set_buffer(
+            MetalSwiGluBufferAbi::GATE as u64,
+            Some(gate_buffer),
+            gate_offset,
+        );
+        encoder.set_buffer(MetalSwiGluBufferAbi::UP as u64, Some(up_buffer), up_offset);
+        encoder.set_buffer(
+            MetalSwiGluBufferAbi::S_IN as u64,
+            Some(&projection.mapping.inner.buffer),
+            projection.s_in_offset,
+        );
+        for dispatch in &projection.dispatches {
+            let pipeline = match dispatch.dtype {
+                TensorDType::Q2B64 => &self.q2_swiglu_pipeline,
+                TensorDType::Q4B64 => &self.q4_swiglu_pipeline,
+                _ => unreachable!("mapped Metal SwiGLU projection is Q2/Q4"),
+            };
+            if dispatch.thread_width > pipeline.max_total_threads_per_threadgroup() as usize {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal SwiGLU projection requires {} threads but pipeline admits {}",
+                    dispatch.thread_width,
+                    pipeline.max_total_threads_per_threadgroup()
+                )));
+            }
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(
+                MetalSwiGluBufferAbi::WEIGHTS as u64,
+                Some(&projection.mapping.inner.buffer),
+                dispatch.weights_offset,
+            );
+            encoder.set_buffer(
+                MetalSwiGluBufferAbi::S_OUT as u64,
+                Some(&projection.mapping.inner.buffer),
+                dispatch.s_out_offset,
+            );
+            encoder.set_buffer(
+                MetalSwiGluBufferAbi::BIAS as u64,
+                Some(&projection.bias_buffer),
+                dispatch.bias_offset,
+            );
+            encoder.set_buffer(
+                MetalSwiGluBufferAbi::OUTPUT as u64,
+                Some(output_buffer),
+                output_offset
+                    .checked_add(dispatch.output_offset)
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget(
+                            "Metal SwiGLU output view offset overflows".into(),
+                        )
+                    })?,
+            );
+            encoder.set_buffer(
+                MetalSwiGluBufferAbi::PARAMS as u64,
+                Some(&dispatch.params_buffer),
+                0,
+            );
+            let grid = MTLSize {
+                width: dispatch
+                    .rows
+                    .div_ceil((dispatch.thread_width / 32) * ROWS_PER_SIMDGROUP)
+                    as u64,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_thread_groups(
+                grid,
+                MTLSize {
+                    width: dispatch.thread_width as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Verifier-only wrapper for the fused SwiGLU projection entry points.
+    /// Production graph execution binds arena views through the schedule-bound
+    /// path instead of allocating these temporary input/output buffers.
+    pub fn dispatch_mapped_swiglu_projection(
+        &self,
+        projection: &PreparedMappedMetalMatVec,
+        gate: &[f32],
+        up: &[f32],
+    ) -> Result<Vec<f32>> {
+        if projection.input_buffer.is_some()
+            || projection.output_buffer.is_some()
+            || gate.len() != projection.columns
+            || up.len() != projection.columns
+            || gate.iter().chain(up).any(|value| !value.is_finite())
+        {
+            return Err(EngineError::Shape(
+                "Metal fused SwiGLU verifier requires graph-I/O projection and finite exact-width gate/up inputs"
+                    .into(),
+            ));
+        }
+        let gate_buffer = buffer_with_data(&self.device, as_bytes(gate));
+        let up_buffer = buffer_with_data(&self.device, as_bytes(up));
+        let output_bytes = projection
+            .rows
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal SwiGLU output bytes overflow".into())
+            })?;
+        let output_buffer = self
+            .device
+            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-swiglu-projection-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_swiglu_projection_between(
+            encoder,
+            projection,
+            &gate_buffer,
+            0,
+            &up_buffer,
+            0,
+            &output_buffer,
+            0,
+        )?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal fused SwiGLU verifier ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(output_buffer.contents().cast::<f32>(), projection.rows).to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal fused SwiGLU verifier produced non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
     /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
     /// projection in a single command encoder. The projection consumes the
     /// RMSNorm output buffer directly and therefore owns no second activation
@@ -5653,12 +5848,13 @@ impl MetalCandidateRuntime {
             .collect()
     }
 
-    /// Dispatch up to the exact first ten operations of the frozen decode graph:
+    /// Dispatch up to the exact first eleven operations of the frozen decode graph:
     /// embedding, layer-0 RMSNorm, four-way linear-attention fan-out, in-place
     /// convolution, five-output GatedDelta preparation, recurrent update, and
     /// direct-weight gated RMSNorm, the recovered linear output projection, and
     /// fused residual-add plus Qwen RMSNorm into the next hidden/normalized views,
-    /// and the mixed-Q2/Q4 two-way FFN gate/up fan-out.
+    /// the mixed-Q2/Q4 two-way FFN gate/up fan-out, and fused SwiGLU down
+    /// projection without a materialized SwiGLU activation.
     /// All activations are typed views into one schedule-derived arena. The
     /// prepared graph resources own only immutable parameters and tiny command
     /// metadata; no operation-local input or output activation is allocated.
@@ -5694,6 +5890,7 @@ impl MetalCandidateRuntime {
             [&PreparedMappedMetalMatVec; 2],
             &PreparedMetalDecodeStepView<'_>,
         )>,
+        swiglu_down: Option<(&PreparedMappedMetalMatVec, &PreparedMetalDecodeStepView<'_>)>,
         embedding_output: &PreparedMetalDecodeBufferView<'_>,
         normalized_output: &PreparedMetalDecodeBufferView<'_>,
         projection_outputs: [&PreparedMetalDecodeBufferView<'_>; 4],
@@ -6093,6 +6290,42 @@ impl MetalCandidateRuntime {
                 }
             }
         }
+        if let Some((projection, step)) = swiglu_down.as_ref() {
+            let reads = step.reads();
+            let writes = step.writes();
+            let (_, ffn_step) = ffn_gate_up.as_ref().ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal graph SwiGLU down projection requires FFN gate/up fan-out".into(),
+                )
+            })?;
+            let ffn_writes = ffn_step.writes();
+            if step.step().schedule_index != 10
+                || step.step().layer != Some(0)
+                || step.step().operation != MetalDecodeOperation::SwiGluDownProjection
+                || reads.len() != 2
+                || writes.len() != 1
+                || reads[0].slot() != MetalBufferSlot::FfnGate
+                || reads[0].offset() != ffn_writes[0].offset()
+                || reads[1].slot() != MetalBufferSlot::FfnUp
+                || reads[1].offset() != ffn_writes[1].offset()
+                || writes[0].slot() != MetalBufferSlot::FfnDown
+                || projection.input_buffer.is_some()
+                || projection.output_buffer.is_some()
+                || !Rc::ptr_eq(&projection.mapping.inner, &embedding.mapping.inner)
+                || projection.columns != reads[0].values()
+                || reads[1].values() != projection.columns
+                || projection.rows != embedding.columns
+                || writes[0].values() != projection.rows
+                || [&reads[0], &reads[1], &writes[0]]
+                    .iter()
+                    .any(|view| !std::ptr::eq(arena, view.buffer()))
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph fused SwiGLU down projection does not match frozen schedule step 10"
+                        .into(),
+                ));
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-decode-prefix");
@@ -6211,6 +6444,18 @@ impl MetalCandidateRuntime {
                     output.offset(),
                 )?;
             }
+        }
+        if let Some((projection, step)) = swiglu_down.as_ref() {
+            self.encode_mapped_swiglu_projection_between(
+                encoder,
+                projection,
+                arena,
+                step.reads()[0].offset(),
+                arena,
+                step.reads()[1].offset(),
+                arena,
+                step.writes()[0].offset(),
+            )?;
         }
         encoder.end_encoding();
         command_buffer.commit();
@@ -8304,6 +8549,84 @@ mod tests {
     }
 
     #[test]
+    fn mapped_q2_q4_swiglu_down_matches_scalar_oracle_without_product_buffer() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let rows = 11;
+        let columns = 3 * BLOCK_LEN;
+        let s_in = f16_bytes(
+            &(0..columns)
+                .map(|index| 0.875 + 0.015625 * (index % 9) as f32)
+                .collect::<Vec<_>>(),
+        );
+        let directory = tempdir().expect("temporary SwiGLU artifact directory");
+        let path = directory.path().join("swiglu-down.ctoxq");
+        let mut tensors = Vec::new();
+        for (name, dtype, s_out) in [
+            ("q2.down.weight", TensorDType::Q2B64, 0.9375),
+            ("q4.down.weight", TensorDType::Q4B64, 1.0625),
+        ] {
+            tensors.extend(repeated_recovered_tensors(
+                name, dtype, rows, columns, &s_in, s_out,
+            ));
+        }
+        ArtifactBuilder {
+            model: "test/qwen38-swiglu-down".into(),
+            revision: "0123456789abcdef".into(),
+            target: "canonical-b64".into(),
+            alignment: DEFAULT_ALIGNMENT,
+            tensors,
+        }
+        .write_new(&path)
+        .expect("write SwiGLU artifact fixture");
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open SwiGLU artifact fixture");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("map SwiGLU artifact fixture");
+        let gate: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.019).sin() * 1.3 - 0.2)
+            .collect();
+        let up: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.023).cos() * 0.9 + 0.1)
+            .collect();
+        let product = crate::reference::swiglu(&gate, &up).expect("execute SwiGLU oracle");
+        let validation = vec![0.0; columns];
+
+        for name in ["q2.down.weight", "q4.down.weight"] {
+            let matrix = artifact
+                .recovered_matrix(name)
+                .expect("resolve SwiGLU down matrix");
+            let operation = matrix
+                .operation(&validation, Activation::Identity)
+                .expect("build SwiGLU down operation");
+            let prepared = runtime
+                .prepare_mapped_fused_matvec_graph_io(&mapping, &operation)
+                .expect("prepare graph-I/O SwiGLU down projection");
+            let expected = cpu
+                .fused_matvec(
+                    &matrix
+                        .operation(&product, Activation::Identity)
+                        .expect("build scalar SwiGLU down oracle"),
+                )
+                .expect("execute scalar SwiGLU down oracle");
+            let actual = runtime
+                .dispatch_mapped_swiglu_projection(&prepared, &gate, &up)
+                .expect("dispatch mapped SwiGLU down verifier");
+            for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 5.0e-4_f32.max(expected.abs() * 6.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "{name} SwiGLU row {row}: expected {expected}, got {actual}"
+                );
+            }
+            assert!(runtime
+                .dispatch_mapped_swiglu_projection(&prepared, &gate[..columns - 1], &up)
+                .is_err());
+        }
+    }
+
+    #[test]
     fn graph_embedding_norm_linear_fanout_uses_only_shared_arena_views() {
         let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
         let cpu = CpuBackend::scalar_verifier();
@@ -8432,6 +8755,16 @@ mod tests {
                 0.984375,
             ));
         }
+        let ffn_down_s_in_values = vec![0.953125_f32; config.intermediate_size];
+        let ffn_down_s_in = f16_bytes(&ffn_down_s_in_values);
+        tensors.extend(repeated_recovered_tensors(
+            "layer0.mlp.down.weight",
+            TensorDType::Q2B64,
+            columns,
+            config.intermediate_size,
+            &ffn_down_s_in,
+            1.015625,
+        ));
         ArtifactBuilder {
             model: "test/qwen38-shared-arena".into(),
             revision: "0123456789abcdef".into(),
@@ -8569,6 +8902,16 @@ mod tests {
                 .prepare_mapped_fused_matvec_graph_io(&mapping, &operation)
                 .expect("prepare graph FFN gate/up projection without activation buffers")
         });
+        let ffn_down_matrix = artifact
+            .recovered_matrix("layer0.mlp.down.weight")
+            .expect("resolve graph FFN down projection");
+        let ffn_down_validation = vec![0.0; config.intermediate_size];
+        let ffn_down_operation = ffn_down_matrix
+            .operation(&ffn_down_validation, Activation::Identity)
+            .expect("build graph FFN down projection contract");
+        let ffn_down_projection = runtime
+            .prepare_mapped_fused_matvec_graph_io(&mapping, &ffn_down_operation)
+            .expect("prepare graph FFN down projection without activation buffers");
         assert!(runtime
             .prepare_mapped_gated_delta_prepare_graph_io(
                 &mapping,
@@ -8640,6 +8983,13 @@ mod tests {
             );
             assert!(projection.write_input(&validation_input).is_err());
         }
+        assert_eq!(
+            ffn_down_projection.transient_bytes(),
+            std::mem::size_of::<f32>() + MetalFusedMatVecParams::BYTE_LEN
+        );
+        assert!(ffn_down_projection
+            .write_input(&vec![0.0; config.intermediate_size])
+            .is_err());
         assert!(!gated_norm.has_owned_io());
         assert!(gated_norm
             .write_inputs(
@@ -8690,6 +9040,7 @@ mod tests {
         let linear_output_step = &program.steps()[7];
         let residual_norm_step = &program.steps()[8];
         let ffn_gate_up_step = &program.steps()[9];
+        let swiglu_down_step = &program.steps()[10];
         let projection_refs = [
             &prepared_projections[0],
             &prepared_projections[1],
@@ -8703,6 +9054,7 @@ mod tests {
                 1,
                 &norm,
                 projection_refs,
+                None,
                 None,
                 None,
                 None,
@@ -8742,6 +9094,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8758,6 +9111,7 @@ mod tests {
                 Some((&delta_prepare, delta_outputs)),
                 Some((&mut recurrence, recurrence_step)),
                 Some((&gated_norm, recurrence_step)),
+                None,
                 None,
                 None,
                 None,
@@ -8781,6 +9135,7 @@ mod tests {
                 Some((&linear_output_projection, gated_norm_step)),
                 None,
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8800,6 +9155,7 @@ mod tests {
                 Some((&gated_norm, gated_norm_step)),
                 Some((&linear_output_projection, linear_output_step)),
                 Some((&residual_norm, linear_output_step)),
+                None,
                 None,
                 embedding_output,
                 normalized_output,
@@ -8821,6 +9177,28 @@ mod tests {
                 Some((&linear_output_projection, linear_output_step)),
                 Some((&residual_norm, residual_norm_step)),
                 Some((ffn_projection_refs, residual_norm_step)),
+                None,
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .is_err());
+        assert!(!convolution.poisoned);
+        assert!(!recurrence.poisoned);
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, gated_norm_step)),
+                Some((&linear_output_projection, linear_output_step)),
+                Some((&residual_norm, residual_norm_step)),
+                Some((ffn_projection_refs, ffn_gate_up_step)),
+                Some((&ffn_down_projection, ffn_gate_up_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8889,6 +9267,7 @@ mod tests {
                 Some((&gated_norm, gated_norm_step)),
                 Some((&linear_output_projection, linear_output_step)),
                 Some((&residual_norm, residual_norm_step)),
+                None,
                 None,
                 embedding_output,
                 normalized_output,
@@ -9077,6 +9456,7 @@ mod tests {
                 Some((&linear_output_projection, linear_output_step)),
                 Some((&residual_norm, residual_norm_step)),
                 Some((ffn_projection_refs, ffn_gate_up_step)),
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -9093,7 +9473,7 @@ mod tests {
                 .read_f32(MetalBufferSlot::FfnUp)
                 .expect("read graph FFN up projection"),
         ];
-        for (branch, (matrix, actual)) in ffn_matrices.iter().zip(actual_ffn).enumerate() {
+        for (branch, (matrix, actual)) in ffn_matrices.iter().zip(&actual_ffn).enumerate() {
             let expected = cpu
                 .fused_matvec(
                     &matrix
@@ -9115,6 +9495,57 @@ mod tests {
         convolution
             .restore_speculative(&runtime)
             .expect("restore graph convolution after FFN prefix");
+
+        let expected_swiglu = crate::reference::swiglu(&actual_ffn[0], &actual_ffn[1])
+            .expect("execute graph SwiGLU oracle");
+        let expected_down = cpu
+            .fused_matvec(
+                &ffn_down_matrix
+                    .operation(&expected_swiglu, Activation::Identity)
+                    .expect("build graph fused SwiGLU down oracle operation"),
+            )
+            .expect("execute graph fused SwiGLU down oracle");
+        convolution
+            .begin_speculative(&runtime)
+            .expect("snapshot graph convolution state for SwiGLU prefix");
+        recurrence
+            .begin_speculative(&runtime)
+            .expect("snapshot graph recurrence state for SwiGLU prefix");
+        runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, gated_norm_step)),
+                Some((&linear_output_projection, linear_output_step)),
+                Some((&residual_norm, residual_norm_step)),
+                Some((ffn_projection_refs, ffn_gate_up_step)),
+                Some((&ffn_down_projection, swiglu_down_step)),
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .expect("dispatch first eleven decode steps through shared arena");
+        let actual_down = workspace
+            .read_f32(MetalBufferSlot::FfnDown)
+            .expect("read graph fused SwiGLU down projection");
+        for (row, (expected, actual)) in expected_down.iter().zip(actual_down).enumerate() {
+            let tolerance = 1.2e-3_f32.max(expected.abs() * 8.0e-4);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "graph fused SwiGLU down row {row}: expected {expected}, got {actual}"
+            );
+        }
+        recurrence
+            .restore_speculative(&runtime)
+            .expect("restore graph recurrence after SwiGLU prefix");
+        convolution
+            .restore_speculative(&runtime)
+            .expect("restore graph convolution after SwiGLU prefix");
     }
 
     #[test]
