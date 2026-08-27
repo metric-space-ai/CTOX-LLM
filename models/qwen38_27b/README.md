@@ -239,8 +239,11 @@ resource reuse.
 One closed full-attention layer owner now combines that mixer with its packed
 KV state and the common residual/FFN tail. Its exact-Qwen Layer-3 Golden reaches
 the Layer-4 normalized arena view and rejects a Layer-7 schedule before cache
-mutation. KV metadata currently imposes a bounded command boundary; eliminating
-that boundary remains part of the final one-command-buffer executor work.
+mutation. Production KV metadata and device descriptors are planned before
+encoding, then all ten operations execute in one command encoder and one wait.
+The independent CPU KV oracle exists only in tests and commits from test-only
+device snapshots after successful completion; release builds retain no CPU
+tensor mirror and introduce no KV metadata command boundary.
 The corresponding all-layer loader admits exactly the 16 frozen full-attention
 layers in canonical order or drops the partial allocation on the first error.
 Every logical read and write of all 645 bound decode steps now resolves

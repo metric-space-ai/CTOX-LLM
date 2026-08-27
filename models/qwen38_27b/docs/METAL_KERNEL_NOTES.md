@@ -93,9 +93,12 @@ projection directly to `MixerOutput`.
 `PreparedMappedMetalFullAttentionLayer` is the corresponding closed ten-step
 resource owner. It binds the exact layer Q/K/V, query norm, `o_proj`, both
 residual norms, three FFN matrices, and one packed KV owner to one canonical
-mmap identity. Its staged executor keeps all activations in the shared arena;
-KV descriptor planning is still a bounded command boundary, while the complete
-residual/FFN tail is encoded together.
+mmap identity. Production KV metadata and device descriptors are prepared
+before encoding; Q/K/V fan-out, Query/Gate norm+RoPE, Key-RoPE, packed append,
+paged GQA, fused gated output projection, and the complete residual/FFN tail
+then execute in one command encoder and one wait. Test builds snapshot K/V on
+device before later legal arena aliases and update their independent CPU oracle
+only after successful completion. That verifier path is absent from releases.
 The all-layer entry point constructs exactly 16 such owners in frozen topology
 order and returns no partial vector if any tensor, cache geometry, or mapping
 identity fails validation.
@@ -594,8 +597,9 @@ dequantization array before this source was accepted.
   normalization/RoPE, Key-RoPE, combined KV-append/paged-GQA, and fused
   sigmoid-gated mixed-Q2/Q4 output projection edges are also executable. The
   complete first full-attention mixer and its residual/FFN tail are therefore
-  wired through the next normalized layer input. Later layer instances, removal
-  of the KV metadata command boundary, the prefill arena, removal of the
-  verifier CPU KV mirror, and complete model-graph execution remain unfinished.
+  wired through the next normalized layer input in one encoder and one wait.
+  Later layer execution, the prefill arena, release-build memory/high-watermark
+  evidence, and complete model-graph execution remain unfinished. The CPU KV
+  mirror is verifier-only and is not present in release builds.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

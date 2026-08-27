@@ -1273,6 +1273,15 @@ kernel void qwen_causal_conv_silu_f16(
     output[channel] = sum / (1.0f + exp(-sum));
 }
 
+// Test builds use this only to preserve verifier inputs across later legal
+// shared-arena aliases. Production dispatch never binds this kernel.
+kernel void qwen_copy_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    uint index [[thread_position_in_grid]]) {
+    output[index] = input[index];
+}
+
 // Stage one saturates the device with independent 256-thread reductions.
 kernel void qwen_argmax_f32_partial(
     device const float* input [[buffer(0)]],

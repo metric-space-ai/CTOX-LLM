@@ -51,6 +51,8 @@ use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Qwen38Config, Result};
 
 const KERNEL_SOURCE: &str = include_str!("../../kernels/metal/q2q4_fused_matvec.metal");
+#[cfg(test)]
+const COPY_F32_KERNEL_NAME: &str = "qwen_copy_f32";
 const MAX_THREADS_PER_GROUP: usize = MAX_SIMDGROUPS_PER_THREADGROUP * 32;
 const DEFAULT_SIMDGROUPS: usize = 2;
 const ROWS_PER_SIMDGROUP: usize = 4;
@@ -80,6 +82,8 @@ pub struct MetalCandidateRuntime {
     rms_norm_gated_pipeline: ComputePipelineState,
     partial_rope_pipeline: ComputePipelineState,
     query_gate_norm_rope_pipeline: ComputePipelineState,
+    #[cfg(test)]
+    copy_f32_pipeline: ComputePipelineState,
     kv_q4_pack_pipeline: ComputePipelineState,
     kv_q4_to_q2_pipeline: ComputePipelineState,
     paged_gqa_decode_pipeline: ComputePipelineState,
@@ -593,6 +597,10 @@ pub struct PreparedMetalPagedGqa {
     cache: MetalPagedKvMetadata,
     #[cfg(test)]
     verifier_cache: PagedKvCache,
+    #[cfg(test)]
+    verifier_key_snapshot_buffer: Buffer,
+    #[cfg(test)]
+    verifier_value_snapshot_buffer: Buffer,
     page_to_q4_slot: Vec<Option<usize>>,
     free_q4_slots: Vec<usize>,
     q2_pages_buffer: Buffer,
@@ -651,6 +659,8 @@ struct MetalPagedGqaAppendPlan {
     demotions: Vec<(usize, usize)>,
     q4_slot: usize,
     token_in_page: usize,
+    #[cfg(test)]
+    verifier_update: MetalPagedKvUpdate,
 }
 
 impl MetalPagedKvMetadata {
@@ -2266,6 +2276,15 @@ impl MetalCandidateRuntime {
                     "Metal query/gate norm+RoPE function lookup failed: {message}"
                 ))
             })?;
+        #[cfg(test)]
+        let copy_f32_function =
+            library
+                .get_function(COPY_F32_KERNEL_NAME, None)
+                .map_err(|message| {
+                    EngineError::InvalidState(format!(
+                        "Metal verifier copy function lookup failed: {message}"
+                    ))
+                })?;
         let kv_q4_pack_function =
             library
                 .get_function(KV_Q4_PACK_KERNEL_NAME, None)
@@ -2466,6 +2485,14 @@ impl MetalCandidateRuntime {
                 query_gate_norm_rope_pipeline.thread_execution_width()
             )));
         }
+        #[cfg(test)]
+        let copy_f32_pipeline = device
+            .new_compute_pipeline_state_with_function(&copy_f32_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal verifier copy pipeline creation failed: {message}"
+                ))
+            })?;
         let kv_q4_pack_pipeline = device
             .new_compute_pipeline_state_with_function(&kv_q4_pack_function)
             .map_err(|message| {
@@ -2562,6 +2589,8 @@ impl MetalCandidateRuntime {
             rms_norm_gated_pipeline,
             partial_rope_pipeline,
             query_gate_norm_rope_pipeline,
+            #[cfg(test)]
+            copy_f32_pipeline,
             kv_q4_pack_pipeline,
             kv_q4_to_q2_pipeline,
             paged_gqa_decode_pipeline,
@@ -4854,6 +4883,16 @@ impl MetalCandidateRuntime {
             cache,
             #[cfg(test)]
             verifier_cache,
+            #[cfg(test)]
+            verifier_key_snapshot_buffer: new_zeroed_buffer(
+                &self.device,
+                component_values * std::mem::size_of::<f32>(),
+            )?,
+            #[cfg(test)]
+            verifier_value_snapshot_buffer: new_zeroed_buffer(
+                &self.device,
+                component_values * std::mem::size_of::<f32>(),
+            )?,
             page_to_q4_slot: vec![None; maximum_pages],
             free_q4_slots: (0..q4_slots).rev().collect(),
             q2_pages_buffer: new_zeroed_buffer(&self.device, q2_arena_bytes)?,
@@ -6221,34 +6260,12 @@ impl MetalCandidateRuntime {
     fn plan_paged_gqa_append(
         &self,
         prepared: &mut PreparedMetalPagedGqa,
-        verifier_key: &[f32],
-        verifier_value: &[f32],
     ) -> Result<MetalPagedGqaAppendPlan> {
         let retain_q4 = prepared.speculative_checkpoint.is_some();
         let update = prepared.cache.push(retain_q4)?;
-        #[cfg(test)]
-        {
-            let verifier_update = if retain_q4 {
-                prepared
-                    .verifier_cache
-                    .push_retaining_q4(verifier_key, verifier_value)?
-            } else {
-                prepared.verifier_cache.push(verifier_key, verifier_value)?
-            };
-            if verifier_update.page_index != update.page_index
-                || verifier_update.token_in_page != update.token_in_page
-                || verifier_update.demoted_pages != update.demoted_pages
-            {
-                return Err(EngineError::InvalidState(
-                    "Metal paged KV metadata diverged from verifier policy".into(),
-                ));
-            }
-        }
-        #[cfg(not(test))]
-        let _ = (verifier_key, verifier_value);
 
         let mut demotions = Vec::with_capacity(update.demoted_pages.len());
-        for page_index in update.demoted_pages {
+        for &page_index in &update.demoted_pages {
             let page = prepared.cache.pages.get(page_index).ok_or_else(|| {
                 EngineError::InvalidState("Metal demoted KV page is missing".into())
             })?;
@@ -6289,7 +6306,33 @@ impl MetalCandidateRuntime {
             demotions,
             q4_slot,
             token_in_page: update.token_in_page,
+            #[cfg(test)]
+            verifier_update: update,
         })
+    }
+
+    #[cfg(test)]
+    fn commit_paged_gqa_verifier_append(
+        &self,
+        prepared: &mut PreparedMetalPagedGqa,
+        plan: &MetalPagedGqaAppendPlan,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<()> {
+        let verifier_update = if prepared.speculative_checkpoint.is_some() {
+            prepared.verifier_cache.push_retaining_q4(key, value)?
+        } else {
+            prepared.verifier_cache.push(key, value)?
+        };
+        if verifier_update.page_index != plan.verifier_update.page_index
+            || verifier_update.token_in_page != plan.verifier_update.token_in_page
+            || verifier_update.demoted_pages != plan.verifier_update.demoted_pages
+        {
+            return Err(EngineError::InvalidState(
+                "Metal paged KV metadata diverged from verifier policy".into(),
+            ));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6544,18 +6587,9 @@ impl MetalCandidateRuntime {
             )
             .to_vec()
         };
-        #[cfg(not(test))]
-        let verifier_key: Vec<f32> = Vec::new();
-        #[cfg(not(test))]
-        let verifier_value: Vec<f32> = Vec::new();
-
         prepared.poisoned = true;
         let result = (|| {
-            let plan = self.plan_paged_gqa_append(
-                prepared,
-                verifier_key.as_slice(),
-                verifier_value.as_slice(),
-            )?;
+            let plan = self.plan_paged_gqa_append(prepared)?;
             write_metal_paged_gqa_descriptors(prepared)?;
             write_metal_paged_gqa_params(prepared)?;
             let command_buffer = self.queue.new_command_buffer();
@@ -6583,6 +6617,8 @@ impl MetalCandidateRuntime {
                     command_buffer.status()
                 )));
             }
+            #[cfg(test)]
+            self.commit_paged_gqa_verifier_append(prepared, &plan, &verifier_key, &verifier_value)?;
             Ok(())
         })();
         if result.is_ok() {
@@ -6598,7 +6634,7 @@ impl MetalCandidateRuntime {
         key: &[f32],
         value: &[f32],
     ) -> Result<Vec<f32>> {
-        let plan = self.plan_paged_gqa_append(prepared, key, value)?;
+        let plan = self.plan_paged_gqa_append(prepared)?;
         write_metal_paged_gqa_descriptors(prepared)?;
         let query_buffer = prepared.query_buffer.as_ref().ok_or_else(|| {
             EngineError::InvalidState("Metal standalone GQA query buffer is missing".into())
@@ -6654,6 +6690,8 @@ impl MetalCandidateRuntime {
                 "Metal paged GQA produced a non-finite output".into(),
             ));
         }
+        #[cfg(test)]
+        self.commit_paged_gqa_verifier_append(prepared, &plan, key, value)?;
         Ok(output)
     }
 
@@ -8547,9 +8585,47 @@ impl MetalCandidateRuntime {
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-query-gate-norm-rope");
         let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_query_gate_norm_rope_between(
+            encoder,
+            prepared,
+            arena,
+            input.offset(),
+            arena,
+            query.offset(),
+            arena,
+            gate.offset(),
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal query/gate layer {layer} ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_query_gate_norm_rope_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalQueryGate,
+        input_buffer: &Buffer,
+        input_offset: u64,
+        query_buffer: &Buffer,
+        query_offset: u64,
+        gate_buffer: &Buffer,
+        gate_offset: u64,
+    ) {
         encoder.set_compute_pipeline_state(&self.query_gate_norm_rope_pipeline);
         for (binding, buffer, offset) in [
-            (MetalQueryGateBufferAbi::QUERY_GATE, arena, input.offset()),
+            (
+                MetalQueryGateBufferAbi::QUERY_GATE,
+                input_buffer,
+                input_offset,
+            ),
             (
                 MetalQueryGateBufferAbi::Q_NORM_WEIGHT,
                 &prepared.mapping.inner.buffer,
@@ -8557,8 +8633,8 @@ impl MetalCandidateRuntime {
             ),
             (MetalQueryGateBufferAbi::COSINE, &prepared.cosine_buffer, 0),
             (MetalQueryGateBufferAbi::SINE, &prepared.sine_buffer, 0),
-            (MetalQueryGateBufferAbi::QUERY, arena, query.offset()),
-            (MetalQueryGateBufferAbi::GATE, arena, gate.offset()),
+            (MetalQueryGateBufferAbi::QUERY, query_buffer, query_offset),
+            (MetalQueryGateBufferAbi::GATE, gate_buffer, gate_offset),
             (MetalQueryGateBufferAbi::PARAMS, &prepared.params_buffer, 0),
         ] {
             encoder.set_buffer(binding as u64, Some(buffer), offset);
@@ -8575,16 +8651,6 @@ impl MetalCandidateRuntime {
                 depth: 1,
             },
         );
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        if command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(EngineError::InvalidState(format!(
-                "Metal query/gate layer {layer} ended with {:?}",
-                command_buffer.status()
-            )));
-        }
-        Ok(())
     }
 
     /// Apply the per-channel sigmoid attention gate, recovery `s_in`, and the
@@ -8654,7 +8720,7 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
-    fn dispatch_mapped_transformer_tail_views(
+    pub fn dispatch_mapped_transformer_tail_views(
         &self,
         steps: &[PreparedMetalDecodeStepView<'_>],
         layer: usize,
@@ -8841,9 +8907,9 @@ impl MetalCandidateRuntime {
     }
 
     /// Execute one complete target full-attention layer through its exact ten
-    /// schedule views. KV metadata creates a bounded command boundary; all
-    /// activation tensors remain device-resident and the residual/FFN tail is
-    /// encoded together.
+    /// schedule views in one command encoder and one wait. CPU cache metadata
+    /// is planned before encoding; K/V projection output is consumed only by
+    /// later kernels in the same command buffer.
     pub fn dispatch_prepared_mapped_full_attention_layer(
         &self,
         steps: &[PreparedMetalDecodeStepView<'_>],
@@ -8907,23 +8973,319 @@ impl MetalCandidateRuntime {
                 "Metal full-attention layer {layer} resources do not share one canonical mapping"
             )));
         }
-
-        self.dispatch_mapped_full_attention_fanout_views(&steps[0], &prepared.fanout)?;
-        self.dispatch_mapped_query_gate_norm_rope_view(&steps[1], &prepared.query_gate)?;
-        self.dispatch_partial_rope_view(&prepared.key_rope, &steps[2].writes()[0])?;
-        self.append_and_dispatch_paged_gqa_views(&mut prepared.attention, &steps[3], &steps[4])?;
-        self.dispatch_mapped_attention_gate_output_projection_view(
-            &steps[5],
-            &prepared.attention_output,
-        )?;
-        self.dispatch_mapped_transformer_tail_views(
-            &steps[6..],
-            layer,
-            &prepared.residual_rms_norm,
-            [&prepared.ffn_gate_up[0], &prepared.ffn_gate_up[1]],
-            &prepared.swiglu_down,
-            &prepared.post_ffn_residual_rms_norm,
-        )
+        let arena = steps[0].reads()[0].buffer();
+        if steps
+            .iter()
+            .flat_map(|step| step.reads().iter().chain(step.writes()))
+            .any(|view| !std::ptr::eq(arena, view.buffer()))
+            || prepared.attention.poisoned
+            || prepared.attention.query_buffer.is_some()
+            || prepared.attention.output_buffer.is_some()
+            || prepared.key_rope.has_owned_values()
+            || prepared.attention.cache.tokens() >= prepared.attention.maximum_tokens
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} arena or persistent state is not ready"
+            )));
+        }
+        let fanout = &steps[0];
+        let query_gate = &steps[1];
+        let key_rope = &steps[2];
+        let append = &steps[3];
+        let gqa = &steps[4];
+        let attention_output = &steps[5];
+        let residual = &steps[6];
+        let ffn = &steps[7];
+        let down = &steps[8];
+        let post_ffn = &steps[9];
+        let query_values = prepared
+            .attention
+            .query_heads
+            .checked_mul(prepared.attention.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal query width overflows".into()))?;
+        let component_values = prepared
+            .attention
+            .key_value_heads
+            .checked_mul(prepared.attention.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal KV width overflows".into()))?;
+        if fanout.reads().len() != 1
+            || fanout.writes().len() != 3
+            || query_gate.reads().len() != 1
+            || query_gate.writes().len() != 2
+            || key_rope.reads().len() != 1
+            || key_rope.writes().len() != 1
+            || append.reads().len() != 2
+            || !append.writes().is_empty()
+            || gqa.reads().len() != 1
+            || gqa.writes().len() != 1
+            || attention_output.reads().len() != 2
+            || attention_output.writes().len() != 1
+            || fanout.reads()[0].slot() != MetalBufferSlot::Normalized
+            || fanout.writes()[0].slot() != MetalBufferSlot::QueryGate
+            || fanout.writes()[1].slot() != MetalBufferSlot::Key
+            || fanout.writes()[2].slot() != MetalBufferSlot::Value
+            || query_gate.reads()[0].slot() != MetalBufferSlot::QueryGate
+            || query_gate.writes()[0].slot() != MetalBufferSlot::Query
+            || query_gate.writes()[1].slot() != MetalBufferSlot::AttentionGate
+            || key_rope.reads()[0].slot() != MetalBufferSlot::Key
+            || key_rope.writes()[0].slot() != MetalBufferSlot::Key
+            || append.reads()[0].slot() != MetalBufferSlot::Key
+            || append.reads()[1].slot() != MetalBufferSlot::Value
+            || gqa.reads()[0].slot() != MetalBufferSlot::Query
+            || gqa.writes()[0].slot() != MetalBufferSlot::AttentionOutput
+            || attention_output.reads()[0].slot() != MetalBufferSlot::AttentionOutput
+            || attention_output.reads()[1].slot() != MetalBufferSlot::AttentionGate
+            || attention_output.writes()[0].slot() != MetalBufferSlot::MixerOutput
+            || residual.reads().len() != 2
+            || residual.writes().len() != 2
+            || residual.reads()[0].slot() != MetalBufferSlot::HiddenA
+            || residual.reads()[1].slot() != MetalBufferSlot::MixerOutput
+            || residual.writes()[0].slot() != MetalBufferSlot::HiddenB
+            || residual.writes()[1].slot() != MetalBufferSlot::Normalized
+            || ffn.reads().len() != 1
+            || ffn.writes().len() != 2
+            || ffn.reads()[0].slot() != MetalBufferSlot::Normalized
+            || ffn.writes()[0].slot() != MetalBufferSlot::FfnGate
+            || ffn.writes()[1].slot() != MetalBufferSlot::FfnUp
+            || down.reads().len() != 2
+            || down.writes().len() != 1
+            || down.reads()[0].slot() != MetalBufferSlot::FfnGate
+            || down.reads()[1].slot() != MetalBufferSlot::FfnUp
+            || down.writes()[0].slot() != MetalBufferSlot::FfnDown
+            || post_ffn.reads().len() != 2
+            || post_ffn.writes().len() != 2
+            || post_ffn.reads()[0].slot() != MetalBufferSlot::HiddenB
+            || post_ffn.reads()[1].slot() != MetalBufferSlot::FfnDown
+            || post_ffn.writes()[0].slot() != MetalBufferSlot::HiddenA
+            || post_ffn.writes()[1].slot() != MetalBufferSlot::Normalized
+            || gqa.reads()[0].values() < query_values
+            || gqa.writes()[0].values() < query_values
+            || append.reads()[0].values() < component_values
+            || append.reads()[1].values() < component_values
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} views are not the frozen Qwen graph"
+            )));
+        }
+        let config = Qwen38Config::default();
+        let hidden = config.hidden_size;
+        let intermediate = config.intermediate_size;
+        if prepared.fanout.projections[0].columns != hidden
+            || prepared.fanout.projections[0].rows != query_values * 2
+            || prepared.fanout.projections[1].columns != hidden
+            || prepared.fanout.projections[1].rows != component_values
+            || prepared.fanout.projections[2].columns != hidden
+            || prepared.fanout.projections[2].rows != component_values
+            || prepared.attention_output.projection.columns != query_values
+            || prepared.attention_output.projection.rows != hidden
+            || prepared.residual_rms_norm.columns != hidden
+            || prepared.post_ffn_residual_rms_norm.columns != hidden
+            || prepared.ffn_gate_up.iter().any(|projection| {
+                projection.columns != hidden
+                    || projection.rows != intermediate
+                    || projection.input_buffer.is_some()
+                    || projection.output_buffer.is_some()
+            })
+            || prepared.swiglu_down.columns != intermediate
+            || prepared.swiglu_down.rows != hidden
+            || prepared.swiglu_down.input_buffer.is_some()
+            || prepared.swiglu_down.output_buffer.is_some()
+            || prepared.residual_rms_norm.input_buffer.is_some()
+            || prepared.residual_rms_norm.output_buffer.is_some()
+            || prepared.post_ffn_residual_rms_norm.input_buffer.is_some()
+            || prepared.post_ffn_residual_rms_norm.output_buffer.is_some()
+            || prepared.ffn_gate_up[1].packed_s_in_bytes()?
+                != prepared.ffn_gate_up[0].packed_s_in_bytes()?
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} resources are not graph-owned or shape-compatible"
+            )));
+        }
+        let thread_width = dispatch_width(&self.partial_rope_pipeline, DEFAULT_SIMDGROUPS)?;
+        prepared.attention.poisoned = true;
+        let result = (|| {
+            let plan = self.plan_paged_gqa_append(&mut prepared.attention)?;
+            write_metal_paged_gqa_descriptors(&prepared.attention)?;
+            write_metal_paged_gqa_params(&prepared.attention)?;
+            let command_buffer = self.queue.new_command_buffer();
+            command_buffer.set_label("ctox-qwen38-shared-arena-full-attention-layer");
+            let encoder = command_buffer.new_compute_command_encoder();
+            for (projection, output) in prepared.fanout.projections.iter().zip(fanout.writes()) {
+                self.encode_mapped_projection_between(
+                    encoder,
+                    projection,
+                    arena,
+                    fanout.reads()[0].offset(),
+                    arena,
+                    output.offset(),
+                )?;
+            }
+            self.encode_mapped_query_gate_norm_rope_between(
+                encoder,
+                &prepared.query_gate,
+                arena,
+                query_gate.reads()[0].offset(),
+                arena,
+                query_gate.writes()[0].offset(),
+                arena,
+                query_gate.writes()[1].offset(),
+            );
+            self.encode_partial_rope_between(
+                encoder,
+                &prepared.key_rope,
+                arena,
+                key_rope.writes()[0].offset(),
+                thread_width,
+            )?;
+            #[cfg(test)]
+            {
+                encoder.set_compute_pipeline_state(&self.copy_f32_pipeline);
+                encoder.set_buffer(0, Some(arena), append.reads()[0].offset());
+                encoder.set_buffer(1, Some(&prepared.attention.verifier_key_snapshot_buffer), 0);
+                encoder.dispatch_thread_groups(
+                    MTLSize {
+                        width: component_values as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                encoder.set_buffer(0, Some(arena), append.reads()[1].offset());
+                encoder.set_buffer(
+                    1,
+                    Some(&prepared.attention.verifier_value_snapshot_buffer),
+                    0,
+                );
+                encoder.dispatch_thread_groups(
+                    MTLSize {
+                        width: component_values as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
+            self.encode_paged_gqa_append_and_attention(
+                encoder,
+                &prepared.attention,
+                &plan,
+                arena,
+                gqa.reads()[0].offset(),
+                arena,
+                append.reads()[0].offset(),
+                arena,
+                append.reads()[1].offset(),
+                arena,
+                gqa.writes()[0].offset(),
+            )?;
+            self.encode_mapped_sigmoid_gate_projection_between(
+                encoder,
+                &prepared.attention_output.projection,
+                arena,
+                attention_output.reads()[0].offset(),
+                arena,
+                attention_output.reads()[1].offset(),
+                arena,
+                attention_output.writes()[0].offset(),
+            )?;
+            self.encode_mapped_residual_rms_norm_between(
+                encoder,
+                &prepared.residual_rms_norm,
+                arena,
+                residual.reads()[0].offset(),
+                arena,
+                residual.reads()[1].offset(),
+                arena,
+                residual.writes()[0].offset(),
+                arena,
+                residual.writes()[1].offset(),
+            );
+            for (projection, output) in prepared.ffn_gate_up.iter().zip(ffn.writes()) {
+                self.encode_mapped_projection_between(
+                    encoder,
+                    projection,
+                    arena,
+                    ffn.reads()[0].offset(),
+                    arena,
+                    output.offset(),
+                )?;
+            }
+            self.encode_mapped_swiglu_projection_between(
+                encoder,
+                &prepared.swiglu_down,
+                arena,
+                down.reads()[0].offset(),
+                arena,
+                down.reads()[1].offset(),
+                arena,
+                down.writes()[0].offset(),
+            )?;
+            self.encode_mapped_residual_rms_norm_between(
+                encoder,
+                &prepared.post_ffn_residual_rms_norm,
+                arena,
+                post_ffn.reads()[0].offset(),
+                arena,
+                post_ffn.reads()[1].offset(),
+                arena,
+                post_ffn.writes()[0].offset(),
+                arena,
+                post_ffn.writes()[1].offset(),
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal full-attention layer {layer} ended with {:?}",
+                    command_buffer.status()
+                )));
+            }
+            #[cfg(test)]
+            {
+                let key = unsafe {
+                    slice::from_raw_parts(
+                        prepared
+                            .attention
+                            .verifier_key_snapshot_buffer
+                            .contents()
+                            .cast::<f32>(),
+                        component_values,
+                    )
+                    .to_vec()
+                };
+                let value = unsafe {
+                    slice::from_raw_parts(
+                        prepared
+                            .attention
+                            .verifier_value_snapshot_buffer
+                            .contents()
+                            .cast::<f32>(),
+                        component_values,
+                    )
+                    .to_vec()
+                };
+                self.commit_paged_gqa_verifier_append(
+                    &mut prepared.attention,
+                    &plan,
+                    &key,
+                    &value,
+                )?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            prepared.attention.poisoned = false;
+        }
+        result
     }
 
     /// Execute one complete frozen linear-attention transformer layer from an
