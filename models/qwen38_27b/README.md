@@ -342,7 +342,12 @@ to record zero, returning the exact fixed-size records needed by the bounded
 accepted-prefix replay path. `dispatch_prepared_mapped_greedy_mtp4_verifier`
 then replays only records 1 through `accepted_prefix - 1` via the same full
 causal verifier. Any replay mismatch poisons both graphs fail-closed. Production
-executor wiring and eliminating the separate initial-record wait remain open.
+executor wiring remains open. The additional
+`dispatch_prepared_mapped_greedy_mtp4_from_token_verifier` path removes the
+separate initial-record completion wait from the fully accepted case: all four
+records plus prefix reduction share one command buffer. A shorter prefix rolls
+back to the pre-initial state, replays the mandatory initial transition, and
+then replays only its accepted tail; replay divergence poisons both graphs.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those
@@ -366,13 +371,17 @@ full-attention layers, and the MTP layer use the same dispatch-plan boundary
 while the large Q2/Q4 page arenas remain single-copy. A two-depth regression
 retains the first snapshots after the second append is planned; this is the
 metadata boundary required to enqueue successive speculative steps safely.
+Every full-attention owner now preallocates four such metadata slots. MTP4
+planning fills each slot once, retains only its existing MTLBuffer handles in
+the queued plan, and includes the pool in resident-state accounting; no
+decode-time replacement buffer is allocated for these snapshots.
 The graph dispatch plan also snapshots Query/Key RoPE tables and the key-RoPE
 position block. A device regression mutates the owner to another position
 after planning and still reproduces the original-position oracle, preventing
 later speculative depths from rotating earlier queued work with the wrong
 position.
-Full-artifact same-device evidence, a four-candidate device branch,
-partial-prefix restore/replay, and production executor wiring remain pending.
+Full-artifact same-device evidence and production executor wiring remain
+pending.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

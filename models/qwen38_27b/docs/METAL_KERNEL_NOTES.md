@@ -225,8 +225,13 @@ partial acceptance restores the entire tail and returns four exact replay
 records while resetting selectors to record zero. The complete MTP4 wrapper
 replays only the accepted tail through the ordinary full target/MTP verifier
 and rejects any record divergence by poisoning both graphs. Full-artifact
-device evidence, eliminating the initial-record wait, and production executor
-integration remain pending.
+device evidence and production executor integration remain pending. The fused
+from-token wrapper now places record zero, records 1-3, and prefix reduction in
+one command buffer, eliminating the separate initial-record completion wait on
+the 4/4 path. A partial branch restores the pre-initial transaction, replays
+the mandatory initial transition even when its draft was rejected, and then
+replays only the accepted tail; every replay record must match the speculative
+record exactly.
 
 The continuation path now preserves each canonical mapped draft in a distinct
 full-vocabulary candidate selector with a two-word device copy before the
