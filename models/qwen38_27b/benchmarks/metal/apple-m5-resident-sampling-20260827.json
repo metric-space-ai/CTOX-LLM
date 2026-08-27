@@ -1,0 +1,57 @@
+{
+  "format": "ctox.metal-resident-sampling-candidate-evidence.v1",
+  "captured_at": "2026-08-27",
+  "status": "verifier_only_not_promotion_evidence",
+  "source_commit": "4ce529b1f712f1c0569fd3461a292a747d3db228",
+  "host_profile": {
+    "device": "Apple M5",
+    "os": "macOS 26.2 (25C56)",
+    "rustc": "1.97.0 (2d8144b78 2026-07-07)",
+    "metal_frontend": "Apple metal 32023.883 (metalfe-32023.883)"
+  },
+  "source_sha256": {
+    "kernels/metal/q2q4_fused_matvec.metal": "de393d46a3da11bbc9411a4fd4cac225fadb9ab8b6376771c3e0ffe0592b7fc9",
+    "target/release/qwen38-metal-selection-bench": "f63e8546566185ef8424ee00f4b4914963183d607b27d00ad301cd4cc3a4c349"
+  },
+  "invocation": "target/release/qwen38-metal-selection-bench --warmup 20 --iterations 100 --dispatches-per-command 64 --groups 32 --sampling-warmup 5 --sampling-iterations 20",
+  "contract": {
+    "valid_tokenizer_values": 248077,
+    "logical_input_bytes": 992308,
+    "returned_bytes": 16,
+    "sampling_temperature": 0.8,
+    "sampling_top_k": 40,
+    "sampling_top_p": 0.95,
+    "sampling_draw": 0.625,
+    "selected_token": 17,
+    "canonical_host_selected_token": 17,
+    "nucleus_len": 2,
+    "nucleus_total": 1.5210388,
+    "tie_rule": "larger_valid_token_id",
+    "nonfinite_policy": "fail_closed"
+  },
+  "greedy_argmax": {
+    "warmup_commands": 20,
+    "measured_commands": 100,
+    "dispatches_per_command": 64,
+    "total_dispatches": 6400,
+    "groups": 32,
+    "mean_microseconds": 17.8933203125,
+    "logical_gb_per_second": 55.456895795174965,
+    "canonical_host_mean_microseconds": 509.60896484375
+  },
+  "resident_topk_topp": {
+    "warmup_dispatches": 5,
+    "measured_dispatches": 20,
+    "mean_microseconds": 4796.2199,
+    "canonical_host_mean_microseconds": 5406.89075,
+    "every_iteration_matched_canonical_token": true
+  },
+  "limitations": [
+    "The sampler is bound to resident logits and returns only a compact four-u32 result, but this standalone benchmark owns synthetic input logits.",
+    "The verifier-grade kernel performs repeated vocabulary scans for each top-k rank and is O(top_k * vocabulary); it is not the promoted bandwidth-limit design.",
+    "The engine supplies an explicit canonical draw. On-device deterministic RNG state is not implemented.",
+    "Timing uses host command submission/completion and no Metal hardware counters.",
+    "This evidence does not cover final recovered model quality, stochastic MTP acceptance, long-context residency, or a complete decoder token step."
+  ],
+  "conclusion": "The resident bounded sampler is token-decision equivalent to the canonical Rust sampler and faster than the host reference on this synthetic full-vocabulary distribution. It remains a verifier candidate pending a bandwidth-efficient selection algorithm, on-device RNG, complete-graph integration evidence, and final-model golden gates."
+}
