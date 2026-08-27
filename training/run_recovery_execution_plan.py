@@ -321,6 +321,7 @@ def run(plan_path: Path, state_path: Path, resume: bool, dry_run: bool) -> None:
             flush=True,
         )
         if dry_run:
+            completed_records[name] = {"name": name, "status": "dry-run"}
             continue
         validate_implementation(document)
         state.update(active_stage=name, failure=None, updated_unix=time.time())

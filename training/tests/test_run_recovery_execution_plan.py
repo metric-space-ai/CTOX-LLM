@@ -202,6 +202,59 @@ class RecoveryExecutionPlanRunnerTests(unittest.TestCase):
                 hashlib.sha256(output.read_bytes()).hexdigest(),
             )
 
+    def test_dry_run_validates_all_dependencies_without_writing_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "stage.py"
+            script.write_text("raise SystemExit('must not execute')\n", encoding="utf-8")
+            python = Path(sys.executable).resolve()
+            stages = []
+            for index, requires in enumerate((["admission"], ["stage-0"])):
+                stages.append(
+                    {
+                        "name": f"stage-{index}",
+                        "requires": requires,
+                        "environment": {"CUDA_VISIBLE_DEVICES": "1"},
+                        "gpu_count": 1,
+                        "argv": [
+                            str(python),
+                            str(script),
+                            str(root / f"output-{index}.json"),
+                            "--device",
+                            "cuda:0",
+                        ],
+                        "outputs": [str(root / f"output-{index}.json")],
+                    }
+                )
+            plan = root / "plan.json"
+            plan.write_text(
+                json.dumps(
+                    {
+                        "format": "ctox.recovery.execution-plan.v1",
+                        "status": "admitted",
+                        "execution_order": "serial",
+                        "implementation": {
+                            "python": str(python),
+                            "scripts": {
+                                "stage.py": {
+                                    "path": str(script),
+                                    "sha256": hashlib.sha256(
+                                        script.read_bytes()
+                                    ).hexdigest(),
+                                }
+                            },
+                        },
+                        "stages": stages,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = root / "state.json"
+            with mock.patch("run_recovery_execution_plan.subprocess.run") as execute:
+                run(plan, state, resume=False, dry_run=True)
+            execute.assert_not_called()
+            self.assertFalse(state.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
