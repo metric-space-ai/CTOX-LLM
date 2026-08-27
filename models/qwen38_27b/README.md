@@ -343,6 +343,11 @@ records on device to the causal accepted-prefix length and selects either the
 first mismatching target token or, after full acceptance, the resident bonus
 target token. Malformed acceptance words, token bounds, or selector status
 fail closed in the same four-word result.
+The accepted continuation now copies the mapped restricted draft result into
+a separate full-vocabulary candidate selector on device before the next MTP
+argmax overwrites its source. Both MTP and target consume that preserved
+candidate, eliminating the last implicit dependency on the previous target
+selector from the future wait-free branch.
 Paged-GQA encoding now binds immutable per-dispatch descriptor and parameter
 buffers independently of the persistent KV owner. Standalone, all 16 target
 full-attention layers, and the MTP layer use the same dispatch-plan boundary

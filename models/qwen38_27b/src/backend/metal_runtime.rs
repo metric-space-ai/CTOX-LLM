@@ -57,7 +57,6 @@ use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::{EngineError, Qwen38Config, Result};
 
 const KERNEL_SOURCE: &str = include_str!("../../kernels/metal/q2q4_fused_matvec.metal");
-#[cfg(test)]
 const COPY_F32_KERNEL_NAME: &str = "qwen_copy_f32";
 const MAX_THREADS_PER_GROUP: usize = MAX_SIMDGROUPS_PER_THREADGROUP * 32;
 const DEFAULT_SIMDGROUPS: usize = 2;
@@ -96,7 +95,6 @@ pub struct MetalCandidateRuntime {
     rms_norm_gated_pipeline: ComputePipelineState,
     partial_rope_pipeline: ComputePipelineState,
     query_gate_norm_rope_pipeline: ComputePipelineState,
-    #[cfg(test)]
     copy_f32_pipeline: ComputePipelineState,
     kv_q4_pack_pipeline: ComputePipelineState,
     kv_q4_to_q2_pipeline: ComputePipelineState,
@@ -542,6 +540,7 @@ pub struct PreparedMappedMetalMtpCore {
     embedding: PreparedMappedMetalEmbedding,
     target_selector: PreparedMetalArgMaxScratch,
     draft_selector: PreparedMetalArgMaxScratch,
+    candidate_selector: PreparedMetalArgMaxScratch,
     verification_buffer: Buffer,
     prefix_result_buffer: Buffer,
     prefix_params_buffer: Buffer,
@@ -2580,6 +2579,7 @@ impl PreparedMappedMetalMtpCore {
             self.embedding.transient_bytes(),
             self.target_selector.transient_bytes(),
             self.draft_selector.transient_bytes(),
+            self.candidate_selector.transient_bytes(),
             METAL_GREEDY_MTP_HISTORY_BYTES,
             METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>(),
             MetalGreedyMtpPrefixParams::BYTE_LEN,
@@ -2827,7 +2827,6 @@ impl MetalCandidateRuntime {
                     "Metal query/gate norm+RoPE function lookup failed: {message}"
                 ))
             })?;
-        #[cfg(test)]
         let copy_f32_function =
             library
                 .get_function(COPY_F32_KERNEL_NAME, None)
@@ -3091,7 +3090,6 @@ impl MetalCandidateRuntime {
                 query_gate_norm_rope_pipeline.thread_execution_width()
             )));
         }
-        #[cfg(test)]
         let copy_f32_pipeline = device
             .new_compute_pipeline_state_with_function(&copy_f32_function)
             .map_err(|message| {
@@ -3220,7 +3218,6 @@ impl MetalCandidateRuntime {
             rms_norm_gated_pipeline,
             partial_rope_pipeline,
             query_gate_norm_rope_pipeline,
-            #[cfg(test)]
             copy_f32_pipeline,
             kv_q4_pack_pipeline,
             kv_q4_to_q2_pipeline,
@@ -3882,6 +3879,38 @@ impl MetalCandidateRuntime {
                 depth: 1,
             },
         );
+    }
+
+    fn encode_copy_argmax_result(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        source: &PreparedMetalArgMaxScratch,
+        destination: &PreparedMetalArgMaxScratch,
+    ) -> Result<()> {
+        let bytes = 2 * std::mem::size_of::<u32>();
+        if source.result_buffer.length() < bytes as u64
+            || destination.result_buffer.length() < bytes as u64
+        {
+            return Err(EngineError::InvalidState(
+                "Metal argmax result copy requires two compact words".into(),
+            ));
+        }
+        encoder.set_compute_pipeline_state(&self.copy_f32_pipeline);
+        encoder.set_buffer(0, Some(&source.result_buffer), 0);
+        encoder.set_buffer(1, Some(&destination.result_buffer), 0);
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: 2,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
     }
 
     fn encode_greedy_mtp_verify(
@@ -5092,6 +5121,7 @@ impl MetalCandidateRuntime {
         )?;
         let target_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
         let draft_selector = self.prepare_argmax_f32_scratch(draft_token_ids.len())?;
+        let candidate_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
         let verification_buffer = new_zeroed_buffer(&self.device, METAL_GREEDY_MTP_HISTORY_BYTES)?;
         let prefix_result_buffer = new_zeroed_buffer(
             &self.device,
@@ -5115,6 +5145,7 @@ impl MetalCandidateRuntime {
             || embedding.output_buffer.is_some()
             || target_selector.values != config.vocab_size
             || draft_selector.values != draft_token_ids.len()
+            || candidate_selector.values != config.vocab_size
             || pre_embedding_norm.rows != 1
             || pre_embedding_norm.columns != hidden
             || pre_hidden_norm.rows != 1
@@ -5170,6 +5201,7 @@ impl MetalCandidateRuntime {
             embedding,
             target_selector,
             draft_selector,
+            candidate_selector,
             verification_buffer,
             prefix_result_buffer,
             prefix_params_buffer,
@@ -11807,6 +11839,7 @@ impl MetalCandidateRuntime {
             || prepared.hidden_size() != config.hidden_size
             || prepared.target_selector.values != config.vocab_size
             || prepared.draft_selector.values != prepared.draft_vocabulary_rows()
+            || prepared.candidate_selector.values != config.vocab_size
             || !prepared
                 .pre_embedding_norm
                 .matches_weight_tensor("mtp.pre_fc_norm_embedding.weight")?
@@ -12322,6 +12355,29 @@ impl MetalCandidateRuntime {
         )
     }
 
+    fn encode_prepared_mapped_mtp_draft_from_selector(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        step: &PreparedMetalDecodeStepView<'_>,
+        prepared: &PreparedMappedMetalMtpCore,
+        selector: &PreparedMetalArgMaxScratch,
+        dispatch: &MetalPagedGqaDispatchPlan,
+        component_values: usize,
+        thread_width: usize,
+    ) -> Result<()> {
+        self.encode_prepared_mapped_mtp_frontend_from_selector(
+            encoder, step, prepared, selector, false,
+        )?;
+        self.encode_prepared_mapped_mtp_layer_and_draft(
+            encoder,
+            step,
+            prepared,
+            dispatch,
+            component_values,
+            thread_width,
+        )
+    }
+
     fn encode_prepared_mapped_mtp_layer_and_draft(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -12742,10 +12798,16 @@ impl MetalCandidateRuntime {
             command_buffer.set_label("ctox-qwen38-greedy-mtp-target-verifier");
             let encoder = command_buffer.new_compute_command_encoder();
             let encoded: Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> = (|| {
-                self.encode_prepared_mapped_mtp_draft(
+                self.encode_copy_argmax_result(
+                    encoder,
+                    &mtp.draft_selector,
+                    &mtp.candidate_selector,
+                )?;
+                self.encode_prepared_mapped_mtp_draft_from_selector(
                     encoder,
                     mtp_step,
                     mtp,
+                    &mtp.candidate_selector,
                     &mtp_dispatch,
                     component_values,
                     thread_width,
@@ -12754,7 +12816,7 @@ impl MetalCandidateRuntime {
                     encoder,
                     program,
                     target,
-                    &mtp.target_selector,
+                    &mtp.candidate_selector,
                 )?;
                 self.encode_argmax_f32_at(
                     encoder,
@@ -14875,6 +14937,41 @@ mod tests {
             runtime
                 .read_mapped_argmax_result(&scratch, crate::tokenizer::TOKENIZER_VOCAB_SIZE)
                 .expect("read canonical token"),
+            9_001
+        );
+    }
+
+    #[test]
+    fn compact_draft_selector_copies_to_full_vocab_candidate_on_device() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let draft = runtime
+            .prepare_argmax_f32_scratch(4)
+            .expect("draft selector scratch");
+        let candidate = runtime
+            .prepare_argmax_f32_scratch(crate::tokenizer::TOKENIZER_VOCAB_SIZE)
+            .expect("candidate selector scratch");
+        write_buffer_range(
+            &draft.result_buffer,
+            0,
+            as_bytes(&[9_001_u32, 0]),
+            2 * std::mem::size_of::<u32>(),
+        )
+        .expect("write mapped draft selector");
+        zero_buffer(&candidate.result_buffer, 2 * std::mem::size_of::<u32>());
+
+        let command_buffer = runtime.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        runtime
+            .encode_copy_argmax_result(encoder, &draft, &candidate)
+            .expect("copy compact candidate on device");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        assert_eq!(
+            runtime
+                .read_argmax_result(&candidate)
+                .expect("read full-vocabulary candidate"),
             9_001
         );
     }

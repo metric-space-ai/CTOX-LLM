@@ -1423,8 +1423,8 @@ kernel void qwen_causal_conv_silu_f16(
     output[channel] = sum / (1.0f + exp(-sum));
 }
 
-// Test builds use this only to preserve verifier inputs across later legal
-// shared-arena aliases. Production dispatch never binds this kernel.
+// Preserve small verifier/candidate values across later legal aliases. The
+// same bitwise copy also carries compact uint argmax result words.
 kernel void qwen_copy_f32(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],

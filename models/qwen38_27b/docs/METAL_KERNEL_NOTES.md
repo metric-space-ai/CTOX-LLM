@@ -222,6 +222,13 @@ bonus token without separate selector reads. The four-candidate device branch,
 partial-prefix restore/replay, full-artifact device evidence, and production
 executor integration remain pending.
 
+The continuation path now preserves each canonical mapped draft in a distinct
+full-vocabulary candidate selector with a two-word device copy before the
+restricted selector is overwritten. MTP embedding and target embedding both
+consume that candidate. This keeps speculative inputs draft-driven even when
+later verification rejects them; the host still reads only the final compact
+verification result.
+
 Paged-GQA dispatch no longer implicitly hard-wires its owner's mutable
 descriptor and parameter buffers. An explicit metadata-binding encoder accepts
 immutable per-step snapshots while retaining the same single Q2/Q4 KV arenas,
