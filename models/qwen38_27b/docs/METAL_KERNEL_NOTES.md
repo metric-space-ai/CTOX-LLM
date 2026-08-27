@@ -200,7 +200,14 @@ The gathered kernels share one canonical row-ID buffer across mixed Q2/Q4
 segments. A second finite-checking argmax selects the restricted local row and
 `qwen_argmax_index_to_token` maps it in place to the global token through that
 same buffer, without an intermediate host read. Only the verifier reads draft
-logits. Target verification and the joint target transaction remain pending.
+logits. The greedy one-draft verifier now appends a selector-driven complete
+target transition and its second full-vocabulary argmax to the same encoder.
+It requires target state to enter exactly one token ahead of MTP, checks that
+the relation is restored after both transitions, and commits both checkpoint
+sets only after the single completion wait and compact target/draft comparison.
+Encoding, GPU, non-finite, alignment, and verifier failures restore both
+branches. Chained MTP4, partial-prefix replay, full-artifact device evidence,
+and production executor integration remain pending.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

@@ -544,6 +544,13 @@ pub struct PreparedMappedMetalMtpCore {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGreedyMtpVerification {
+    pub target_token: u32,
+    pub draft_token: u32,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetalTargetCheckpointKind {
     FullAttention,
     LinearConvolution,
@@ -2298,6 +2305,29 @@ impl PreparedMappedMetalTargetLayers {
         })
     }
 
+    pub fn cached_tokens(&self) -> Result<usize> {
+        let mut expected = None;
+        for layer in &self.layers {
+            let PreparedMappedMetalTargetLayer::FullAttention(layer) = layer else {
+                continue;
+            };
+            match expected {
+                Some(tokens) if tokens != layer.cached_tokens() => {
+                    return Err(EngineError::InvalidState(format!(
+                        "Metal target full-attention caches disagree at layer {}: {tokens} versus {}",
+                        layer.layer(),
+                        layer.cached_tokens()
+                    )));
+                }
+                None => expected = Some(layer.cached_tokens()),
+                _ => {}
+            }
+        }
+        expected.ok_or_else(|| {
+            EngineError::InvalidState("Metal target graph has no full-attention cache".into())
+        })
+    }
+
     pub fn copied_model_bytes(&self) -> u64 {
         0
     }
@@ -2311,6 +2341,22 @@ impl PreparedMappedMetalTargetLayers {
 
     pub fn transaction_active(&self) -> bool {
         self.transaction_active
+    }
+
+    fn commit_ready(&self) -> bool {
+        self.transaction_active
+            && !self.poisoned
+            && self.layers.iter().all(|layer| match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    !layer.convolution.poisoned
+                        && layer.convolution.checkpoint_valid
+                        && !layer.recurrence.poisoned
+                        && layer.recurrence.checkpoint_valid
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    !layer.attention.poisoned && layer.attention.speculative_checkpoint.is_some()
+                }
+            })
     }
 
     pub fn begin_speculative(&mut self, runtime: &MetalCandidateRuntime) -> Result<()> {
@@ -2429,20 +2475,7 @@ impl PreparedMappedMetalTargetLayers {
     }
 
     pub fn commit_speculative(&mut self) -> Result<()> {
-        if !self.transaction_active
-            || self.poisoned
-            || self.layers.iter().any(|layer| match layer {
-                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
-                    layer.convolution.poisoned
-                        || !layer.convolution.checkpoint_valid
-                        || layer.recurrence.poisoned
-                        || !layer.recurrence.checkpoint_valid
-                }
-                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
-                    layer.attention.poisoned || layer.attention.speculative_checkpoint.is_none()
-                }
-            })
-        {
+        if !self.commit_ready() {
             return Err(EngineError::InvalidState(
                 "Metal target-layer commit requires one complete healthy transaction".into(),
             ));
@@ -2473,6 +2506,10 @@ impl PreparedMappedMetalTargetCore {
 
     pub fn resident_state_bytes(&self) -> Result<usize> {
         self.layers.resident_state_bytes()
+    }
+
+    pub fn cached_tokens(&self) -> Result<usize> {
+        self.layers.cached_tokens()
     }
 
     pub fn target_layers(&self) -> &PreparedMappedMetalTargetLayers {
@@ -11193,11 +11230,12 @@ impl MetalCandidateRuntime {
                 };
             }
         };
-        self.finish_prepared_mapped_target_core(prepared, &full_plans)?;
+        self.validate_completed_mapped_target_core(prepared, &full_plans)?;
+        prepared.layers.commit_speculative()?;
         Ok(selected)
     }
 
-    fn finish_prepared_mapped_target_core(
+    fn validate_completed_mapped_target_core(
         &self,
         prepared: &mut PreparedMappedMetalTargetCore,
         full_plans: &[(usize, MetalPagedGqaAppendPlan)],
@@ -11264,7 +11302,78 @@ impl MetalCandidateRuntime {
                 };
             }
         }
-        prepared.layers.commit_speculative()
+        Ok(())
+    }
+
+    fn validate_completed_mapped_mtp_layer(
+        &self,
+        prepared: &mut PreparedMappedMetalMtpCore,
+        plan: &MetalPagedGqaAppendPlan,
+        component_values: usize,
+    ) -> Result<()> {
+        prepared.layer.attention.poisoned = false;
+        #[cfg(not(test))]
+        let _ = (plan, component_values);
+        #[cfg(test)]
+        {
+            let key = unsafe {
+                slice::from_raw_parts(
+                    prepared
+                        .layer
+                        .attention
+                        .verifier_key_snapshot_buffer
+                        .contents()
+                        .cast::<f32>(),
+                    component_values,
+                )
+                .to_vec()
+            };
+            let value = unsafe {
+                slice::from_raw_parts(
+                    prepared
+                        .layer
+                        .attention
+                        .verifier_value_snapshot_buffer
+                        .contents()
+                        .cast::<f32>(),
+                    component_values,
+                )
+                .to_vec()
+            };
+            self.commit_paged_gqa_verifier_append(
+                &mut prepared.layer.attention,
+                plan,
+                &key,
+                &value,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn restore_mapped_greedy_mtp_target(
+        &self,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+    ) -> Result<()> {
+        let mut errors = Vec::new();
+        if mtp.layer.attention.speculative_checkpoint.is_some() {
+            if let Err(error) = mtp.layer.attention.restore_speculative() {
+                errors.push(format!("MTP: {error}"));
+            }
+        }
+        if target.layers.transaction_active {
+            if let Err(error) = target.layers.restore_speculative(self) {
+                errors.push(format!("target: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(EngineError::InvalidState(format!(
+                "Metal joint target/MTP rollback failed: {}",
+                errors.join("; ")
+            )))
+        }
     }
 
     fn validate_prepared_mapped_mtp_frontend<'program, 'arena>(
@@ -11766,6 +11875,48 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    fn encode_prepared_mapped_mtp_draft(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        step: &PreparedMetalDecodeStepView<'_>,
+        prepared: &PreparedMappedMetalMtpCore,
+        plan: &MetalPagedGqaAppendPlan,
+        component_values: usize,
+        thread_width: usize,
+    ) -> Result<()> {
+        self.encode_prepared_mapped_mtp_frontend(encoder, step, prepared)?;
+        self.encode_prepared_mapped_mtp_layer(
+            encoder,
+            prepared,
+            plan,
+            component_values,
+            thread_width,
+        )?;
+        let final_normalized = prepared
+            .workspace
+            .buffer_and_offset(MetalMtpBufferSlot::FinalNormalized)?;
+        self.encode_mapped_gathered_between(
+            encoder,
+            &prepared.lm_head,
+            final_normalized.0,
+            final_normalized.1,
+            step.writes()[0].buffer(),
+            step.writes()[0].offset(),
+        )?;
+        self.encode_argmax_f32_at(
+            encoder,
+            step.writes()[0].buffer(),
+            step.writes()[0].offset(),
+            &prepared.draft_selector,
+        );
+        self.encode_argmax_index_to_token(
+            encoder,
+            &prepared.lm_head.row_ids_buffer,
+            &prepared.draft_selector,
+        );
+        Ok(())
+    }
+
     /// Bring-up execution of the complete native MTP frontend, one transformer
     /// layer, and canonical restricted LM head. It advances the dedicated MTP
     /// KV state only after a successful finite draft and restores append
@@ -11796,39 +11947,14 @@ impl MetalCandidateRuntime {
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-mtp-frontend-layer-verifier");
             let encoder = command_buffer.new_compute_command_encoder();
-            let encoded: Result<()> = (|| {
-                self.encode_prepared_mapped_mtp_frontend(encoder, step, prepared)?;
-                self.encode_prepared_mapped_mtp_layer(
-                    encoder,
-                    prepared,
-                    &plan,
-                    component_values,
-                    thread_width,
-                )?;
-                let final_normalized = prepared
-                    .workspace
-                    .buffer_and_offset(MetalMtpBufferSlot::FinalNormalized)?;
-                self.encode_mapped_gathered_between(
-                    encoder,
-                    &prepared.lm_head,
-                    final_normalized.0,
-                    final_normalized.1,
-                    step.writes()[0].buffer(),
-                    step.writes()[0].offset(),
-                )?;
-                self.encode_argmax_f32_at(
-                    encoder,
-                    step.writes()[0].buffer(),
-                    step.writes()[0].offset(),
-                    &prepared.draft_selector,
-                );
-                self.encode_argmax_index_to_token(
-                    encoder,
-                    &prepared.lm_head.row_ids_buffer,
-                    &prepared.draft_selector,
-                );
-                Ok(())
-            })();
+            let encoded = self.encode_prepared_mapped_mtp_draft(
+                encoder,
+                step,
+                prepared,
+                &plan,
+                component_values,
+                thread_width,
+            );
             encoder.end_encoding();
             encoded?;
             command_buffer.commit();
@@ -11906,6 +12032,131 @@ impl MetalCandidateRuntime {
                 Ok(()) => Err(primary),
                 Err(rollback) => Err(EngineError::InvalidState(format!(
                     "Metal MTP layer failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            },
+        }
+    }
+
+    /// Execute one greedy MTP proposal and its full target verification in a
+    /// single Metal command buffer. The entry contract is the canonical
+    /// target-one-token-ahead state. MTP consumes the resident target-selected
+    /// token, the target graph consumes that same device selector, and the
+    /// resulting full-vocabulary target argmax is compared with the mapped
+    /// restricted draft only after the sole completion wait.
+    pub fn dispatch_prepared_mapped_greedy_mtp_target_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+    ) -> Result<MetalGreedyMtpVerification> {
+        let mtp_step = self.validate_prepared_mapped_mtp_frontend(program, mtp)?;
+        let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(mtp)?;
+        let target_lm_head = self.validate_prepared_mapped_target_core(program, target)?[2];
+        let target_tokens = target.cached_tokens()?;
+        let mtp_tokens = mtp.cached_tokens();
+        if target_tokens == 0
+            || target_tokens != mtp_tokens.saturating_add(1)
+            || mtp.target_selector.values != target.vocabulary_rows()
+            || !Rc::ptr_eq(
+                &target.embedding.mapping.inner,
+                &mtp.embedding.mapping.inner,
+            )
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal greedy MTP verification requires one canonical target-one-ahead graph, observed target/MTP tokens {target_tokens}/{mtp_tokens}"
+            )));
+        }
+
+        target.layers.begin_speculative(self)?;
+        if let Err(primary) = mtp.layer.attention.begin_speculative() {
+            return match self.restore_mapped_greedy_mtp_target(target, mtp) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal joint checkpoint failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            };
+        }
+
+        let result = (|| {
+            let mtp_plan = self.plan_paged_gqa_append(&mut mtp.layer.attention)?;
+            write_metal_paged_gqa_descriptors(&mtp.layer.attention)?;
+            write_metal_paged_gqa_params(&mtp.layer.attention)?;
+            mtp.layer.attention.poisoned = true;
+            zero_buffer(
+                &mtp.target_selector.result_buffer,
+                2 * std::mem::size_of::<u32>(),
+            );
+            zero_buffer(
+                &mtp.draft_selector.result_buffer,
+                2 * std::mem::size_of::<u32>(),
+            );
+
+            let command_buffer = self.queue.new_command_buffer();
+            command_buffer.set_label("ctox-qwen38-greedy-mtp-target-verifier");
+            let encoder = command_buffer.new_compute_command_encoder();
+            let encoded: Result<Vec<(usize, MetalPagedGqaAppendPlan)>> = (|| {
+                self.encode_prepared_mapped_mtp_draft(
+                    encoder,
+                    mtp_step,
+                    mtp,
+                    &mtp_plan,
+                    component_values,
+                    thread_width,
+                )?;
+                let target_plans = self.encode_prepared_mapped_target_core_from_selector(
+                    encoder,
+                    program,
+                    target,
+                    &mtp.target_selector,
+                )?;
+                self.encode_argmax_f32_at(
+                    encoder,
+                    target_lm_head.writes()[0].buffer(),
+                    target_lm_head.writes()[0].offset(),
+                    &mtp.target_selector,
+                );
+                Ok(target_plans)
+            })();
+            encoder.end_encoding();
+            let target_plans = encoded?;
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal joint target/MTP command ended with {:?}",
+                    command_buffer.status()
+                )));
+            }
+
+            self.validate_completed_mapped_mtp_layer(mtp, &mtp_plan, component_values)?;
+            self.validate_completed_mapped_target_core(target, &target_plans)?;
+            let target_token = self.read_argmax_result(&mtp.target_selector)?;
+            let draft_token =
+                self.read_mapped_argmax_result(&mtp.draft_selector, target.vocabulary_rows())?;
+            if target.cached_tokens()? != mtp.cached_tokens().saturating_add(1)
+                || !target.layers.commit_ready()
+                || mtp.layer.attention.poisoned
+                || mtp.layer.attention.speculative_checkpoint.is_none()
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal joint target/MTP completion broke one-ahead or commit readiness".into(),
+                ));
+            }
+            target.layers.commit_speculative()?;
+            mtp.layer.attention.commit_speculative()?;
+            Ok(MetalGreedyMtpVerification {
+                target_token,
+                draft_token,
+                accepted: target_token == draft_token,
+            })
+        })();
+
+        match result {
+            Ok(verified) => Ok(verified),
+            Err(primary) => match self.restore_mapped_greedy_mtp_target(target, mtp) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal joint target/MTP verification failed ({primary}) and rollback failed: {rollback}"
                 ))),
             },
         }

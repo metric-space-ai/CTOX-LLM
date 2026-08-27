@@ -306,7 +306,8 @@ initial norm, all 64 layers, and the LM head without materializing its token as
 a host embedding request. Validation is shared with the ordinary host-token
 entry point, and state commits only after GPU completion plus compact selector
 status validation. This is the target-transition primitive required to verify
-the first MTP draft; the combined transaction is not yet assembled.
+the first MTP draft. The greedy one-draft verifier now assembles it with the
+MTP path below; chained MTP4 remains separate work.
 A native f32 concatenate kernel now also joins the normalized selected-token
 embedding and retained target hidden state directly in caller-owned Metal
 storage. A dedicated liveness-derived MTP arena backs the complete frontend in
@@ -320,8 +321,13 @@ now drive a gathered Q2/Q4 head that writes exactly those rows to `MtpDraft`
 without private activation I/O. A finite-checking restricted argmax selects a
 local row, then `qwen_argmax_index_to_token` maps it through that same
 canonical row-ID buffer to the global vocabulary token in the same encoder.
-Only target verification and the joint target+MTP transaction are still
-pending.
+`dispatch_prepared_mapped_greedy_mtp_target_verifier` now continues in that
+same command buffer: the full target graph consumes the resident selected
+token, produces fresh full-vocabulary logits, and runs the second target
+argmax. After the sole wait, compact target/draft IDs determine acceptance;
+both state graphs commit only if they still satisfy the target-one-token-ahead
+contract, otherwise both roll back. Full-artifact same-device evidence,
+chained MTP4, replay-on-reject, and production executor wiring remain pending.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first
