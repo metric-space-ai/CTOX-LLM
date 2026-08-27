@@ -8103,6 +8103,52 @@ impl MetalCandidateRuntime {
         output_buffer: &Buffer,
         output_offset: u64,
     ) -> Result<()> {
+        self.encode_paged_gqa_append_and_attention_with_metadata(
+            encoder,
+            prepared,
+            plan,
+            query_buffer,
+            query_offset,
+            key_buffer,
+            key_offset,
+            value_buffer,
+            value_offset,
+            output_buffer,
+            output_offset,
+            &prepared.descriptors_buffer,
+            &prepared.params_buffer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_paged_gqa_append_and_attention_with_metadata(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMetalPagedGqa,
+        plan: &MetalPagedGqaAppendPlan,
+        query_buffer: &Buffer,
+        query_offset: u64,
+        key_buffer: &Buffer,
+        key_offset: u64,
+        value_buffer: &Buffer,
+        value_offset: u64,
+        output_buffer: &Buffer,
+        output_offset: u64,
+        descriptors_buffer: &Buffer,
+        params_buffer: &Buffer,
+    ) -> Result<()> {
+        let descriptor_capacity = prepared
+            .page_to_q4_slot
+            .len()
+            .checked_mul(METAL_PAGED_KV_DESCRIPTOR_BYTES)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal KV descriptors overflow".into()))?;
+        if descriptors_buffer.length() < descriptor_capacity as u64
+            || params_buffer.length() < MetalPagedGqaParams::BYTE_LEN as u64
+        {
+            return Err(EngineError::MemoryBudget(
+                "Metal paged GQA metadata binding is truncated".into(),
+            ));
+        }
         let token_blocks = (prepared.key_value_heads * prepared.head_dim * 2) / BLOCK_LEN;
         let page_blocks = prepared
             .page_tokens
@@ -8170,7 +8216,7 @@ impl MetalCandidateRuntime {
         );
         encoder.set_buffer(
             MetalPagedGqaBufferAbi::DESCRIPTORS as u64,
-            Some(&prepared.descriptors_buffer),
+            Some(descriptors_buffer),
             0,
         );
         encoder.set_buffer(
@@ -8180,7 +8226,7 @@ impl MetalCandidateRuntime {
         );
         encoder.set_buffer(
             MetalPagedGqaBufferAbi::PARAMS as u64,
-            Some(&prepared.params_buffer),
+            Some(params_buffer),
             0,
         );
         encoder.dispatch_thread_groups(
@@ -8389,6 +8435,8 @@ impl MetalCandidateRuntime {
     ) -> Result<Vec<f32>> {
         let plan = self.plan_paged_gqa_append(prepared)?;
         write_metal_paged_gqa_descriptors(prepared)?;
+        let descriptor_snapshot =
+            buffer_with_data(&self.device, &metal_paged_gqa_descriptor_bytes(prepared)?);
         let query_buffer = prepared.query_buffer.as_ref().ok_or_else(|| {
             EngineError::InvalidState("Metal standalone GQA query buffer is missing".into())
         })?;
@@ -8403,13 +8451,15 @@ impl MetalCandidateRuntime {
             );
         }
         write_metal_paged_gqa_params(prepared)?;
+        let params_snapshot =
+            buffer_with_data(&self.device, &metal_paged_gqa_params_bytes(prepared)?);
 
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-paged-q2q4-gqa-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
         let key_buffer = buffer_with_data(&self.device, as_bytes(key));
         let value_buffer = buffer_with_data(&self.device, as_bytes(value));
-        self.encode_paged_gqa_append_and_attention(
+        self.encode_paged_gqa_append_and_attention_with_metadata(
             encoder,
             prepared,
             &plan,
@@ -8421,6 +8471,8 @@ impl MetalCandidateRuntime {
             0,
             output_buffer,
             0,
+            &descriptor_snapshot,
+            &params_snapshot,
         )?;
         encoder.end_encoding();
         command_buffer.commit();
@@ -13757,6 +13809,16 @@ fn buffer_with_data(device: &Device, bytes: &[u8]) -> metal_driver::Buffer {
 }
 
 fn write_metal_paged_gqa_descriptors(prepared: &PreparedMetalPagedGqa) -> Result<()> {
+    let descriptors = metal_paged_gqa_descriptor_bytes(prepared)?;
+    write_buffer_range(
+        &prepared.descriptors_buffer,
+        0,
+        &descriptors,
+        descriptors.len(),
+    )
+}
+
+fn metal_paged_gqa_descriptor_bytes(prepared: &PreparedMetalPagedGqa) -> Result<Vec<u8>> {
     let capacity = prepared
         .page_to_q4_slot
         .len()
@@ -13784,16 +13846,30 @@ fn write_metal_paged_gqa_descriptors(prepared: &PreparedMetalPagedGqa) -> Result
                 .map_err(|_| EngineError::Shape("Metal KV token index exceeds u32".into()))?,
         ]);
     }
-    zero_buffer(&prepared.descriptors_buffer, capacity);
-    write_buffer_range(
-        &prepared.descriptors_buffer,
-        0,
-        as_bytes(&descriptor_words),
-        capacity,
-    )
+    let words = as_bytes(&descriptor_words);
+    if words.len() > capacity {
+        return Err(EngineError::MemoryBudget(
+            "Metal populated KV descriptors exceed their capacity".into(),
+        ));
+    }
+    let mut descriptors = vec![0_u8; capacity];
+    descriptors[..words.len()].copy_from_slice(words);
+    Ok(descriptors)
 }
 
 fn write_metal_paged_gqa_params(prepared: &PreparedMetalPagedGqa) -> Result<()> {
+    let params = metal_paged_gqa_params_bytes(prepared)?;
+    write_buffer_range(
+        &prepared.params_buffer,
+        0,
+        &params,
+        MetalPagedGqaParams::BYTE_LEN,
+    )
+}
+
+fn metal_paged_gqa_params_bytes(
+    prepared: &PreparedMetalPagedGqa,
+) -> Result<[u8; MetalPagedGqaParams::BYTE_LEN]> {
     let combined_values = prepared
         .key_value_heads
         .checked_mul(prepared.head_dim)
@@ -13813,12 +13889,7 @@ fn write_metal_paged_gqa_params(prepared: &PreparedMetalPagedGqa) -> Result<()> 
         q4_page_bytes: usize_to_u32(prepared.q4_page_bytes, "Metal Q4 page bytes")?,
         scale: 1.0 / (prepared.head_dim as f32).sqrt(),
     };
-    write_buffer_range(
-        &prepared.params_buffer,
-        0,
-        &params.encode(),
-        MetalPagedGqaParams::BYTE_LEN,
-    )
+    Ok(params.encode())
 }
 
 fn usize_to_u32(value: usize, label: &str) -> Result<u32> {

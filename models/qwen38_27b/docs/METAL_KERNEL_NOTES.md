@@ -222,6 +222,14 @@ bonus token without separate selector reads. The four-candidate device branch,
 partial-prefix restore/replay, full-artifact device evidence, and production
 executor integration remain pending.
 
+Paged-GQA dispatch no longer implicitly hard-wires its owner's mutable
+descriptor and parameter buffers. An explicit metadata-binding encoder accepts
+immutable per-step snapshots while retaining the same single Q2/Q4 KV arenas,
+pack parameters, and append plan. The standalone paged-GQA oracle now executes
+through snapshot buffers and still matches the quantized scalar reference
+through page demotion. Multi-command speculative enqueue can therefore retain
+the exact page view and token count for each depth without copying KV payloads.
+
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
 active, appends retain all pre-branch Q4 pages and use the memory-plan boundary
