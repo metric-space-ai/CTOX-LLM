@@ -555,6 +555,7 @@ pub struct PreparedMappedMetalMtpCore {
     layer: PreparedMappedMetalFullAttentionLayer,
     lm_head: PreparedMappedMetalGatheredMatVec,
     workspace: PreparedMetalMtpWorkspace,
+    target_hidden_checkpoint: PreparedMetalF32Checkpoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,7 +814,7 @@ struct MetalPartialRopeDispatchPlan {
     params_buffer: Buffer,
 }
 
-/// One of four persistent metadata slots owned by every full-attention layer.
+/// One of five persistent metadata slots owned by every full-attention layer.
 /// Slots retain only compact dispatch descriptors/parameters and test-only
 /// K/V verifier snapshots; packed KV payloads remain in the single cache.
 struct MetalFullAttentionDispatchSlot {
@@ -1016,6 +1017,10 @@ impl PreparedMetalDecodeWorkspace {
         self.plan.total_bytes()
     }
 
+    pub fn reset(&mut self) {
+        zero_buffer(&self.buffer, self.plan.total_bytes());
+    }
+
     pub fn binding(&self, slot: MetalBufferSlot) -> Result<MetalDecodeBufferBinding> {
         self.plan.binding(slot)
     }
@@ -1126,6 +1131,12 @@ impl PreparedMetalDecodeWorkspace {
             )
         };
         Ok(values.to_vec())
+    }
+}
+
+impl PreparedMetalMtpWorkspace {
+    pub fn reset(&mut self) {
+        zero_buffer(&self.buffer, self.plan.total_bytes());
     }
 }
 
@@ -2285,6 +2296,29 @@ impl PreparedMappedMetalLinearAttentionLayer {
     pub fn copied_model_bytes(&self) -> u64 {
         0
     }
+
+    pub fn transient_bytes(&self) -> Result<usize> {
+        self.projections
+            .iter()
+            .map(PreparedMappedMetalMatVec::transient_bytes)
+            .chain([
+                self.convolution.transient_bytes(),
+                self.gated_delta_prepare.transient_bytes(),
+                self.recurrence.transient_bytes(),
+                self.gated_rms_norm.transient_bytes(),
+                self.linear_output_projection.transient_bytes(),
+                self.residual_rms_norm.transient_bytes(),
+                self.ffn_gate_up[0].transient_bytes(),
+                self.ffn_gate_up[1].transient_bytes(),
+                self.swiglu_down.transient_bytes(),
+                self.post_ffn_residual_rms_norm.transient_bytes(),
+            ])
+            .try_fold(0_usize, |total, bytes| {
+                total.checked_add(bytes).ok_or_else(|| {
+                    EngineError::MemoryBudget("Metal linear-attention graph bytes overflow".into())
+                })
+            })
+    }
 }
 
 impl PreparedMappedMetalFullAttentionFanout {
@@ -2346,6 +2380,28 @@ impl PreparedMappedMetalFullAttentionLayer {
         self.query_gate.write_position(position)?;
         self.key_rope.write_position(position)
     }
+
+    pub fn transient_bytes(&self) -> Result<usize> {
+        [
+            self.fanout.transient_bytes(),
+            self.query_gate.transient_bytes(),
+            self.key_norm.transient_bytes(),
+            self.key_rope.transient_bytes(),
+            self.attention.transient_bytes(),
+            self.attention_output.transient_bytes(),
+            self.residual_rms_norm.transient_bytes(),
+            self.ffn_gate_up[0].transient_bytes(),
+            self.ffn_gate_up[1].transient_bytes(),
+            self.swiglu_down.transient_bytes(),
+            self.post_ffn_residual_rms_norm.transient_bytes(),
+        ]
+        .into_iter()
+        .try_fold(0_usize, |total, bytes| {
+            total.checked_add(bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("Metal full-attention graph bytes overflow".into())
+            })
+        })
+    }
 }
 
 impl PreparedMappedMetalTargetLayer {
@@ -2378,6 +2434,13 @@ impl PreparedMappedMetalTargetLayer {
         match self {
             Self::LinearAttention(_) => Ok(()),
             Self::FullAttention(layer) => layer.write_position(position),
+        }
+    }
+
+    pub fn transient_bytes(&self) -> Result<usize> {
+        match self {
+            Self::LinearAttention(layer) => layer.transient_bytes(),
+            Self::FullAttention(layer) => layer.transient_bytes(),
         }
     }
 }
@@ -2436,6 +2499,14 @@ impl PreparedMappedMetalTargetLayers {
 
     pub fn copied_model_bytes(&self) -> u64 {
         0
+    }
+
+    pub fn transient_bytes(&self) -> Result<usize> {
+        self.layers.iter().try_fold(0_usize, |total, layer| {
+            total.checked_add(layer.transient_bytes()?).ok_or_else(|| {
+                EngineError::MemoryBudget("Metal target graph bytes overflow".into())
+            })
+        })
     }
 
     pub fn write_position(&self, position: u64) -> Result<()> {
@@ -2600,6 +2671,23 @@ impl PreparedMappedMetalTargetLayers {
         self.transaction_active = false;
         Ok(())
     }
+
+    pub fn reset_session(&mut self) -> Result<()> {
+        for layer in &mut self.layers {
+            match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    layer.convolution.reset();
+                    layer.recurrence.reset();
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    layer.attention.reset();
+                }
+            }
+        }
+        self.transaction_active = false;
+        self.poisoned = false;
+        self.write_position(0)
+    }
 }
 
 impl PreparedMappedMetalTargetCore {
@@ -2612,6 +2700,21 @@ impl PreparedMappedMetalTargetCore {
 
     pub fn resident_state_bytes(&self) -> Result<usize> {
         self.layers.resident_state_bytes()
+    }
+
+    pub fn transient_bytes(&self) -> Result<usize> {
+        [
+            self.embedding.transient_bytes(),
+            self.initial_norm.transient_bytes(),
+            self.layers.transient_bytes()?,
+            self.lm_head.transient_bytes(),
+        ]
+        .into_iter()
+        .try_fold(0_usize, |total, bytes| {
+            total.checked_add(bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("Metal target-core graph bytes overflow".into())
+            })
+        })
     }
 
     pub fn cached_tokens(&self) -> Result<usize> {
@@ -2639,6 +2742,10 @@ impl PreparedMappedMetalTargetCore {
         debug_assert_eq!(self.embedding.columns, self.initial_norm.columns);
         self.initial_norm.columns
     }
+
+    pub fn reset_session(&mut self) -> Result<()> {
+        self.layers.reset_session()
+    }
 }
 
 impl PreparedMappedMetalMtpCore {
@@ -2659,6 +2766,7 @@ impl PreparedMappedMetalMtpCore {
     pub fn transient_bytes(&self) -> Result<usize> {
         [
             self.workspace.transient_bytes()?,
+            self.target_hidden_checkpoint.resident_bytes(),
             self.embedding.transient_bytes(),
             self.target_selector.transient_bytes(),
             self.draft_selector.transient_bytes(),
@@ -2714,6 +2822,30 @@ impl PreparedMappedMetalMtpCore {
 
     pub fn scratch_bytes(&self) -> usize {
         self.workspace.total_bytes()
+    }
+
+    pub fn reset_session(&mut self) -> Result<()> {
+        self.layer.attention.reset();
+        self.workspace.reset();
+        self.target_hidden_checkpoint.clear();
+        zero_buffer(
+            &self.target_selector.result_buffer,
+            2 * std::mem::size_of::<u32>(),
+        );
+        zero_buffer(
+            &self.draft_selector.result_buffer,
+            2 * std::mem::size_of::<u32>(),
+        );
+        zero_buffer(
+            &self.candidate_selector.result_buffer,
+            2 * std::mem::size_of::<u32>(),
+        );
+        zero_buffer(&self.verification_buffer, METAL_GREEDY_MTP_HISTORY_BYTES);
+        zero_buffer(
+            &self.prefix_result_buffer,
+            METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>(),
+        );
+        self.write_position(0)
     }
 }
 
@@ -5315,6 +5447,7 @@ impl MetalCandidateRuntime {
             new_zeroed_buffer(&self.device, MetalGreedyMtpPrefixParams::BYTE_LEN)?;
         let workspace_plan = MetalMtpWorkspacePlan::qwen38(&config)?;
         let workspace = self.prepare_mtp_workspace(&workspace_plan)?;
+        let target_hidden_checkpoint = self.prepare_f32_checkpoint(hidden)?;
 
         let canonical = &mapping.inner;
         let mut layer_mappings = layer
@@ -5396,6 +5529,7 @@ impl MetalCandidateRuntime {
             layer,
             lm_head,
             workspace,
+            target_hidden_checkpoint,
         })
     }
 
@@ -11876,6 +12010,43 @@ impl MetalCandidateRuntime {
         prepared: &mut PreparedMappedMetalTargetCore,
         token: usize,
     ) -> Result<()> {
+        self.dispatch_prepared_mapped_target_core_with_cursor(program, prepared, token, None)
+            .map(|_| ())
+    }
+
+    /// Execute one target-only token under the same 645-step cursor contract
+    /// used by the joint target/MTP path. The new position is publishable only
+    /// after the sole Metal completion barrier and state commit both succeed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_prepared_mapped_complete_target_core(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetCore,
+        token: usize,
+        token_position: usize,
+        committed_tokens: usize,
+        admitted_context: usize,
+    ) -> Result<usize> {
+        self.dispatch_prepared_mapped_target_core_with_cursor(
+            program,
+            prepared,
+            token,
+            Some((token_position, committed_tokens, admitted_context)),
+        )?
+        .ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal complete target dispatch omitted its execution cursor".into(),
+            )
+        })
+    }
+
+    fn dispatch_prepared_mapped_target_core_with_cursor(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetCore,
+        token: usize,
+        cursor_contract: Option<(usize, usize, usize)>,
+    ) -> Result<Option<usize>> {
         if token >= prepared.embedding.rows {
             return Err(EngineError::InvalidState(
                 "Metal target core token exceeds the admitted embedding".into(),
@@ -11883,6 +12054,21 @@ impl MetalCandidateRuntime {
         }
         let [embedding, initial_norm, lm_head] =
             self.validate_prepared_mapped_target_core(program, prepared)?;
+        let target_tokens = prepared.cached_tokens()?;
+        let mut execution_cursor = cursor_contract
+            .map(|(token_position, committed_tokens, admitted_context)| {
+                if committed_tokens != target_tokens {
+                    return Err(EngineError::InvalidState(format!(
+                        "Metal complete target cursor reports {committed_tokens} committed tokens but target state contains {target_tokens}"
+                    )));
+                }
+                program.plan.execution_cursor(
+                    token_position,
+                    committed_tokens,
+                    admitted_context,
+                )
+            })
+            .transpose()?;
         let arena = embedding.writes()[0].buffer();
         prepared.layers.begin_speculative(self)?;
         let command_buffer = self.queue.new_command_buffer();
@@ -11919,6 +12105,21 @@ impl MetalCandidateRuntime {
         #[cfg(not(test))]
         let _ = &full_plans;
         encoder.end_encoding();
+        let final_schedule_index = match execution_cursor
+            .as_mut()
+            .map(record_complete_encoded_token)
+            .transpose()
+        {
+            Ok(index) => index,
+            Err(primary) => {
+                return match prepared.layers.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal target cursor encoding failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            }
+        };
         command_buffer.commit();
         command_buffer.wait_until_completed();
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
@@ -11933,6 +12134,27 @@ impl MetalCandidateRuntime {
                 ))),
             };
         }
+        let next_position_result = match (execution_cursor.take(), final_schedule_index) {
+            (Some(mut cursor), Some(schedule_index)) => cursor
+                .commit_after_completion(schedule_index)
+                .and_then(|_| cursor.finish())
+                .map(Some),
+            (None, None) => Ok(None),
+            _ => Err(EngineError::InvalidState(
+                "Metal complete target cursor lost its final barrier".into(),
+            )),
+        };
+        let next_position = match next_position_result {
+            Ok(position) => position,
+            Err(primary) => {
+                return match prepared.layers.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal target cursor completion failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            }
+        };
         for layer in &mut prepared.layers.layers {
             match layer {
                 PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
@@ -11976,7 +12198,8 @@ impl MetalCandidateRuntime {
                 };
             }
         }
-        prepared.layers.commit_speculative()
+        prepared.layers.commit_speculative()?;
+        Ok(next_position)
     }
 
     /// Bring-up boundary for a target transition whose input token already
@@ -12042,6 +12265,49 @@ impl MetalCandidateRuntime {
         self.validate_completed_mapped_target_core(prepared, &full_plans)?;
         prepared.layers.commit_speculative()?;
         Ok(selected)
+    }
+
+    /// Select the greedy token from the resident full-vocabulary target logits
+    /// without copying that distribution to the host. The MTP core contributes
+    /// only its preallocated full-vocabulary argmax scratch; no MTP state is
+    /// advanced by this operation.
+    pub fn dispatch_prepared_mapped_target_argmax(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &PreparedMappedMetalTargetCore,
+        mtp: &PreparedMappedMetalMtpCore,
+    ) -> Result<u32> {
+        let target_lm_head = self.validate_prepared_mapped_target_core(program, target)?[2];
+        if mtp.target_selector.values != target.vocabulary_rows()
+            || mtp.vocabulary_rows() != target.vocabulary_rows()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target argmax scratch does not cover the canonical vocabulary".into(),
+            ));
+        }
+        zero_buffer(
+            &mtp.target_selector.result_buffer,
+            2 * std::mem::size_of::<u32>(),
+        );
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-resident-target-argmax");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_argmax_f32_at(
+            encoder,
+            target_lm_head.writes()[0].buffer(),
+            target_lm_head.writes()[0].offset(),
+            &mtp.target_selector,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal target argmax ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        self.read_argmax_result(&mtp.target_selector)
     }
 
     fn validate_completed_mapped_target_core(
@@ -12120,8 +12386,39 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    fn begin_mapped_greedy_mtp_target(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+    ) -> Result<()> {
+        target.layers.begin_speculative(self)?;
+        if let Err(primary) = mtp.layer.attention.begin_speculative() {
+            return match target.layers.restore_speculative(self) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal MTP attention checkpoint failed ({primary}) and target rollback failed: {rollback}"
+                ))),
+            };
+        }
+        if let Err(primary) = self.snapshot_workspace_f32(
+            &mut mtp.target_hidden_checkpoint,
+            program.workspace,
+            MetalBufferSlot::Normalized,
+        ) {
+            return match self.restore_mapped_greedy_mtp_target(program, target, mtp) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal target-hidden checkpoint failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            };
+        }
+        Ok(())
+    }
+
     fn restore_mapped_greedy_mtp_target(
         &self,
+        program: &PreparedMetalDecodeProgram<'_>,
         target: &mut PreparedMappedMetalTargetCore,
         mtp: &mut PreparedMappedMetalMtpCore,
     ) -> Result<()> {
@@ -12136,6 +12433,15 @@ impl MetalCandidateRuntime {
                 errors.push(format!("target: {error}"));
             }
         }
+        if mtp.target_hidden_checkpoint.is_active() {
+            if let Err(error) = self.restore_workspace_f32(
+                &mut mtp.target_hidden_checkpoint,
+                program.workspace,
+                MetalBufferSlot::Normalized,
+            ) {
+                errors.push(format!("target hidden: {error}"));
+            }
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -12144,6 +12450,25 @@ impl MetalCandidateRuntime {
                 errors.join("; ")
             )))
         }
+    }
+
+    fn commit_mapped_greedy_mtp_target(
+        &self,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+    ) -> Result<()> {
+        if !target.layers.commit_ready()
+            || mtp.layer.attention.poisoned
+            || mtp.layer.attention.speculative_checkpoint.is_none()
+            || !mtp.target_hidden_checkpoint.is_active()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal joint target/MTP commit is not completely checkpointed and healthy".into(),
+            ));
+        }
+        target.layers.commit_speculative()?;
+        mtp.layer.attention.commit_speculative()?;
+        mtp.target_hidden_checkpoint.commit()
     }
 
     fn restore_mapped_greedy_mtp_selectors(
@@ -13074,15 +13399,7 @@ impl MetalCandidateRuntime {
             )));
         }
 
-        target.layers.begin_speculative(self)?;
-        if let Err(primary) = mtp.layer.attention.begin_speculative() {
-            return match self.restore_mapped_greedy_mtp_target(target, mtp) {
-                Ok(()) => Err(primary),
-                Err(rollback) => Err(EngineError::InvalidState(format!(
-                    "Metal initial target/MTP checkpoint failed ({primary}) and rollback failed: {rollback}"
-                ))),
-            };
-        }
+        self.begin_mapped_greedy_mtp_target(program, target, mtp)?;
 
         let result = (|| {
             let mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
@@ -13182,20 +13499,20 @@ impl MetalCandidateRuntime {
                 || !target.layers.commit_ready()
                 || mtp.layer.attention.poisoned
                 || mtp.layer.attention.speculative_checkpoint.is_none()
+                || !mtp.target_hidden_checkpoint.is_active()
             {
                 return Err(EngineError::InvalidState(
                     "Metal initial target/MTP completion broke one-ahead or commit readiness"
                         .into(),
                 ));
             }
-            target.layers.commit_speculative()?;
-            mtp.layer.attention.commit_speculative()?;
+            self.commit_mapped_greedy_mtp_target(target, mtp)?;
             Ok((verified, next_position))
         })();
 
         match result {
             Ok(completed) => Ok(completed),
-            Err(primary) => match self.restore_mapped_greedy_mtp_target(target, mtp) {
+            Err(primary) => match self.restore_mapped_greedy_mtp_target(program, target, mtp) {
                 Ok(()) => Err(primary),
                 Err(rollback) => Err(EngineError::InvalidState(format!(
                     "Metal initial target/MTP verification failed ({primary}) and rollback failed: {rollback}"
@@ -13294,15 +13611,7 @@ impl MetalCandidateRuntime {
             )));
         }
 
-        target.layers.begin_speculative(self)?;
-        if let Err(primary) = mtp.layer.attention.begin_speculative() {
-            return match self.restore_mapped_greedy_mtp_target(target, mtp) {
-                Ok(()) => Err(primary),
-                Err(rollback) => Err(EngineError::InvalidState(format!(
-                    "Metal joint checkpoint failed ({primary}) and rollback failed: {rollback}"
-                ))),
-            };
-        }
+        self.begin_mapped_greedy_mtp_target(program, target, mtp)?;
 
         let result = (|| {
             let mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
@@ -13391,19 +13700,19 @@ impl MetalCandidateRuntime {
                 || !target.layers.commit_ready()
                 || mtp.layer.attention.poisoned
                 || mtp.layer.attention.speculative_checkpoint.is_none()
+                || !mtp.target_hidden_checkpoint.is_active()
             {
                 return Err(EngineError::InvalidState(
                     "Metal joint target/MTP completion broke one-ahead or commit readiness".into(),
                 ));
             }
-            target.layers.commit_speculative()?;
-            mtp.layer.attention.commit_speculative()?;
+            self.commit_mapped_greedy_mtp_target(target, mtp)?;
             Ok((verified, next_position))
         })();
 
         match result {
             Ok(completed) => Ok(completed),
-            Err(primary) => match self.restore_mapped_greedy_mtp_target(target, mtp) {
+            Err(primary) => match self.restore_mapped_greedy_mtp_target(program, target, mtp) {
                 Ok(()) => Err(primary),
                 Err(rollback) => Err(EngineError::InvalidState(format!(
                     "Metal joint target/MTP verification failed ({primary}) and rollback failed: {rollback}"
@@ -13505,15 +13814,7 @@ impl MetalCandidateRuntime {
             )));
         }
 
-        target.layers.begin_speculative(self)?;
-        if let Err(primary) = mtp.layer.attention.begin_speculative() {
-            return match self.restore_mapped_greedy_mtp_target(target, mtp) {
-                Ok(()) => Err(primary),
-                Err(rollback) => Err(EngineError::InvalidState(format!(
-                    "Metal fused MTP4 checkpoint failed ({primary}) and rollback failed: {rollback}"
-                ))),
-            };
-        }
+        self.begin_mapped_greedy_mtp_target(program, target, mtp)?;
 
         let branch = (|| {
             write_buffer_range(
@@ -13734,6 +14035,7 @@ impl MetalCandidateRuntime {
                 || !target.layers.commit_ready()
                 || mtp.layer.attention.poisoned
                 || mtp.layer.attention.speculative_checkpoint.is_none()
+                || !mtp.target_hidden_checkpoint.is_active()
             {
                 return Err(EngineError::InvalidState(
                     "Metal fused MTP4 completion broke one-ahead or commit readiness".into(),
@@ -13744,8 +14046,7 @@ impl MetalCandidateRuntime {
                     .take()
                     .map(|cursor| cursor.commit_after_shared_completion(final_schedule_indices))
                     .transpose()?;
-                target.layers.commit_speculative()?;
-                mtp.layer.attention.commit_speculative()?;
+                self.commit_mapped_greedy_mtp_target(target, mtp)?;
                 Ok((
                     MetalGreedyMtp4Branch {
                         prefix,
@@ -13755,7 +14056,7 @@ impl MetalCandidateRuntime {
                     next_position,
                 ))
             } else {
-                self.restore_mapped_greedy_mtp_target(target, mtp)?;
+                self.restore_mapped_greedy_mtp_target(program, target, mtp)?;
                 // Dropping the provisional block cursor with its five final
                 // barriers still pending makes the speculative positions
                 // unpublishable. Accepted state is rebuilt below from the real
@@ -13775,7 +14076,7 @@ impl MetalCandidateRuntime {
         let (branch, speculative_next_position) = match branch {
             Ok(branch) => branch,
             Err(primary) => {
-                return match self.restore_mapped_greedy_mtp_target(target, mtp) {
+                return match self.restore_mapped_greedy_mtp_target(program, target, mtp) {
                     Ok(()) => Err(primary),
                     Err(rollback) => Err(EngineError::InvalidState(format!(
                         "Metal fused MTP4 failed ({primary}) and rollback failed: {rollback}"
@@ -13909,15 +14210,7 @@ impl MetalCandidateRuntime {
             )));
         }
 
-        target.layers.begin_speculative(self)?;
-        if let Err(primary) = mtp.layer.attention.begin_speculative() {
-            return match self.restore_mapped_greedy_mtp_target(target, mtp) {
-                Ok(()) => Err(primary),
-                Err(rollback) => Err(EngineError::InvalidState(format!(
-                    "Metal MTP4 checkpoint failed ({primary}) and rollback failed: {rollback}"
-                ))),
-            };
-        }
+        self.begin_mapped_greedy_mtp_target(program, target, mtp)?;
 
         let result = (|| {
             zero_buffer(
@@ -14068,6 +14361,7 @@ impl MetalCandidateRuntime {
                 || !target.layers.commit_ready()
                 || mtp.layer.attention.poisoned
                 || mtp.layer.attention.speculative_checkpoint.is_none()
+                || !mtp.target_hidden_checkpoint.is_active()
             {
                 return Err(EngineError::InvalidState(
                     "Metal MTP4 completion broke prefix, one-ahead, or commit readiness".into(),
@@ -14076,10 +14370,9 @@ impl MetalCandidateRuntime {
             let branch_committed =
                 prefix.accepted_prefix as usize == MAXIMUM_METAL_GREEDY_MTP_DRAFTS;
             if branch_committed {
-                target.layers.commit_speculative()?;
-                mtp.layer.attention.commit_speculative()?;
+                self.commit_mapped_greedy_mtp_target(target, mtp)?;
             } else {
-                self.restore_mapped_greedy_mtp_target(target, mtp)?;
+                self.restore_mapped_greedy_mtp_target(program, target, mtp)?;
                 self.restore_mapped_greedy_mtp_selectors(mtp, previous)?;
             }
             Ok(MetalGreedyMtp4Branch {
@@ -14091,7 +14384,7 @@ impl MetalCandidateRuntime {
 
         match result {
             Ok(branch) => Ok(branch),
-            Err(primary) => match self.restore_mapped_greedy_mtp_target(target, mtp) {
+            Err(primary) => match self.restore_mapped_greedy_mtp_target(program, target, mtp) {
                 Ok(()) => match self.restore_mapped_greedy_mtp_selectors(mtp, previous) {
                     Ok(()) => Err(primary),
                     Err(selector_rollback) => Err(EngineError::InvalidState(format!(

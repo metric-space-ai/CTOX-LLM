@@ -366,8 +366,18 @@ a block cursor that keeps all five logical positions (input plus four drafts)
 provisional until its one shared GPU barrier completes; a partial prefix
 discards that cursor and publishes only the cursor-bound
 input-plus-accepted-draft replay positions. This closes the Metal runtime
-MTP4 cursor contract, not `ModelExecutor` integration, prefill, full-artifact
-Golden, or production promotion gates.
+MTP4 cursor contract. `MetalModelExecutor` now owns that runtime through the
+shared engine ABI: it prepares one mmap, one target arena, target/MTP state,
+cursor-bound target-only and joint decode, serial causally shifted prefill,
+resident greedy selection, reset, allocation reporting, and complete owned
+resource unload without a CPU model fallback. Its speculative commit method is
+an acknowledgement of the already device-resolved branch and fails closed if
+the engine-derived prefix differs. The joint checkpoint now also snapshots the
+last normalized target hidden vector on device, so partial rollback restores
+KV, convolution, GatedDelta, and the MTP frontend boundary together. This is a
+verifier lifecycle, not yet the threaded server adapter, chunked prefill,
+stochastic Metal sampler, full-artifact Golden, allocator high-watermark proof,
+or production promotion.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those
