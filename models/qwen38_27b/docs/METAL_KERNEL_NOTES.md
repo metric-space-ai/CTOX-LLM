@@ -77,6 +77,13 @@ tensors only when their packed FP16 bytes are identical. The dispatch consumes
 `Normalized` and writes `QueryGate`, `Key`, and `Value` at their shared-arena
 offsets in one encoder; it retains no input or output activation buffers.
 
+`PreparedMappedMetalQueryGate` retains the layer-specific mmap-backed FP16
+query norm plus only the reusable cosine/sine tables and a 32-byte parameter
+block. The Metal kernel ports the verified CUDA equation: it deinterleaves each
+256-value Query/Gate head, reduces query variance in one simdgroup, applies
+`(1 + weight)`, rotates the first 64 dimensions, and writes Query plus Gate to
+their exact arena views without a temporary normalized vector.
+
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
 active, appends retain all pre-branch Q4 pages and use the memory-plan boundary
@@ -130,6 +137,7 @@ the complete step set remains executor work.
 | `qwen_residual_rms_norm_1p_f32` | FP16 weight, two f32 inputs/two f32 outputs | fused residual add plus Qwen RMSNorm, one 32-wide simdgroup per row |
 | `qwen_rms_norm_gated_f32` | FP16 weight, f32 core/gate | one 32-wide simdgroup per value head |
 | `qwen_partial_rope_f32` | f32 Q/K heads in place | one thread per non-interleaved rotary pair |
+| `qwen_query_gate_norm_rope_f32` | mmap FP16 Q norm, interleaved f32 Query/Gate | one 32-wide simdgroup per query head; deinterleave + Qwen RMSNorm + partial RoPE |
 | `qwen_paged_q2q4_gqa_decode_f32` | f32 query/output, packed Q2/Q4 K/V | one 32-wide simdgroup per query head |
 | `qwen_gated_delta_recurrent_f16` | f32 step inputs/output, FP16 recurrent state | one threadgroup per value head |
 | `qwen_causal_conv_silu_f16` | f32 input/output, mmap FP16 weight/state | one thread per channel |
@@ -457,6 +465,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   canonical Layer-3 Q2/Q4 Q/K/V projections, compares every one of the 14,336
   logical arena outputs with independent recovered-row oracles, proves unused
   alias tails remain zero, and rejects the Layer-7 schedule view.
+- `query_gate_norm_rope_deinterleaves_directly_in_shared_arena` checks all
+  6,144 normalized/rotated Query values and all 6,144 untouched Gate values at
+  position 12,345, reuses the same owner at position zero, and rejects a
+  different layer before encoding.
 - `paged_q2q4_gqa_decode_matches_quantized_oracle_and_demotes_pages` forces a
   Q4-to-Q2 page transition, compares every decode step with the scalar GQA
   oracle using the identical quantized cache, verifies bounded arena byte
@@ -551,10 +563,10 @@ dequantization array before this source was accepted.
   `Normalized` view, then mixed-Q2/Q4 FFN gate/up fan-out and fused SwiGLU-down
   projection, then fused post-FFN residual-add/next-layer Qwen RMSNorm). The
   complete first linear-attention layer is therefore wired. Full-attention
-  schedule slices and the shared-arena Layer-3 fan-out, Key-RoPE, and combined
-  KV-append/paged-GQA edges are also executable. The remaining query/gate
-  normalization/RoPE, gated output projection, and later schedule
-  steps, the prefill arena, removal of the verifier CPU KV mirror, and complete
+  schedule slices and the shared-arena Layer-3 fan-out, Query/Gate
+  normalization/RoPE, Key-RoPE, and combined KV-append/paged-GQA edges are also
+  executable. The remaining gated output projection and later schedule steps,
+  the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

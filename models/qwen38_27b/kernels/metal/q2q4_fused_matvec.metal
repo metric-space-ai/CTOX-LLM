@@ -62,6 +62,17 @@ struct PartialRopeParams {
     uint reserved2;
 };
 
+struct QueryGateParams {
+    uint heads;
+    uint head_dim;
+    uint rotary_dim;
+    uint reserved0;
+    float epsilon;
+    uint reserved1;
+    uint reserved2;
+    uint reserved3;
+};
+
 struct KvPackParams {
     uint component_values;
     uint blocks;
@@ -786,6 +797,53 @@ kernel void qwen_partial_rope_f32(
     float right = values[base + index + half_dim];
     values[base + index] = left * cosine[index] - right * sine[index];
     values[base + index + half_dim] = right * cosine[index] + left * sine[index];
+}
+
+// Deinterleave each [query, gate] head, apply the exact Qwen query RMSNorm
+// convention normalized * (1 + weight), and rotate the non-interleaved query
+// prefix. One 32-wide simdgroup owns one complete 256-value head; no temporary
+// normalized query or host-visible split is materialized.
+// ref: kernels/cuda/q2q4_fused_matvec_sm86.cu:1427-1485
+kernel void qwen_query_gate_norm_rope_f32(
+    device const float* query_gate [[buffer(0)]],
+    device const half* q_norm_weight [[buffer(1)]],
+    device const float* cosine [[buffer(2)]],
+    device const float* sine [[buffer(3)]],
+    device float* query [[buffer(4)]],
+    device float* gate [[buffer(5)]],
+    constant QueryGateParams& params [[buffer(6)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (head >= params.heads || params.head_dim != 256u
+        || params.rotary_dim != 64u) {
+        return;
+    }
+    ulong input_base = ulong(head) * params.head_dim * 2u;
+    ulong output_base = ulong(head) * params.head_dim;
+    float sum_squares = 0.0f;
+    for (uint column = lane; column < params.head_dim; column += 32u) {
+        float value = query_gate[input_base + column];
+        gate[output_base + column] = query_gate[input_base + params.head_dim + column];
+        sum_squares = fma(value, value, sum_squares);
+    }
+    float variance = simd_sum(sum_squares) / float(params.head_dim);
+    float inverse = rsqrt(variance + params.epsilon);
+    uint half_dim = params.rotary_dim / 2u;
+    for (uint pair = lane; pair < half_dim; pair += 32u) {
+        uint right_column = pair + half_dim;
+        float left = query_gate[input_base + pair] * inverse
+            * (1.0f + float(q_norm_weight[pair]));
+        float right = query_gate[input_base + right_column] * inverse
+            * (1.0f + float(q_norm_weight[right_column]));
+        query[output_base + pair] = left * cosine[pair] - right * sine[pair];
+        query[output_base + right_column] = right * cosine[pair] + left * sine[pair];
+    }
+    for (uint column = params.rotary_dim + lane;
+         column < params.head_dim;
+         column += 32u) {
+        query[output_base + column] = query_gate[input_base + column] * inverse
+            * (1.0f + float(q_norm_weight[column]));
+    }
 }
 
 // Pack one device-resident [K,V] token directly into canonical Q4_B64. One

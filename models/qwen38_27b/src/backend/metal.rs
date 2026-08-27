@@ -29,6 +29,7 @@ pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
 pub const RESIDUAL_RMS_NORM_1P_KERNEL_NAME: &str = "qwen_residual_rms_norm_1p_f32";
 pub const RMS_NORM_GATED_KERNEL_NAME: &str = "qwen_rms_norm_gated_f32";
 pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
+pub const QUERY_GATE_NORM_ROPE_KERNEL_NAME: &str = "qwen_query_gate_norm_rope_f32";
 pub const KV_Q4_PACK_KERNEL_NAME: &str = "qwen_kv_q4_pack_f32";
 pub const KV_Q4_TO_Q2_KERNEL_NAME: &str = "qwen_kv_q4_to_q2";
 pub const PAGED_GQA_DECODE_KERNEL_NAME: &str = "qwen_paged_q2q4_gqa_decode_f32";
@@ -123,6 +124,19 @@ impl MetalPartialRopeBufferAbi {
     pub const COSINE: u32 = 1;
     pub const SINE: u32 = 2;
     pub const PARAMS: u32 = 3;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalQueryGateBufferAbi;
+
+impl MetalQueryGateBufferAbi {
+    pub const QUERY_GATE: u32 = 0;
+    pub const Q_NORM_WEIGHT: u32 = 1;
+    pub const COSINE: u32 = 2;
+    pub const SINE: u32 = 3;
+    pub const QUERY: u32 = 4;
+    pub const GATE: u32 = 5;
+    pub const PARAMS: u32 = 6;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +295,18 @@ pub struct MetalPartialRopeParams {
     pub reserved2: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalQueryGateParams {
+    pub heads: u32,
+    pub head_dim: u32,
+    pub rotary_dim: u32,
+    pub reserved0: u32,
+    pub epsilon: f32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+    pub reserved3: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetalKvPackParams {
     pub component_values: u32,
@@ -323,6 +349,30 @@ impl MetalPartialRopeParams {
             self.reserved0,
             self.reserved1,
             self.reserved2,
+        ]
+        .iter()
+        .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
+}
+
+impl MetalQueryGateParams {
+    pub const BYTE_LEN: usize = 32;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.heads,
+            self.head_dim,
+            self.rotary_dim,
+            self.reserved0,
+            self.epsilon.to_bits(),
+            self.reserved1,
+            self.reserved2,
+            self.reserved3,
         ]
         .iter()
         .enumerate()
@@ -974,6 +1024,18 @@ mod tests {
         );
         assert_eq!(
             [
+                MetalQueryGateBufferAbi::QUERY_GATE,
+                MetalQueryGateBufferAbi::Q_NORM_WEIGHT,
+                MetalQueryGateBufferAbi::COSINE,
+                MetalQueryGateBufferAbi::SINE,
+                MetalQueryGateBufferAbi::QUERY,
+                MetalQueryGateBufferAbi::GATE,
+                MetalQueryGateBufferAbi::PARAMS,
+            ],
+            [0, 1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            [
                 MetalGatedDeltaBufferAbi::QUERY,
                 MetalGatedDeltaBufferAbi::KEY,
                 MetalGatedDeltaBufferAbi::VALUE,
@@ -1251,6 +1313,25 @@ mod tests {
     }
 
     #[test]
+    fn query_gate_params_encode_matches_msl_struct() {
+        let words = MetalQueryGateParams {
+            heads: 24,
+            head_dim: 256,
+            rotary_dim: 64,
+            reserved0: 0,
+            epsilon: 1.0e-6,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }
+        .encode()
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+        assert_eq!(words, vec![24, 256, 64, 0, 1.0e-6_f32.to_bits(), 0, 0, 0]);
+    }
+
+    #[test]
     fn kv_pack_params_encode_matches_msl_struct() {
         let words = MetalKvPackParams {
             component_values: 1_024,
@@ -1446,6 +1527,7 @@ mod tests {
             RMS_NORM_1P_KERNEL_NAME,
             RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
             PARTIAL_ROPE_KERNEL_NAME,
+            QUERY_GATE_NORM_ROPE_KERNEL_NAME,
             PAGED_GQA_DECODE_KERNEL_NAME,
             GATED_DELTA_F16_KERNEL_NAME,
             GATED_DELTA_PREP_F32_KERNEL_NAME,

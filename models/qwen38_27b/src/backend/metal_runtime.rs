@@ -23,14 +23,16 @@ use super::metal::{
     MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi,
     MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalKvPackParams,
     MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi, MetalPagedGqaParams,
-    MetalPartialRopeBufferAbi, MetalPartialRopeParams, MetalResidualRmsNormBufferAbi,
-    MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSwiGluBufferAbi, ARGMAX_F32_FINAL_KERNEL_NAME,
-    ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME,
-    GATED_DELTA_PREP_F32_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME,
-    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
-    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME,
-    Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
-    RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
+    MetalPartialRopeBufferAbi, MetalPartialRopeParams, MetalQueryGateBufferAbi,
+    MetalQueryGateParams, MetalResidualRmsNormBufferAbi, MetalRmsNormBufferAbi, MetalRmsNormParams,
+    MetalSwiGluBufferAbi, ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME,
+    CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME,
+    KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP,
+    PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
+    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
+    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
+    QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
+    RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
@@ -74,6 +76,7 @@ pub struct MetalCandidateRuntime {
     residual_rms_norm_1p_pipeline: ComputePipelineState,
     rms_norm_gated_pipeline: ComputePipelineState,
     partial_rope_pipeline: ComputePipelineState,
+    query_gate_norm_rope_pipeline: ComputePipelineState,
     kv_q4_pack_pipeline: ComputePipelineState,
     kv_q4_to_q2_pipeline: ComputePipelineState,
     paged_gqa_decode_pipeline: ComputePipelineState,
@@ -444,6 +447,23 @@ pub struct PreparedMappedMetalCausalConv {
 pub struct PreparedMappedMetalFullAttentionFanout {
     layer: usize,
     projections: [PreparedMappedMetalMatVec; 3],
+}
+
+/// Mmap-backed query RMSNorm plus reusable partial-RoPE tables for one exact
+/// full-attention layer. QueryGate/Query/AttentionGate remain arena views.
+pub struct PreparedMappedMetalQueryGate {
+    layer: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f32,
+    epsilon: f32,
+    mapping: MappedMetalArtifact,
+    q_norm_weight_offset: u64,
+    cosine_buffer: Buffer,
+    sine_buffer: Buffer,
+    params_buffer: Buffer,
+    transient_bytes: usize,
 }
 
 /// Complete immutable resources and persistent state for one target
@@ -2020,6 +2040,51 @@ impl PreparedMappedMetalFullAttentionFanout {
     }
 }
 
+impl PreparedMappedMetalQueryGate {
+    pub fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
+
+    fn matches_weight_tensor(&self, name: &str) -> Result<bool> {
+        let (dtype, offset, values) = self.mapping.float_tensor_binding(name)?;
+        Ok(dtype == TensorDType::F16
+            && offset == self.q_norm_weight_offset
+            && values == self.head_dim)
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        partial_rope_params(
+            self.heads,
+            self.head_dim,
+            self.rotary_dim,
+            position,
+            self.theta,
+        )?;
+        let (cosine, sine) = partial_rope_tables(self.rotary_dim, position, self.theta)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cosine.as_ptr(),
+                self.cosine_buffer.contents().cast::<f32>(),
+                cosine.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                sine.as_ptr(),
+                self.sine_buffer.contents().cast::<f32>(),
+                sine.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -2116,6 +2181,13 @@ impl MetalCandidateRuntime {
             .map_err(|message| {
                 EngineError::InvalidState(format!(
                     "Metal Qwen partial-RoPE function lookup failed: {message}"
+                ))
+            })?;
+        let query_gate_norm_rope_function = library
+            .get_function(QUERY_GATE_NORM_ROPE_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal query/gate norm+RoPE function lookup failed: {message}"
                 ))
             })?;
         let kv_q4_pack_function =
@@ -2282,6 +2354,19 @@ impl MetalCandidateRuntime {
                     "Metal Qwen partial-RoPE pipeline creation failed: {message}"
                 ))
             })?;
+        let query_gate_norm_rope_pipeline = device
+            .new_compute_pipeline_state_with_function(&query_gate_norm_rope_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal query/gate norm+RoPE pipeline creation failed: {message}"
+                ))
+            })?;
+        if query_gate_norm_rope_pipeline.thread_execution_width() != 32 {
+            return Err(EngineError::InvalidState(format!(
+                "Metal query/gate norm+RoPE requires a 32-wide simdgroup, device reports {}",
+                query_gate_norm_rope_pipeline.thread_execution_width()
+            )));
+        }
         let kv_q4_pack_pipeline = device
             .new_compute_pipeline_state_with_function(&kv_q4_pack_function)
             .map_err(|message| {
@@ -2375,6 +2460,7 @@ impl MetalCandidateRuntime {
             residual_rms_norm_1p_pipeline,
             rms_norm_gated_pipeline,
             partial_rope_pipeline,
+            query_gate_norm_rope_pipeline,
             kv_q4_pack_pipeline,
             kv_q4_to_q2_pipeline,
             paged_gqa_decode_pipeline,
@@ -3123,6 +3209,82 @@ impl MetalCandidateRuntime {
             )));
         }
         Ok(PreparedMappedMetalFullAttentionFanout { layer, projections })
+    }
+
+    /// Prepare the exact per-layer query RMSNorm and partial-RoPE tables for
+    /// graph-owned QueryGate/Query/AttentionGate arena views.
+    pub fn prepare_mapped_query_gate_norm_rope(
+        &self,
+        mapping: &MappedMetalArtifact,
+        layer: usize,
+        position: u64,
+    ) -> Result<PreparedMappedMetalQueryGate> {
+        let config = Qwen38Config::default();
+        if config.layer_kind(layer) != Some(LayerKind::FullAttention) {
+            return Err(EngineError::InvalidState(format!(
+                "Metal layer {layer} is not a frozen Qwen full-attention layer"
+            )));
+        }
+        partial_rope_params(
+            config.num_attention_heads,
+            config.head_dim,
+            config.rotary_dim,
+            position,
+            config.rope_theta,
+        )?;
+        let name = format!("model.language_model.layers.{layer}.self_attn.q_norm.weight");
+        let weight = mapping.inner.artifact.float_tensor(&name)?;
+        let expected_weight_bytes = config
+            .head_dim
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q norm weight overflows".into()))?;
+        let weight_bytes = match weight {
+            FloatTensorView::F16Le(bytes) if bytes.len() == expected_weight_bytes => bytes,
+            FloatTensorView::F16Le(bytes) => {
+                return Err(EngineError::Shape(format!(
+                    "Metal Q norm weight has {} bytes, expected {expected_weight_bytes}",
+                    bytes.len()
+                )))
+            }
+            FloatTensorView::F32Le(_) => {
+                return Err(EngineError::UnsupportedDType(
+                    "Metal Q norm weight must remain packed FP16".into(),
+                ))
+            }
+        };
+        let q_norm_weight_offset = mapping.byte_offset(weight_bytes, "query RMSNorm weight")?;
+        let (cosine, sine) = partial_rope_tables(config.rotary_dim, position, config.rope_theta)?;
+        let params = MetalQueryGateParams {
+            heads: u32::try_from(config.num_attention_heads)
+                .map_err(|_| EngineError::Shape("Metal query heads exceed u32".into()))?,
+            head_dim: u32::try_from(config.head_dim)
+                .map_err(|_| EngineError::Shape("Metal query head dim exceeds u32".into()))?,
+            rotary_dim: u32::try_from(config.rotary_dim)
+                .map_err(|_| EngineError::Shape("Metal query rotary dim exceeds u32".into()))?,
+            reserved0: 0,
+            epsilon: config.rms_norm_epsilon,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        };
+        let transient_bytes = size_of_val(cosine.as_slice())
+            .checked_add(size_of_val(sine.as_slice()))
+            .and_then(|bytes| bytes.checked_add(MetalQueryGateParams::BYTE_LEN))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal query/gate bytes overflow".into()))?;
+        Ok(PreparedMappedMetalQueryGate {
+            layer,
+            heads: config.num_attention_heads,
+            head_dim: config.head_dim,
+            rotary_dim: config.rotary_dim,
+            theta: config.rope_theta,
+            epsilon: config.rms_norm_epsilon,
+            mapping: mapping.clone(),
+            q_norm_weight_offset,
+            cosine_buffer: buffer_with_data(&self.device, as_bytes(&cosine)),
+            sine_buffer: buffer_with_data(&self.device, as_bytes(&sine)),
+            params_buffer: buffer_with_data(&self.device, &params.encode()),
+            transient_bytes,
+        })
     }
 
     /// Prepare every immutable tensor and persistent state owner for one exact
@@ -7998,6 +8160,99 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    /// Deinterleave, Qwen-normalize, and partially rotate the query branch of
+    /// one full-attention layer directly between shared-arena views. The gate
+    /// branch is copied to its canonical arena slot in the same kernel.
+    pub fn dispatch_mapped_query_gate_norm_rope_view(
+        &self,
+        step: &PreparedMetalDecodeStepView<'_>,
+        prepared: &PreparedMappedMetalQueryGate,
+    ) -> Result<()> {
+        let layer = prepared.layer;
+        if step.step().layer != Some(layer)
+            || step.step().operation != MetalDecodeOperation::QueryGateNormRope
+            || step.reads().len() != 1
+            || step.writes().len() != 2
+            || step.reads()[0].slot() != MetalBufferSlot::QueryGate
+            || step.writes()[0].slot() != MetalBufferSlot::Query
+            || step.writes()[1].slot() != MetalBufferSlot::AttentionGate
+            || prepared.heads != 24
+            || prepared.head_dim != 256
+            || prepared.rotary_dim != 64
+            || !prepared.epsilon.is_finite()
+            || prepared.epsilon <= 0.0
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal query/gate layer {layer} does not match the frozen Qwen schedule or geometry"
+            )));
+        }
+        let query_values = prepared
+            .heads
+            .checked_mul(prepared.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal query width overflows".into()))?;
+        let input_values = query_values
+            .checked_mul(2)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal query/gate width overflows".into()))?;
+        let input = &step.reads()[0];
+        let query = &step.writes()[0];
+        let gate = &step.writes()[1];
+        let arena = input.buffer();
+        if input.values() < input_values
+            || query.values() < query_values
+            || gate.values() < query_values
+            || !std::ptr::eq(arena, query.buffer())
+            || !std::ptr::eq(arena, gate.buffer())
+            || !prepared.matches_weight_tensor(&format!(
+                "model.language_model.layers.{layer}.self_attn.q_norm.weight"
+            ))?
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal query/gate layer {layer} has incompatible arena views or Q-norm identity"
+            )));
+        }
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-shared-arena-query-gate-norm-rope");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.query_gate_norm_rope_pipeline);
+        for (binding, buffer, offset) in [
+            (MetalQueryGateBufferAbi::QUERY_GATE, arena, input.offset()),
+            (
+                MetalQueryGateBufferAbi::Q_NORM_WEIGHT,
+                &prepared.mapping.inner.buffer,
+                prepared.q_norm_weight_offset,
+            ),
+            (MetalQueryGateBufferAbi::COSINE, &prepared.cosine_buffer, 0),
+            (MetalQueryGateBufferAbi::SINE, &prepared.sine_buffer, 0),
+            (MetalQueryGateBufferAbi::QUERY, arena, query.offset()),
+            (MetalQueryGateBufferAbi::GATE, arena, gate.offset()),
+            (MetalQueryGateBufferAbi::PARAMS, &prepared.params_buffer, 0),
+        ] {
+            encoder.set_buffer(binding as u64, Some(buffer), offset);
+        }
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: prepared.heads as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal query/gate layer {layer} ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        Ok(())
+    }
+
     /// Execute one complete frozen linear-attention transformer layer from an
     /// already-normalized shared-arena input. The ten bound schedule views are
     /// reusable for every linear layer; immutable tensors remain mmap-backed,
@@ -12133,6 +12388,174 @@ mod tests {
                 );
             }
             assert!(actual[logical_values..].iter().all(|value| *value == 0.0));
+        }
+    }
+
+    #[test]
+    fn query_gate_norm_rope_deinterleaves_directly_in_shared_arena() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let config = Qwen38Config::default();
+        let heads = config.num_attention_heads;
+        let head_dim = config.head_dim;
+        let query_values = heads * head_dim;
+        let position = 12_345;
+        let q_norm_values: Vec<f32> = (0..head_dim)
+            .map(|index| ((index % 17) as f32 - 8.0) * 0.015625)
+            .collect();
+        let directory = tempdir().expect("temporary query/gate directory");
+        let path = directory.path().join("query-gate.ctoxq");
+        ArtifactBuilder {
+            model: "test/qwen38-query-gate".into(),
+            revision: "0123456789abcdef".into(),
+            target: "canonical-b64".into(),
+            alignment: DEFAULT_ALIGNMENT,
+            tensors: vec![PackedTensor {
+                name: "model.language_model.layers.3.self_attn.q_norm.weight".into(),
+                dtype: TensorDType::F16,
+                shape: vec![head_dim as u64],
+                bytes: f16_bytes(&q_norm_values),
+            }],
+        }
+        .write_new(&path)
+        .expect("write query/gate fixture");
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open query/gate fixture");
+        let mapped_q_norm = artifact
+            .float_tensor("model.language_model.layers.3.self_attn.q_norm.weight")
+            .expect("resolve query norm")
+            .to_f32_vec()
+            .expect("widen query norm oracle");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("map query/gate fixture");
+        let prepared = runtime
+            .prepare_mapped_query_gate_norm_rope(&mapping, 3, position)
+            .expect("prepare mapped query/gate kernel");
+        assert_eq!(prepared.layer(), 3);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert_eq!(
+            prepared.transient_bytes(),
+            config.rotary_dim * std::mem::size_of::<f32>() + MetalQueryGateParams::BYTE_LEN
+        );
+        assert!(runtime
+            .prepare_mapped_query_gate_norm_rope(&mapping, 0, position)
+            .is_err());
+        drop(mapping);
+        drop(artifact);
+
+        let mut query_gate = Vec::with_capacity(query_values * 2);
+        let mut raw_query = Vec::with_capacity(query_values);
+        let mut expected_gate = Vec::with_capacity(query_values);
+        for head in 0..heads {
+            let query = (0..head_dim)
+                .map(|column| ((head * 13 + column) as f32 * 0.019).sin() * 0.7)
+                .collect::<Vec<_>>();
+            let gate = (0..head_dim)
+                .map(|column| ((head * 17 + column) as f32 * 0.013).cos() * 0.5)
+                .collect::<Vec<_>>();
+            query_gate.extend_from_slice(&query);
+            query_gate.extend_from_slice(&gate);
+            raw_query.extend_from_slice(&query);
+            expected_gate.extend_from_slice(&gate);
+        }
+        let mut expected_query = crate::reference::rms_norm_1p_weight(
+            &raw_query,
+            heads,
+            head_dim,
+            &mapped_q_norm,
+            config.rms_norm_epsilon,
+        )
+        .expect("query RMSNorm oracle");
+        let mut unused_key = vec![0.0; head_dim];
+        crate::reference::apply_partial_rope(
+            &mut expected_query,
+            &mut unused_key,
+            heads,
+            1,
+            head_dim,
+            config.rotary_dim,
+            position,
+            config.rope_theta,
+        )
+        .expect("query partial-RoPE oracle");
+
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let projection_plan = MetalProjectionPlan::qwen38(&config).expect("Metal projection plan");
+        let binding_plan = MetalDecodeBindingPlan::qwen38(&schedule, &projection_plan, &config)
+            .expect("complete Metal binding plan");
+        let workspace_plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("decode workspace plan");
+        let mut workspace = runtime
+            .prepare_decode_workspace(&workspace_plan)
+            .expect("allocate shared decode arena");
+        workspace
+            .write_f32(MetalBufferSlot::QueryGate, &query_gate)
+            .expect("seed query/gate arena slot");
+        let program = workspace
+            .bind_decode_program(&binding_plan)
+            .expect("bind shared-arena decode program");
+        let layer_three = program
+            .full_attention_layer_steps(3)
+            .expect("bind layer-3 full attention");
+        let wrong_layer = program
+            .full_attention_layer_steps(7)
+            .expect("bind layer-7 full attention");
+        assert!(runtime
+            .dispatch_mapped_query_gate_norm_rope_view(&wrong_layer[1], &prepared)
+            .is_err());
+        runtime
+            .dispatch_mapped_query_gate_norm_rope_view(&layer_three[1], &prepared)
+            .expect("dispatch query/gate norm+RoPE in shared arena");
+        drop(program);
+        let actual_query = workspace
+            .read_f32(MetalBufferSlot::Query)
+            .expect("read query arena slot");
+        let actual_gate = workspace
+            .read_f32(MetalBufferSlot::AttentionGate)
+            .expect("read attention gate arena slot");
+        for (label, expected, actual) in [
+            ("query", &expected_query, &actual_query),
+            ("gate", &expected_gate, &actual_gate),
+        ] {
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 4.0e-5_f32.max(expected.abs() * 5.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "query/gate {label} value {index}: expected {expected}, got {actual}"
+                );
+            }
+        }
+
+        prepared
+            .write_position(0)
+            .expect("reuse query/gate tables at position zero");
+        workspace
+            .write_f32(MetalBufferSlot::QueryGate, &query_gate)
+            .expect("restore query/gate arena slot");
+        let program = workspace
+            .bind_decode_program(&binding_plan)
+            .expect("rebind shared-arena decode program");
+        let step = &program
+            .full_attention_layer_steps(3)
+            .expect("rebind layer-3 full attention")[1];
+        runtime
+            .dispatch_mapped_query_gate_norm_rope_view(step, &prepared)
+            .expect("reuse query/gate kernel at position zero");
+        drop(program);
+        let identity_query = workspace
+            .read_f32(MetalBufferSlot::Query)
+            .expect("read position-zero query");
+        let normalized_query = crate::reference::rms_norm_1p_weight(
+            &raw_query,
+            heads,
+            head_dim,
+            &mapped_q_norm,
+            config.rms_norm_epsilon,
+        )
+        .expect("position-zero query oracle");
+        for (expected, actual) in normalized_query.iter().zip(identity_query) {
+            let tolerance = 4.0e-5_f32.max(expected.abs() * 5.0e-5);
+            assert!((expected - actual).abs() <= tolerance);
         }
     }
 
