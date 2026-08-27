@@ -194,3 +194,8 @@ required-features = ["cuda"]
 name = "qwen38-cuda-sampling-verify"
 path = "src/bin/cuda_sampling_verify.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "qwen38-metal-executor-verify"
+path = "src/bin/metal_executor_verify.rs"
+required-features = ["metal"]

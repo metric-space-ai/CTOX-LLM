@@ -747,9 +747,17 @@ dequantization array before this source was accepted.
 
 ## Not yet done (promotion blockers)
 
-- The no-copy CTOXQ import is verified on a small real container, but complete
-  resident model tensor ownership, allocator high-watermark, and complete
-  unload have not yet been measured on the 7.8-GiB artifact.
+- `MetalModelExecutor` now owns one checksummed CTOXQ mmap, the complete target
+  and MTP graph, causally shifted serial prefill, resident target selection,
+  fused greedy MTP4 with exact partial-prefix replay, cancellation/reset, and
+  deterministic unload. `ThreadedMetalModelExecutor` keeps all Metal objects
+  on one driver thread and is reachable through the signed-profile Unix-socket
+  verifier server. `qwen38-metal-executor-verify` binds an exact artifact and
+  draft-vocabulary hash and records load/prefill/decode/commit/reset/cancel/
+  unload timings, target/MTP counters, and accounted residency. It is ready to
+  run when the final trained pack exists; no synthetic output is release
+  evidence. External allocator high-watermark and post-process residue still
+  need measurement on that final 7.8-GiB pack.
 - Exploratory 17408x5120 FFN measurements with eight dispatches per command
   reached roughly 26.55 GB/s for Q2 (four simdgroups/threadgroup) and
   43.95 GB/s for Q4 (two simdgroups/threadgroup). The earlier CTOX M5 hardware
@@ -787,8 +795,10 @@ dequantization array before this source was accepted.
   sigmoid-gated mixed-Q2/Q4 output projection edges are also executable. The
   complete first full-attention mixer and its residual/FFN tail are therefore
   wired through the next normalized layer input in one encoder and one wait.
-  Later layer execution, the prefill arena, release-build memory/high-watermark
-  evidence, and complete model-graph execution remain unfinished. The CPU KV
-  mirror is verifier-only and is not present in release builds.
+  The same encoders now cover the complete 64-layer target and native one-layer
+  MTP resource graphs through the executor. Serial prefill is correct but not
+  the final throughput path; a chunked prefill arena, release-build external
+  allocator evidence, and final-pack BF16/golden execution remain unfinished.
+  The CPU KV mirror is verifier-only and is not present in release builds.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

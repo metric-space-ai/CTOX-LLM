@@ -97,6 +97,9 @@ enum MetalWorkerCommand {
     Allocations {
         reply: SyncSender<Result<AllocationSnapshot>>,
     },
+    SessionTokenCounters {
+        reply: SyncSender<Result<(usize, usize)>>,
+    },
     Shutdown {
         reply: SyncSender<Result<()>>,
     },
@@ -246,6 +249,21 @@ impl MetalModelExecutor {
     fn accepted_prefix(records: &[MetalGreedyMtpVerification]) -> usize {
         records.iter().take_while(|record| record.accepted).count()
     }
+
+    /// Return committed target/MTP positions for lifecycle and replay
+    /// evidence. The target is one token ahead after a causally aligned MTP
+    /// prefill or decode transaction.
+    pub fn session_token_counters(&self) -> Result<(usize, usize)> {
+        let target = self
+            .target
+            .as_ref()
+            .ok_or_else(|| EngineError::InvalidState("Metal target is not loaded".into()))?;
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| EngineError::InvalidState("Metal MTP is not loaded".into()))?;
+        Ok((target.cached_tokens()?, mtp.cached_tokens()))
+    }
 }
 
 impl ThreadedMetalModelExecutor {
@@ -325,6 +343,12 @@ impl ThreadedMetalModelExecutor {
             MetalWorkerCommand::Allocations { reply }
         })?;
         Ok(())
+    }
+
+    pub fn session_token_counters(&self) -> Result<(usize, usize)> {
+        self.request("session token counters", |reply| {
+            MetalWorkerCommand::SessionTokenCounters { reply }
+        })
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -425,6 +449,9 @@ fn run_metal_worker(
             }
             MetalWorkerCommand::Allocations { reply } => {
                 let _ = reply.send(Ok(executor.allocations()));
+            }
+            MetalWorkerCommand::SessionTokenCounters { reply } => {
+                let _ = reply.send(executor.session_token_counters());
             }
             MetalWorkerCommand::Shutdown { reply } => {
                 let reset = executor.reset_session();

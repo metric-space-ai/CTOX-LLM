@@ -382,6 +382,11 @@ on one dedicated driver thread without an unsafe `Send` escape, and
 `qwen38-server --verification-metal` now loads the exact signed pack profile
 through the same Unix-socket Responses ABI as CPU and CUDA. The server mode
 remains verifier-only until the full-artifact and performance gates pass.
+`qwen38-metal-executor-verify` is the corresponding direct hardware-evidence
+runner: it rehashes the complete artifact and restricted MTP vocabulary, checks
+the hard resident-byte ceiling, executes prefill plus MTP4, validates committed
+target/MTP counters, cancellation and reset, and requires zero accounted bytes
+after unload.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those
