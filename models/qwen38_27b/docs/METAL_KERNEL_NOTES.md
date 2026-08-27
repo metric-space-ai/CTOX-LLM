@@ -74,11 +74,12 @@ Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
 active, appends retain all pre-branch Q4 pages and use the memory-plan boundary
 slot, so no referenced packed page is demoted or overwritten. Restore
-truncates appended mirror bytes, restores descriptor/parameter metadata, and
+truncates page metadata (and the test-only oracle), restores descriptors, and
 leaves unreferenced device bytes harmless; it never snapshots the Q2/Q4
 arenas. A four-token branch restores to the exact eight-token prefix and its
 replay produces bit-identical Metal attention outputs. The CPU packed mirror
-is still verifier-only and remains a promotion blocker.
+is compiled only under `cfg(test)`; release owners contain metadata and packed
+device arenas only.
 
 `PreparedMetalSpeculativeTransaction` composes those primitives into one
 all-or-nothing operation for the frozen decode graph: the final normalized
@@ -311,24 +312,28 @@ a bounded Q4 arena holds only sink pages, recent pages, and one
 precision-boundary page. One 16-byte descriptor per logical page selects the
 arena and physical slot. Stable three-pass softmax decodes Q2/Q4 blocks
 directly into registers and never creates an f32 K/V device cache. An append
-uploads only its changed page plus any page crossing the Q4-to-Q2 boundary.
+now packs only the new K/V token into its Q4 slot on device; a page crossing
+the retention boundary is demoted directly from its Q4 slot into the fixed Q2
+arena before that slot is reused.
 
 A device-only transition candidate now packs resident K/V inputs directly to
 canonical Q4_B64 and demotes Q4 blocks to canonical Q2_B64 in the same command
 encoder. Its Apple-device Golden test compares every output byte against the
 Rust Q4 quantizer and the exact Q4-dequantize-to-Q2 oracle. The paged-cache
-host path has not yet been switched to these kernels, so the CPU packed mirror
-remains an explicit promotion blocker rather than being hidden by this result.
+verifier now uses these kernels for its actual device pages and verifies every
+resident page byte against the independent CPU oracle. The CPU packed mirror
+exists only in test builds and drives reference policy/quality checks; release
+builds cannot allocate it.
 
 For the frozen 24-query-head/4-KV-head/256-wide topology, a token contains
 2,048 combined K/V values: 576 Q2 bytes or 1,088 Q4 bytes. A 128K layer with
 128-token pages, 128 sink tokens, and 256 recent tokens reserves 75,497,472
 Q2-arena bytes, 557,056 Q4-arena bytes, and 16,384 descriptor bytes:
 76,070,912 bytes (72.546875 MiB) per GQA layer and 1,217,134,592 bytes
-(1.133545 GiB) across all 16 attention layers. The verifier currently retains
-a CPU packed mirror for deterministic page transitions; that duplicate is not
-included in these device figures and must be eliminated by GPU-side packing
-and demotion before promotion.
+(1.133545 GiB) across all 16 attention layers. The production owner uses a
+metadata-only page policy and the packed arenas above. A full CPU packed mirror
+is present only in test builds and is excluded from release residency by
+construction.
 
 The recurrent GatedDeltaNet candidate keeps its matrix state exclusively in
 FP16. One threadgroup owns one value head and one thread owns one value column;
@@ -505,8 +510,8 @@ dequantization array before this source was accepted.
   evidence exists yet.
 - Recovered embedding rows, both Qwen RMSNorm variants, partial RoPE, packed
   decode GQA, causal convolution, and FP16 recurrent GatedDeltaNet exist as
-  verifier candidates. GQA still
-  duplicates its packed pages in a CPU correctness mirror; neither attention
+  verifier candidates. GQA release builds now keep only metadata plus packed
+  device arenas, while tests retain an independent CPU oracle; neither attention
   path has controlled performance evidence. The MTP block and sampling do not
   exist yet. A deterministic shared decode arena and its single Metal buffer
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
@@ -521,8 +526,8 @@ dequantization array before this source was accepted.
   projection, then fused post-FFN residual-add/next-layer Qwen RMSNorm). The
   complete first linear-attention layer is therefore wired. Full-attention
   schedule slices and the Layer-3 key-RoPE arena edge are also executable. The
-  remaining Full-Attention fan-out, query/gate normalization, device-only KV
-  append, paged-GQA arena edge, gated output projection, and later schedule
+  remaining Full-Attention fan-out, query/gate normalization, shared-arena KV
+  append input, paged-GQA arena edge, gated output projection, and later schedule
   steps, the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;

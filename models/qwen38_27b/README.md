@@ -260,7 +260,10 @@ lifecycle and account one checkpoint equal to their active-state bytes. Paged
 KV now uses a constant-size append marker plus small page-slot metadata: an
 active four-token branch suppresses Q4 demotion and consumes the already
 budgeted boundary slot, so restore never copies the full Q2/Q4 arenas. Metal
-replay reproduces the original branch outputs exactly. A graph-wide Metal
+packs new K/V tokens to Q4 and demotes complete pages to Q2 directly between
+device buffers. Release builds retain only page metadata and the packed Metal
+arenas; the full CPU byte mirror exists exclusively in tests as an independent
+oracle. Replay reproduces the original branch outputs exactly. A graph-wide Metal
 transaction now coordinates the final normalized target hidden, all 17
 target/MTP attention owners, and all 48 paired causal-convolution/GatedDelta
 owners. Begin prevalidates the entire resource set before changing any owner;

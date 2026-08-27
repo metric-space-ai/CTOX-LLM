@@ -308,6 +308,7 @@ pub struct KvCacheUpdate {
 /// Constant-size rollback marker for an append-only speculative KV branch.
 /// It is valid only when the branch suppresses page demotion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct PagedKvAppendCheckpoint {
     tokens: usize,
     pages: usize,
@@ -381,6 +382,7 @@ impl PagedKvCache {
     /// Append while retaining all existing Q4 pages. A bounded speculative
     /// branch uses this so rollback needs only truncate appended bytes and
     /// metadata; no pre-branch packed page can be demoted or overwritten.
+    #[cfg(test)]
     pub(crate) fn push_retaining_q4(
         &mut self,
         key: &[f32],
@@ -426,6 +428,7 @@ impl PagedKvCache {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn append_checkpoint(&self) -> PagedKvAppendCheckpoint {
         PagedKvAppendCheckpoint {
             tokens: self.tokens,
@@ -434,6 +437,7 @@ impl PagedKvCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn restore_append_checkpoint(
         &mut self,
         checkpoint: PagedKvAppendCheckpoint,
