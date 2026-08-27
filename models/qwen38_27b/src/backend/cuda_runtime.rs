@@ -1043,9 +1043,9 @@ pub struct PreparedCudaPagedGqa {
     speculative_checkpoint: Option<CudaPagedGqaCheckpoint>,
 }
 
-/// Fixed-address scratch for the unpromoted five-query split-KV verifier.
-/// It borrows the canonical cache at dispatch time and never owns or widens
-/// persistent K/V pages.
+/// Fixed-address scratch shared by ordinary one-query decode and MTP tail
+/// verification. It borrows the canonical cache at dispatch time and never
+/// owns or widens persistent K/V pages.
 pub struct PreparedCudaSplitPagedGqa {
     context: Rc<CudaContextInner>,
     query: DeviceBuffer,
@@ -4607,6 +4607,69 @@ impl CudaCandidateRuntime {
         self.append_and_dispatch_paged_q2q4_gqa_inner(prepared, query_ptr, key_ptr, value_ptr)?;
         prepared.poisoned = false;
         prepared.output.f32_view(0, query_values)
+    }
+
+    /// Appends one K/V row and evaluates its query with the shared split-KV
+    /// workspace. This is the production long-context decode entry point: K/V
+    /// packing, any page demotion, partial attention, and the online-softmax
+    /// combine remain in one context-owned submission without a dense cache or
+    /// host staging copy.
+    pub fn append_and_dispatch_paged_q2q4_gqa_split_device<'a>(
+        &self,
+        paged: &mut PreparedCudaPagedGqa,
+        split: &'a mut PreparedCudaSplitPagedGqa,
+        query: CudaDeviceF32View<'_>,
+        key: CudaDeviceF32View<'_>,
+        value: CudaDeviceF32View<'_>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &paged.context) || !Rc::ptr_eq(&self.inner, &split.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA split paged GQA operands belong to another context".into(),
+            ));
+        }
+        if paged.poisoned {
+            return Err(EngineError::InvalidState(
+                "CUDA split paged GQA state is poisoned; reset is required".into(),
+            ));
+        }
+        let query_values = paged.config.query_heads * paged.config.head_dim;
+        let component_values = paged.config.key_value_heads * paged.config.head_dim;
+        for (name, view, expected) in [
+            ("query", query, query_values),
+            ("key", key, component_values),
+            ("value", value, component_values),
+        ] {
+            if !Rc::ptr_eq(&self.inner, view.context) {
+                return Err(EngineError::InvalidState(format!(
+                    "CUDA split paged GQA {name} belongs to another context"
+                )));
+            }
+            if view.values() != expected {
+                return Err(EngineError::Shape(format!(
+                    "CUDA split paged GQA {name} has {} values, expected {expected}",
+                    view.values()
+                )));
+            }
+        }
+        if paged.tokens >= paged.config.maximum_tokens {
+            return Err(EngineError::MemoryBudget(
+                "CUDA split paged GQA reached its token capacity".into(),
+            ));
+        }
+
+        let query_ptr = query.ptr()?;
+        let key_ptr = key.ptr()?;
+        let value_ptr = value.ptr()?;
+        paged.poisoned = true;
+        let dispatched = (|| {
+            self.append_paged_q2q4_kv_inner(paged, key_ptr, value_ptr)?;
+            self.dispatch_paged_q2q4_gqa_split_inner(paged, split, query_ptr, 1)
+        })();
+        if let Err(error) = dispatched {
+            return Err(error);
+        }
+        paged.poisoned = false;
+        split.output.f32_view(0, query_values)
     }
 
     fn append_and_dispatch_paged_q2q4_gqa_inner(

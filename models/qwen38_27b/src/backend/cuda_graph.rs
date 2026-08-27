@@ -22,6 +22,7 @@ use crate::backend::cuda_runtime::{
     PreparedCudaGatedDeltaScanOutput, PreparedCudaGatedRmsNorm, PreparedCudaGatheredA8Projection,
     PreparedCudaPagedGqa, PreparedCudaPagedGqaPrefillOutput, PreparedCudaPartialRope,
     PreparedCudaQueryGate, PreparedCudaResidualRmsNorm, PreparedCudaRmsNorm,
+    PreparedCudaSplitPagedGqa,
 };
 use crate::backend::cuda_schedule::{
     CudaDecodeOperation, CudaDecodeSchedule, CudaDecodeStep, CudaMtpPrefillAlignment,
@@ -1592,6 +1593,7 @@ pub struct PreparedCudaProjectionGraph {
     mtp_draft_projection: Option<PreparedCudaGatheredA8Projection>,
     linear_mixers: BTreeMap<usize, PreparedCudaLinearMixerLayer>,
     full_attention: BTreeMap<String, PreparedCudaFullAttentionLayer>,
+    decode_split_workspace: PreparedCudaSplitPagedGqa,
     norms: PreparedCudaNormGraph,
     prefill_workspaces: PreparedCudaPrefillWorkspaces,
     mtp_concat: PreparedCudaF32Concat,
@@ -2009,6 +2011,41 @@ impl PreparedCudaFullAttentionLayer {
         let key = runtime.dispatch_partial_rope_f32_device(key_rope, key)?;
         let attention =
             runtime.append_and_dispatch_paged_q2q4_gqa_device(kv, query, key, value_input)?;
+        Ok((attention, gate))
+    }
+
+    /// Ordinary decode path using the graph-owned split-KV workspace. The
+    /// workspace is passed in by the model graph so all sixteen target layers
+    /// and the MTP layer reuse one fixed 2.23-MB allocation.
+    pub fn dispatch_split_device<'a>(
+        &'a mut self,
+        runtime: &CudaCandidateRuntime,
+        split: &'a mut PreparedCudaSplitPagedGqa,
+        query_gate_input: CudaDeviceF32View<'_>,
+        key_input: CudaDeviceF32View<'_>,
+        value_input: CudaDeviceF32View<'_>,
+        position: u64,
+    ) -> Result<(CudaDeviceF32View<'a>, CudaDeviceF32View<'a>)> {
+        let Self {
+            query_gate,
+            key_norm,
+            key_rope,
+            kv,
+            ..
+        } = self;
+        query_gate.write_position(position)?;
+        key_rope.write_position(position)?;
+        let (query, gate) =
+            runtime.dispatch_query_gate_norm_rope_device(query_gate, query_gate_input)?;
+        let key = runtime.dispatch_qwen_rms_norm_f16_device(key_norm, key_input)?;
+        let key = runtime.dispatch_partial_rope_f32_device(key_rope, key)?;
+        let attention = runtime.append_and_dispatch_paged_q2q4_gqa_split_device(
+            kv,
+            split,
+            query,
+            key,
+            value_input,
+        )?;
         Ok((attention, gate))
     }
 
@@ -2550,6 +2587,23 @@ impl PreparedCudaProjectionGraph {
                 full_attention.len()
             )));
         }
+        let representative_kv = &full_attention
+            .values()
+            .next()
+            .ok_or_else(|| {
+                EngineError::InvalidState(
+                    "prepared CUDA graph has no full-attention cache for split-KV setup".into(),
+                )
+            })?
+            .kv;
+        let decode_split_workspace = runtime.prepare_paged_q2q4_gqa_split(representative_kv)?;
+        graph_bytes = checked_add(
+            graph_bytes,
+            u64::try_from(decode_split_workspace.transient_bytes()).map_err(|_| {
+                EngineError::MemoryBudget("CUDA split-KV workspace exceeds u64".into())
+            })?,
+            "CUDA graph bytes",
+        )?;
         let norms = prepare_norms(runtime, artifact, config)?;
         model_bytes = checked_add(model_bytes, norms.model_bytes, "CUDA model bytes")?;
         graph_bytes = checked_add(graph_bytes, norms.graph_bytes, "CUDA graph bytes")?;
@@ -2616,6 +2670,7 @@ impl PreparedCudaProjectionGraph {
             mtp_draft_projection,
             linear_mixers,
             full_attention,
+            decode_split_workspace,
             norms,
             prefill_workspaces,
             mtp_concat,
@@ -2818,6 +2873,10 @@ impl PreparedCudaProjectionGraph {
         self.full_attention.get_mut(key).ok_or_else(|| {
             EngineError::InvalidState(format!("prepared CUDA full attention {key} not found"))
         })
+    }
+
+    pub fn decode_split_workspace_bytes(&self) -> usize {
+        self.decode_split_workspace.transient_bytes()
     }
 
     pub fn norms(&self) -> &PreparedCudaNormGraph {
@@ -3471,6 +3530,7 @@ impl PreparedCudaProjectionGraph {
             projections,
             linear_mixers,
             full_attention,
+            decode_split_workspace,
             norms,
             target_tokens,
             poisoned,
@@ -3507,8 +3567,9 @@ impl PreparedCudaProjectionGraph {
                                     "CUDA full-attention layer {layer} is not resident"
                                 ))
                             })?;
-                        let (attention_output, gate) = attention.dispatch_device(
+                        let (attention_output, gate) = attention.dispatch_split_device(
                             runtime,
+                            decode_split_workspace,
                             query_gate,
                             key,
                             value,
@@ -3732,6 +3793,7 @@ impl PreparedCudaProjectionGraph {
             activations,
             projections,
             full_attention,
+            decode_split_workspace,
             norms,
             mtp_concat,
             mtp_draft_projection,
@@ -3777,8 +3839,9 @@ impl PreparedCudaProjectionGraph {
             let attention = full_attention.get_mut("mtp:0").ok_or_else(|| {
                 EngineError::InvalidState("CUDA MTP full-attention state is not resident".into())
             })?;
-            let (attention_output, gate) = attention.dispatch_device(
+            let (attention_output, gate) = attention.dispatch_split_device(
                 runtime,
+                decode_split_workspace,
                 query_gate,
                 key,
                 value,
