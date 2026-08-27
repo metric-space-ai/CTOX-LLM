@@ -32,8 +32,8 @@ use super::metal::{
     Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME,
     Q2_SIGMOID_GATE_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
     Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
-    QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME,
-    RMS_NORM_GATED_KERNEL_NAME,
+    QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
+    RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
@@ -78,6 +78,7 @@ pub struct MetalCandidateRuntime {
     q2_recovered_row_pipeline: ComputePipelineState,
     q4_recovered_row_pipeline: ComputePipelineState,
     rms_norm_1p_pipeline: ComputePipelineState,
+    rms_norm_1p_head256_inplace_pipeline: ComputePipelineState,
     residual_rms_norm_1p_pipeline: ComputePipelineState,
     rms_norm_gated_pipeline: ComputePipelineState,
     partial_rope_pipeline: ComputePipelineState,
@@ -469,6 +470,7 @@ pub struct PreparedMappedMetalFullAttentionLayer {
     layer: usize,
     fanout: PreparedMappedMetalFullAttentionFanout,
     query_gate: PreparedMappedMetalQueryGate,
+    key_norm: PreparedMappedMetalRmsNorm,
     key_rope: PreparedMetalPartialRope,
     attention: PreparedMetalPagedGqa,
     attention_output: PreparedMappedMetalAttentionOutput,
@@ -503,6 +505,21 @@ pub struct PreparedMappedMetalTargetCore {
     embedding: PreparedMappedMetalEmbedding,
     initial_norm: PreparedMappedMetalRmsNorm,
     layers: PreparedMappedMetalTargetLayers,
+    lm_head: PreparedMappedMetalMatVec,
+}
+
+/// Closed no-copy resource owner for the native one-layer MTP graph. The
+/// embedding and shared LM-head views deliberately retain the same canonical
+/// mmap as the target core; only the packed MTP KV cache and small selector
+/// scratch own additional device memory.
+pub struct PreparedMappedMetalMtpCore {
+    embedding: PreparedMappedMetalEmbedding,
+    target_selector: PreparedMetalArgMaxScratch,
+    pre_embedding_norm: PreparedMappedMetalRmsNorm,
+    pre_hidden_norm: PreparedMappedMetalRmsNorm,
+    fc: PreparedMappedMetalMatVec,
+    input_norm: PreparedMappedMetalRmsNorm,
+    layer: PreparedMappedMetalFullAttentionLayer,
     lm_head: PreparedMappedMetalMatVec,
 }
 
@@ -2417,6 +2434,69 @@ impl PreparedMappedMetalTargetCore {
     }
 }
 
+impl PreparedMappedMetalMtpCore {
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.embedding.copied_model_bytes()
+            + self.pre_embedding_norm.copied_model_bytes()
+            + self.pre_hidden_norm.copied_model_bytes()
+            + self.fc.copied_model_bytes()
+            + self.input_norm.copied_model_bytes()
+            + self.layer.copied_model_bytes()
+            + self.lm_head.copied_model_bytes()
+    }
+
+    pub fn resident_state_bytes(&self) -> usize {
+        self.layer.resident_state_bytes()
+    }
+
+    pub fn transient_bytes(&self) -> Result<usize> {
+        [
+            self.embedding.transient_bytes(),
+            self.target_selector.transient_bytes(),
+            self.pre_embedding_norm.transient_bytes(),
+            self.pre_hidden_norm.transient_bytes(),
+            self.fc.transient_bytes(),
+            self.input_norm.transient_bytes(),
+            self.layer.fanout.transient_bytes(),
+            self.layer.query_gate.transient_bytes(),
+            self.layer.key_norm.transient_bytes(),
+            self.layer.key_rope.transient_bytes(),
+            self.layer.attention.transient_bytes(),
+            self.layer.attention_output.transient_bytes(),
+            self.layer.residual_rms_norm.transient_bytes(),
+            self.layer.ffn_gate_up[0].transient_bytes(),
+            self.layer.ffn_gate_up[1].transient_bytes(),
+            self.layer.swiglu_down.transient_bytes(),
+            self.layer.post_ffn_residual_rms_norm.transient_bytes(),
+            self.lm_head.transient_bytes(),
+        ]
+        .into_iter()
+        .try_fold(0_usize, |total, bytes| {
+            total.checked_add(bytes).ok_or_else(|| {
+                EngineError::MemoryBudget("Metal MTP transient bytes overflow".into())
+            })
+        })
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        self.layer.write_position(position)
+    }
+
+    pub fn cached_tokens(&self) -> usize {
+        self.layer.cached_tokens()
+    }
+
+    pub fn vocabulary_rows(&self) -> usize {
+        debug_assert_eq!(self.embedding.rows, self.lm_head.rows);
+        self.lm_head.rows
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        debug_assert_eq!(self.embedding.columns, self.pre_embedding_norm.columns);
+        self.embedding.columns
+    }
+}
+
 impl PreparedMappedMetalQueryGate {
     pub fn layer(&self) -> usize {
         self.layer
@@ -2551,6 +2631,13 @@ impl MetalCandidateRuntime {
             .map_err(|message| {
                 EngineError::InvalidState(format!(
                     "Metal Qwen RMSNorm function lookup failed: {message}"
+                ))
+            })?;
+        let rms_norm_1p_head256_inplace_function = library
+            .get_function(RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal in-place head-256 RMSNorm function lookup failed: {message}"
                 ))
             })?;
         let residual_rms_norm_1p_function = library
@@ -2744,6 +2831,19 @@ impl MetalCandidateRuntime {
                 rms_norm_1p_pipeline.thread_execution_width()
             )));
         }
+        let rms_norm_1p_head256_inplace_pipeline = device
+            .new_compute_pipeline_state_with_function(&rms_norm_1p_head256_inplace_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal in-place head-256 RMSNorm pipeline creation failed: {message}"
+                ))
+            })?;
+        if rms_norm_1p_head256_inplace_pipeline.thread_execution_width() != 32 {
+            return Err(EngineError::InvalidState(format!(
+                "Metal in-place head-256 RMSNorm requires a 32-wide simdgroup, device reports {}",
+                rms_norm_1p_head256_inplace_pipeline.thread_execution_width()
+            )));
+        }
         let residual_rms_norm_1p_pipeline = device
             .new_compute_pipeline_state_with_function(&residual_rms_norm_1p_function)
             .map_err(|message| {
@@ -2890,6 +2990,7 @@ impl MetalCandidateRuntime {
             q2_recovered_row_pipeline,
             q4_recovered_row_pipeline,
             rms_norm_1p_pipeline,
+            rms_norm_1p_head256_inplace_pipeline,
             residual_rms_norm_1p_pipeline,
             rms_norm_gated_pipeline,
             partial_rope_pipeline,
@@ -3660,6 +3761,22 @@ impl MetalCandidateRuntime {
                 "Metal layer {layer} is not a frozen Qwen full-attention layer"
             )));
         }
+        self.prepare_named_mapped_query_gate_norm_rope(
+            mapping,
+            layer,
+            &format!("model.language_model.layers.{layer}.self_attn.q_norm.weight"),
+            position,
+        )
+    }
+
+    fn prepare_named_mapped_query_gate_norm_rope(
+        &self,
+        mapping: &MappedMetalArtifact,
+        layer: usize,
+        name: &str,
+        position: u64,
+    ) -> Result<PreparedMappedMetalQueryGate> {
+        let config = Qwen38Config::default();
         partial_rope_params(
             config.num_attention_heads,
             config.head_dim,
@@ -3667,8 +3784,7 @@ impl MetalCandidateRuntime {
             position,
             config.rope_theta,
         )?;
-        let name = format!("model.language_model.layers.{layer}.self_attn.q_norm.weight");
-        let weight = mapping.inner.artifact.float_tensor(&name)?;
+        let weight = mapping.inner.artifact.float_tensor(name)?;
         let expected_weight_bytes = config
             .head_dim
             .checked_mul(std::mem::size_of::<half::f16>())
@@ -3773,6 +3889,15 @@ impl MetalCandidateRuntime {
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let mlp_prefix = format!("{layer_prefix}.mlp");
         let hidden_validation = vec![0.0_f32; config.hidden_size];
+        let key_validation = vec![
+            0.0_f32;
+            config
+                .num_key_value_heads
+                .checked_mul(config.head_dim)
+                .ok_or_else(|| EngineError::MemoryBudget(
+                    "Metal key normalization width overflows".into()
+                ))?
+        ];
         let residual_rms_norm = self.prepare_mapped_rms_norm_1p_graph_io(
             mapping,
             mapping
@@ -3818,6 +3943,17 @@ impl MetalCandidateRuntime {
             layer,
             fanout: self.prepare_mapped_full_attention_fanout(mapping, layer)?,
             query_gate: self.prepare_mapped_query_gate_norm_rope(mapping, layer, position)?,
+            key_norm: self.prepare_mapped_rms_norm_1p_graph_io(
+                mapping,
+                mapping
+                    .inner
+                    .artifact
+                    .float_tensor(&format!("{layer_prefix}.self_attn.k_norm.weight"))?,
+                &key_validation,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.rms_norm_epsilon,
+            )?,
             key_rope: self.prepare_partial_rope_graph(
                 config.num_key_value_heads,
                 config.head_dim,
@@ -4143,6 +4279,276 @@ impl MetalCandidateRuntime {
             embedding,
             initial_norm,
             layers,
+            lm_head,
+        })
+    }
+
+    /// Load the complete immutable and persistent resource set for Qwen's
+    /// native one-layer MTP graph. All tensor views must resolve through the
+    /// same no-copy CTOXQ mapping used by the target core. The extra embedding
+    /// and LM-head owners contain only offsets/dispatch metadata, never a
+    /// duplicate of either large matrix.
+    pub fn prepare_mapped_mtp_core(
+        &self,
+        mapping: &MappedMetalArtifact,
+        position: u64,
+        cache: MetalPagedGqaConfig,
+    ) -> Result<PreparedMappedMetalMtpCore> {
+        let config = Qwen38Config::default();
+        if cache.query_heads != config.num_attention_heads
+            || cache.key_value_heads != config.num_key_value_heads
+            || cache.head_dim != config.head_dim
+        {
+            return Err(EngineError::InvalidState(
+                "Metal MTP cache geometry differs from frozen Qwen full attention".into(),
+            ));
+        }
+        let hidden = config.hidden_size;
+        let concatenated_hidden = hidden
+            .checked_mul(2)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP concat width overflows".into()))?;
+        let hidden_validation = vec![0.0_f32; hidden];
+        let key_values = config
+            .num_key_value_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP key width overflows".into()))?;
+        let key_validation = vec![0.0_f32; key_values];
+        let embedding = self.prepare_mapped_embedding_graph_output(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .recovered_matrix("model.language_model.embed_tokens.weight")?,
+        )?;
+        let pre_embedding_norm = self.prepare_mapped_rms_norm_1p_graph_io(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .float_tensor("mtp.pre_fc_norm_embedding.weight")?,
+            &hidden_validation,
+            1,
+            hidden,
+            config.rms_norm_epsilon,
+        )?;
+        let pre_hidden_norm = self.prepare_mapped_rms_norm_1p_graph_io(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .float_tensor("mtp.pre_fc_norm_hidden.weight")?,
+            &hidden_validation,
+            1,
+            hidden,
+            config.rms_norm_epsilon,
+        )?;
+        let fc = self.prepare_named_mapped_projection_graph_io(mapping, "mtp.fc.weight")?;
+        let input_norm = self.prepare_mapped_rms_norm_1p_graph_io(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .float_tensor("mtp.layers.0.input_layernorm.weight")?,
+            &hidden_validation,
+            1,
+            hidden,
+            config.rms_norm_epsilon,
+        )?;
+
+        let layer_index = config.num_hidden_layers;
+        let layer_prefix = "mtp.layers.0";
+        let attention_prefix = "mtp.layers.0.self_attn";
+        let fanout_projections = [
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                "mtp.layers.0.self_attn.q_proj.weight",
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                "mtp.layers.0.self_attn.k_proj.weight",
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                "mtp.layers.0.self_attn.v_proj.weight",
+            )?,
+        ];
+        let query_values = config
+            .num_attention_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP query width overflows".into()))?;
+        let query_gate_values = query_values.checked_mul(2).ok_or_else(|| {
+            EngineError::MemoryBudget("Metal MTP query/gate width overflows".into())
+        })?;
+        if fanout_projections[0].columns != hidden
+            || fanout_projections[0].rows != query_gate_values
+            || fanout_projections[1].columns != hidden
+            || fanout_projections[1].rows != key_values
+            || fanout_projections[2].columns != hidden
+            || fanout_projections[2].rows != key_values
+            || fanout_projections[1].packed_s_in_bytes()?
+                != fanout_projections[0].packed_s_in_bytes()?
+            || fanout_projections[2].packed_s_in_bytes()?
+                != fanout_projections[0].packed_s_in_bytes()?
+        {
+            return Err(EngineError::InvalidArtifact(
+                "Metal MTP Q/K/V fan-out has incompatible shape or recovery input".into(),
+            ));
+        }
+        let attention_output_projection = self.prepare_named_mapped_projection_graph_io(
+            mapping,
+            "mtp.layers.0.self_attn.o_proj.weight",
+        )?;
+        if attention_output_projection.columns != query_values
+            || attention_output_projection.rows != hidden
+        {
+            return Err(EngineError::InvalidArtifact(
+                "Metal MTP attention output projection has incompatible shape".into(),
+            ));
+        }
+        let ffn_gate_up = [
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                "mtp.layers.0.mlp.gate_proj.weight",
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                "mtp.layers.0.mlp.up_proj.weight",
+            )?,
+        ];
+        let swiglu_down = self.prepare_named_mapped_projection_graph_io(
+            mapping,
+            "mtp.layers.0.mlp.down_proj.weight",
+        )?;
+        let layer = PreparedMappedMetalFullAttentionLayer {
+            layer: layer_index,
+            fanout: PreparedMappedMetalFullAttentionFanout {
+                layer: layer_index,
+                projections: fanout_projections,
+            },
+            query_gate: self.prepare_named_mapped_query_gate_norm_rope(
+                mapping,
+                layer_index,
+                &format!("{attention_prefix}.q_norm.weight"),
+                position,
+            )?,
+            key_norm: self.prepare_mapped_rms_norm_1p_graph_io(
+                mapping,
+                mapping
+                    .inner
+                    .artifact
+                    .float_tensor(&format!("{attention_prefix}.k_norm.weight"))?,
+                &key_validation,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.rms_norm_epsilon,
+            )?,
+            key_rope: self.prepare_partial_rope_graph(
+                config.num_key_value_heads,
+                config.head_dim,
+                config.rotary_dim,
+                position,
+                config.rope_theta,
+            )?,
+            attention: self.prepare_paged_gqa_decode_internal(Some(layer_index), cache, false)?,
+            attention_output: PreparedMappedMetalAttentionOutput {
+                layer: layer_index,
+                projection: attention_output_projection,
+            },
+            residual_rms_norm: self.prepare_mapped_rms_norm_1p_graph_io(
+                mapping,
+                mapping
+                    .inner
+                    .artifact
+                    .float_tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+                &hidden_validation,
+                1,
+                hidden,
+                config.rms_norm_epsilon,
+            )?,
+            ffn_gate_up,
+            swiglu_down,
+            post_ffn_residual_rms_norm: self.prepare_mapped_rms_norm_1p_graph_io(
+                mapping,
+                mapping.inner.artifact.float_tensor("mtp.norm.weight")?,
+                &hidden_validation,
+                1,
+                hidden,
+                config.rms_norm_epsilon,
+            )?,
+        };
+        let lm_head = self.prepare_named_mapped_projection_graph_io(mapping, "lm_head.weight")?;
+        let target_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
+
+        let canonical = &mapping.inner;
+        let mut layer_mappings = layer
+            .fanout
+            .projections
+            .iter()
+            .chain(layer.ffn_gate_up.iter())
+            .chain(std::iter::once(&layer.swiglu_down))
+            .chain(std::iter::once(&layer.attention_output.projection));
+        if embedding.rows != config.vocab_size
+            || embedding.columns != hidden
+            || embedding.output_buffer.is_some()
+            || target_selector.values != config.vocab_size
+            || pre_embedding_norm.rows != 1
+            || pre_embedding_norm.columns != hidden
+            || pre_hidden_norm.rows != 1
+            || pre_hidden_norm.columns != hidden
+            || fc.rows != hidden
+            || fc.columns != concatenated_hidden
+            || input_norm.rows != 1
+            || input_norm.columns != hidden
+            || lm_head.rows != config.vocab_size
+            || lm_head.columns != hidden
+            || layer.ffn_gate_up.iter().any(|projection| {
+                projection.rows != config.intermediate_size || projection.columns != hidden
+            })
+            || layer.ffn_gate_up[1].packed_s_in_bytes()?
+                != layer.ffn_gate_up[0].packed_s_in_bytes()?
+            || layer.swiglu_down.rows != hidden
+            || layer.swiglu_down.columns != config.intermediate_size
+            || !Rc::ptr_eq(&embedding.mapping.inner, canonical)
+            || !Rc::ptr_eq(&pre_embedding_norm.mapping.inner, canonical)
+            || !Rc::ptr_eq(&pre_hidden_norm.mapping.inner, canonical)
+            || !Rc::ptr_eq(&fc.mapping.inner, canonical)
+            || !Rc::ptr_eq(&input_norm.mapping.inner, canonical)
+            || !Rc::ptr_eq(&layer.query_gate.mapping.inner, canonical)
+            || !Rc::ptr_eq(&layer.key_norm.mapping.inner, canonical)
+            || !Rc::ptr_eq(&layer.residual_rms_norm.mapping.inner, canonical)
+            || !Rc::ptr_eq(&layer.post_ffn_residual_rms_norm.mapping.inner, canonical)
+            || layer_mappings.any(|projection| !Rc::ptr_eq(&projection.mapping.inner, canonical))
+            || !Rc::ptr_eq(&lm_head.mapping.inner, canonical)
+            || !pre_embedding_norm.matches_weight_tensor("mtp.pre_fc_norm_embedding.weight")?
+            || !pre_hidden_norm.matches_weight_tensor("mtp.pre_fc_norm_hidden.weight")?
+            || !input_norm.matches_weight_tensor("mtp.layers.0.input_layernorm.weight")?
+            || !layer
+                .query_gate
+                .matches_weight_tensor("mtp.layers.0.self_attn.q_norm.weight")?
+            || !layer
+                .key_norm
+                .matches_weight_tensor("mtp.layers.0.self_attn.k_norm.weight")?
+            || !layer
+                .residual_rms_norm
+                .matches_weight_tensor("mtp.layers.0.post_attention_layernorm.weight")?
+            || !layer
+                .post_ffn_residual_rms_norm
+                .matches_weight_tensor("mtp.norm.weight")?
+            || !fc.matches_recovered_tensor("mtp.fc.weight")?
+            || !lm_head.matches_recovered_tensor("lm_head.weight")?
+        {
+            return Err(EngineError::InvalidState(
+                "Metal MTP core resources are not one canonical frozen model".into(),
+            ));
+        }
+        Ok(PreparedMappedMetalMtpCore {
+            embedding,
+            target_selector,
+            pre_embedding_norm,
+            pre_hidden_norm,
+            fc,
+            input_norm,
+            layer,
             lm_head,
         })
     }
@@ -7592,6 +7998,46 @@ impl MetalCandidateRuntime {
         );
     }
 
+    fn encode_mapped_head256_norm_in_place(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        norm: &PreparedMappedMetalRmsNorm,
+        buffer: &Buffer,
+        offset: u64,
+    ) -> Result<()> {
+        if norm.columns != 256 || norm.rows == 0 {
+            return Err(EngineError::InvalidState(
+                "Metal in-place head norm requires one or more 256-wide heads".into(),
+            ));
+        }
+        encoder.set_compute_pipeline_state(&self.rms_norm_1p_head256_inplace_pipeline);
+        encoder.set_buffer(MetalRmsNormBufferAbi::INPUT as u64, Some(buffer), offset);
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::WEIGHT as u64,
+            Some(&norm.mapping.inner.buffer),
+            norm.weight_offset,
+        );
+        encoder.set_buffer(MetalRmsNormBufferAbi::OUTPUT as u64, Some(buffer), offset);
+        encoder.set_buffer(
+            MetalRmsNormBufferAbi::PARAMS as u64,
+            Some(&norm.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: norm.rows as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_mapped_residual_rms_norm_between(
         &self,
@@ -9382,6 +9828,7 @@ impl MetalCandidateRuntime {
             || prepared.attention.owner_layer != Some(layer)
             || prepared.attention_output.layer != layer
             || !Rc::ptr_eq(&prepared.query_gate.mapping.inner, mapping)
+            || !Rc::ptr_eq(&prepared.key_norm.mapping.inner, mapping)
             || !Rc::ptr_eq(&prepared.attention_output.projection.mapping.inner, mapping)
             || prepared
                 .fanout
@@ -9505,6 +9952,10 @@ impl MetalCandidateRuntime {
             || prepared.fanout.projections[2].rows != component_values
             || prepared.attention_output.projection.columns != query_values
             || prepared.attention_output.projection.rows != hidden
+            || prepared.key_norm.rows != config.num_key_value_heads
+            || prepared.key_norm.columns != config.head_dim
+            || prepared.key_norm.input_buffer.is_some()
+            || prepared.key_norm.output_buffer.is_some()
             || prepared.residual_rms_norm.columns != hidden
             || prepared.post_ffn_residual_rms_norm.columns != hidden
             || prepared.ffn_gate_up.iter().any(|projection| {
@@ -9526,6 +9977,13 @@ impl MetalCandidateRuntime {
         {
             return Err(EngineError::InvalidState(format!(
                 "Metal full-attention layer {layer} resources are not graph-owned or shape-compatible"
+            )));
+        }
+        if !prepared.key_norm.matches_weight_tensor(&format!(
+            "model.language_model.layers.{layer}.self_attn.k_norm.weight"
+        ))? {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} key norm has the wrong tensor identity"
             )));
         }
         let thread_width = dispatch_width(&self.partial_rope_pipeline, DEFAULT_SIMDGROUPS)?;
@@ -10119,6 +10577,12 @@ impl MetalCandidateRuntime {
             arena,
             query_gate.writes()[1].offset(),
         );
+        self.encode_mapped_head256_norm_in_place(
+            encoder,
+            &prepared.key_norm,
+            arena,
+            key_rope.writes()[0].offset(),
+        )?;
         self.encode_partial_rope_between(
             encoder,
             &prepared.key_rope,
@@ -13015,6 +13479,21 @@ mod tests {
                 },
             )
             .is_err());
+        assert!(runtime
+            .prepare_mapped_mtp_core(
+                &mapping,
+                1,
+                MetalPagedGqaConfig {
+                    query_heads: config.num_attention_heads,
+                    key_value_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                    maximum_tokens: 8,
+                    page_tokens: 2,
+                    sink_tokens: 2,
+                    recent_tokens: 2,
+                },
+            )
+            .is_err());
         let embedding_matrix = artifact
             .recovered_matrix("embedding.weight")
             .expect("resolve graph embedding");
@@ -14785,6 +15264,7 @@ mod tests {
         let post_attention_norm = vec![0.0625_f32; hidden];
         let next_input_norm = vec![-0.03125_f32; hidden];
         let q_norm = vec![0.0_f32; config.head_dim];
+        let k_norm = vec![0.0_f32; config.head_dim];
         let prefix = "model.language_model.layers.3";
         let attention_prefix = format!("{prefix}.self_attn");
         let mlp_prefix = format!("{prefix}.mlp");
@@ -14860,6 +15340,12 @@ mod tests {
                 dtype: TensorDType::F16,
                 shape: vec![config.head_dim as u64],
                 bytes: f16_bytes(&q_norm),
+            },
+            PackedTensor {
+                name: format!("{attention_prefix}.k_norm.weight"),
+                dtype: TensorDType::F16,
+                shape: vec![config.head_dim as u64],
+                bytes: f16_bytes(&k_norm),
             },
             PackedTensor {
                 name: format!("{prefix}.post_attention_layernorm.weight"),
@@ -14955,6 +15441,18 @@ mod tests {
             &format!("{attention_prefix}.v_proj.weight"),
             &corrected_hidden,
         );
+        let key_scalar = recovered_scalar(
+            &format!("{attention_prefix}.k_proj.weight"),
+            &corrected_hidden,
+        );
+        let expected_normalized_key = crate::reference::rms_norm_1p_weight(
+            &vec![key_scalar; key_value_values],
+            config.num_key_value_heads,
+            config.head_dim,
+            &k_norm,
+            config.rms_norm_epsilon,
+        )
+        .expect("key norm oracle");
         let quantized_value = Q4Block64::quantize(&[value_scalar; BLOCK_LEN])
             .expect("quantize one-token value oracle")
             .value(0);
@@ -15032,6 +15530,25 @@ mod tests {
         runtime
             .dispatch_prepared_mapped_full_attention_layer(layer_three, &mut prepared)
             .expect("dispatch complete full-attention layer");
+        let actual_key = unsafe {
+            slice::from_raw_parts(
+                prepared
+                    .attention
+                    .verifier_key_snapshot_buffer
+                    .contents()
+                    .cast::<f32>(),
+                key_value_values,
+            )
+        };
+        for (index, (expected, actual)) in
+            expected_normalized_key.iter().zip(actual_key).enumerate()
+        {
+            let tolerance = 2.0e-5_f32.max(expected.abs() * 2.0e-5);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "complete full-attention normalized key {index}: expected {expected}, got {actual}"
+            );
+        }
         drop(program);
         assert_eq!(prepared.cached_tokens(), 1);
         drop(mapping);

@@ -852,6 +852,39 @@ kernel void qwen_rms_norm_1p_f32(
     }
 }
 
+// In-place-safe specialization for Qwen's 256-wide per-head K normalization.
+// The generic kernel deliberately rereads its input after the simd reduction;
+// aliasing input/output would therefore race with those writes. Here each lane
+// retains its eight source values until the variance is known, so Key can stay
+// in its single shared-arena slot without a second 1,024-float activation.
+kernel void qwen_rms_norm_1p_head256_inplace_f32(
+    device const float* input [[buffer(0)]],
+    device const half* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant RmsNormParams& params [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= params.rows || params.columns != 256u) {
+        return;
+    }
+    ulong row_offset = ulong(row) * 256ul;
+    float values[8];
+    float sum_squares = 0.0f;
+    for (uint item = 0u; item < 8u; ++item) {
+        uint column = lane + item * 32u;
+        float value = input[row_offset + column];
+        values[item] = value;
+        sum_squares = fma(value, value, sum_squares);
+    }
+    float variance = simd_sum(sum_squares) * (1.0f / 256.0f);
+    float inverse = rsqrt(variance + params.epsilon);
+    for (uint item = 0u; item < 8u; ++item) {
+        uint column = lane + item * 32u;
+        output[row_offset + column] = values[item] * inverse
+            * (1.0f + float(weight[column]));
+    }
+}
+
 // Fuse the transformer residual edge with the following Qwen RMSNorm. The
 // summed residual is retained for the next sublayer while the normalized view
 // feeds the next projection without a host-visible vector-add pass.

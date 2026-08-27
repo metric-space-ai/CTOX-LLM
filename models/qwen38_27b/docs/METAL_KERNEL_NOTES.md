@@ -94,7 +94,8 @@ projection directly to `MixerOutput`.
 resource owner. It binds the exact layer Q/K/V, query norm, `o_proj`, both
 residual norms, three FFN matrices, and one packed KV owner to one canonical
 mmap identity. Production KV metadata and device descriptors are prepared
-before encoding; Q/K/V fan-out, Query/Gate norm+RoPE, Key-RoPE, packed append,
+before encoding; Q/K/V fan-out, Query/Gate norm+RoPE, per-head Key
+RMSNorm+RoPE, packed append,
 paged GQA, fused gated output projection, and the complete residual/FFN tail
 then execute in one command encoder and one wait. Test builds snapshot K/V on
 device before later legal arena aliases and update their independent CPU oracle
@@ -147,6 +148,21 @@ vocabulary-sized host readback occurs. Encoding, command-buffer, and test-only
 KV-verifier failures restore the complete target-layer transaction. This does
 not yet execute the MTP transition, draft/verify loop, sampler, or final
 barrier, so it is not the complete 645-step token executor.
+
+The full-attention path now applies the previously missing Qwen K RMSNorm
+before partial RoPE. Because K must remain in one shared-arena slot, a dedicated
+256-wide per-head kernel retains all eight values per lane across the variance
+reduction and is safe when input and output alias. A Golden assertion reads the
+test-only pre-pack snapshot and compares all four normalized K heads with the
+CPU equation. This corrects target and future MTP attention semantics without
+adding a production K activation buffer.
+
+`PreparedMappedMetalMtpCore` is the corresponding atomic load boundary for the
+native one-layer MTP graph. It admits the shared embedding and LM head as
+offset-only views, both pre-FC norms, `mtp.fc`, input norm, complete MTP
+attention/MLP resource set, packed KV state, and target-selector scratch only
+when every tensor and mapping identity matches. The loader still precedes the
+MTP encoder; no draft/verify execution claim is made here.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
@@ -641,7 +657,8 @@ dequantization array before this source was accepted.
   projection, then fused post-FFN residual-add/next-layer Qwen RMSNorm). The
   complete first linear-attention layer is therefore wired. Full-attention
   schedule slices and the shared-arena Layer-3 fan-out, Query/Gate
-  normalization/RoPE, Key-RoPE, combined KV-append/paged-GQA, and fused
+  normalization/RoPE, per-head Key RMSNorm/RoPE, combined KV-append/paged-GQA,
+  and fused
   sigmoid-gated mixed-Q2/Q4 output projection edges are also executable. The
   complete first full-attention mixer and its residual/FFN tail are therefore
   wired through the next normalized layer input in one encoder and one wait.

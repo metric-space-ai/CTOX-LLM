@@ -284,6 +284,13 @@ vocabulary tensor on the host, and treats all 16 KV caches plus all 48
 convolution/recurrent-state pairs as one rollback unit across encode, GPU, and
 test-verifier failures. The native MTP transition, draft/verify loop, sampling,
 and final barrier remain to be joined before this is a complete token executor.
+`PreparedMappedMetalMtpCore` now also closes the MTP load boundary: the shared
+embedding and LM head remain duplicate-free mmap views, while both pre-FC
+norms, `mtp.fc`, the MTP input norm, the complete one-layer full-attention/MLP
+resource set, packed MTP KV state, and resident target-selector scratch are
+constructed atomically from the same artifact identity. Execution is still
+pending, but a missing MTP tensor or incompatible cache geometry can no longer
+leave a partially admitted device graph.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

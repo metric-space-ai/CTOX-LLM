@@ -28,6 +28,7 @@ pub const Q4_GATHERED_KERNEL_NAME: &str = "q4_b64_gathered_matvec";
 pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
 pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
 pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
+pub const RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME: &str = "qwen_rms_norm_1p_head256_inplace_f32";
 pub const RESIDUAL_RMS_NORM_1P_KERNEL_NAME: &str = "qwen_residual_rms_norm_1p_f32";
 pub const RMS_NORM_GATED_KERNEL_NAME: &str = "qwen_rms_norm_gated_f32";
 pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
@@ -1149,6 +1150,7 @@ mod tests {
         assert!(Q2_RECOVERED_ROW_KERNEL_NAME.starts_with("q2_b64"));
         assert!(Q4_RECOVERED_ROW_KERNEL_NAME.starts_with("q4_b64"));
         assert!(RMS_NORM_1P_KERNEL_NAME.starts_with("qwen_rms_norm"));
+        assert!(RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME.contains("head256_inplace"));
         assert!(PARTIAL_ROPE_KERNEL_NAME.starts_with("qwen_partial_rope"));
         assert!(PAGED_GQA_DECODE_KERNEL_NAME.contains("paged_q2q4_gqa"));
         assert!(GATED_DELTA_F16_KERNEL_NAME.contains("gated_delta_recurrent_f16"));
