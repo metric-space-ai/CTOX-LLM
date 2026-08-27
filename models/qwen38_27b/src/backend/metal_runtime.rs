@@ -765,6 +765,19 @@ struct MetalPagedGqaDispatchPlan {
     params_buffer: Buffer,
 }
 
+struct MetalPartialRopeDispatchPlan {
+    cosine_buffer: Buffer,
+    sine_buffer: Buffer,
+    params_buffer: Buffer,
+}
+
+struct MetalFullAttentionDispatchPlan {
+    gqa: MetalPagedGqaDispatchPlan,
+    query_cosine_buffer: Buffer,
+    query_sine_buffer: Buffer,
+    key_rope: MetalPartialRopeDispatchPlan,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ValidatedMetalFullAttentionLayer {
     layer: usize,
@@ -7817,6 +7830,30 @@ impl MetalCandidateRuntime {
         values_offset: u64,
         thread_width: usize,
     ) -> Result<()> {
+        self.encode_partial_rope_between_with_dispatch(
+            encoder,
+            prepared,
+            values_buffer,
+            values_offset,
+            thread_width,
+            &prepared.cosine_buffer,
+            &prepared.sine_buffer,
+            &prepared.params_buffer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_partial_rope_between_with_dispatch(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMetalPartialRope,
+        values_buffer: &Buffer,
+        values_offset: u64,
+        thread_width: usize,
+        cosine_buffer: &Buffer,
+        sine_buffer: &Buffer,
+        params_buffer: &Buffer,
+    ) -> Result<()> {
         encoder.set_compute_pipeline_state(&self.partial_rope_pipeline);
         encoder.set_buffer(
             MetalPartialRopeBufferAbi::VALUES as u64,
@@ -7825,17 +7862,13 @@ impl MetalCandidateRuntime {
         );
         encoder.set_buffer(
             MetalPartialRopeBufferAbi::COSINE as u64,
-            Some(&prepared.cosine_buffer),
+            Some(cosine_buffer),
             0,
         );
-        encoder.set_buffer(
-            MetalPartialRopeBufferAbi::SINE as u64,
-            Some(&prepared.sine_buffer),
-            0,
-        );
+        encoder.set_buffer(MetalPartialRopeBufferAbi::SINE as u64, Some(sine_buffer), 0);
         encoder.set_buffer(
             MetalPartialRopeBufferAbi::PARAMS as u64,
-            Some(&prepared.params_buffer),
+            Some(params_buffer),
             0,
         );
         let pair_count = prepared
@@ -8113,6 +8146,32 @@ impl MetalCandidateRuntime {
             append,
             descriptors_buffer: buffer_with_data(&self.device, &descriptors),
             params_buffer: buffer_with_data(&self.device, &params),
+        })
+    }
+
+    fn snapshot_partial_rope_dispatch(
+        &self,
+        prepared: &PreparedMetalPartialRope,
+    ) -> Result<MetalPartialRopeDispatchPlan> {
+        Ok(MetalPartialRopeDispatchPlan {
+            cosine_buffer: clone_shared_buffer(&self.device, &prepared.cosine_buffer)?,
+            sine_buffer: clone_shared_buffer(&self.device, &prepared.sine_buffer)?,
+            params_buffer: clone_shared_buffer(&self.device, &prepared.params_buffer)?,
+        })
+    }
+
+    fn plan_full_attention_dispatch(
+        &self,
+        prepared: &mut PreparedMappedMetalFullAttentionLayer,
+    ) -> Result<MetalFullAttentionDispatchPlan> {
+        Ok(MetalFullAttentionDispatchPlan {
+            gqa: self.plan_paged_gqa_dispatch(&mut prepared.attention)?,
+            query_cosine_buffer: clone_shared_buffer(
+                &self.device,
+                &prepared.query_gate.cosine_buffer,
+            )?,
+            query_sine_buffer: clone_shared_buffer(&self.device, &prepared.query_gate.sine_buffer)?,
+            key_rope: self.snapshot_partial_rope_dispatch(&prepared.key_rope)?,
         })
     }
 
@@ -10510,6 +10569,34 @@ impl MetalCandidateRuntime {
         gate_buffer: &Buffer,
         gate_offset: u64,
     ) {
+        self.encode_mapped_query_gate_norm_rope_between_with_tables(
+            encoder,
+            prepared,
+            input_buffer,
+            input_offset,
+            query_buffer,
+            query_offset,
+            gate_buffer,
+            gate_offset,
+            &prepared.cosine_buffer,
+            &prepared.sine_buffer,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_query_gate_norm_rope_between_with_tables(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalQueryGate,
+        input_buffer: &Buffer,
+        input_offset: u64,
+        query_buffer: &Buffer,
+        query_offset: u64,
+        gate_buffer: &Buffer,
+        gate_offset: u64,
+        cosine_buffer: &Buffer,
+        sine_buffer: &Buffer,
+    ) {
         encoder.set_compute_pipeline_state(&self.query_gate_norm_rope_pipeline);
         for (binding, buffer, offset) in [
             (
@@ -10522,8 +10609,8 @@ impl MetalCandidateRuntime {
                 &prepared.mapping.inner.buffer,
                 prepared.q_norm_weight_offset,
             ),
-            (MetalQueryGateBufferAbi::COSINE, &prepared.cosine_buffer, 0),
-            (MetalQueryGateBufferAbi::SINE, &prepared.sine_buffer, 0),
+            (MetalQueryGateBufferAbi::COSINE, cosine_buffer, 0),
+            (MetalQueryGateBufferAbi::SINE, sine_buffer, 0),
             (MetalQueryGateBufferAbi::QUERY, query_buffer, query_offset),
             (MetalQueryGateBufferAbi::GATE, gate_buffer, gate_offset),
             (MetalQueryGateBufferAbi::PARAMS, &prepared.params_buffer, 0),
@@ -11022,7 +11109,7 @@ impl MetalCandidateRuntime {
         let validated = self.validate_prepared_mapped_full_attention_layer(steps, prepared)?;
         prepared.attention.poisoned = true;
         let result = (|| {
-            let dispatch = self.plan_paged_gqa_dispatch(&mut prepared.attention)?;
+            let dispatch = self.plan_full_attention_dispatch(prepared)?;
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-shared-arena-full-attention-layer");
             let encoder = command_buffer.new_compute_command_encoder();
@@ -11070,7 +11157,7 @@ impl MetalCandidateRuntime {
                 };
                 self.commit_paged_gqa_verifier_append(
                     &mut prepared.attention,
-                    &dispatch.append,
+                    &dispatch.gqa.append,
                     &key,
                     &value,
                 )?;
@@ -11189,7 +11276,7 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         program: &PreparedMetalDecodeProgram<'_>,
         prepared: &mut PreparedMappedMetalTargetLayers,
-    ) -> Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> {
+    ) -> Result<Vec<(usize, MetalFullAttentionDispatchPlan)>> {
         if !prepared.transaction_active {
             return Err(EngineError::InvalidState(
                 "Metal target graph encoding requires an active state transaction".into(),
@@ -11225,7 +11312,7 @@ impl MetalCandidateRuntime {
                     let validated =
                         self.validate_prepared_mapped_full_attention_layer(steps, layer)?;
                     layer.attention.poisoned = true;
-                    let dispatch = self.plan_paged_gqa_dispatch(&mut layer.attention)?;
+                    let dispatch = self.plan_full_attention_dispatch(layer)?;
                     self.encode_prepared_mapped_full_attention_layer(
                         encoder,
                         steps,
@@ -11337,7 +11424,7 @@ impl MetalCandidateRuntime {
             };
             if let Err(primary) = self.commit_paged_gqa_verifier_append(
                 &mut layer.attention,
-                &dispatch.append,
+                &dispatch.gqa.append,
                 &key,
                 &value,
             ) {
@@ -11424,7 +11511,7 @@ impl MetalCandidateRuntime {
         prepared: &mut PreparedMappedMetalTargetCore,
         initial_norm: &PreparedMetalDecodeStepView<'_>,
         lm_head: &PreparedMetalDecodeStepView<'_>,
-    ) -> Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> {
+    ) -> Result<Vec<(usize, MetalFullAttentionDispatchPlan)>> {
         let arena = initial_norm.reads()[0].buffer();
         self.encode_mapped_norm_between(
             encoder,
@@ -11453,7 +11540,7 @@ impl MetalCandidateRuntime {
         program: &PreparedMetalDecodeProgram<'_>,
         prepared: &mut PreparedMappedMetalTargetCore,
         selector: &PreparedMetalArgMaxScratch,
-    ) -> Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> {
+    ) -> Result<Vec<(usize, MetalFullAttentionDispatchPlan)>> {
         let [embedding, initial_norm, lm_head] =
             self.validate_prepared_mapped_target_core(program, prepared)?;
         self.encode_mapped_embedding_from_selector_to(
@@ -11590,7 +11677,7 @@ impl MetalCandidateRuntime {
             };
             if let Err(primary) = self.commit_paged_gqa_verifier_append(
                 &mut layer.attention,
-                &dispatch.append,
+                &dispatch.gqa.append,
                 &key,
                 &value,
             ) {
@@ -11673,7 +11760,7 @@ impl MetalCandidateRuntime {
     fn validate_completed_mapped_target_core(
         &self,
         prepared: &mut PreparedMappedMetalTargetCore,
-        full_plans: &[(usize, MetalPagedGqaDispatchPlan)],
+        full_plans: &[(usize, MetalFullAttentionDispatchPlan)],
     ) -> Result<()> {
         for layer in &mut prepared.layers.layers {
             match layer {
@@ -11728,7 +11815,7 @@ impl MetalCandidateRuntime {
             };
             if let Err(primary) = self.commit_paged_gqa_verifier_append(
                 &mut layer.attention,
-                &dispatch.append,
+                &dispatch.gqa.append,
                 &key,
                 &value,
             ) {
@@ -12163,7 +12250,7 @@ impl MetalCandidateRuntime {
         &self,
         encoder: &ComputeCommandEncoderRef,
         prepared: &PreparedMappedMetalMtpCore,
-        dispatch: &MetalPagedGqaDispatchPlan,
+        dispatch: &MetalFullAttentionDispatchPlan,
         component_values: usize,
         thread_width: usize,
     ) -> Result<()> {
@@ -12205,7 +12292,7 @@ impl MetalCandidateRuntime {
                 encoder, projection, arena, normalized, arena, output,
             )?;
         }
-        self.encode_mapped_query_gate_norm_rope_between(
+        self.encode_mapped_query_gate_norm_rope_between_with_tables(
             encoder,
             &prepared.layer.query_gate,
             arena,
@@ -12214,14 +12301,19 @@ impl MetalCandidateRuntime {
             query,
             arena,
             attention_gate,
+            &dispatch.query_cosine_buffer,
+            &dispatch.query_sine_buffer,
         );
         self.encode_mapped_head256_norm_in_place(encoder, &prepared.layer.key_norm, arena, key)?;
-        self.encode_partial_rope_between(
+        self.encode_partial_rope_between_with_dispatch(
             encoder,
             &prepared.layer.key_rope,
             arena,
             key,
             thread_width,
+            &dispatch.key_rope.cosine_buffer,
+            &dispatch.key_rope.sine_buffer,
+            &dispatch.key_rope.params_buffer,
         )?;
         #[cfg(test)]
         {
@@ -12266,7 +12358,7 @@ impl MetalCandidateRuntime {
         self.encode_paged_gqa_append_and_attention_with_metadata(
             encoder,
             &prepared.layer.attention,
-            &dispatch.append,
+            &dispatch.gqa.append,
             arena,
             query,
             arena,
@@ -12275,8 +12367,8 @@ impl MetalCandidateRuntime {
             value,
             arena,
             attention_output,
-            &dispatch.descriptors_buffer,
-            &dispatch.params_buffer,
+            &dispatch.gqa.descriptors_buffer,
+            &dispatch.gqa.params_buffer,
         )?;
         self.encode_mapped_sigmoid_gate_projection_between(
             encoder,
@@ -12340,7 +12432,7 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         step: &PreparedMetalDecodeStepView<'_>,
         prepared: &PreparedMappedMetalMtpCore,
-        dispatch: &MetalPagedGqaDispatchPlan,
+        dispatch: &MetalFullAttentionDispatchPlan,
         component_values: usize,
         thread_width: usize,
     ) -> Result<()> {
@@ -12361,7 +12453,7 @@ impl MetalCandidateRuntime {
         step: &PreparedMetalDecodeStepView<'_>,
         prepared: &PreparedMappedMetalMtpCore,
         selector: &PreparedMetalArgMaxScratch,
-        dispatch: &MetalPagedGqaDispatchPlan,
+        dispatch: &MetalFullAttentionDispatchPlan,
         component_values: usize,
         thread_width: usize,
     ) -> Result<()> {
@@ -12383,7 +12475,7 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         step: &PreparedMetalDecodeStepView<'_>,
         prepared: &PreparedMappedMetalMtpCore,
-        dispatch: &MetalPagedGqaDispatchPlan,
+        dispatch: &MetalFullAttentionDispatchPlan,
         component_values: usize,
         thread_width: usize,
     ) -> Result<()> {
@@ -12434,7 +12526,7 @@ impl MetalCandidateRuntime {
         let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(prepared)?;
         prepared.layer.attention.begin_speculative()?;
         let result = (|| {
-            let dispatch = self.plan_paged_gqa_dispatch(&mut prepared.layer.attention)?;
+            let dispatch = self.plan_full_attention_dispatch(&mut prepared.layer)?;
             prepared.layer.attention.poisoned = true;
             zero_buffer(
                 &prepared.target_selector.result_buffer,
@@ -12494,7 +12586,7 @@ impl MetalCandidateRuntime {
                 };
                 self.commit_paged_gqa_verifier_append(
                     &mut prepared.layer.attention,
-                    &dispatch.append,
+                    &dispatch.gqa.append,
                     &key,
                     &value,
                 )?;
@@ -12634,7 +12726,7 @@ impl MetalCandidateRuntime {
         }
 
         let result = (|| {
-            let mtp_dispatch = self.plan_paged_gqa_dispatch(&mut mtp.layer.attention)?;
+            let mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
             mtp.layer.attention.poisoned = true;
             write_buffer_range(
                 &mtp.target_selector.result_buffer,
@@ -12651,7 +12743,7 @@ impl MetalCandidateRuntime {
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-initial-mtp-target-verifier");
             let encoder = command_buffer.new_compute_command_encoder();
-            let encoded: Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> = (|| {
+            let encoded: Result<Vec<(usize, MetalFullAttentionDispatchPlan)>> = (|| {
                 self.encode_prepared_mapped_mtp_frontend_from_selector(
                     encoder,
                     mtp_step,
@@ -12706,7 +12798,11 @@ impl MetalCandidateRuntime {
                 )));
             }
 
-            self.validate_completed_mapped_mtp_layer(mtp, &mtp_dispatch.append, component_values)?;
+            self.validate_completed_mapped_mtp_layer(
+                mtp,
+                &mtp_dispatch.gqa.append,
+                component_values,
+            )?;
             self.validate_completed_mapped_target_core(target, &target_plans)?;
             let verified = self
                 .read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
@@ -12782,7 +12878,7 @@ impl MetalCandidateRuntime {
         }
 
         let result = (|| {
-            let mtp_dispatch = self.plan_paged_gqa_dispatch(&mut mtp.layer.attention)?;
+            let mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
             mtp.layer.attention.poisoned = true;
             zero_buffer(
                 &mtp.target_selector.result_buffer,
@@ -12797,7 +12893,7 @@ impl MetalCandidateRuntime {
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-greedy-mtp-target-verifier");
             let encoder = command_buffer.new_compute_command_encoder();
-            let encoded: Result<Vec<(usize, MetalPagedGqaDispatchPlan)>> = (|| {
+            let encoded: Result<Vec<(usize, MetalFullAttentionDispatchPlan)>> = (|| {
                 self.encode_copy_argmax_result(
                     encoder,
                     &mtp.draft_selector,
@@ -12843,7 +12939,11 @@ impl MetalCandidateRuntime {
                 )));
             }
 
-            self.validate_completed_mapped_mtp_layer(mtp, &mtp_dispatch.append, component_values)?;
+            self.validate_completed_mapped_mtp_layer(
+                mtp,
+                &mtp_dispatch.gqa.append,
+                component_values,
+            )?;
             self.validate_completed_mapped_target_core(target, &target_plans)?;
             let verified = self
                 .read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
@@ -12877,7 +12977,7 @@ impl MetalCandidateRuntime {
         encoder: &ComputeCommandEncoderRef,
         steps: &[PreparedMetalDecodeStepView<'_>],
         prepared: &PreparedMappedMetalFullAttentionLayer,
-        dispatch: &MetalPagedGqaDispatchPlan,
+        dispatch: &MetalFullAttentionDispatchPlan,
         thread_width: usize,
         component_values: usize,
     ) -> Result<()> {
@@ -12904,7 +13004,7 @@ impl MetalCandidateRuntime {
                 output.offset(),
             )?;
         }
-        self.encode_mapped_query_gate_norm_rope_between(
+        self.encode_mapped_query_gate_norm_rope_between_with_tables(
             encoder,
             &prepared.query_gate,
             arena,
@@ -12913,6 +13013,8 @@ impl MetalCandidateRuntime {
             query_gate.writes()[0].offset(),
             arena,
             query_gate.writes()[1].offset(),
+            &dispatch.query_cosine_buffer,
+            &dispatch.query_sine_buffer,
         );
         self.encode_mapped_head256_norm_in_place(
             encoder,
@@ -12920,12 +13022,15 @@ impl MetalCandidateRuntime {
             arena,
             key_rope.writes()[0].offset(),
         )?;
-        self.encode_partial_rope_between(
+        self.encode_partial_rope_between_with_dispatch(
             encoder,
             &prepared.key_rope,
             arena,
             key_rope.writes()[0].offset(),
             thread_width,
+            &dispatch.key_rope.cosine_buffer,
+            &dispatch.key_rope.sine_buffer,
+            &dispatch.key_rope.params_buffer,
         )?;
         #[cfg(test)]
         {
@@ -12966,7 +13071,7 @@ impl MetalCandidateRuntime {
         self.encode_paged_gqa_append_and_attention_with_metadata(
             encoder,
             &prepared.attention,
-            &dispatch.append,
+            &dispatch.gqa.append,
             arena,
             gqa.reads()[0].offset(),
             arena,
@@ -12975,8 +13080,8 @@ impl MetalCandidateRuntime {
             append.reads()[1].offset(),
             arena,
             gqa.writes()[0].offset(),
-            &dispatch.descriptors_buffer,
-            &dispatch.params_buffer,
+            &dispatch.gqa.descriptors_buffer,
+            &dispatch.gqa.params_buffer,
         )?;
         self.encode_mapped_sigmoid_gate_projection_between(
             encoder,
@@ -13885,6 +13990,18 @@ fn buffer_with_data(device: &Device, bytes: &[u8]) -> metal_driver::Buffer {
         bytes.len() as u64,
         MTLResourceOptions::StorageModeShared,
     )
+}
+
+fn clone_shared_buffer(device: &Device, source: &Buffer) -> Result<Buffer> {
+    let length = usize::try_from(source.length())
+        .map_err(|_| EngineError::MemoryBudget("Metal buffer length exceeds usize".into()))?;
+    if length == 0 {
+        return Err(EngineError::Shape(
+            "Metal cannot snapshot a zero-length buffer".into(),
+        ));
+    }
+    let bytes = unsafe { slice::from_raw_parts(source.contents().cast::<u8>(), length) };
+    Ok(buffer_with_data(device, bytes))
 }
 
 fn write_metal_paged_gqa_descriptors(prepared: &PreparedMetalPagedGqa) -> Result<()> {
@@ -17602,12 +17719,48 @@ mod tests {
             let tail = head * head_dim + rotary_dim..(head + 1) * head_dim;
             assert_eq!(&actual_query[tail.clone()], &query[tail]);
         }
+        let dispatch = runtime
+            .snapshot_partial_rope_dispatch(&prepared_query)
+            .expect("snapshot current RoPE dispatch");
         prepared_query
             .write_values(&query)
             .expect("restore query values");
         prepared_query
             .write_position(0)
             .expect("update RoPE position");
+        let values_buffer = prepared_query
+            .values_buffer
+            .as_ref()
+            .expect("standalone RoPE values");
+        let command_buffer = runtime.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        runtime
+            .encode_partial_rope_between_with_dispatch(
+                encoder,
+                &prepared_query,
+                values_buffer,
+                0,
+                dispatch_width(&runtime.partial_rope_pipeline, DEFAULT_SIMDGROUPS)
+                    .expect("snapshot RoPE width"),
+                &dispatch.cosine_buffer,
+                &dispatch.sine_buffer,
+                &dispatch.params_buffer,
+            )
+            .expect("encode immutable RoPE snapshot");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        let snapshot_output = unsafe {
+            slice::from_raw_parts(values_buffer.contents().cast::<f32>(), query.len()).to_vec()
+        };
+        for (expected, actual) in expected_query.iter().zip(snapshot_output) {
+            let tolerance = 3.0e-5_f32.max(expected.abs() * 4.0e-5);
+            assert!((expected - actual).abs() <= tolerance);
+        }
+        prepared_query
+            .write_values(&query)
+            .expect("restore query values after snapshot dispatch");
         let identity = runtime
             .dispatch_partial_rope(&prepared_query)
             .expect("dispatch position-zero RoPE");

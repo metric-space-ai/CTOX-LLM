@@ -354,6 +354,11 @@ full-attention layers, and the MTP layer use the same dispatch-plan boundary
 while the large Q2/Q4 page arenas remain single-copy. A two-depth regression
 retains the first snapshots after the second append is planned; this is the
 metadata boundary required to enqueue successive speculative steps safely.
+The graph dispatch plan also snapshots Query/Key RoPE tables and the key-RoPE
+position block. A device regression mutates the owner to another position
+after planning and still reproduces the original-position oracle, preventing
+later speculative depths from rotating earlier queued work with the wrong
+position.
 Full-artifact same-device evidence, a four-candidate device branch,
 partial-prefix restore/replay, and production executor wiring remain pending.
 Every logical read and write of all 645 bound decode steps now resolves
