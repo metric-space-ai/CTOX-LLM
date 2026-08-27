@@ -90,6 +90,13 @@ gated activation allocation. Dedicated Q2/Q4 entry points read
 sigmoid gate and recovery `s_in` in registers, and write the recovered output
 projection directly to `MixerOutput`.
 
+`PreparedMappedMetalFullAttentionLayer` is the corresponding closed ten-step
+resource owner. It binds the exact layer Q/K/V, query norm, `o_proj`, both
+residual norms, three FFN matrices, and one packed KV owner to one canonical
+mmap identity. Its staged executor keeps all activations in the shared arena;
+KV descriptor planning is still a bounded command boundary, while the complete
+residual/FFN tail is encoded together.
+
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
 active, appends retain all pre-branch Q4 pages and use the memory-plan boundary
@@ -481,6 +488,11 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   a mixed Q2/Q4 Layer-3 output projection against the scalar oracle for all
   5,120 rows, proves the 6,144-value gated tensor is not owned, reuses the same
   resources for a zero-input dispatch, and rejects Layer-7 views.
+- `complete_full_attention_layer_reaches_next_normalized_view` executes the
+  exact ten-step Layer-3 schedule through the Layer-4 normalized arena view,
+  compares both final residual and normalization with an independent scalar
+  oracle, proves one packed KV token is committed, and rejects Layer 7 before
+  cache mutation.
 - `paged_q2q4_gqa_decode_matches_quantized_oracle_and_demotes_pages` forces a
   Q4-to-Q2 page transition, compares every decode step with the scalar GQA
   oracle using the identical quantized cache, verifies bounded arena byte
@@ -578,8 +590,9 @@ dequantization array before this source was accepted.
   schedule slices and the shared-arena Layer-3 fan-out, Query/Gate
   normalization/RoPE, Key-RoPE, combined KV-append/paged-GQA, and fused
   sigmoid-gated mixed-Q2/Q4 output projection edges are also executable. The
-  complete first full-attention mixer is therefore wired. Later schedule steps,
-  the prefill arena, removal of the verifier CPU KV mirror, and complete
-  model-graph execution remain unfinished.
+  complete first full-attention mixer and its residual/FFN tail are therefore
+  wired through the next normalized layer input. Later layer instances, removal
+  of the KV metadata command boundary, the prefill arena, removal of the
+  verifier CPU KV mirror, and complete model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.

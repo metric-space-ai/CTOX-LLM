@@ -236,6 +236,11 @@ the paged-GQA result by `sigmoid(AttentionGate)`, apply recovery `s_in`, and
 project directly into `MixerOutput`; the 6,144-value gated tensor exists only
 in registers. A mixed-Q2/Q4 Apple Golden checks all 5,120 output rows and
 resource reuse.
+One closed full-attention layer owner now combines that mixer with its packed
+KV state and the common residual/FFN tail. Its exact-Qwen Layer-3 Golden reaches
+the Layer-4 normalized arena view and rejects a Layer-7 schedule before cache
+mutation. KV metadata currently imposes a bounded command boundary; eliminating
+that boundary remains part of the final one-command-buffer executor work.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first
@@ -266,7 +271,7 @@ and mutable state of a layer; its all-layer entry point admits exactly the 48
 linear layers in canonical order or drops the partial load on the first error.
 These graph preparations retain no operation-local input/output activation
 buffers; separately stored recovery inputs must be byte-identical. The
-remaining 627 schedule steps and the complete executor remain open. A bounded
+remaining 623 schedule steps and the complete executor remain open. A bounded
 f32 checkpoint can now snapshot and restore an
 exact arena slot through a Metal device-to-device blit with no host mirror. It
 is single-use and fail-closed across snapshot/restore/commit, providing the

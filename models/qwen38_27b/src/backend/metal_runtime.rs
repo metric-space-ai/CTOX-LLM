@@ -459,6 +459,21 @@ pub struct PreparedMappedMetalAttentionOutput {
     projection: PreparedMappedMetalMatVec,
 }
 
+/// Closed resource owner for one exact target full-attention transformer
+/// layer, including its packed KV state and the common residual/FFN tail.
+pub struct PreparedMappedMetalFullAttentionLayer {
+    layer: usize,
+    fanout: PreparedMappedMetalFullAttentionFanout,
+    query_gate: PreparedMappedMetalQueryGate,
+    key_rope: PreparedMetalPartialRope,
+    attention: PreparedMetalPagedGqa,
+    attention_output: PreparedMappedMetalAttentionOutput,
+    residual_rms_norm: PreparedMappedMetalRmsNorm,
+    ffn_gate_up: [PreparedMappedMetalMatVec; 2],
+    swiglu_down: PreparedMappedMetalMatVec,
+    post_ffn_residual_rms_norm: PreparedMappedMetalRmsNorm,
+}
+
 /// Mmap-backed query RMSNorm plus reusable partial-RoPE tables for one exact
 /// full-attention layer. QueryGate/Query/AttentionGate remain arena views.
 pub struct PreparedMappedMetalQueryGate {
@@ -2064,6 +2079,29 @@ impl PreparedMappedMetalAttentionOutput {
     }
 }
 
+impl PreparedMappedMetalFullAttentionLayer {
+    pub fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub fn resident_state_bytes(&self) -> usize {
+        self.attention.packed_device_bytes()
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn cached_tokens(&self) -> usize {
+        self.attention.tokens()
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        self.query_gate.write_position(position)?;
+        self.key_rope.write_position(position)
+    }
+}
+
 impl PreparedMappedMetalQueryGate {
     pub fn layer(&self) -> usize {
         self.layer
@@ -3376,6 +3414,91 @@ impl MetalCandidateRuntime {
             )));
         }
         Ok(PreparedMappedMetalAttentionOutput { layer, projection })
+    }
+
+    /// Prepare one closed full-attention layer owner. All immutable tensors
+    /// must come from the same admitted mapping; only the packed Q2/Q4 KV
+    /// cache owns persistent mutable device memory.
+    pub fn prepare_mapped_full_attention_layer(
+        &self,
+        mapping: &MappedMetalArtifact,
+        layer: usize,
+        position: u64,
+        cache: MetalPagedGqaConfig,
+    ) -> Result<PreparedMappedMetalFullAttentionLayer> {
+        let config = Qwen38Config::default();
+        if config.layer_kind(layer) != Some(LayerKind::FullAttention)
+            || cache.query_heads != config.num_attention_heads
+            || cache.key_value_heads != config.num_key_value_heads
+            || cache.head_dim != config.head_dim
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} has incompatible frozen topology or cache geometry"
+            )));
+        }
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let mlp_prefix = format!("{layer_prefix}.mlp");
+        let hidden_validation = vec![0.0_f32; config.hidden_size];
+        let residual_rms_norm = self.prepare_mapped_rms_norm_1p_graph_io(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .float_tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+            &hidden_validation,
+            1,
+            config.hidden_size,
+            config.rms_norm_epsilon,
+        )?;
+        let ffn_gate_up = [
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{mlp_prefix}.gate_proj.weight"),
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{mlp_prefix}.up_proj.weight"),
+            )?,
+        ];
+        let swiglu_down = self.prepare_named_mapped_projection_graph_io(
+            mapping,
+            &format!("{mlp_prefix}.down_proj.weight"),
+        )?;
+        let next_norm_name = if layer + 1 == config.num_hidden_layers {
+            "model.language_model.norm.weight".to_owned()
+        } else {
+            format!(
+                "model.language_model.layers.{}.input_layernorm.weight",
+                layer + 1
+            )
+        };
+        let post_ffn_residual_rms_norm = self.prepare_mapped_rms_norm_1p_graph_io(
+            mapping,
+            mapping.inner.artifact.float_tensor(&next_norm_name)?,
+            &hidden_validation,
+            1,
+            config.hidden_size,
+            config.rms_norm_epsilon,
+        )?;
+        Ok(PreparedMappedMetalFullAttentionLayer {
+            layer,
+            fanout: self.prepare_mapped_full_attention_fanout(mapping, layer)?,
+            query_gate: self.prepare_mapped_query_gate_norm_rope(mapping, layer, position)?,
+            key_rope: self.prepare_partial_rope_graph(
+                config.num_key_value_heads,
+                config.head_dim,
+                config.rotary_dim,
+                position,
+                config.rope_theta,
+            )?,
+            attention: self.prepare_paged_gqa_decode_graph(layer, cache)?,
+            attention_output: self
+                .prepare_mapped_attention_gate_output_projection(mapping, layer)?,
+            residual_rms_norm,
+            ffn_gate_up,
+            swiglu_down,
+            post_ffn_residual_rms_norm,
+        })
     }
 
     /// Prepare every immutable tensor and persistent state owner for one exact
@@ -8503,6 +8626,278 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    fn dispatch_mapped_transformer_tail_views(
+        &self,
+        steps: &[PreparedMetalDecodeStepView<'_>],
+        layer: usize,
+        residual_rms_norm: &PreparedMappedMetalRmsNorm,
+        ffn_gate_up: [&PreparedMappedMetalMatVec; 2],
+        swiglu_down: &PreparedMappedMetalMatVec,
+        post_ffn_residual_rms_norm: &PreparedMappedMetalRmsNorm,
+    ) -> Result<()> {
+        const OPERATIONS: [MetalDecodeOperation; 4] = [
+            MetalDecodeOperation::ResidualRmsNorm,
+            MetalDecodeOperation::FfnGateUpFanout,
+            MetalDecodeOperation::SwiGluDownProjection,
+            MetalDecodeOperation::ResidualRmsNorm,
+        ];
+        if steps.len() != OPERATIONS.len()
+            || steps.iter().zip(OPERATIONS).any(|(step, operation)| {
+                step.step().layer != Some(layer) || step.step().operation != operation
+            })
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal transformer tail layer {layer} does not match its four-step schedule"
+            )));
+        }
+        let residual = &steps[0];
+        let ffn = &steps[1];
+        let down = &steps[2];
+        let post_ffn = &steps[3];
+        if residual.reads().len() != 2
+            || residual.writes().len() != 2
+            || residual.reads()[0].slot() != MetalBufferSlot::HiddenA
+            || residual.reads()[1].slot() != MetalBufferSlot::MixerOutput
+            || residual.writes()[0].slot() != MetalBufferSlot::HiddenB
+            || residual.writes()[1].slot() != MetalBufferSlot::Normalized
+            || ffn.reads().len() != 1
+            || ffn.writes().len() != 2
+            || ffn.reads()[0].slot() != MetalBufferSlot::Normalized
+            || ffn.writes()[0].slot() != MetalBufferSlot::FfnGate
+            || ffn.writes()[1].slot() != MetalBufferSlot::FfnUp
+            || down.reads().len() != 2
+            || down.writes().len() != 1
+            || down.reads()[0].slot() != MetalBufferSlot::FfnGate
+            || down.reads()[1].slot() != MetalBufferSlot::FfnUp
+            || down.writes()[0].slot() != MetalBufferSlot::FfnDown
+            || post_ffn.reads().len() != 2
+            || post_ffn.writes().len() != 2
+            || post_ffn.reads()[0].slot() != MetalBufferSlot::HiddenB
+            || post_ffn.reads()[1].slot() != MetalBufferSlot::FfnDown
+            || post_ffn.writes()[0].slot() != MetalBufferSlot::HiddenA
+            || post_ffn.writes()[1].slot() != MetalBufferSlot::Normalized
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal transformer tail layer {layer} has incompatible arena slots"
+            )));
+        }
+        let arena = residual.reads()[0].buffer();
+        if steps
+            .iter()
+            .flat_map(|step| step.reads().iter().chain(step.writes()))
+            .any(|view| !std::ptr::eq(arena, view.buffer()))
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal transformer tail layer {layer} does not use one activation arena"
+            )));
+        }
+        let mapping = &ffn_gate_up[0].mapping.inner;
+        let hidden = Qwen38Config::default().hidden_size;
+        let intermediate = Qwen38Config::default().intermediate_size;
+        if residual_rms_norm.input_buffer.is_some()
+            || residual_rms_norm.output_buffer.is_some()
+            || post_ffn_residual_rms_norm.input_buffer.is_some()
+            || post_ffn_residual_rms_norm.output_buffer.is_some()
+            || ffn_gate_up.iter().any(|projection| {
+                projection.input_buffer.is_some()
+                    || projection.output_buffer.is_some()
+                    || !Rc::ptr_eq(&projection.mapping.inner, mapping)
+                    || projection.columns != hidden
+                    || projection.rows != intermediate
+            })
+            || swiglu_down.input_buffer.is_some()
+            || swiglu_down.output_buffer.is_some()
+            || !Rc::ptr_eq(&swiglu_down.mapping.inner, mapping)
+            || !Rc::ptr_eq(&residual_rms_norm.mapping.inner, mapping)
+            || !Rc::ptr_eq(&post_ffn_residual_rms_norm.mapping.inner, mapping)
+            || swiglu_down.columns != intermediate
+            || swiglu_down.rows != hidden
+            || residual_rms_norm.rows != 1
+            || residual_rms_norm.columns != hidden
+            || post_ffn_residual_rms_norm.rows != 1
+            || post_ffn_residual_rms_norm.columns != hidden
+            || ffn_gate_up[1].packed_s_in_bytes()? != ffn_gate_up[0].packed_s_in_bytes()?
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal transformer tail layer {layer} resources are not graph-owned or shape-compatible"
+            )));
+        }
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let mlp_prefix = format!("{layer_prefix}.mlp");
+        for (projection, name) in [
+            (ffn_gate_up[0], format!("{mlp_prefix}.gate_proj.weight")),
+            (ffn_gate_up[1], format!("{mlp_prefix}.up_proj.weight")),
+            (swiglu_down, format!("{mlp_prefix}.down_proj.weight")),
+        ] {
+            if !projection.matches_recovered_tensor(&name)? {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal transformer tail layer {layer} projection does not match {name}"
+                )));
+            }
+        }
+        let config = Qwen38Config::default();
+        let next_norm_name = if layer + 1 == config.num_hidden_layers {
+            "model.language_model.norm.weight".to_owned()
+        } else {
+            format!(
+                "model.language_model.layers.{}.input_layernorm.weight",
+                layer + 1
+            )
+        };
+        if !residual_rms_norm
+            .matches_weight_tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?
+            || !post_ffn_residual_rms_norm.matches_weight_tensor(&next_norm_name)?
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal transformer tail layer {layer} norm identity is incompatible"
+            )));
+        }
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-shared-arena-transformer-tail");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_residual_rms_norm_between(
+            encoder,
+            residual_rms_norm,
+            arena,
+            residual.reads()[0].offset(),
+            arena,
+            residual.reads()[1].offset(),
+            arena,
+            residual.writes()[0].offset(),
+            arena,
+            residual.writes()[1].offset(),
+        );
+        for (projection, output) in ffn_gate_up.iter().zip(ffn.writes()) {
+            self.encode_mapped_projection_between(
+                encoder,
+                projection,
+                arena,
+                ffn.reads()[0].offset(),
+                arena,
+                output.offset(),
+            )?;
+        }
+        self.encode_mapped_swiglu_projection_between(
+            encoder,
+            swiglu_down,
+            arena,
+            down.reads()[0].offset(),
+            arena,
+            down.reads()[1].offset(),
+            arena,
+            down.writes()[0].offset(),
+        )?;
+        self.encode_mapped_residual_rms_norm_between(
+            encoder,
+            post_ffn_residual_rms_norm,
+            arena,
+            post_ffn.reads()[0].offset(),
+            arena,
+            post_ffn.reads()[1].offset(),
+            arena,
+            post_ffn.writes()[0].offset(),
+            arena,
+            post_ffn.writes()[1].offset(),
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal transformer tail layer {layer} ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Execute one complete target full-attention layer through its exact ten
+    /// schedule views. KV metadata creates a bounded command boundary; all
+    /// activation tensors remain device-resident and the residual/FFN tail is
+    /// encoded together.
+    pub fn dispatch_prepared_mapped_full_attention_layer(
+        &self,
+        steps: &[PreparedMetalDecodeStepView<'_>],
+        prepared: &mut PreparedMappedMetalFullAttentionLayer,
+    ) -> Result<()> {
+        const OPERATIONS: [MetalDecodeOperation; 10] = [
+            MetalDecodeOperation::FullAttentionFanout,
+            MetalDecodeOperation::QueryGateNormRope,
+            MetalDecodeOperation::KeyRope,
+            MetalDecodeOperation::PagedKvAppend,
+            MetalDecodeOperation::PagedGqa,
+            MetalDecodeOperation::AttentionGateOutputProjection,
+            MetalDecodeOperation::ResidualRmsNorm,
+            MetalDecodeOperation::FfnGateUpFanout,
+            MetalDecodeOperation::SwiGluDownProjection,
+            MetalDecodeOperation::ResidualRmsNorm,
+        ];
+        let layer = prepared.layer;
+        let expected_start = layer
+            .checked_mul(OPERATIONS.len())
+            .and_then(|offset| offset.checked_add(2))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal full-attention schedule index overflows".into())
+            })?;
+        if steps.len() != OPERATIONS.len()
+            || steps
+                .iter()
+                .zip(OPERATIONS)
+                .enumerate()
+                .any(|(offset, (step, operation))| {
+                    step.step().schedule_index != expected_start + offset
+                        || step.step().layer != Some(layer)
+                        || step.step().operation != operation
+                })
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} does not match its frozen ten-step schedule"
+            )));
+        }
+        let mapping = &prepared.fanout.projections[0].mapping.inner;
+        if prepared.fanout.layer != layer
+            || prepared.query_gate.layer != layer
+            || prepared.attention.owner_layer != Some(layer)
+            || prepared.attention_output.layer != layer
+            || !Rc::ptr_eq(&prepared.query_gate.mapping.inner, mapping)
+            || !Rc::ptr_eq(&prepared.attention_output.projection.mapping.inner, mapping)
+            || prepared
+                .fanout
+                .projections
+                .iter()
+                .any(|projection| !Rc::ptr_eq(&projection.mapping.inner, mapping))
+            || prepared
+                .ffn_gate_up
+                .iter()
+                .any(|projection| !Rc::ptr_eq(&projection.mapping.inner, mapping))
+            || !Rc::ptr_eq(&prepared.swiglu_down.mapping.inner, mapping)
+            || !Rc::ptr_eq(&prepared.residual_rms_norm.mapping.inner, mapping)
+            || !Rc::ptr_eq(&prepared.post_ffn_residual_rms_norm.mapping.inner, mapping)
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} resources do not share one canonical mapping"
+            )));
+        }
+
+        self.dispatch_mapped_full_attention_fanout_views(&steps[0], &prepared.fanout)?;
+        self.dispatch_mapped_query_gate_norm_rope_view(&steps[1], &prepared.query_gate)?;
+        self.dispatch_partial_rope_view(&prepared.key_rope, &steps[2].writes()[0])?;
+        self.append_and_dispatch_paged_gqa_views(&mut prepared.attention, &steps[3], &steps[4])?;
+        self.dispatch_mapped_attention_gate_output_projection_view(
+            &steps[5],
+            &prepared.attention_output,
+        )?;
+        self.dispatch_mapped_transformer_tail_views(
+            &steps[6..],
+            layer,
+            &prepared.residual_rms_norm,
+            [&prepared.ffn_gate_up[0], &prepared.ffn_gate_up[1]],
+            &prepared.swiglu_down,
+            &prepared.post_ffn_residual_rms_norm,
+        )
+    }
+
     /// Execute one complete frozen linear-attention transformer layer from an
     /// already-normalized shared-arena input. The ten bound schedule views are
     /// reusable for every linear layer; immutable tensors remain mmap-backed,
@@ -12929,6 +13324,293 @@ mod tests {
             .expect("read zero attention projection")
             .iter()
             .all(|value| value.abs() <= f32::EPSILON));
+    }
+
+    #[test]
+    fn complete_full_attention_layer_reaches_next_normalized_view() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let config = Qwen38Config::default();
+        let hidden = config.hidden_size;
+        let query_values = config.num_attention_heads * config.head_dim;
+        let key_value_values = config.num_key_value_heads * config.head_dim;
+        let intermediate = config.intermediate_size;
+        let hidden_s_in_values = vec![0.9375_f32; hidden];
+        let hidden_s_in = f16_bytes(&hidden_s_in_values);
+        let attention_s_in_values = vec![0.96875_f32; query_values];
+        let attention_s_in = f16_bytes(&attention_s_in_values);
+        let down_s_in_values = vec![0.953125_f32; intermediate];
+        let down_s_in = f16_bytes(&down_s_in_values);
+        let post_attention_norm = vec![0.0625_f32; hidden];
+        let next_input_norm = vec![-0.03125_f32; hidden];
+        let q_norm = vec![0.0_f32; config.head_dim];
+        let prefix = "model.language_model.layers.3";
+        let attention_prefix = format!("{prefix}.self_attn");
+        let mlp_prefix = format!("{prefix}.mlp");
+        let projection_specs = [
+            (
+                format!("{attention_prefix}.q_proj.weight"),
+                TensorDType::Q2B64,
+                query_values * 2,
+                hidden,
+                hidden_s_in.as_slice(),
+                0.9375,
+            ),
+            (
+                format!("{attention_prefix}.k_proj.weight"),
+                TensorDType::Q4B64,
+                key_value_values,
+                hidden,
+                hidden_s_in.as_slice(),
+                1.03125,
+            ),
+            (
+                format!("{attention_prefix}.v_proj.weight"),
+                TensorDType::Q2B64,
+                key_value_values,
+                hidden,
+                hidden_s_in.as_slice(),
+                1.0625,
+            ),
+            (
+                format!("{attention_prefix}.o_proj.weight"),
+                TensorDType::Q4B64,
+                hidden,
+                query_values,
+                attention_s_in.as_slice(),
+                1.015625,
+            ),
+            (
+                format!("{mlp_prefix}.gate_proj.weight"),
+                TensorDType::Q2B64,
+                intermediate,
+                hidden,
+                hidden_s_in.as_slice(),
+                0.984375,
+            ),
+            (
+                format!("{mlp_prefix}.up_proj.weight"),
+                TensorDType::Q4B64,
+                intermediate,
+                hidden,
+                hidden_s_in.as_slice(),
+                1.03125,
+            ),
+            (
+                format!("{mlp_prefix}.down_proj.weight"),
+                TensorDType::Q2B64,
+                hidden,
+                intermediate,
+                down_s_in.as_slice(),
+                1.015625,
+            ),
+        ];
+        let directory = tempdir().expect("temporary complete full-attention directory");
+        let path = directory.path().join("full-attention-layer.ctoxq");
+        let mut tensors = Vec::new();
+        for (name, dtype, rows, columns, s_in, s_out) in &projection_specs {
+            tensors.extend(repeated_recovered_tensors(
+                name, *dtype, *rows, *columns, s_in, *s_out,
+            ));
+        }
+        tensors.extend([
+            PackedTensor {
+                name: format!("{attention_prefix}.q_norm.weight"),
+                dtype: TensorDType::F16,
+                shape: vec![config.head_dim as u64],
+                bytes: f16_bytes(&q_norm),
+            },
+            PackedTensor {
+                name: format!("{prefix}.post_attention_layernorm.weight"),
+                dtype: TensorDType::F16,
+                shape: vec![hidden as u64],
+                bytes: f16_bytes(&post_attention_norm),
+            },
+            PackedTensor {
+                name: "model.language_model.layers.4.input_layernorm.weight".into(),
+                dtype: TensorDType::F16,
+                shape: vec![hidden as u64],
+                bytes: f16_bytes(&next_input_norm),
+            },
+        ]);
+        ArtifactBuilder {
+            model: "test/qwen38-complete-full-attention".into(),
+            revision: "0123456789abcdef".into(),
+            target: "canonical-b64".into(),
+            alignment: DEFAULT_ALIGNMENT,
+            tensors,
+        }
+        .write_new(&path)
+        .expect("write complete full-attention fixture");
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open complete full-attention fixture");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("map complete full-attention fixture");
+        let cache = MetalPagedGqaConfig {
+            query_heads: config.num_attention_heads,
+            key_value_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            maximum_tokens: 8,
+            page_tokens: 2,
+            sink_tokens: 2,
+            recent_tokens: 2,
+        };
+        let mut prepared = runtime
+            .prepare_mapped_full_attention_layer(&mapping, 3, 0, cache)
+            .expect("prepare complete full-attention layer");
+        assert_eq!(prepared.layer(), 3);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert!(prepared.resident_state_bytes() > 0);
+        assert_eq!(prepared.cached_tokens(), 0);
+        assert!(runtime
+            .prepare_mapped_full_attention_layer(&mapping, 0, 0, cache)
+            .is_err());
+        assert!(runtime
+            .prepare_mapped_full_attention_layer(
+                &mapping,
+                3,
+                0,
+                MetalPagedGqaConfig {
+                    query_heads: 12,
+                    ..cache
+                },
+            )
+            .is_err());
+
+        let residual_input: Vec<f32> = (0..hidden)
+            .map(|index| (index as f32 * 0.007).cos() * 0.4)
+            .collect();
+        let normalized_input: Vec<f32> = (0..hidden)
+            .map(|index| (index as f32 * 0.011).sin() * 0.55 - 0.03)
+            .collect();
+        let corrected_hidden: Vec<f32> = normalized_input
+            .iter()
+            .zip(&hidden_s_in_values)
+            .map(|(value, scale)| value * scale)
+            .collect();
+        let recovered_scalar = |name: &str, corrected_input: &[f32]| {
+            let row = artifact
+                .recovered_matrix(name)
+                .expect("resolve complete-layer oracle matrix")
+                .row_operation(0)
+                .expect("resolve complete-layer oracle row");
+            cpu.recovered_row_matvec(&RecoveredRowMatVec {
+                dtype: row.dtype,
+                weights: row.weights,
+                corrected_input,
+                s_out: row.s_out,
+            })
+            .expect("execute complete-layer row oracle")
+        };
+        let query_gate_scalar = recovered_scalar(
+            &format!("{attention_prefix}.q_proj.weight"),
+            &corrected_hidden,
+        );
+        let value_scalar = recovered_scalar(
+            &format!("{attention_prefix}.v_proj.weight"),
+            &corrected_hidden,
+        );
+        let quantized_value = Q4Block64::quantize(&[value_scalar; BLOCK_LEN])
+            .expect("quantize one-token value oracle")
+            .value(0);
+        let gated_attention = quantized_value / (1.0 + (-query_gate_scalar).exp());
+        let corrected_attention = vec![gated_attention * attention_s_in_values[0]; query_values];
+        let mixer_scalar = recovered_scalar(
+            &format!("{attention_prefix}.o_proj.weight"),
+            &corrected_attention,
+        );
+        let first_residual: Vec<f32> = residual_input
+            .iter()
+            .map(|value| value + mixer_scalar)
+            .collect();
+        let first_normalized = crate::reference::rms_norm_1p_weight(
+            &first_residual,
+            1,
+            hidden,
+            &post_attention_norm,
+            config.rms_norm_epsilon,
+        )
+        .expect("post-attention norm oracle");
+        let corrected_ffn: Vec<f32> = first_normalized
+            .iter()
+            .zip(&hidden_s_in_values)
+            .map(|(value, scale)| value * scale)
+            .collect();
+        let gate_scalar =
+            recovered_scalar(&format!("{mlp_prefix}.gate_proj.weight"), &corrected_ffn);
+        let up_scalar = recovered_scalar(&format!("{mlp_prefix}.up_proj.weight"), &corrected_ffn);
+        let swiglu_scalar = gate_scalar / (1.0 + (-gate_scalar).exp()) * up_scalar;
+        let corrected_down = vec![swiglu_scalar * down_s_in_values[0]; intermediate];
+        let down_scalar =
+            recovered_scalar(&format!("{mlp_prefix}.down_proj.weight"), &corrected_down);
+        let expected_hidden: Vec<f32> = first_residual
+            .iter()
+            .map(|value| value + down_scalar)
+            .collect();
+        let expected_normalized = crate::reference::rms_norm_1p_weight(
+            &expected_hidden,
+            1,
+            hidden,
+            &next_input_norm,
+            config.rms_norm_epsilon,
+        )
+        .expect("next-layer norm oracle");
+
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let projection_plan = MetalProjectionPlan::qwen38(&config).expect("Metal projection plan");
+        let binding_plan = MetalDecodeBindingPlan::qwen38(&schedule, &projection_plan, &config)
+            .expect("complete Metal binding plan");
+        let workspace_plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("decode workspace plan");
+        let mut workspace = runtime
+            .prepare_decode_workspace(&workspace_plan)
+            .expect("allocate shared decode arena");
+        workspace
+            .write_f32(MetalBufferSlot::HiddenA, &residual_input)
+            .expect("seed residual input");
+        workspace
+            .write_f32(MetalBufferSlot::Normalized, &normalized_input)
+            .expect("seed normalized input");
+        let program = workspace
+            .bind_decode_program(&binding_plan)
+            .expect("bind complete decode program");
+        let wrong_layer = program
+            .full_attention_layer_steps(7)
+            .expect("bind wrong full-attention layer");
+        assert!(runtime
+            .dispatch_prepared_mapped_full_attention_layer(wrong_layer, &mut prepared)
+            .is_err());
+        assert_eq!(prepared.cached_tokens(), 0);
+        let layer_three = program
+            .full_attention_layer_steps(3)
+            .expect("bind layer-3 full attention");
+        runtime
+            .dispatch_prepared_mapped_full_attention_layer(layer_three, &mut prepared)
+            .expect("dispatch complete full-attention layer");
+        drop(program);
+        assert_eq!(prepared.cached_tokens(), 1);
+        drop(mapping);
+        drop(artifact);
+
+        let actual_hidden = workspace
+            .read_f32(MetalBufferSlot::HiddenA)
+            .expect("read complete-layer residual");
+        let actual_normalized = workspace
+            .read_f32(MetalBufferSlot::Normalized)
+            .expect("read complete-layer normalized output");
+        for (label, expected, actual) in [
+            ("hidden", &expected_hidden, &actual_hidden),
+            ("normalized", &expected_normalized, &actual_normalized),
+        ] {
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 3.0e-3_f32.max(expected.abs() * 8.0e-4);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "complete full-attention {label} {index}: expected {expected}, got {actual}"
+                );
+            }
+        }
     }
 
     #[test]
