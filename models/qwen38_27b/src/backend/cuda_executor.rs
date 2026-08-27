@@ -38,6 +38,22 @@ pub struct CudaGatheredMtpVerification {
     pub maximum_absolute_error: f32,
 }
 
+/// Process-visible CUDA residency sampled around the executor lifecycle.
+///
+/// The baseline is captured after the CUDA context/module exists but before
+/// the model graph is prepared. `sampled_peak_bytes` is therefore the largest
+/// executor-owned delta observed at an explicit lifecycle boundary, rather
+/// than total device usage by unrelated processes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaAllocatorStats {
+    pub free_before_load_bytes: u64,
+    pub minimum_free_bytes: u64,
+    pub free_after_unload_bytes: u64,
+    pub sampled_peak_bytes: u64,
+    pub reclaimed_bytes: u64,
+    pub residual_bytes: u64,
+}
+
 #[derive(Debug)]
 struct PendingCudaSpeculativeBranch {
     candidate_tokens: Vec<u32>,
@@ -60,6 +76,7 @@ pub struct CudaModelExecutor {
     admitted_context: usize,
     admitted_draft_tokens: usize,
     free_bytes_before_graph: Option<usize>,
+    allocator_stats: CudaAllocatorStats,
     mtp_output_mode: CudaMtpOutputMode,
     warmed: bool,
     allocations: AllocationSnapshot,
@@ -116,6 +133,9 @@ enum CudaWorkerCommand {
         token: u32,
         reply: SyncSender<Result<CudaGatheredMtpVerification>>,
     },
+    AllocatorStats {
+        reply: SyncSender<Result<CudaAllocatorStats>>,
+    },
     Shutdown {
         reply: SyncSender<Result<()>>,
     },
@@ -156,6 +176,7 @@ impl CudaModelExecutor {
             admitted_context: 0,
             admitted_draft_tokens: 0,
             free_bytes_before_graph: None,
+            allocator_stats: CudaAllocatorStats::default(),
             mtp_output_mode,
             warmed: false,
             allocations: AllocationSnapshot::default(),
@@ -196,6 +217,23 @@ impl CudaModelExecutor {
             && ids
                 .iter()
                 .all(|token| (*token as usize) < TOKENIZER_VOCAB_SIZE)
+    }
+
+    fn sample_allocator_stats(&mut self) -> Result<CudaAllocatorStats> {
+        if let Some(runtime) = self.runtime.as_ref() {
+            let (free, _) = runtime.memory_info()?;
+            let free = u64::try_from(free)
+                .map_err(|_| EngineError::MemoryBudget("CUDA free bytes exceed u64".into()))?;
+            if self.allocator_stats.free_before_load_bytes != 0 {
+                self.allocator_stats.minimum_free_bytes =
+                    self.allocator_stats.minimum_free_bytes.min(free);
+                self.allocator_stats.sampled_peak_bytes = self
+                    .allocator_stats
+                    .free_before_load_bytes
+                    .saturating_sub(self.allocator_stats.minimum_free_bytes);
+            }
+        }
+        Ok(self.allocator_stats)
     }
 
     /// Submission accounting is exposed only for verifier evidence. Production
@@ -386,6 +424,14 @@ impl ThreadedCudaModelExecutor {
         })
     }
 
+    /// Sample CUDA free memory on the driver-owning worker and return the
+    /// accumulated lifecycle high-watermark evidence.
+    pub fn allocator_stats(&self) -> Result<CudaAllocatorStats> {
+        self.request("allocator statistics", |reply| {
+            CudaWorkerCommand::AllocatorStats { reply }
+        })
+    }
+
     fn shutdown(&mut self) -> Result<()> {
         let Some(sender) = self.sender.take() else {
             return Ok(());
@@ -497,6 +543,9 @@ fn run_cuda_worker(mut executor: CudaModelExecutor, receiver: mpsc::Receiver<Cud
             CudaWorkerCommand::VerifyGatheredMtp { token, reply } => {
                 let _ = reply.send(executor.verify_gathered_mtp(token));
             }
+            CudaWorkerCommand::AllocatorStats { reply } => {
+                let _ = reply.send(executor.sample_allocator_stats());
+            }
             CudaWorkerCommand::Shutdown { reply } => {
                 let reset = executor.reset_session();
                 let unload = executor.unload();
@@ -590,6 +639,7 @@ impl ModelExecutor for CudaModelExecutor {
         )?;
         let argmax = runtime.prepare_argmax_f32()?;
         let target_sampler = runtime.prepare_topk_topp_sampler(TOKENIZER_VOCAB_SIZE)?;
+        let (free_after_graph, _) = runtime.memory_info()?;
         let expected_checkpoint = profile
             .speculative_linear_state_bytes_per_session
             .checked_add(
@@ -630,6 +680,16 @@ impl ModelExecutor for CudaModelExecutor {
         self.admitted_context = admitted_context;
         self.admitted_draft_tokens = profile.mtp_draft_tokens as usize;
         self.free_bytes_before_graph = Some(free_before_graph);
+        let free_before_load_bytes = u64::try_from(free_before_graph)
+            .map_err(|_| EngineError::MemoryBudget("CUDA baseline bytes exceed u64".into()))?;
+        let minimum_free_bytes = u64::try_from(free_after_graph)
+            .map_err(|_| EngineError::MemoryBudget("CUDA free bytes exceed u64".into()))?;
+        self.allocator_stats = CudaAllocatorStats {
+            free_before_load_bytes,
+            minimum_free_bytes,
+            sampled_peak_bytes: free_before_load_bytes.saturating_sub(minimum_free_bytes),
+            ..CudaAllocatorStats::default()
+        };
         Ok(())
     }
 
@@ -1082,10 +1142,20 @@ impl ModelExecutor for CudaModelExecutor {
         self.allocations = AllocationSnapshot::default();
         let observed_free = observed_free?.map(|(free, _)| free);
         if let (Some(expected), Some(observed)) = (expected_free, observed_free) {
+            self.allocator_stats.free_after_unload_bytes =
+                u64::try_from(observed).map_err(|_| {
+                    EngineError::MemoryBudget("CUDA post-unload free bytes exceed u64".into())
+                })?;
+            self.allocator_stats.residual_bytes = u64::try_from(expected.saturating_sub(observed))
+                .map_err(|_| EngineError::MemoryBudget("CUDA residual bytes exceed u64".into()))?;
+            self.allocator_stats.reclaimed_bytes = self
+                .allocator_stats
+                .sampled_peak_bytes
+                .saturating_sub(self.allocator_stats.residual_bytes);
             if observed != expected {
                 return Err(EngineError::MemoryBudget(format!(
-                    "CUDA executor retained {} bytes after unload",
-                    expected.saturating_sub(observed)
+                    "CUDA executor post-unload free-memory drift: baseline={expected}, observed={observed}, retained={}",
+                    expected.saturating_sub(observed),
                 )));
             }
         }

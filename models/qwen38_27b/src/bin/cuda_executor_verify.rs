@@ -82,6 +82,12 @@ struct Report {
     commit_milliseconds: f64,
     unload_milliseconds: f64,
     allocations_zero_after_unload: bool,
+    allocator_free_before_load_bytes: u64,
+    allocator_minimum_free_bytes: u64,
+    allocator_free_after_unload_bytes: u64,
+    allocator_sampled_peak_bytes: u64,
+    allocator_reclaimed_bytes: u64,
+    allocator_residual_bytes: u64,
     compact_mode_capability: bool,
     compact_prefill_host_logit_values: usize,
     compact_decode_host_logit_values: usize,
@@ -94,6 +100,8 @@ struct Report {
     compact_decode_milliseconds: f64,
     compact_unload_milliseconds: f64,
     compact_allocations_zero_after_unload: bool,
+    compact_allocator_sampled_peak_bytes: u64,
+    compact_allocator_residual_bytes: u64,
     note: &'static str,
 }
 
@@ -286,9 +294,11 @@ fn main() -> anyhow::Result<()> {
         executor.session_token_counters()? == (0, 0),
         "CUDA executor reset retained token state"
     );
+    let _ = executor.allocator_stats()?;
     let unload_started = Instant::now();
     executor.unload()?;
     let unload_milliseconds = unload_started.elapsed().as_secs_f64() * 1.0e3;
+    let allocator_stats = executor.allocator_stats()?;
     let allocations_zero_after_unload = executor.allocations().is_zero();
     anyhow::ensure!(
         allocations_zero_after_unload,
@@ -393,9 +403,11 @@ fn main() -> anyhow::Result<()> {
         compact_stats.context_synchronizations,
     );
     compact_executor.reset_session()?;
+    let _ = compact_executor.allocator_stats()?;
     let compact_unload_started = Instant::now();
     compact_executor.unload()?;
     let compact_unload_milliseconds = compact_unload_started.elapsed().as_secs_f64() * 1.0e3;
+    let compact_allocator_stats = compact_executor.allocator_stats()?;
     let compact_allocations_zero_after_unload = compact_executor.allocations().is_zero();
     anyhow::ensure!(
         compact_allocations_zero_after_unload,
@@ -449,6 +461,12 @@ fn main() -> anyhow::Result<()> {
             commit_milliseconds,
             unload_milliseconds,
             allocations_zero_after_unload,
+            allocator_free_before_load_bytes: allocator_stats.free_before_load_bytes,
+            allocator_minimum_free_bytes: allocator_stats.minimum_free_bytes,
+            allocator_free_after_unload_bytes: allocator_stats.free_after_unload_bytes,
+            allocator_sampled_peak_bytes: allocator_stats.sampled_peak_bytes,
+            allocator_reclaimed_bytes: allocator_stats.reclaimed_bytes,
+            allocator_residual_bytes: allocator_stats.residual_bytes,
             compact_mode_capability,
             compact_prefill_host_logit_values,
             compact_decode_host_logit_values,
@@ -461,7 +479,9 @@ fn main() -> anyhow::Result<()> {
             compact_decode_milliseconds,
             compact_unload_milliseconds,
             compact_allocations_zero_after_unload,
-            note: "Exercises both CUDA executor output modes through dedicated thread-affine workers without CPU model-operation fallback. The evidence mode proves complete gathered/target distributions and host-oracle decisions. The server mode returns zero host logit values and matches every evidence-mode draft/target/bonus decision. A fully accepted block commits its already computed state after one final headless MTP transition; partial acceptance restores and causally replays only the accepted prefix. Both paths unload fully. Production still requires on-device RNG state, unrestricted top-p, stochastic MTP accept/reject, BF16/logit quality, long-context, and roofline evidence on the release checkpoint.",
+            compact_allocator_sampled_peak_bytes: compact_allocator_stats.sampled_peak_bytes,
+            compact_allocator_residual_bytes: compact_allocator_stats.residual_bytes,
+            note: "Exercises both CUDA executor output modes through dedicated thread-affine workers without CPU model-operation fallback. The evidence mode proves complete gathered/target distributions and host-oracle decisions. The server mode returns zero host logit values and matches every evidence-mode draft/target/bonus decision. A fully accepted block commits its already computed state after one final headless MTP transition; partial acceptance restores and causally replays only the accepted prefix. Both paths report CUDA free-memory baselines, sampled residency peaks, reclamation, and exact zero post-unload drift. Production still requires on-device RNG state, unrestricted top-p, stochastic MTP accept/reject, BF16/logit quality, long-context, and roofline evidence on the release checkpoint.",
         })?
     );
     Ok(())

@@ -23,6 +23,11 @@ paths needed to build them.
 | Snapdragon | QNN/Vulkan/AHardwareBuffer contract | Exact Fold SoC support, compiled HTP/Vulkan graph, shared-memory proof, and device measurements |
 | Runtime | Checksummed v1/v2 container, corrected memory planner, graph ownership plan, stable lifecycle/wire contracts, pinned pure-Rust tokenizer plus text/reasoning/tool template, signed/rehashed multilingual MTP draft-vocabulary contract, two-phase target+MTP verification/commit composition, fail-closed greedy MTP verification, concurrent/cancellable token-ID `EngineServer`, unbuffered multilingual Responses/tool frontend, CPU correctness executor, and threaded CUDA verifier executor reachable through the same server ABI | Promoted production executor binding, probability-correct non-greedy MTP, optimized streaming prefill/decode, and measured full-artifact unload evidence |
 
+The CUDA full-artifact verifier now also records the driver-visible free-memory
+baseline, sampled executor residency peak, reclaimed bytes, and exact
+post-`unload` drift for both evidence and compact server modes. These fields are
+plumbing evidence only until they have been measured on the final checkpoint.
+
 The corrected 9.5822-GiB baseline and 9.6110-GiB initializer 128K figures are
 verified no-MTP calculations, not measured RSS/PSS/VRAM peaks. The v2 correction adds
 the previously omitted 7.5-MiB causal-convolution state to the 144-MiB
