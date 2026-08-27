@@ -300,6 +300,13 @@ consume that token directly; every mixed-precision segment is dispatched but
 only the owning segment writes the recovered row. The same-command Golden
 selects rows on both sides of a Q2/Q4 boundary and matches the static CPU
 oracle without a token readback or an embedding-table repack.
+The target core now exposes the matching verifier boundary in the other
+direction: a resident full-vocabulary selector can drive target embedding,
+initial norm, all 64 layers, and the LM head without materializing its token as
+a host embedding request. Validation is shared with the ordinary host-token
+entry point, and state commits only after GPU completion plus compact selector
+status validation. This is the target-transition primitive required to verify
+the first MTP draft; the combined transaction is not yet assembled.
 A native f32 concatenate kernel now also joins the normalized selected-token
 embedding and retained target hidden state directly in caller-owned Metal
 storage. A dedicated liveness-derived MTP arena backs the complete frontend in

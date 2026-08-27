@@ -10883,26 +10883,12 @@ impl MetalCandidateRuntime {
         prepared.commit_speculative()
     }
 
-    /// Execute target embedding, initial norm, all 64 transformer layers, and
-    /// the full LM head in one shared-arena command buffer. Target logits stay
-    /// resident for the following MTP draft/verify stage; this method performs
-    /// no sampling and never reads the vocabulary tensor on the host.
-    pub fn dispatch_prepared_mapped_target_core(
+    fn validate_prepared_mapped_target_core<'program, 'arena>(
         &self,
-        program: &PreparedMetalDecodeProgram<'_>,
-        prepared: &mut PreparedMappedMetalTargetCore,
-        token: usize,
-    ) -> Result<()> {
+        program: &'program PreparedMetalDecodeProgram<'arena>,
+        prepared: &PreparedMappedMetalTargetCore,
+    ) -> Result<[&'program PreparedMetalDecodeStepView<'arena>; 3]> {
         let config = Qwen38Config::default();
-        if token >= prepared.embedding.rows
-            || prepared.copied_model_bytes() != 0
-            || prepared.vocabulary_rows() != config.vocab_size
-            || prepared.hidden_size() != config.hidden_size
-        {
-            return Err(EngineError::InvalidState(
-                "Metal target core token or frozen dimensions are invalid".into(),
-            ));
-        }
         let embedding = program.steps.first().ok_or_else(|| {
             EngineError::InvalidState("Metal target core has no embedding step".into())
         })?;
@@ -10912,7 +10898,10 @@ impl MetalCandidateRuntime {
         let lm_head = program.steps.get(642).ok_or_else(|| {
             EngineError::InvalidState("Metal target core has no LM-head step".into())
         })?;
-        if embedding.step().schedule_index != 0
+        if prepared.copied_model_bytes() != 0
+            || prepared.vocabulary_rows() != config.vocab_size
+            || prepared.hidden_size() != config.hidden_size
+            || embedding.step().schedule_index != 0
             || embedding.step().layer.is_some()
             || embedding.step().operation != MetalDecodeOperation::Embedding
             || !embedding.reads().is_empty()
@@ -10936,8 +10925,7 @@ impl MetalCandidateRuntime {
             || lm_head.writes()[0].values() != config.vocab_size
         {
             return Err(EngineError::InvalidState(
-                "Metal target core frontend or LM-head views diverge from the frozen schedule"
-                    .into(),
+                "Metal target core views diverge from the frozen graph or dimensions".into(),
             ));
         }
         let arena = embedding.writes()[0].buffer();
@@ -10957,6 +10945,82 @@ impl MetalCandidateRuntime {
             ));
         }
         self.validate_prepared_mapped_target_layers(program, &prepared.layers)?;
+        Ok([embedding, initial_norm, lm_head])
+    }
+
+    fn encode_prepared_mapped_target_core_after_embedding(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetCore,
+        initial_norm: &PreparedMetalDecodeStepView<'_>,
+        lm_head: &PreparedMetalDecodeStepView<'_>,
+    ) -> Result<Vec<(usize, MetalPagedGqaAppendPlan)>> {
+        let arena = initial_norm.reads()[0].buffer();
+        self.encode_mapped_norm_between(
+            encoder,
+            &prepared.initial_norm,
+            arena,
+            initial_norm.reads()[0].offset(),
+            arena,
+            initial_norm.writes()[0].offset(),
+        );
+        let full_plans =
+            self.encode_prepared_mapped_target_layers(encoder, program, &mut prepared.layers)?;
+        self.encode_mapped_projection_between(
+            encoder,
+            &prepared.lm_head,
+            arena,
+            lm_head.reads()[0].offset(),
+            arena,
+            lm_head.writes()[0].offset(),
+        )?;
+        Ok(full_plans)
+    }
+
+    fn encode_prepared_mapped_target_core_from_selector(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetCore,
+        selector: &PreparedMetalArgMaxScratch,
+    ) -> Result<Vec<(usize, MetalPagedGqaAppendPlan)>> {
+        let [embedding, initial_norm, lm_head] =
+            self.validate_prepared_mapped_target_core(program, prepared)?;
+        self.encode_mapped_embedding_from_selector_to(
+            encoder,
+            &prepared.embedding,
+            selector,
+            embedding.writes()[0].buffer(),
+            embedding.writes()[0].offset(),
+        )?;
+        self.encode_prepared_mapped_target_core_after_embedding(
+            encoder,
+            program,
+            prepared,
+            initial_norm,
+            lm_head,
+        )
+    }
+
+    /// Execute target embedding, initial norm, all 64 transformer layers, and
+    /// the full LM head in one shared-arena command buffer. Target logits stay
+    /// resident for the following MTP draft/verify stage; this method performs
+    /// no sampling and never reads the vocabulary tensor on the host.
+    pub fn dispatch_prepared_mapped_target_core(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetCore,
+        token: usize,
+    ) -> Result<()> {
+        if token >= prepared.embedding.rows {
+            return Err(EngineError::InvalidState(
+                "Metal target core token exceeds the admitted embedding".into(),
+            ));
+        }
+        let [embedding, initial_norm, lm_head] =
+            self.validate_prepared_mapped_target_core(program, prepared)?;
+        let arena = embedding.writes()[0].buffer();
         prepared.layers.begin_speculative(self)?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-complete-target-core");
@@ -10969,25 +11033,13 @@ impl MetalCandidateRuntime {
                 arena,
                 embedding.writes()[0].offset(),
             )?;
-            self.encode_mapped_norm_between(
+            self.encode_prepared_mapped_target_core_after_embedding(
                 encoder,
-                &prepared.initial_norm,
-                arena,
-                initial_norm.reads()[0].offset(),
-                arena,
-                initial_norm.writes()[0].offset(),
-            );
-            let full_plans =
-                self.encode_prepared_mapped_target_layers(encoder, program, &mut prepared.layers)?;
-            self.encode_mapped_projection_between(
-                encoder,
-                &prepared.lm_head,
-                arena,
-                lm_head.reads()[0].offset(),
-                arena,
-                lm_head.writes()[0].offset(),
-            )?;
-            Ok(full_plans)
+                program,
+                prepared,
+                initial_norm,
+                lm_head,
+            )
         })();
         let full_plans = match encoded {
             Ok(plans) => plans,
@@ -11074,6 +11126,140 @@ impl MetalCandidateRuntime {
                     Ok(()) => Err(primary),
                     Err(rollback) => Err(EngineError::InvalidState(format!(
                         "Metal target-core verification failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            }
+        }
+        prepared.layers.commit_speculative()
+    }
+
+    /// Bring-up boundary for a target transition whose input token already
+    /// resides in an argmax result buffer. The selected token is never copied
+    /// into a host-side embedding request; the host reads only the compact
+    /// selector status after GPU completion and before committing state.
+    pub fn dispatch_prepared_mapped_target_core_from_selector_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetCore,
+        selector: &PreparedMetalArgMaxScratch,
+    ) -> Result<u32> {
+        if selector.values != prepared.vocabulary_rows() {
+            return Err(EngineError::InvalidState(
+                "Metal target selector does not cover the full vocabulary".into(),
+            ));
+        }
+        self.validate_prepared_mapped_target_core(program, prepared)?;
+        prepared.layers.begin_speculative(self)?;
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-target-core-from-selector-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoded = self
+            .encode_prepared_mapped_target_core_from_selector(encoder, program, prepared, selector);
+        let full_plans = match encoded {
+            Ok(plans) => plans,
+            Err(primary) => {
+                encoder.end_encoding();
+                return match prepared.layers.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal selected target encoding failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            }
+        };
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            let primary = EngineError::InvalidState(format!(
+                "Metal selected target core ended with {:?}",
+                command_buffer.status()
+            ));
+            return match prepared.layers.restore_speculative(self) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal selected target core failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            };
+        }
+        let selected = match self.read_argmax_result(selector) {
+            Ok(token) => token,
+            Err(primary) => {
+                return match prepared.layers.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal selected target input failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            }
+        };
+        self.finish_prepared_mapped_target_core(prepared, &full_plans)?;
+        Ok(selected)
+    }
+
+    fn finish_prepared_mapped_target_core(
+        &self,
+        prepared: &mut PreparedMappedMetalTargetCore,
+        full_plans: &[(usize, MetalPagedGqaAppendPlan)],
+    ) -> Result<()> {
+        for layer in &mut prepared.layers.layers {
+            match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    layer.convolution.poisoned = false;
+                    layer.recurrence.poisoned = false;
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    layer.attention.poisoned = false;
+                }
+            }
+        }
+        #[cfg(not(test))]
+        let _ = full_plans;
+        #[cfg(test)]
+        for (layer_index, plan) in full_plans {
+            let PreparedMappedMetalTargetLayer::FullAttention(layer) =
+                &mut prepared.layers.layers[*layer_index]
+            else {
+                let primary = EngineError::InvalidState(
+                    "Metal selected target verifier plan diverged from topology".into(),
+                );
+                return match prepared.layers.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal selected target verification failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            };
+            let component_values = layer.attention.key_value_heads * layer.attention.head_dim;
+            let key = unsafe {
+                slice::from_raw_parts(
+                    layer
+                        .attention
+                        .verifier_key_snapshot_buffer
+                        .contents()
+                        .cast::<f32>(),
+                    component_values,
+                )
+                .to_vec()
+            };
+            let value = unsafe {
+                slice::from_raw_parts(
+                    layer
+                        .attention
+                        .verifier_value_snapshot_buffer
+                        .contents()
+                        .cast::<f32>(),
+                    component_values,
+                )
+                .to_vec()
+            };
+            if let Err(primary) =
+                self.commit_paged_gqa_verifier_append(&mut layer.attention, plan, &key, &value)
+            {
+                return match prepared.layers.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal selected target verification failed ({primary}) and rollback failed: {rollback}"
                     ))),
                 };
             }

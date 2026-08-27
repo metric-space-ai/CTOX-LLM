@@ -172,6 +172,12 @@ buffer; `q2_b64_dynamic_embedding_row` and
 segments each carry a fixed 32-byte range/stride parameter block and only the
 segment containing the selected row writes the shared output. A same-command
 Golden crosses the Q2/Q4 boundary and matches loader-resolved static rows.
+The complete target core can now consume that same selector ABI as well. Its
+shared validator admits the frozen embedding/norm/64-layer/LM-head graph once,
+then the selector-driven verifier encodes the whole target transition without
+a host token-to-embedding handoff. It validates the compact selector status
+before committing all target states, so a non-finite source selection restores
+the speculative transition.
 `qwen_concat_f32` now supplies the next native MTP frontend primitive: it joins
 the normalized selected-token embedding and retained target hidden state into
 one caller-owned device view, with a fixed 16-byte ABI and no host staging.
