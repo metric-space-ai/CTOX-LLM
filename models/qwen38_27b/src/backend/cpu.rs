@@ -588,15 +588,16 @@ unsafe fn avx2_horizontal_sum(vector: __m256) -> f32 {
 /// Each little-endian u32 word of the 16 code bytes holds 16 two-bit codes:
 /// code `l` sits at bits `2l`. Variable per-lane right shifts broadcast the
 /// word and extract eight codes per vector. The dequantized value is
-/// `scale * (2 * code - 3) / 3`, which is bit-identical to
-/// `scale * Q2_CODEBOOK[code]` because `(2c - 3) / 3` and the codebook
-/// constant are the correctly rounded results of the same real quotient.
+/// logically `scale * (2 * code - 3) / 3`; the kernel evaluates this as
+/// `(scale / 3) * (2 * code - 3)` to keep division outside the SIMD loop.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_packed_q2_dot(scale: f32, codes: &[u8; 16], input: &[f32; BLOCK_LEN]) -> f32 {
     use std::arch::x86_64::*;
-    let vscale = _mm256_set1_ps(scale);
-    let divisor = _mm256_set1_ps(3.0);
+    // Hoist the normalization out of the inner SIMD loop. A vector divide is
+    // especially expensive here and the divisor is constant for the complete
+    // packed block.
+    let factor = _mm256_set1_ps(scale / 3.0);
     let mask = _mm256_set1_epi32(0x03);
     let offset = _mm256_set1_epi32(3);
     let shifts_lo = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
@@ -611,8 +612,7 @@ unsafe fn avx2_packed_q2_dot(scale: f32, codes: &[u8; 16], input: &[f32; BLOCK_L
         ] {
             let code = _mm256_and_si256(_mm256_srlv_epi32(broadcast, shifts), mask);
             let centered = _mm256_sub_epi32(_mm256_slli_epi32::<1>(code), offset);
-            let normalized = _mm256_div_ps(_mm256_cvtepi32_ps(centered), divisor);
-            let value = _mm256_mul_ps(normalized, vscale);
+            let value = _mm256_mul_ps(_mm256_cvtepi32_ps(centered), factor);
             let x = _mm256_loadu_ps(input.as_ptr().add(input_offset));
             acc = _mm256_add_ps(acc, _mm256_mul_ps(value, x));
         }
@@ -626,14 +626,13 @@ unsafe fn avx2_packed_q2_dot(scale: f32, codes: &[u8; 16], input: &[f32; BLOCK_L
 /// (code `2j + 1`), so even-indexed codes pair with even-indexed inputs.
 /// Two contiguous input vectors are deinterleaved with `shuffle_ps` plus a
 /// lane-fixing `permutevar8x32_ps`; codes are widened with `cvtepu8_epi32`.
-/// The value `scale * (2 * code - 15) / 15` is bit-identical to the scalar
-/// `scale * (code - 7.5) / 7.5` (same real quotient, correctly rounded).
+/// The logical value `scale * (2 * code - 15) / 15` is evaluated with the
+/// block-wide factor `scale / 15` to keep division outside the SIMD loop.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_packed_q4_dot(scale: f32, codes: &[u8; 32], input: &[f32; BLOCK_LEN]) -> f32 {
     use std::arch::x86_64::*;
-    let vscale = _mm256_set1_ps(scale);
-    let divisor = _mm256_set1_ps(15.0);
+    let factor = _mm256_set1_ps(scale / 15.0);
     let nibble_mask = _mm_set1_epi8(0x0f);
     let offset = _mm256_set1_epi32(15);
     let lane_fix = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
@@ -651,8 +650,7 @@ unsafe fn avx2_packed_q4_dot(scale: f32, codes: &[u8; 32], input: &[f32; BLOCK_L
             _mm256_permutevar8x32_ps(_mm256_shuffle_ps::<0b1101_1101>(lower, upper), lane_fix);
         for (code_vector, x) in [(even_codes, even_inputs), (odd_codes, odd_inputs)] {
             let centered = _mm256_sub_epi32(_mm256_slli_epi32::<1>(code_vector), offset);
-            let normalized = _mm256_div_ps(_mm256_cvtepi32_ps(centered), divisor);
-            let value = _mm256_mul_ps(normalized, vscale);
+            let value = _mm256_mul_ps(_mm256_cvtepi32_ps(centered), factor);
             acc = _mm256_add_ps(acc, _mm256_mul_ps(value, x));
         }
     }
@@ -687,8 +685,7 @@ unsafe fn neon_packed_q2_dot(scale: f32, codes: &[u8; 16], input: &[f32; BLOCK_L
         [-24, -26, -28, -30],
     ];
     let mask = vdupq_n_u32(0x03);
-    let vscale = vdupq_n_f32(scale);
-    let divisor = vdupq_n_f32(3.0);
+    let factor = vdupq_n_f32(scale / 3.0);
     let offset = vdupq_n_s32(3);
     let mut acc = vdupq_n_f32(0.0);
     for (word_index, word_bytes) in codes.chunks_exact(4).enumerate() {
@@ -697,10 +694,9 @@ unsafe fn neon_packed_q2_dot(scale: f32, codes: &[u8; 16], input: &[f32; BLOCK_L
         for (group, shift_lanes) in SHIFT_LANES.iter().enumerate() {
             let code = vandq_u32(vshlq_u32(broadcast, vld1q_s32(shift_lanes.as_ptr())), mask);
             let centered = vsubq_s32(vshlq_n_s32::<1>(vreinterpretq_s32_u32(code)), offset);
-            let normalized = vdivq_f32(vcvtq_f32_s32(centered), divisor);
-            let value = vmulq_f32(normalized, vscale);
             let x = vld1q_f32(input.as_ptr().add(word_index * 16 + group * 4));
-            acc = vfmaq_f32(acc, value, x);
+            let scaled_x = vmulq_f32(x, factor);
+            acc = vfmaq_f32(acc, vcvtq_f32_s32(centered), scaled_x);
         }
     }
     vaddvq_f32(acc)
@@ -713,8 +709,7 @@ unsafe fn neon_packed_q2_dot(scale: f32, codes: &[u8; 16], input: &[f32; BLOCK_L
 unsafe fn neon_packed_q4_dot(scale: f32, codes: &[u8; 32], input: &[f32; BLOCK_LEN]) -> f32 {
     use std::arch::aarch64::*;
     let nibble_mask = vdupq_n_u8(0x0f);
-    let vscale = vdupq_n_f32(scale);
-    let divisor = vdupq_n_f32(15.0);
+    let factor = vdupq_n_f32(scale / 15.0);
     let offset = vdupq_n_s32(15);
     let mut acc = vdupq_n_f32(0.0);
     for (half, byte_half) in codes.chunks_exact(16).enumerate() {
@@ -726,9 +721,8 @@ unsafe fn neon_packed_q4_dot(scale: f32, codes: &[u8; 32], input: &[f32; BLOCK_L
             for (code_vector, x) in [(*even, pair.0), (*odd, pair.1)] {
                 let centered =
                     vsubq_s32(vshlq_n_s32::<1>(vreinterpretq_s32_u32(code_vector)), offset);
-                let normalized = vdivq_f32(vcvtq_f32_s32(centered), divisor);
-                let value = vmulq_f32(normalized, vscale);
-                acc = vfmaq_f32(acc, value, x);
+                let scaled_x = vmulq_f32(x, factor);
+                acc = vfmaq_f32(acc, vcvtq_f32_s32(centered), scaled_x);
             }
         }
     }

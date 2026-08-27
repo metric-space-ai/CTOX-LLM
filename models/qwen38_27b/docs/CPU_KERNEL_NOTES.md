@@ -40,15 +40,21 @@ for every block of every row. The current implementation:
    row inside a mixed tensor, and composes block scale, FP16 `s_in`, and the
    single selected FP16 `s_out` value while producing the 5,120-element hidden
    vector. It never materializes or scans the complete vocabulary matrix.
+6. Hoists the fixed Q2/Q4 normalization divisor out of the inner SIMD loop.
+   AVX2 and NEON compute one `scale / 3` or `scale / 15` factor per packed
+   block; the hot loop then uses multiplication, and NEON feeds the centered
+   code and scaled activation directly to FMA. This removes every vector
+   division from packed decode without changing the logical Q2/Q4 codes or
+   allocating another activation buffer.
 
 ## Packed decode schemes
 
-Both SIMD families dequantize per element as
-`scale * (2c - 3) / 3` (Q2) and `scale * (2c - 15) / 15` (Q4). These are
-bit-identical to the scalar forms `scale * Q2_CODEBOOK[c]` and
-`scale * (c - 7.5) / 7.5`: numerators and denominators are exactly
-representable and both sides are the correctly rounded result of the same
-real quotient. Only the accumulation order differs from the oracle.
+Both SIMD families implement the logical per-element values
+`scale * (2c - 3) / 3` (Q2) and `scale * (2c - 15) / 15` (Q4). They evaluate
+these as `(scale / 3) * (2c - 3)` and `(scale / 15) * (2c - 15)` so that the
+division happens once per block rather than in every SIMD group. This changes
+only floating-point association; the verifier bounds the resulting difference
+against the sequential scalar oracle.
 
 - AVX2 Q2: broadcast each little-endian u32 code word (16 codes at bits `2l`)
   and extract eight codes per vector with `_mm256_srlv_epi32`.
@@ -80,8 +86,8 @@ an empty fan-out.
 The mmap-to-kernel test also executes a recovered packed matrix and embedding
 row through the CPU backend and checks the composed numerical result.
 
-SIMD-vs-oracle differences come only from lane-wise reassociation and NEON
-FMA contraction (per-element products are bit-identical, see above). For
+SIMD-vs-oracle differences come only from lane-wise reassociation, hoisting the
+constant normalization factor, and NEON FMA contraction. For
 O(1) terms over at most a few hundred products per row this stays far below
 the documented absolute tolerance of 2e-4; the `qwen38-kernel-bench`
 verification gate keeps its tighter 1e-4 maximum-absolute-error check.
@@ -103,3 +109,17 @@ The full test suite and arbitrary-code decoder tests passed on both hosts.
 Per `docs/PROMOTION_GATES.md`, the CPU SIMD profiles remain `Experimental`:
 promotion to `optimized` still requires a pinned same-hardware reference run
 plus the model/Fold quality gates.
+
+The normalization-hoisting change was also measured directly against its
+parent commit on the same Apple M5 host. Each median below is from eight
+alternating old/new runs of 500 iterations, so process warm-up does not always
+favor the candidate:
+
+| dtype | parent median (ms) | hoisted median (ms) | kernel-time reduction | max abs err vs scalar |
+|---|---:|---:|---:|---:|
+| q2_b64 | 35.779 | 31.793 | 11.1% | 8.6e-6 |
+| q4_b64 | 40.595 | 31.855 | 21.5% | 7.3e-6 |
+
+The x86_64 Linux target cross-check also compiles the AVX2 implementation.
+These isolated 512-by-512 measurements are kernel evidence, not the required
+same-hardware full-model promotion benchmark.
