@@ -1538,3 +1538,22 @@ kernel void qwen_argmax_index_to_token(
     }
     result[0] = row_ids[local_index];
 }
+
+// Compact greedy verification result:
+// {target_token, draft_token, accepted, combined_status}. The status word
+// preserves any non-finite count or fail-closed mapping bit from either
+// selector, so the host never has to compare separate selector buffers.
+kernel void qwen_greedy_mtp_verify(
+    device const uint* target [[buffer(0)]],
+    device const uint* draft [[buffer(1)]],
+    device uint* result [[buffer(2)]],
+    uint lane [[thread_position_in_grid]]) {
+    if (lane != 0u) {
+        return;
+    }
+    uint status = target[1] | draft[1];
+    result[0] = target[0];
+    result[1] = draft[0];
+    result[2] = status == 0u && target[0] == draft[0] ? 1u : 0u;
+    result[3] = status;
+}

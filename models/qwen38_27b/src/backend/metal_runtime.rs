@@ -23,19 +23,20 @@ use super::metal::{
     MetalConcatBufferAbi, MetalConcatParams, MetalDynamicEmbeddingParams, MetalFusedMatVecParams,
     MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi,
     MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalGatheredMatVecParams,
-    MetalKvPackParams, MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi,
-    MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
-    MetalQueryGateBufferAbi, MetalQueryGateParams, MetalResidualRmsNormBufferAbi,
-    MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi,
-    ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME,
-    ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, CONCAT_F32_KERNEL_NAME,
-    GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME,
-    KV_Q4_TO_Q2_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME,
-    PARTIAL_ROPE_KERNEL_NAME, Q2_DYNAMIC_EMBEDDING_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
-    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SIGMOID_GATE_KERNEL_NAME,
-    Q2_SWIGLU_KERNEL_NAME, Q4_DYNAMIC_EMBEDDING_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
-    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME,
-    Q4_SWIGLU_KERNEL_NAME, QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
+    MetalGreedyMtpVerifyBufferAbi, MetalKvPackParams, MetalKvQ4PackBufferAbi,
+    MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi,
+    MetalPartialRopeParams, MetalQueryGateBufferAbi, MetalQueryGateParams,
+    MetalResidualRmsNormBufferAbi, MetalRmsNormBufferAbi, MetalRmsNormParams,
+    MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi, ARGMAX_F32_FINAL_KERNEL_NAME,
+    ARGMAX_F32_PARTIAL_KERNEL_NAME, ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME,
+    CONCAT_F32_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME,
+    GREEDY_MTP_VERIFY_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME,
+    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
+    Q2_DYNAMIC_EMBEDDING_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
+    Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SIGMOID_GATE_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME,
+    Q4_DYNAMIC_EMBEDDING_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
+    Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
+    QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
     RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::metal_graph::{
@@ -101,6 +102,7 @@ pub struct MetalCandidateRuntime {
     argmax_f32_partial_pipeline: ComputePipelineState,
     argmax_f32_final_pipeline: ComputePipelineState,
     argmax_index_to_token_pipeline: ComputePipelineState,
+    greedy_mtp_verify_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -534,6 +536,7 @@ pub struct PreparedMappedMetalMtpCore {
     embedding: PreparedMappedMetalEmbedding,
     target_selector: PreparedMetalArgMaxScratch,
     draft_selector: PreparedMetalArgMaxScratch,
+    verification_buffer: Buffer,
     pre_embedding_norm: PreparedMappedMetalRmsNorm,
     pre_hidden_norm: PreparedMappedMetalRmsNorm,
     fc: PreparedMappedMetalMatVec,
@@ -2556,6 +2559,7 @@ impl PreparedMappedMetalMtpCore {
             self.embedding.transient_bytes(),
             self.target_selector.transient_bytes(),
             self.draft_selector.transient_bytes(),
+            4 * std::mem::size_of::<u32>(),
             self.pre_embedding_norm.transient_bytes(),
             self.pre_hidden_norm.transient_bytes(),
             self.fc.transient_bytes(),
@@ -2873,6 +2877,13 @@ impl MetalCandidateRuntime {
                     "Metal argmax token-map function lookup failed: {message}"
                 ))
             })?;
+        let greedy_mtp_verify_function = library
+            .get_function(GREEDY_MTP_VERIFY_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal greedy MTP verification function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -3133,6 +3144,13 @@ impl MetalCandidateRuntime {
                     "Metal argmax token-map pipeline creation failed: {message}"
                 ))
             })?;
+        let greedy_mtp_verify_pipeline = device
+            .new_compute_pipeline_state_with_function(&greedy_mtp_verify_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal greedy MTP verification pipeline creation failed: {message}"
+                ))
+            })?;
         if argmax_f32_partial_pipeline.max_total_threads_per_threadgroup() < 256
             || argmax_f32_final_pipeline.max_total_threads_per_threadgroup() < 256
         {
@@ -3176,6 +3194,7 @@ impl MetalCandidateRuntime {
             argmax_f32_partial_pipeline,
             argmax_f32_final_pipeline,
             argmax_index_to_token_pipeline,
+            greedy_mtp_verify_pipeline,
         })
     }
 
@@ -3827,6 +3846,43 @@ impl MetalCandidateRuntime {
         );
     }
 
+    fn encode_greedy_mtp_verify(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        target: &PreparedMetalArgMaxScratch,
+        draft: &PreparedMetalArgMaxScratch,
+        result: &Buffer,
+    ) {
+        encoder.set_compute_pipeline_state(&self.greedy_mtp_verify_pipeline);
+        encoder.set_buffer(
+            MetalGreedyMtpVerifyBufferAbi::TARGET as u64,
+            Some(&target.result_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalGreedyMtpVerifyBufferAbi::DRAFT as u64,
+            Some(&draft.result_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalGreedyMtpVerifyBufferAbi::RESULT as u64,
+            Some(result),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
     fn read_argmax_result(&self, scratch: &PreparedMetalArgMaxScratch) -> Result<u32> {
         let result =
             unsafe { slice::from_raw_parts(scratch.result_buffer.contents().cast::<u32>(), 2) };
@@ -3872,6 +3928,45 @@ impl MetalCandidateRuntime {
             )));
         }
         Ok(result[0])
+    }
+
+    fn read_greedy_mtp_verification(
+        &self,
+        result_buffer: &Buffer,
+        vocabulary_rows: usize,
+    ) -> Result<MetalGreedyMtpVerification> {
+        let result = unsafe { slice::from_raw_parts(result_buffer.contents().cast::<u32>(), 4) };
+        if result[3] != 0 {
+            return Err(EngineError::InvalidArtifact(format!(
+                "Metal greedy MTP verification rejected selector status 0x{:08x}",
+                result[3]
+            )));
+        }
+        if result[0] as usize >= vocabulary_rows || result[1] as usize >= vocabulary_rows {
+            return Err(EngineError::InvalidState(format!(
+                "Metal greedy MTP tokens {}/{} exceed vocabulary rows {vocabulary_rows}",
+                result[0], result[1]
+            )));
+        }
+        let accepted = match result[2] {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal greedy MTP acceptance word is {value}, expected zero or one"
+                )));
+            }
+        };
+        if accepted != (result[0] == result[1]) {
+            return Err(EngineError::InvalidState(
+                "Metal greedy MTP acceptance disagrees with target/draft equality".into(),
+            ));
+        }
+        Ok(MetalGreedyMtpVerification {
+            target_token: result[0],
+            draft_token: result[1],
+            accepted,
+        })
     }
 
     /// Import the complete immutable CTOXQ mmap once through Metal shared
@@ -4761,6 +4856,7 @@ impl MetalCandidateRuntime {
         )?;
         let target_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
         let draft_selector = self.prepare_argmax_f32_scratch(draft_token_ids.len())?;
+        let verification_buffer = new_zeroed_buffer(&self.device, 4 * std::mem::size_of::<u32>())?;
         let workspace_plan = MetalMtpWorkspacePlan::qwen38(&config)?;
         let workspace = self.prepare_mtp_workspace(&workspace_plan)?;
 
@@ -4832,6 +4928,7 @@ impl MetalCandidateRuntime {
             embedding,
             target_selector,
             draft_selector,
+            verification_buffer,
             pre_embedding_norm,
             pre_hidden_norm,
             fc,
@@ -12090,6 +12187,7 @@ impl MetalCandidateRuntime {
                 &mtp.draft_selector.result_buffer,
                 2 * std::mem::size_of::<u32>(),
             );
+            zero_buffer(&mtp.verification_buffer, 4 * std::mem::size_of::<u32>());
 
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-greedy-mtp-target-verifier");
@@ -12115,6 +12213,12 @@ impl MetalCandidateRuntime {
                     target_lm_head.writes()[0].offset(),
                     &mtp.target_selector,
                 );
+                self.encode_greedy_mtp_verify(
+                    encoder,
+                    &mtp.target_selector,
+                    &mtp.draft_selector,
+                    &mtp.verification_buffer,
+                );
                 Ok(target_plans)
             })();
             encoder.end_encoding();
@@ -12130,9 +12234,8 @@ impl MetalCandidateRuntime {
 
             self.validate_completed_mapped_mtp_layer(mtp, &mtp_plan, component_values)?;
             self.validate_completed_mapped_target_core(target, &target_plans)?;
-            let target_token = self.read_argmax_result(&mtp.target_selector)?;
-            let draft_token =
-                self.read_mapped_argmax_result(&mtp.draft_selector, target.vocabulary_rows())?;
+            let verified = self
+                .read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
             if target.cached_tokens()? != mtp.cached_tokens().saturating_add(1)
                 || !target.layers.commit_ready()
                 || mtp.layer.attention.poisoned
@@ -12144,11 +12247,7 @@ impl MetalCandidateRuntime {
             }
             target.layers.commit_speculative()?;
             mtp.layer.attention.commit_speculative()?;
-            Ok(MetalGreedyMtpVerification {
-                target_token,
-                draft_token,
-                accepted: target_token == draft_token,
-            })
+            Ok(verified)
         })();
 
         match result {
@@ -14208,6 +14307,87 @@ mod tests {
                 .expect("read canonical token"),
             9_001
         );
+    }
+
+    #[test]
+    fn greedy_mtp_verification_compares_compact_device_results() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let target = runtime
+            .prepare_argmax_f32_scratch(4)
+            .expect("target selector scratch");
+        let draft = runtime
+            .prepare_argmax_f32_scratch(4)
+            .expect("draft selector scratch");
+        write_buffer_range(
+            &target.result_buffer,
+            0,
+            as_bytes(&[9_001_u32, 0]),
+            2 * std::mem::size_of::<u32>(),
+        )
+        .expect("write target selector");
+        write_buffer_range(
+            &draft.result_buffer,
+            0,
+            as_bytes(&[9_001_u32, 0]),
+            2 * std::mem::size_of::<u32>(),
+        )
+        .expect("write draft selector");
+        let result = new_zeroed_buffer(&runtime.device, 4 * std::mem::size_of::<u32>())
+            .expect("greedy verification result");
+        let dispatch = |target: &PreparedMetalArgMaxScratch, draft: &PreparedMetalArgMaxScratch| {
+            zero_buffer(&result, 4 * std::mem::size_of::<u32>());
+            let command_buffer = runtime.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            runtime.encode_greedy_mtp_verify(encoder, target, draft, &result);
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        };
+
+        dispatch(&target, &draft);
+        assert_eq!(
+            runtime
+                .read_greedy_mtp_verification(&result, crate::tokenizer::TOKENIZER_VOCAB_SIZE,)
+                .expect("read accepted greedy verification"),
+            MetalGreedyMtpVerification {
+                target_token: 9_001,
+                draft_token: 9_001,
+                accepted: true,
+            }
+        );
+
+        write_buffer_range(
+            &draft.result_buffer,
+            0,
+            as_bytes(&[101_u32, 0]),
+            2 * std::mem::size_of::<u32>(),
+        )
+        .expect("write rejected draft");
+        dispatch(&target, &draft);
+        assert_eq!(
+            runtime
+                .read_greedy_mtp_verification(&result, crate::tokenizer::TOKENIZER_VOCAB_SIZE,)
+                .expect("read rejected greedy verification"),
+            MetalGreedyMtpVerification {
+                target_token: 9_001,
+                draft_token: 101,
+                accepted: false,
+            }
+        );
+
+        write_buffer_range(
+            &target.result_buffer,
+            0,
+            as_bytes(&[9_001_u32, 1]),
+            2 * std::mem::size_of::<u32>(),
+        )
+        .expect("write invalid target status");
+        dispatch(&target, &draft);
+        assert!(matches!(
+            runtime.read_greedy_mtp_verification(&result, crate::tokenizer::TOKENIZER_VOCAB_SIZE,),
+            Err(EngineError::InvalidArtifact(_))
+        ));
     }
 
     #[test]

@@ -204,10 +204,12 @@ logits. The greedy one-draft verifier now appends a selector-driven complete
 target transition and its second full-vocabulary argmax to the same encoder.
 It requires target state to enter exactly one token ahead of MTP, checks that
 the relation is restored after both transitions, and commits both checkpoint
-sets only after the single completion wait and compact target/draft comparison.
-Encoding, GPU, non-finite, alignment, and verifier failures restore both
-branches. Chained MTP4, partial-prefix replay, full-artifact device evidence,
-and production executor integration remain pending.
+sets only after `qwen_greedy_mtp_verify` has written a four-u32
+target/draft/accept/status record and the single completion wait validates it.
+The host no longer reads or compares separate selector buffers. Encoding, GPU,
+non-finite, alignment, and verifier failures restore both branches. Chained
+MTP4, partial-prefix replay, full-artifact device evidence, and production
+executor integration remain pending.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

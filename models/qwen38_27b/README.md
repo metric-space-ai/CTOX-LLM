@@ -324,10 +324,12 @@ canonical row-ID buffer to the global vocabulary token in the same encoder.
 `dispatch_prepared_mapped_greedy_mtp_target_verifier` now continues in that
 same command buffer: the full target graph consumes the resident selected
 token, produces fresh full-vocabulary logits, and runs the second target
-argmax. After the sole wait, compact target/draft IDs determine acceptance;
-both state graphs commit only if they still satisfy the target-one-token-ahead
-contract, otherwise both roll back. Full-artifact same-device evidence,
-chained MTP4, replay-on-reject, and production executor wiring remain pending.
+argmax. `qwen_greedy_mtp_verify` compares the two compact device results and
+writes one four-word target/draft/accept/status record before the sole wait;
+both state graphs commit only if that record and the restored
+target-one-token-ahead contract validate, otherwise both roll back.
+Full-artifact same-device evidence, chained MTP4, replay-on-reject, and
+production executor wiring remain pending.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

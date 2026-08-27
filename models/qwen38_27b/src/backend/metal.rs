@@ -45,6 +45,7 @@ pub const CAUSAL_CONV_F16_KERNEL_NAME: &str = "qwen_causal_conv_silu_f16";
 pub const ARGMAX_F32_PARTIAL_KERNEL_NAME: &str = "qwen_argmax_f32_partial";
 pub const ARGMAX_F32_FINAL_KERNEL_NAME: &str = "qwen_argmax_f32_final";
 pub const ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME: &str = "qwen_argmax_index_to_token";
+pub const GREEDY_MTP_VERIFY_KERNEL_NAME: &str = "qwen_greedy_mtp_verify";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -268,6 +269,15 @@ impl MetalArgMaxMapBufferAbi {
     pub const ROW_IDS: u32 = 0;
     pub const RESULT: u32 = 1;
     pub const PARAMS: u32 = 2;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGreedyMtpVerifyBufferAbi;
+
+impl MetalGreedyMtpVerifyBufferAbi {
+    pub const TARGET: u32 = 0;
+    pub const DRAFT: u32 = 1;
+    pub const RESULT: u32 = 2;
 }
 
 /// Activation codes consumed by `apply_activation` in the MSL source.
@@ -1264,6 +1274,14 @@ mod tests {
             ],
             [0, 1, 2]
         );
+        assert_eq!(
+            [
+                MetalGreedyMtpVerifyBufferAbi::TARGET,
+                MetalGreedyMtpVerifyBufferAbi::DRAFT,
+                MetalGreedyMtpVerifyBufferAbi::RESULT,
+            ],
+            [0, 1, 2]
+        );
     }
 
     #[test]
@@ -1302,6 +1320,7 @@ mod tests {
             ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME,
             "qwen_argmax_index_to_token"
         );
+        assert_eq!(GREEDY_MTP_VERIFY_KERNEL_NAME, "qwen_greedy_mtp_verify");
     }
 
     #[test]
