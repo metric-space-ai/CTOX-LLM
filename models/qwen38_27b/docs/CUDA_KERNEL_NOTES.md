@@ -246,7 +246,9 @@ gate and output-projection views, and the online-softmax path still needs
 controlled roofline evidence.
 
 The first mixed-Q2/Q4 split-KV candidate is now isolated beside that
-single-query path. It is derived from the Apache-2.0 syv-ai speculative-decode
+single-query path. It accepts one newest query for ordinary long-context
+decode or up to five causal tail queries for MTP4 verification. It is derived
+from the Apache-2.0 syv-ai speculative-decode
 patch pinned at revision `60daef8255b6757d9791955a44bce27df1658ea6`; the
 byte-identical patch and digest live under
 `vendor/cuda/syv_ai/qwen38-27b-rtx3090/`. For MTP4 it launches
@@ -260,11 +262,12 @@ per attention layer. Two builds from different absolute worktree paths produce
 the identical cubin SHA-256
 `aeb62585a7e4b46079b5110443bf5bd9b845ae9c7319d23429ea25c18b76c8f8`.
 CUDA 12.6 reports 128 registers for the partial kernel and 38 for the combine
-kernel, with zero stack, spill, local, or shared bytes for both. The v3
-paged-GQA verifier compares all five outputs with the
-scalar causal oracle, requires bit-identical results from host-staging and
-borrowed-device entry points, and proves scratch reclamation. Hardware
-numerics and latency versus five sequential launches remain pending. The
+kernel, with zero stack, spill, local, or shared bytes for both. The v4
+paged-GQA verifier accepts `--split-query-tokens 1..=5`, compares every
+selected output with the scalar causal oracle, requires bit-identical results
+from host-staging and borrowed-device entry points, and proves scratch
+reclamation. Hardware numerics and latency for the ordinary one-query shape
+remain pending. The
 verifier now alternates both paths with one final context barrier per block
 and reports their mean latency and speedup; the sequential comparison scans
 the full cache for every query and is therefore a conservative traffic

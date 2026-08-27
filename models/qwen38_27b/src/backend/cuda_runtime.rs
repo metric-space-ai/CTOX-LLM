@@ -5503,11 +5503,11 @@ impl CudaCandidateRuntime {
                 "CUDA split GQA cannot read a poisoned cache".into(),
             ));
         }
-        if !(2..=PAGED_GQA_SPLIT_MAX_QUERY_TOKENS).contains(&query_tokens)
+        if !(1..=PAGED_GQA_SPLIT_MAX_QUERY_TOKENS).contains(&query_tokens)
             || query_tokens > paged.tokens
         {
             return Err(EngineError::Shape(format!(
-                "CUDA split GQA requires 2..={PAGED_GQA_SPLIT_MAX_QUERY_TOKENS} tail queries already present in the cache"
+                "CUDA split GQA requires 1..={PAGED_GQA_SPLIT_MAX_QUERY_TOKENS} tail queries already present in the cache"
             )));
         }
         let expected_values = query_tokens

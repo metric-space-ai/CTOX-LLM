@@ -25,6 +25,11 @@ struct Args {
     relative_tolerance: f32,
     #[arg(long, default_value_t = 20)]
     benchmark_iterations: usize,
+    /// Number of newest causal queries measured by the split-KV path. One is
+    /// the ordinary long-context decode shape; five is the MTP4 verification
+    /// block shape.
+    #[arg(long, default_value_t = PAGED_GQA_SPLIT_MAX_QUERY_TOKENS)]
+    split_query_tokens: usize,
     #[arg(long, value_delimiter = ',', default_value = "1536,16384")]
     latency_contexts: Vec<usize>,
 }
@@ -87,6 +92,11 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(
         (24..=128).contains(&args.tokens),
         "tokens must be between 24 and 128 so the verifier exercises Q4-to-Q2 demotion and non-empty split-KV segments"
+    );
+    anyhow::ensure!(
+        (1..=PAGED_GQA_SPLIT_MAX_QUERY_TOKENS).contains(&args.split_query_tokens)
+            && args.split_query_tokens <= args.tokens,
+        "split-query-tokens must be within 1..={PAGED_GQA_SPLIT_MAX_QUERY_TOKENS} and no greater than tokens"
     );
     anyhow::ensure!(
         !args.latency_contexts.is_empty()
@@ -209,22 +219,21 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        let split_query_values =
-            PAGED_GQA_SPLIT_MAX_QUERY_TOKENS * config.query_heads * config.head_dim;
+        let split_query_values = args.split_query_tokens * config.query_heads * config.head_dim;
         let split_query_start = query_history.len() - split_query_values;
         let split_queries = &query_history[split_query_start..];
         let split_actual = runtime.dispatch_paged_q2q4_gqa_split(
             &prepared,
             &mut split,
             split_queries,
-            PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+            args.split_query_tokens,
         )?;
         split_staging.write(split_queries)?;
         let split_device = runtime.dispatch_paged_q2q4_gqa_split_device(
             &prepared,
             &mut split,
             split_staging.device_view()?,
-            PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+            args.split_query_tokens,
         )?;
         let split_device_actual = runtime.verifier_read_f32(split_device)?;
         anyhow::ensure!(
@@ -239,10 +248,9 @@ fn main() -> anyhow::Result<()> {
         let cached_value = oracle.flattened_value(config.key_value_heads, config.head_dim)?;
         let mut reference_queries = vec![0.0_f32; split_query_values];
         for head in 0..config.query_heads {
-            for query_token in 0..PAGED_GQA_SPLIT_MAX_QUERY_TOKENS {
+            for query_token in 0..args.split_query_tokens {
                 let source = (query_token * config.query_heads + head) * config.head_dim;
-                let target =
-                    (head * PAGED_GQA_SPLIT_MAX_QUERY_TOKENS + query_token) * config.head_dim;
+                let target = (head * args.split_query_tokens + query_token) * config.head_dim;
                 reference_queries[target..target + config.head_dim]
                     .copy_from_slice(&split_queries[source..source + config.head_dim]);
             }
@@ -253,10 +261,10 @@ fn main() -> anyhow::Result<()> {
             &cached_value,
             config.query_heads,
             config.key_value_heads,
-            PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+            args.split_query_tokens,
             args.tokens,
             config.head_dim,
-            args.tokens - PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+            args.tokens - args.split_query_tokens,
         )?;
         for (index, (left, right)) in split_expected.iter().zip(&split_actual).enumerate() {
             let absolute = (left - right).abs();
@@ -272,7 +280,7 @@ fn main() -> anyhow::Result<()> {
             &prepared,
             &mut split,
             split_staging.device_view()?,
-            PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+            args.split_query_tokens,
             args.benchmark_iterations,
         )?;
 
@@ -306,9 +314,8 @@ fn main() -> anyhow::Result<()> {
             drop(latency_keys);
             drop(latency_values);
 
-            let latency_query_values = PAGED_GQA_SPLIT_MAX_QUERY_TOKENS
-                * latency_config.query_heads
-                * latency_config.head_dim;
+            let latency_query_values =
+                args.split_query_tokens * latency_config.query_heads * latency_config.head_dim;
             let latency_queries: Vec<f32> = (0..latency_query_values)
                 .map(|index| ((index.wrapping_mul(17) % 251) as f32 - 125.0) * 0.00175)
                 .collect();
@@ -317,7 +324,7 @@ fn main() -> anyhow::Result<()> {
                 &latency_cache,
                 &mut latency_split,
                 latency_staging.device_view()?,
-                PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+                args.split_query_tokens,
                 args.benchmark_iterations,
             )?;
             latency_sweep.push(LatencyPoint {
@@ -356,7 +363,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Report {
-            format: "ctox.qwen38.cuda_paged_q2q4_gqa_verification.v3",
+            format: "ctox.qwen38.cuda_paged_q2q4_gqa_verification.v4",
             status: "pass",
             device: runtime.device_name(),
             compute_capability: format!(
@@ -376,7 +383,7 @@ fn main() -> anyhow::Result<()> {
             q4_tokens,
             maximum_absolute_error,
             maximum_relative_error,
-            split_query_tokens: PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
+            split_query_tokens: args.split_query_tokens,
             split_segments: PAGED_GQA_SPLIT_SEGMENTS,
             split_transient_bytes,
             split_maximum_absolute_error,
@@ -396,7 +403,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
-            note: "Q/K/V enter the GQA dispatcher as context-bound device views and its output is read back only by the explicit verifier API. The CPU cache exists solely as the external numerical oracle; CUDA packs Q4 and demotes Q4-to-Q2 entirely on device with no host packed-cache mirror. The isolated five-query path splits canonical mixed Q2/Q4 KV across 16 partial blocks per head, combines online-softmax state on device, and verifies tail causality against the scalar oracle before scheduler integration. The latency comparison gives both paths one final context barrier; its five-launch sequential baseline conservatively exposes the full cache to every query, while the split path applies exact per-tail-query causality.",
+            note: "Q/K/V enter the GQA dispatcher as context-bound device views and its output is read back only by the explicit verifier API. The CPU cache exists solely as the external numerical oracle; CUDA packs Q4 and demotes Q4-to-Q2 entirely on device with no host packed-cache mirror. The isolated one-to-five-query path splits canonical mixed Q2/Q4 KV across 16 partial blocks per head, combines online-softmax state on device, and verifies tail causality against the scalar oracle before scheduler integration. The latency comparison gives both paths one final context barrier; its sequential baseline conservatively exposes the full cache to every query, while the split path applies exact per-tail-query causality.",
         })?
     );
     Ok(())
