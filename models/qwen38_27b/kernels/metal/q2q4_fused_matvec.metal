@@ -141,6 +141,17 @@ struct ArgMaxParams {
     uint reserved1;
 };
 
+struct TopKTopPParams {
+    uint values;
+    uint top_k;
+    float inverse_temperature;
+    float top_p;
+    float draw;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
 struct GreedyMtpPrefixParams {
     uint records;
     uint vocabulary_rows;
@@ -1544,6 +1555,150 @@ kernel void qwen_argmax_index_to_token(
         return;
     }
     result[0] = row_ids[local_index];
+}
+
+// Single-request bounded top-k/top-p selection over resident target logits.
+// This is the Metal verifier analogue of the pinned TensorRT-derived CUDA
+// candidate. One 256-thread group scans the vocabulary, repeatedly reduces
+// the next ordered candidate, and emits only compact sampling evidence.
+// Equal logits select the larger token ID, exactly matching the Rust oracle.
+// ref: vendor/cuda/tensorrt_llm/cpp/tensorrt_llm/kernels/samplingTopKKernels.cu:69-234
+// ref: vendor/cuda/tensorrt_llm/cpp/tensorrt_llm/common/reduceKernelUtils.cuh:386-412
+kernel void qwen_topk_topp_sample_f32(
+    device const float* values [[buffer(0)]],
+    device float* scratch [[buffer(1)]],
+    device uint* result [[buffer(2)]],
+    constant TopKTopPParams& params [[buffer(3)]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float best_values[256];
+    threadgroup uint best_indices[256];
+    threadgroup uint invalid_counts[256];
+    threadgroup uint selected_indices[256];
+    threadgroup float selected_logits[256];
+
+    if (lane == 0u) {
+        result[0] = 0u;
+        result[1] = 0u;
+        result[2] = 0u;
+        result[3] = 0u;
+        if (params.values == 0u || params.top_k == 0u || params.top_k > 256u
+            || params.top_k > params.values
+            || !isfinite(params.inverse_temperature)
+            || params.inverse_temperature <= 0.0f
+            || !isfinite(params.top_p) || params.top_p <= 0.0f
+            || params.top_p > 1.0f
+            || !isfinite(params.draw) || params.draw < 0.0f
+            || params.draw >= 1.0f) {
+            result[1] = 1u;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (result[1] != 0u) {
+        return;
+    }
+
+    uint invalid = 0u;
+    for (uint index = lane; index < params.values; index += 256u) {
+        float value = values[index];
+        float scaled = value * params.inverse_temperature;
+        if (!isfinite(value) || !isfinite(scaled)) {
+            invalid += 1u;
+        }
+        scratch[index] = scaled;
+    }
+    invalid_counts[lane] = invalid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            invalid_counts[lane] += invalid_counts[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u && invalid_counts[0] != 0u) {
+        result[1] = 2u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (result[1] != 0u) {
+        return;
+    }
+
+    for (uint rank = 0u; rank < params.top_k; ++rank) {
+        float best = -INFINITY;
+        uint best_index = 0u;
+        bool has_value = false;
+        for (uint index = lane; index < params.values; index += 256u) {
+            float value = scratch[index];
+            if (!has_value || value > best || (value == best && index > best_index)) {
+                best = value;
+                best_index = index;
+                has_value = true;
+            }
+        }
+        best_values[lane] = best;
+        best_indices[lane] = best_index;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                float other = best_values[lane + stride];
+                uint other_index = best_indices[lane + stride];
+                if (other > best_values[lane]
+                    || (other == best_values[lane] && other_index > best_indices[lane])) {
+                    best_values[lane] = other;
+                    best_indices[lane] = other_index;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0u) {
+            uint selected = best_indices[0];
+            selected_indices[rank] = selected;
+            selected_logits[rank] = scratch[selected];
+            scratch[selected] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0u) {
+        float maximum = selected_logits[0];
+        float normalization = 0.0f;
+        for (uint rank = 0u; rank < params.top_k; ++rank) {
+            float weight = exp(selected_logits[rank] - maximum);
+            selected_logits[rank] = weight;
+            normalization += weight;
+        }
+        float nucleus_threshold = params.top_p * normalization;
+        float cumulative = 0.0f;
+        uint nucleus_len = params.top_k;
+        for (uint rank = 0u; rank < params.top_k; ++rank) {
+            cumulative += selected_logits[rank];
+            if (cumulative >= nucleus_threshold) {
+                nucleus_len = rank + 1u;
+                break;
+            }
+        }
+        float nucleus_total = 0.0f;
+        for (uint rank = 0u; rank < nucleus_len; ++rank) {
+            nucleus_total += selected_logits[rank];
+        }
+        float threshold = params.draw * nucleus_total;
+        cumulative = 0.0f;
+        uint sampled = selected_indices[nucleus_len - 1u];
+        for (uint rank = 0u; rank < nucleus_len; ++rank) {
+            cumulative += selected_logits[rank];
+            if (threshold <= cumulative) {
+                sampled = selected_indices[rank];
+                break;
+            }
+        }
+        if (!isfinite(normalization) || normalization <= 0.0f
+            || !isfinite(nucleus_total) || nucleus_total <= 0.0f) {
+            result[1] = 4u;
+            return;
+        }
+        result[0] = sampled;
+        result[2] = nucleus_len;
+        result[3] = as_type<uint>(nucleus_total);
+    }
 }
 
 // Compact greedy verification result:

@@ -45,6 +45,7 @@ pub const CAUSAL_CONV_F16_KERNEL_NAME: &str = "qwen_causal_conv_silu_f16";
 pub const ARGMAX_F32_PARTIAL_KERNEL_NAME: &str = "qwen_argmax_f32_partial";
 pub const ARGMAX_F32_FINAL_KERNEL_NAME: &str = "qwen_argmax_f32_final";
 pub const ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME: &str = "qwen_argmax_index_to_token";
+pub const TOPK_TOPP_SAMPLE_F32_KERNEL_NAME: &str = "qwen_topk_topp_sample_f32";
 pub const GREEDY_MTP_VERIFY_KERNEL_NAME: &str = "qwen_greedy_mtp_verify";
 pub const GREEDY_MTP_PREFIX_KERNEL_NAME: &str = "qwen_greedy_mtp_prefix";
 /// Vendored candidate kernel source, relative to the crate root.
@@ -270,6 +271,16 @@ impl MetalArgMaxMapBufferAbi {
     pub const ROW_IDS: u32 = 0;
     pub const RESULT: u32 = 1;
     pub const PARAMS: u32 = 2;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalTopKTopPBufferAbi;
+
+impl MetalTopKTopPBufferAbi {
+    pub const INPUT: u32 = 0;
+    pub const SCRATCH: u32 = 1;
+    pub const RESULT: u32 = 2;
+    pub const PARAMS: u32 = 3;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,6 +663,40 @@ pub struct MetalArgMaxParams {
     pub threads: u32,
     pub groups: u32,
     pub reserved1: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalTopKTopPParams {
+    pub values: u32,
+    pub top_k: u32,
+    pub inverse_temperature: f32,
+    pub top_p: f32,
+    pub draw: f32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+}
+
+impl MetalTopKTopPParams {
+    pub const BYTE_LEN: usize = 32;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        let words = [
+            self.values,
+            self.top_k,
+            self.inverse_temperature.to_bits(),
+            self.top_p.to_bits(),
+            self.draw.to_bits(),
+            self.reserved0,
+            self.reserved1,
+            self.reserved2,
+        ];
+        for (index, word) in words.iter().enumerate() {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
 }
 
 impl MetalArgMaxParams {
@@ -1558,6 +1603,38 @@ mod tests {
     }
 
     #[test]
+    fn topk_topp_params_encode_matches_msl_struct() {
+        let encoded = MetalTopKTopPParams {
+            values: 248_320,
+            top_k: 40,
+            inverse_temperature: 1.25,
+            top_p: 0.95,
+            draw: 0.625,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
+        }
+        .encode();
+        let words: Vec<u32> = encoded
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            words,
+            vec![
+                248_320,
+                40,
+                1.25_f32.to_bits(),
+                0.95_f32.to_bits(),
+                0.625_f32.to_bits(),
+                0,
+                0,
+                0,
+            ]
+        );
+    }
+
+    #[test]
     fn greedy_mtp_prefix_params_encode_matches_msl_struct() {
         let encoded = MetalGreedyMtpPrefixParams {
             records: 4,
@@ -1839,6 +1916,7 @@ mod tests {
             CAUSAL_CONV_F16_KERNEL_NAME,
             ARGMAX_F32_PARTIAL_KERNEL_NAME,
             ARGMAX_F32_FINAL_KERNEL_NAME,
+            TOPK_TOPP_SAMPLE_F32_KERNEL_NAME,
         ] {
             assert!(
                 text.contains(&format!("kernel void {name}")),

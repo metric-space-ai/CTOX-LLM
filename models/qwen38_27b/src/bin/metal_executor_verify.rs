@@ -50,6 +50,11 @@ struct Report {
     maximum_context_tokens: u64,
     prefill_tokens: Vec<u32>,
     decode_input_token: u32,
+    sampled_input_token: u32,
+    sampling_temperature: f32,
+    sampling_top_k: usize,
+    sampling_top_p: f32,
+    sampling_draw: f32,
     draft_tokens: Vec<u32>,
     target_tokens: Vec<u32>,
     bonus_token: u32,
@@ -145,6 +150,11 @@ fn main() -> anyhow::Result<()> {
     let decode_input_token = executor
         .select_target_token(greedy_sampler(), 0.0)?
         .context("Metal prefill delegated greedy target selection to the host")?;
+    let sampling = SamplerConfig::default();
+    let sampling_draw = 0.625_f32;
+    let sampled_input_token = executor
+        .select_target_token(sampling, sampling_draw)?
+        .context("Metal prefill delegated stochastic target selection to the host")?;
 
     let decode_started = Instant::now();
     let decoded = executor.decode(decode_input_token, true, &cancellation)?;
@@ -222,6 +232,11 @@ fn main() -> anyhow::Result<()> {
             maximum_context_tokens: args.maximum_context_tokens,
             prefill_tokens: args.prefill_tokens,
             decode_input_token,
+            sampled_input_token,
+            sampling_temperature: sampling.temperature,
+            sampling_top_k: sampling.top_k,
+            sampling_top_p: sampling.top_p,
+            sampling_draw,
             draft_tokens: verification.draft_tokens,
             target_tokens: verification.target_tokens,
             bonus_token: verification.bonus_token,
@@ -246,7 +261,7 @@ fn main() -> anyhow::Result<()> {
             unload_milliseconds,
             cancellation_failed_closed,
             allocations_zero_after_unload,
-            note: "Checksummed full-artifact load, exact packed draft vocabulary, serial prefill, resident target selection, fused MTP4 target verification, device-resolved commit acknowledgement, reset, cancellation, and accounted unload through the thread-affine executor. Promotion still requires BF16/logit golden comparison, allocator high-watermark measured outside this process, chunked prefill, stochastic sampling, and controlled roofline evidence.",
+            note: "Checksummed full-artifact load, exact packed draft vocabulary, serial prefill, resident greedy plus bounded top-k/top-p target selection, fused MTP4 target verification, device-resolved commit acknowledgement, reset, cancellation, and accounted unload through the thread-affine executor. Isolated same-device tests bind stochastic decisions to the canonical Rust sampler. Promotion still requires BF16/logit golden comparison, full-checkpoint hardware evidence, chunked prefill, on-device RNG state, probability-correct stochastic MTP, and controlled roofline evidence.",
         })?
     );
     Ok(())

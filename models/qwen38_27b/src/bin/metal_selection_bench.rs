@@ -4,6 +4,7 @@ mod macos {
 
     use clap::Parser;
     use ctox_qwen38_27b::backend::metal_runtime::MetalCandidateRuntime;
+    use ctox_qwen38_27b::sampler::{Sampler, SamplerConfig};
     use ctox_qwen38_27b::tokenizer::TOKENIZER_VOCAB_SIZE;
     use serde::Serialize;
 
@@ -18,6 +19,10 @@ mod macos {
         dispatches_per_command: usize,
         #[arg(long, default_value_t = 32)]
         groups: usize,
+        #[arg(long, default_value_t = 2)]
+        sampling_warmup: usize,
+        #[arg(long, default_value_t = 20)]
+        sampling_iterations: usize,
     }
 
     #[derive(Serialize)]
@@ -40,12 +45,26 @@ mod macos {
         metal_logical_gb_per_second: f64,
         host_elapsed_milliseconds: f64,
         host_mean_microseconds: f64,
+        sampling_temperature: f32,
+        sampling_top_k: usize,
+        sampling_top_p: f32,
+        sampling_draw: f32,
+        sampled_token: u32,
+        sampling_nucleus_len: u32,
+        sampling_metal_elapsed_milliseconds: f64,
+        sampling_metal_mean_microseconds: f64,
+        sampling_host_elapsed_milliseconds: f64,
+        sampling_host_mean_microseconds: f64,
         note: &'static str,
     }
 
     pub fn run() -> anyhow::Result<()> {
         let args = Args::parse();
         anyhow::ensure!(args.iterations > 0, "iterations must be positive");
+        anyhow::ensure!(
+            args.sampling_iterations > 0,
+            "sampling-iterations must be positive"
+        );
         anyhow::ensure!(
             args.dispatches_per_command > 0,
             "dispatches-per-command must be positive"
@@ -84,6 +103,41 @@ mod macos {
             std::hint::black_box(host_argmax(std::hint::black_box(&logits))?);
         }
         let host_elapsed = host_started.elapsed().as_secs_f64();
+        let sampling = SamplerConfig::default();
+        let sampling_draw = 0.625_f32;
+        let expected_sample = Sampler::new(sampling)?.sample_with_draw(&logits, sampling_draw)?;
+        let prepared_sampler = runtime.prepare_topk_topp_f32(&logits)?;
+        let sampled =
+            runtime.dispatch_topk_topp_sample_f32(&prepared_sampler, sampling, sampling_draw)?;
+        anyhow::ensure!(
+            sampled.token as usize == expected_sample,
+            "Metal sampled {}, host oracle sampled {expected_sample}",
+            sampled.token
+        );
+        for _ in 0..args.sampling_warmup {
+            std::hint::black_box(runtime.dispatch_topk_topp_sample_f32(
+                &prepared_sampler,
+                sampling,
+                sampling_draw,
+            )?);
+        }
+        let sampling_metal_started = Instant::now();
+        for _ in 0..args.sampling_iterations {
+            std::hint::black_box(runtime.dispatch_topk_topp_sample_f32(
+                &prepared_sampler,
+                sampling,
+                sampling_draw,
+            )?);
+        }
+        let sampling_metal_elapsed = sampling_metal_started.elapsed().as_secs_f64();
+        let host_sampler = Sampler::new(sampling)?;
+        let sampling_host_started = Instant::now();
+        for _ in 0..args.sampling_iterations {
+            std::hint::black_box(
+                host_sampler.sample_with_draw(std::hint::black_box(&logits), sampling_draw)?,
+            );
+        }
+        let sampling_host_elapsed = sampling_host_started.elapsed().as_secs_f64();
         let logical_input_bytes = logits.len() * std::mem::size_of::<f32>();
         let metal_mean_seconds = metal_elapsed / total_dispatches as f64;
         let host_mean_seconds = host_elapsed / total_dispatches as f64;
@@ -110,7 +164,21 @@ mod macos {
                     / 1.0e9,
                 host_elapsed_milliseconds: host_elapsed * 1.0e3,
                 host_mean_microseconds: host_mean_seconds * 1.0e6,
-                note: "Each interval encodes the declared repeated resident two-stage selections in one command buffer, then performs one completion wait and eight-byte shared-memory result read. Per-selection time amortizes command overhead like a larger decoder graph, but remains candidate evidence rather than a hardware-counter roofline measurement.",
+                sampling_temperature: sampling.temperature,
+                sampling_top_k: sampling.top_k,
+                sampling_top_p: sampling.top_p,
+                sampling_draw,
+                sampled_token: sampled.token,
+                sampling_nucleus_len: sampled.nucleus_len,
+                sampling_metal_elapsed_milliseconds: sampling_metal_elapsed * 1.0e3,
+                sampling_metal_mean_microseconds: sampling_metal_elapsed
+                    / args.sampling_iterations as f64
+                    * 1.0e6,
+                sampling_host_elapsed_milliseconds: sampling_host_elapsed * 1.0e3,
+                sampling_host_mean_microseconds: sampling_host_elapsed
+                    / args.sampling_iterations as f64
+                    * 1.0e6,
+                note: "Argmax intervals encode repeated resident two-stage selections in one command buffer and amortize command overhead. Sampling intervals execute the bounded top-k/top-p kernel against the same resident full-vocabulary logits and verify every selected token against the canonical Rust sampler. Both remain candidate evidence rather than a hardware-counter roofline measurement.",
             })?
         );
         Ok(())

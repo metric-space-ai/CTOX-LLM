@@ -27,6 +27,10 @@ The CUDA full-artifact verifier now also records the driver-visible free-memory
 baseline, sampled executor residency peak, reclaimed bytes, and exact
 post-`unload` drift for both evidence and compact server modes. These fields are
 plumbing evidence only until they have been measured on the final checkpoint.
+The Metal executor now also binds a bounded resident top-k/top-p kernel to the
+same LM-head output as greedy selection. Its explicit engine draw is
+decision-equivalent to the canonical Rust sampler on Apple Silicon; on-device
+RNG state and probability-correct stochastic MTP remain separate release gates.
 
 The corrected 9.5822-GiB baseline and 9.6110-GiB initializer 128K figures are
 verified no-MTP calculations, not measured RSS/PSS/VRAM peaks. The v2 correction adds

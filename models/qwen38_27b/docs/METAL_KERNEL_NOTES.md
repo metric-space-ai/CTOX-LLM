@@ -145,9 +145,9 @@ one transaction across every target-layer state owner, and encodes recovered
 embedding, initial RMSNorm, all 64 target layers, and the full LM head into one
 compute encoder. One commit/wait produces resident `TargetLogits`; no
 vocabulary-sized host readback occurs. Encoding, command-buffer, and test-only
-KV-verifier failures restore the complete target-layer transaction. This does
-not yet execute the MTP transition, draft/verify loop, sampler, or final
-barrier, so it is not the complete 645-step token executor.
+KV-verifier failures restore the complete target-layer transaction. The
+executor composes this boundary with the native MTP transition, compact
+draft/verify loop, greedy or bounded stochastic selection, and final barrier.
 
 The full-attention path now applies the previously missing Qwen K RMSNorm
 before partial RoPE. Because K must remain in one shared-arena slot, a dedicated
@@ -178,6 +178,12 @@ then the selector-driven verifier encodes the whole target transition without
 a host token-to-embedding handoff. It validates the compact selector status
 before committing all target states, so a non-finite source selection restores
 the speculative transition.
+Ordinary stochastic target selection uses `qwen_topk_topp_sample_f32` against
+the same resident LM-head view. Its bounded `top_k <= 256` workspace stays in
+the MTP owner; only `{token, status, nucleus_len, nucleus_total}` crosses the
+device boundary. The executor supplies the canonical engine draw, while an
+isolated Apple-Silicon test proves the selected token matches `Sampler` and
+rejects non-finite logits.
 `qwen_concat_f32` now supplies the next native MTP frontend primitive: it joins
 the normalized selected-token embedding and retained target hidden state into
 one caller-owned device view, with a fixed 16-byte ABI and no host staging.
@@ -349,6 +355,7 @@ the complete step set remains executor work.
 | `qwen_gated_delta_recurrent_f16` | f32 step inputs/output, FP16 recurrent state | one threadgroup per value head |
 | `qwen_causal_conv_silu_f16` | f32 input/output, mmap FP16 weight/state | one thread per channel |
 | `qwen_argmax_f32_partial` / `qwen_argmax_f32_final` | f32 logits, bounded partials, two-u32 result | tuned 32 parallel groups plus one final group |
+| `qwen_topk_topp_sample_f32` | resident f32 logits, bounded mutable scratch, four-u32 result | one 256-thread group; top-k up to 256, canonical draw |
 
 64 values per block, row-major block order, codebook matching
 `src/quant.rs` (Q2: {-1, -1/3, 1/3, 1}; Q4: (code - 7.5) / 7.5). Q3 does not
@@ -716,6 +723,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   dispatches the complete 248,077-token vocabulary, proves the larger-token
   tie rule, reuses the resident buffers for a changed winner, returns only two
   u32 values, and rejects a device-observed NaN.
+- `device_topk_topp_matches_canonical_sampler_and_fails_closed` scans a
+  resident distribution, applies temperature/top-k/top-p with the canonical
+  explicit draw, matches the Rust sampler's token decision, and rejects a
+  device-observed NaN.
 - `mapped_rms_norm_lm_head_argmax_chain_stays_on_device` encodes final RMSNorm,
   a mixed Q2/Q4 LM head, and deterministic selection into one command encoder,
   proves the selected token against the scalar chain, rejects a selector wider
@@ -777,8 +788,9 @@ the final 7.8-GiB pack.
   verifier candidates. GQA release builds now keep only metadata plus packed
   device arenas, while tests retain an independent CPU oracle; neither attention
   path has controlled performance evidence. Target-side embedding through the
-  full LM head now executes in one command buffer; the MTP block and sampling
-  do not exist yet. A deterministic shared decode arena and its single Metal
+  full LM head now executes in one command buffer; the native MTP block and
+  bounded resident target sampler are wired into the executor. A deterministic
+  shared decode arena and its single Metal
   buffer
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic

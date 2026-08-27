@@ -28,17 +28,18 @@ use super::metal::{
     MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
     MetalQueryGateBufferAbi, MetalQueryGateParams, MetalResidualRmsNormBufferAbi,
     MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi,
-    ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME,
-    ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, CONCAT_F32_KERNEL_NAME,
-    GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME, GREEDY_MTP_PREFIX_KERNEL_NAME,
-    GREEDY_MTP_VERIFY_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME,
-    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
-    Q2_DYNAMIC_EMBEDDING_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
-    Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SIGMOID_GATE_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME,
-    Q4_DYNAMIC_EMBEDDING_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
-    Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
-    QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
+    MetalTopKTopPBufferAbi, MetalTopKTopPParams, ARGMAX_F32_FINAL_KERNEL_NAME,
+    ARGMAX_F32_PARTIAL_KERNEL_NAME, ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME,
+    CONCAT_F32_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME,
+    GREEDY_MTP_PREFIX_KERNEL_NAME, GREEDY_MTP_VERIFY_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME,
+    KV_Q4_TO_Q2_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME,
+    PARTIAL_ROPE_KERNEL_NAME, Q2_DYNAMIC_EMBEDDING_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
+    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SIGMOID_GATE_KERNEL_NAME,
+    Q2_SWIGLU_KERNEL_NAME, Q4_DYNAMIC_EMBEDDING_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
+    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME,
+    Q4_SWIGLU_KERNEL_NAME, QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
     RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
+    TOPK_TOPP_SAMPLE_F32_KERNEL_NAME,
 };
 use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
@@ -55,6 +56,7 @@ use crate::kv_cache::KvPrecision;
 use crate::kv_cache::{PagedKvAppendCheckpoint, PagedKvCache};
 use crate::loader::{FloatTensorView, ModelArtifact, RecoveredMatrixView};
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
+use crate::sampler::SamplerConfig;
 use crate::{EngineError, Qwen38Config, Result};
 
 const KERNEL_SOURCE: &str = include_str!("../../kernels/metal/q2q4_fused_matvec.metal");
@@ -107,6 +109,7 @@ pub struct MetalCandidateRuntime {
     argmax_f32_partial_pipeline: ComputePipelineState,
     argmax_f32_final_pipeline: ComputePipelineState,
     argmax_index_to_token_pipeline: ComputePipelineState,
+    topk_topp_sample_f32_pipeline: ComputePipelineState,
     greedy_mtp_verify_pipeline: ComputePipelineState,
     greedy_mtp_prefix_pipeline: ComputePipelineState,
 }
@@ -545,6 +548,7 @@ pub struct PreparedMappedMetalMtpCore {
     target_selector: PreparedMetalArgMaxScratch,
     draft_selector: PreparedMetalArgMaxScratch,
     candidate_selector: PreparedMetalArgMaxScratch,
+    target_sampler: PreparedMetalTopKTopPSampler,
     verification_buffer: Buffer,
     prefix_result_buffer: Buffer,
     prefix_params_buffer: Buffer,
@@ -686,6 +690,34 @@ pub struct PreparedMetalArgMax {
     input_buffer: Buffer,
     scratch: PreparedMetalArgMaxScratch,
     resident_bytes: usize,
+}
+
+/// Bounded top-k/top-p workspace bound directly to resident target logits.
+/// It owns no model output and returns only compact selection evidence.
+pub struct PreparedMetalTopKTopPSampler {
+    max_values: usize,
+    input_buffer: Option<Buffer>,
+    scratch_buffer: Buffer,
+    result_buffer: Buffer,
+    params_buffer: Buffer,
+    transient_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalSampledToken {
+    pub token: u32,
+    pub nucleus_len: u32,
+    pub nucleus_total: f32,
+}
+
+impl PreparedMetalTopKTopPSampler {
+    pub fn max_values(&self) -> usize {
+        self.max_values
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.transient_bytes
+    }
 }
 
 impl PreparedMetalArgMax {
@@ -2771,6 +2803,7 @@ impl PreparedMappedMetalMtpCore {
             self.target_selector.transient_bytes(),
             self.draft_selector.transient_bytes(),
             self.candidate_selector.transient_bytes(),
+            self.target_sampler.transient_bytes(),
             METAL_GREEDY_MTP_HISTORY_BYTES,
             METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>(),
             MetalGreedyMtpPrefixParams::BYTE_LEN,
@@ -3133,6 +3166,13 @@ impl MetalCandidateRuntime {
                     "Metal argmax token-map function lookup failed: {message}"
                 ))
             })?;
+        let topk_topp_sample_f32_function = library
+            .get_function(TOPK_TOPP_SAMPLE_F32_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal top-k/top-p function lookup failed: {message}"
+                ))
+            })?;
         let greedy_mtp_verify_function = library
             .get_function(GREEDY_MTP_VERIFY_KERNEL_NAME, None)
             .map_err(|message| {
@@ -3406,6 +3446,13 @@ impl MetalCandidateRuntime {
                     "Metal argmax token-map pipeline creation failed: {message}"
                 ))
             })?;
+        let topk_topp_sample_f32_pipeline = device
+            .new_compute_pipeline_state_with_function(&topk_topp_sample_f32_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal top-k/top-p pipeline creation failed: {message}"
+                ))
+            })?;
         let greedy_mtp_verify_pipeline = device
             .new_compute_pipeline_state_with_function(&greedy_mtp_verify_function)
             .map_err(|message| {
@@ -3422,11 +3469,13 @@ impl MetalCandidateRuntime {
             })?;
         if argmax_f32_partial_pipeline.max_total_threads_per_threadgroup() < 256
             || argmax_f32_final_pipeline.max_total_threads_per_threadgroup() < 256
+            || topk_topp_sample_f32_pipeline.max_total_threads_per_threadgroup() < 256
         {
             return Err(EngineError::InvalidState(format!(
-                "Metal argmax requires 256 threads, device reports partial/final maxima of {}/{}",
+                "Metal selection requires 256 threads, device reports argmax partial/final and sampler maxima of {}/{}/{}",
                 argmax_f32_partial_pipeline.max_total_threads_per_threadgroup(),
-                argmax_f32_final_pipeline.max_total_threads_per_threadgroup()
+                argmax_f32_final_pipeline.max_total_threads_per_threadgroup(),
+                topk_topp_sample_f32_pipeline.max_total_threads_per_threadgroup(),
             )));
         }
         let queue = device.new_command_queue();
@@ -3462,6 +3511,7 @@ impl MetalCandidateRuntime {
             argmax_f32_partial_pipeline,
             argmax_f32_final_pipeline,
             argmax_index_to_token_pipeline,
+            topk_topp_sample_f32_pipeline,
             greedy_mtp_verify_pipeline,
             greedy_mtp_prefix_pipeline,
         })
@@ -3966,6 +4016,194 @@ impl MetalCandidateRuntime {
             result_buffer,
             params_buffer,
             transient_bytes,
+        })
+    }
+
+    pub fn prepare_topk_topp_f32(&self, input: &[f32]) -> Result<PreparedMetalTopKTopPSampler> {
+        let mut prepared = self.prepare_topk_topp_f32_scratch(input.len())?;
+        prepared.input_buffer = Some(buffer_with_data(&self.device, as_bytes(input)));
+        Ok(prepared)
+    }
+
+    pub fn prepare_topk_topp_f32_scratch(
+        &self,
+        max_values: usize,
+    ) -> Result<PreparedMetalTopKTopPSampler> {
+        if max_values == 0 || u32::try_from(max_values).is_err() {
+            return Err(EngineError::Shape(
+                "Metal sampler capacity must be positive and fit u32".into(),
+            ));
+        }
+        let scratch_bytes = max_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal sampler scratch overflows".into()))?;
+        let result_bytes = 4 * std::mem::size_of::<u32>();
+        let transient_bytes = scratch_bytes
+            .checked_add(result_bytes)
+            .and_then(|bytes| bytes.checked_add(MetalTopKTopPParams::BYTE_LEN))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal sampler bytes overflow".into()))?;
+        Ok(PreparedMetalTopKTopPSampler {
+            max_values,
+            input_buffer: None,
+            scratch_buffer: new_zeroed_buffer(&self.device, scratch_bytes)?,
+            result_buffer: new_zeroed_buffer(&self.device, result_bytes)?,
+            params_buffer: new_zeroed_buffer(&self.device, MetalTopKTopPParams::BYTE_LEN)?,
+            transient_bytes,
+        })
+    }
+
+    pub fn dispatch_topk_topp_sample_f32(
+        &self,
+        prepared: &PreparedMetalTopKTopPSampler,
+        config: SamplerConfig,
+        draw: f32,
+    ) -> Result<MetalSampledToken> {
+        let input = prepared.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("Metal standalone sampler has no input buffer".into())
+        })?;
+        self.dispatch_topk_topp_sample_f32_at(input, 0, prepared.max_values, prepared, config, draw)
+    }
+
+    fn dispatch_topk_topp_sample_f32_at(
+        &self,
+        input: &Buffer,
+        input_offset: u64,
+        values: usize,
+        prepared: &PreparedMetalTopKTopPSampler,
+        config: SamplerConfig,
+        draw: f32,
+    ) -> Result<MetalSampledToken> {
+        if values == 0 || values > prepared.max_values {
+            return Err(EngineError::Shape(format!(
+                "Metal sampler received {values} logits, capacity is {}",
+                prepared.max_values
+            )));
+        }
+        if !config.temperature.is_finite() || config.temperature <= 0.0 {
+            return Err(EngineError::InvalidArtifact(
+                "Metal stochastic sampling requires a finite positive temperature".into(),
+            ));
+        }
+        if config.top_k == 0 || config.top_k > 256 || config.top_k > values {
+            return Err(EngineError::UnsupportedOperation {
+                backend: "metal",
+                operation: "top-k/top-p sampling",
+                reason: "verifier candidate requires top_k in 1..=min(256, vocabulary)".into(),
+            });
+        }
+        if !config.top_p.is_finite() || config.top_p <= 0.0 || config.top_p > 1.0 {
+            return Err(EngineError::InvalidArtifact(
+                "Metal top_p must be in (0, 1]".into(),
+            ));
+        }
+        if !draw.is_finite() || !(0.0..1.0).contains(&draw) {
+            return Err(EngineError::InvalidArtifact(
+                "Metal sampler draw must be finite and in [0, 1)".into(),
+            ));
+        }
+        let inverse_temperature = config.temperature.recip();
+        if !inverse_temperature.is_finite() {
+            return Err(EngineError::InvalidArtifact(
+                "Metal inverse temperature must be finite".into(),
+            ));
+        }
+        let input_bytes = values
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal sampler input bytes overflow".into())
+            })?;
+        if input_offset
+            .checked_add(input_bytes)
+            .map_or(true, |end| end > input.length())
+        {
+            return Err(EngineError::MemoryBudget(
+                "Metal sampler input view exceeds its resident buffer".into(),
+            ));
+        }
+        let params = MetalTopKTopPParams {
+            values: u32::try_from(values)
+                .map_err(|_| EngineError::Shape("Metal sampler values exceed u32".into()))?,
+            top_k: u32::try_from(config.top_k)
+                .map_err(|_| EngineError::Shape("Metal sampler top_k exceeds u32".into()))?,
+            inverse_temperature,
+            top_p: config.top_p,
+            draw,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
+        };
+        write_buffer_range(
+            &prepared.params_buffer,
+            0,
+            &params.encode(),
+            MetalTopKTopPParams::BYTE_LEN,
+        )?;
+        zero_buffer(&prepared.result_buffer, 4 * std::mem::size_of::<u32>());
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-topk-topp-sampler");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.topk_topp_sample_f32_pipeline);
+        encoder.set_buffer(
+            MetalTopKTopPBufferAbi::INPUT as u64,
+            Some(input),
+            input_offset,
+        );
+        encoder.set_buffer(
+            MetalTopKTopPBufferAbi::SCRATCH as u64,
+            Some(&prepared.scratch_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalTopKTopPBufferAbi::RESULT as u64,
+            Some(&prepared.result_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalTopKTopPBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal top-k/top-p command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let result =
+            unsafe { slice::from_raw_parts(prepared.result_buffer.contents().cast::<u32>(), 4) };
+        let nucleus_total = f32::from_bits(result[3]);
+        if result[1] != 0
+            || result[0] as usize >= values
+            || result[2] == 0
+            || result[2] as usize > config.top_k
+            || !nucleus_total.is_finite()
+            || nucleus_total <= 0.0
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal sampler rejected logits or produced invalid evidence (status={}, token={}, nucleus_len={}, nucleus_total={nucleus_total})",
+                result[1], result[0], result[2]
+            )));
+        }
+        Ok(MetalSampledToken {
+            token: result[0],
+            nucleus_len: result[2],
+            nucleus_total,
         })
     }
 
@@ -5457,6 +5695,7 @@ impl MetalCandidateRuntime {
         let target_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
         let draft_selector = self.prepare_argmax_f32_scratch(draft_token_ids.len())?;
         let candidate_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
+        let target_sampler = self.prepare_topk_topp_f32_scratch(config.vocab_size)?;
         let verification_buffer = new_zeroed_buffer(&self.device, METAL_GREEDY_MTP_HISTORY_BYTES)?;
         let prefix_result_buffer = new_zeroed_buffer(
             &self.device,
@@ -5482,6 +5721,7 @@ impl MetalCandidateRuntime {
             || target_selector.values != config.vocab_size
             || draft_selector.values != draft_token_ids.len()
             || candidate_selector.values != config.vocab_size
+            || target_sampler.max_values != config.vocab_size
             || pre_embedding_norm.rows != 1
             || pre_embedding_norm.columns != hidden
             || pre_hidden_norm.rows != 1
@@ -5538,6 +5778,7 @@ impl MetalCandidateRuntime {
             target_selector,
             draft_selector,
             candidate_selector,
+            target_sampler,
             verification_buffer,
             prefix_result_buffer,
             prefix_params_buffer,
@@ -12329,6 +12570,36 @@ impl MetalCandidateRuntime {
         self.read_argmax_result(&mtp.target_selector)
     }
 
+    /// Select a bounded top-k/top-p token directly from the resident target
+    /// LM-head output. Only the selected token and compact nucleus evidence
+    /// cross the device boundary; the full vocabulary distribution remains in
+    /// the shared decode arena.
+    pub fn dispatch_prepared_mapped_target_sample(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &PreparedMappedMetalTargetCore,
+        mtp: &PreparedMappedMetalMtpCore,
+        config: SamplerConfig,
+        draw: f32,
+    ) -> Result<MetalSampledToken> {
+        let target_lm_head = self.validate_prepared_mapped_target_core(program, target)?[2];
+        if mtp.target_sampler.max_values != target.vocabulary_rows()
+            || mtp.vocabulary_rows() != target.vocabulary_rows()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target sampler does not cover the canonical vocabulary".into(),
+            ));
+        }
+        self.dispatch_topk_topp_sample_f32_at(
+            target_lm_head.writes()[0].buffer(),
+            target_lm_head.writes()[0].offset(),
+            target.vocabulary_rows(),
+            &mtp.target_sampler,
+            config,
+            draw,
+        )
+    }
+
     fn validate_completed_mapped_target_core(
         &self,
         prepared: &mut PreparedMappedMetalTargetCore,
@@ -16588,6 +16859,52 @@ mod tests {
         ));
         assert!(prepared.write_input(&[0.0; 3]).is_err());
         assert!(runtime.prepare_argmax_f32_with_groups(&logits, 3).is_err());
+    }
+
+    #[test]
+    fn device_topk_topp_matches_canonical_sampler_and_fails_closed() {
+        let runtime = MetalCandidateRuntime::new().expect("create Metal runtime");
+        let logits = (0..513)
+            .map(|index| {
+                let centered = (index as i32 % 37) - 18;
+                centered as f32 * 0.125 + (index % 5) as f32 * 0.01
+            })
+            .collect::<Vec<_>>();
+        let config = SamplerConfig {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            seed: 0,
+        };
+        let draw = 0.625_f32;
+        let expected = crate::sampler::Sampler::new(config)
+            .expect("canonical sampler")
+            .sample_with_draw(&logits, draw)
+            .expect("canonical sample");
+        let prepared = runtime
+            .prepare_topk_topp_f32(&logits)
+            .expect("prepare Metal sampler");
+        let selected = runtime
+            .dispatch_topk_topp_sample_f32(&prepared, config, draw)
+            .expect("dispatch Metal sampler");
+        assert_eq!(selected.token as usize, expected);
+        assert!(selected.nucleus_len > 0 && selected.nucleus_len <= config.top_k as u32);
+        assert!(selected.nucleus_total.is_finite() && selected.nucleus_total > 0.0);
+
+        let unsupported = SamplerConfig { top_k: 0, ..config };
+        assert!(matches!(
+            runtime.dispatch_topk_topp_sample_f32(&prepared, unsupported, draw),
+            Err(EngineError::UnsupportedOperation {
+                backend: "metal",
+                ..
+            })
+        ));
+        let invalid = runtime
+            .prepare_topk_topp_f32(&[0.0, f32::NAN])
+            .expect("prepare non-finite Metal sampler input");
+        assert!(runtime
+            .dispatch_topk_topp_sample_f32(&invalid, config, draw)
+            .is_err());
     }
 
     #[test]

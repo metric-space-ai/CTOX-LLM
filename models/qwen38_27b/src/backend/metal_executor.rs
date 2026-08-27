@@ -864,19 +864,39 @@ impl ModelExecutor for MetalModelExecutor {
         Ok(Self::compact_step(&records, bonus_token))
     }
 
-    fn select_target_token(&mut self, sampling: SamplerConfig, _draw: f32) -> Result<Option<u32>> {
+    fn select_target_token(&mut self, sampling: SamplerConfig, draw: f32) -> Result<Option<u32>> {
         let _ = Sampler::new(sampling)?;
-        if sampling.temperature != 0.0 {
-            return Err(EngineError::UnsupportedOperation {
-                backend: "metal",
-                operation: "resident target sampling",
-                reason: "Metal top-k/top-p sampling is not yet promoted; greedy selection remains device-resident"
-                    .into(),
+        if sampling.temperature == 0.0 {
+            return self.last_target_token.map(Some).ok_or_else(|| {
+                EngineError::InvalidState("Metal executor has no resident target selection".into())
             });
         }
-        self.last_target_token.take().map(Some).ok_or_else(|| {
-            EngineError::InvalidState("Metal executor has no resident target selection".into())
-        })
+        if self.last_target_token.is_none() {
+            return Err(EngineError::InvalidState(
+                "Metal executor has no resident target distribution".into(),
+            ));
+        }
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("Metal executor runtime is not available".into())
+        })?;
+        let plan = self.binding_plan.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("Metal executor binding plan is not available".into())
+        })?;
+        let workspace = self.workspace.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("Metal executor workspace is not available".into())
+        })?;
+        let program = workspace.bind_decode_program(plan)?;
+        let target = self.target.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("Metal target graph is not available".into())
+        })?;
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| EngineError::InvalidState("Metal MTP graph is not available".into()))?;
+        let token = runtime
+            .dispatch_prepared_mapped_target_sample(&program, target, mtp, sampling, draw)?
+            .token;
+        Ok(Some(token))
     }
 
     fn commit_speculative(
