@@ -85,8 +85,14 @@ def assistant_output_ids(tokenizer: Any, record: dict[str, Any]) -> list[int]:
         raise ValueError(f"record {record['id']} assistant prefix differs from rendered prompt")
     full_ids = list(tokenizer(rendered, add_special_tokens=False).input_ids)
     prefix_ids = list(tokenizer(prefix, add_special_tokens=False).input_ids)
-    if full_ids[: len(prefix_ids)] != prefix_ids or len(full_ids) <= len(prefix_ids):
-        raise ValueError(f"record {record['id']} has no exact assistant token suffix")
+    # Bind selection to the same target boundary used by cache_teacher.py:
+    # the separately tokenized generation prefix contributes the supervised
+    # prefix length. BPE tokenization is not generally prefix-stable because a
+    # token may merge bytes across the prefix/assistant string boundary, so
+    # requiring prefix_ids to equal a literal prefix of full_ids rejects valid
+    # teacher-cache records and would define a different target contract.
+    if len(full_ids) <= len(prefix_ids):
+        raise ValueError(f"record {record['id']} has no assistant token targets")
     return [int(token) for token in full_ids[len(prefix_ids) :]]
 
 

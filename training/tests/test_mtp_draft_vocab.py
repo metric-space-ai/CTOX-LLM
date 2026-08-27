@@ -12,6 +12,7 @@ TRAINING = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TRAINING))
 
 from build_mtp_draft_vocab import (  # noqa: E402
+    assistant_output_ids,
     coverage_ppm,
     select_tokens,
     validate_teacher_cache_set,
@@ -19,6 +20,49 @@ from build_mtp_draft_vocab import (  # noqa: E402
 
 
 class MtpDraftVocabularyTests(unittest.TestCase):
+    def test_assistant_targets_follow_teacher_boundary_when_bpe_prefix_is_unstable(
+        self,
+    ) -> None:
+        class Encoded:
+            def __init__(self, input_ids: list[int]) -> None:
+                self.input_ids = input_ids
+
+        class Tokenizer:
+            def apply_chat_template(
+                self,
+                messages: list[dict[str, str]],
+                *,
+                tokenize: bool,
+                add_generation_prompt: bool,
+                **_kwargs: object,
+            ) -> str:
+                self.assert_false(tokenize)
+                return "PREFIX" if add_generation_prompt else "PREFIXANSWER"
+
+            @staticmethod
+            def assert_false(value: bool) -> None:
+                if value:
+                    raise AssertionError("fixture expects rendered templates")
+
+            def __call__(self, text: str, *, add_special_tokens: bool) -> Encoded:
+                self.assert_false(add_special_tokens)
+                if text == "PREFIX":
+                    return Encoded([10, 11])
+                if text == "PREFIXANSWER":
+                    # The second full-sequence token crosses the textual
+                    # boundary, so separate tokenization is not prefix-stable.
+                    return Encoded([10, 99, 12])
+                raise AssertionError(text)
+
+        record = {
+            "id": "sample",
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+            ],
+        }
+        self.assertEqual(assistant_output_ids(Tokenizer(), record), [12])
+
     def test_selection_balances_common_code_domain_and_language_tokens(self) -> None:
         selected = select_tokens(
             overall=Counter({0: 1000, 1: 100, 2: 10, 3: 1}),
