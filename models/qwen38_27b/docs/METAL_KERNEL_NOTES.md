@@ -158,11 +158,12 @@ CPU equation. This corrects target and future MTP attention semantics without
 adding a production K activation buffer.
 
 `PreparedMappedMetalMtpCore` is the corresponding atomic load boundary for the
-native one-layer MTP graph. It admits the shared embedding and LM head as
-offset-only views, both pre-FC norms, `mtp.fc`, input norm, complete MTP
-attention/MLP resource set, packed KV state, and target-selector scratch only
-when every tensor and mapping identity matches. The loader still precedes the
-MTP encoder; no draft/verify execution claim is made here.
+native one-layer MTP graph. It admits the shared embedding plus the canonical
+restricted LM-head rows as offset-only views, both pre-FC norms, `mtp.fc`,
+input norm, complete MTP attention/MLP resource set, packed KV state, and
+target-selector scratch only when every tensor and mapping identity matches.
+The draft vocabulary must be non-empty, strictly increasing, unique, and
+within the full LM-head row range.
 
 Target selection can now feed MTP embedding without returning the token to the
 host. `qwen_argmax_f32_final` leaves the selected ID in its compact result
@@ -186,9 +187,11 @@ complete native MTP transformer layer as well: Q/K/V fan-out, Q/K norms and
 RoPE, packed paged-GQA append, gated output projection, both residual norms,
 and the Q2/Q4 SwiGLU FFN. Its bring-up boundary checkpoints the independent MTP
 KV owner, commits only after a completed finite result, and restores cache
-metadata on every failure. Only the verifier waits or reads the final
-normalized hidden state; the restricted head and joint target transaction
-remain pending.
+metadata on every failure. A graph-I/O gathered Q2/Q4 head then writes exactly
+the canonical restricted rows into the main arena's `MtpDraft` view in the
+same encoder; its offset Golden proves it allocates no activation input/output.
+Only the verifier waits or reads draft logits. Draft selection, target
+verification, and the joint target transaction remain pending.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

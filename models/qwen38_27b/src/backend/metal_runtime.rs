@@ -277,9 +277,9 @@ pub struct PreparedMappedMetalGatheredMatVec {
     requested_rows: usize,
     s_in_offset: u64,
     mapping: MappedMetalArtifact,
-    input_buffer: Buffer,
+    input_buffer: Option<Buffer>,
     bias_buffer: Buffer,
-    output_buffer: Buffer,
+    output_buffer: Option<Buffer>,
     dispatches: Vec<MappedMetalGatherDispatch>,
     transient_bytes: usize,
 }
@@ -536,7 +536,7 @@ pub struct PreparedMappedMetalMtpCore {
     fc: PreparedMappedMetalMatVec,
     input_norm: PreparedMappedMetalRmsNorm,
     layer: PreparedMappedMetalFullAttentionLayer,
-    lm_head: PreparedMappedMetalMatVec,
+    lm_head: PreparedMappedMetalGatheredMatVec,
     workspace: PreparedMetalMtpWorkspace,
 }
 
@@ -1491,14 +1491,35 @@ impl PreparedMappedMetalGatheredMatVec {
 
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
         validate_metal_input(input, self.columns)?;
+        let input_buffer = self.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal gathered graph projection has no operation-local input buffer".into(),
+            )
+        })?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 input.as_ptr(),
-                self.input_buffer.contents().cast::<f32>(),
+                input_buffer.contents().cast::<f32>(),
                 input.len(),
             );
         }
         Ok(())
+    }
+
+    fn owned_input(&self) -> Result<&Buffer> {
+        self.input_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal gathered graph projection consumes an upstream activation".into(),
+            )
+        })
+    }
+
+    fn owned_output(&self) -> Result<&Buffer> {
+        self.output_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal gathered graph projection writes a shared arena view".into(),
+            )
+        })
     }
 }
 
@@ -2528,8 +2549,11 @@ impl PreparedMappedMetalMtpCore {
     }
 
     pub fn vocabulary_rows(&self) -> usize {
-        debug_assert_eq!(self.embedding.rows, self.lm_head.rows);
-        self.lm_head.rows
+        self.embedding.rows
+    }
+
+    pub fn draft_vocabulary_rows(&self) -> usize {
+        self.lm_head.requested_rows
     }
 
     pub fn hidden_size(&self) -> usize {
@@ -4428,6 +4452,7 @@ impl MetalCandidateRuntime {
         mapping: &MappedMetalArtifact,
         position: u64,
         cache: MetalPagedGqaConfig,
+        draft_token_ids: &[u32],
     ) -> Result<PreparedMappedMetalMtpCore> {
         let config = Qwen38Config::default();
         if cache.query_heads != config.num_attention_heads
@@ -4611,7 +4636,12 @@ impl MetalCandidateRuntime {
                 config.rms_norm_epsilon,
             )?,
         };
-        let lm_head = self.prepare_named_mapped_projection_graph_io(mapping, "lm_head.weight")?;
+        let lm_head = self.prepare_mapped_gathered_matvec_graph_io(
+            mapping,
+            mapping.inner.artifact.recovered_matrix("lm_head.weight")?,
+            &hidden_validation,
+            draft_token_ids,
+        )?;
         let target_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
         let workspace_plan = MetalMtpWorkspacePlan::qwen38(&config)?;
         let workspace = self.prepare_mtp_workspace(&workspace_plan)?;
@@ -4636,8 +4666,10 @@ impl MetalCandidateRuntime {
             || fc.columns != concatenated_hidden
             || input_norm.rows != 1
             || input_norm.columns != hidden
-            || lm_head.rows != config.vocab_size
             || lm_head.columns != hidden
+            || lm_head.requested_rows != draft_token_ids.len()
+            || lm_head.input_buffer.is_some()
+            || lm_head.output_buffer.is_some()
             || layer.ffn_gate_up.iter().any(|projection| {
                 projection.rows != config.intermediate_size || projection.columns != hidden
             })
@@ -4672,7 +4704,6 @@ impl MetalCandidateRuntime {
                 .post_ffn_residual_rms_norm
                 .matches_weight_tensor("mtp.norm.weight")?
             || !fc.matches_recovered_tensor("mtp.fc.weight")?
-            || !lm_head.matches_recovered_tensor("lm_head.weight")?
         {
             return Err(EngineError::InvalidState(
                 "Metal MTP core resources are not one canonical frozen model".into(),
@@ -4843,6 +4874,33 @@ impl MetalCandidateRuntime {
         input: &[f32],
         row_ids: &[u32],
     ) -> Result<PreparedMappedMetalGatheredMatVec> {
+        self.prepare_mapped_gathered_matvec_internal(mapping, matrix, input, row_ids, true)
+    }
+
+    pub fn prepare_mapped_gathered_matvec_graph_io(
+        &self,
+        mapping: &MappedMetalArtifact,
+        matrix: RecoveredMatrixView<'_>,
+        validation_input: &[f32],
+        row_ids: &[u32],
+    ) -> Result<PreparedMappedMetalGatheredMatVec> {
+        self.prepare_mapped_gathered_matvec_internal(
+            mapping,
+            matrix,
+            validation_input,
+            row_ids,
+            false,
+        )
+    }
+
+    fn prepare_mapped_gathered_matvec_internal(
+        &self,
+        mapping: &MappedMetalArtifact,
+        matrix: RecoveredMatrixView<'_>,
+        input: &[f32],
+        row_ids: &[u32],
+        own_io: bool,
+    ) -> Result<PreparedMappedMetalGatheredMatVec> {
         if row_ids.is_empty()
             || row_ids.windows(2).any(|pair| pair[0] >= pair[1])
             || row_ids
@@ -4892,15 +4950,16 @@ impl MetalCandidateRuntime {
         let weights_base = mapping.byte_offset(operation.weights, "gathered weights")?;
         let s_in_offset = mapping.byte_offset(s_in, "gathered s_in")?;
         let s_out_base = mapping.byte_offset(s_out, "gathered s_out")?;
-        let input_buffer = buffer_with_data(&self.device, as_bytes(input));
+        let input_buffer = own_io.then(|| buffer_with_data(&self.device, as_bytes(input)));
         let bias_buffer = buffer_with_data(&self.device, as_bytes(&[0.0_f32]));
         let output_bytes = row_ids
             .len()
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| EngineError::Shape("Metal gathered output bytes overflow".into()))?;
-        let output_buffer = self
-            .device
-            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let output_buffer = own_io.then(|| {
+            self.device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         let mut dispatches = Vec::new();
         let mut selected_rows = 0_usize;
         for (dtype, row_start, row_end, weight_offset, mut params) in contracts {
@@ -4986,9 +5045,15 @@ impl MetalCandidateRuntime {
             .len()
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or_else(|| EngineError::Shape("Metal gathered ID bytes overflow".into()))?;
-        let transient_bytes = size_of_val(input)
+        let io_bytes = if own_io {
+            size_of_val(input)
+                .checked_add(output_bytes)
+                .ok_or_else(|| EngineError::Shape("Metal gathered I/O bytes overflow".into()))?
+        } else {
+            0
+        };
+        let transient_bytes = io_bytes
             .checked_add(std::mem::size_of::<f32>())
-            .and_then(|total| total.checked_add(output_bytes))
             .and_then(|total| total.checked_add(row_id_bytes))
             .and_then(|total| total.checked_add(parameter_bytes))
             .ok_or_else(|| EngineError::Shape("Metal gathered transient bytes overflow".into()))?;
@@ -6412,14 +6477,43 @@ impl MetalCandidateRuntime {
         &self,
         prepared: &PreparedMappedMetalGatheredMatVec,
     ) -> Result<Vec<f32>> {
+        let input = prepared.owned_input()?;
+        let output = prepared.owned_output()?;
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-mmap-gathered-lm-head-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_buffer(
-            MetalBufferAbi::INPUT as u64,
-            Some(&prepared.input_buffer),
-            0,
-        );
+        self.encode_mapped_gathered_between(encoder, prepared, input, 0, output, 0)?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal gathered command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let output = unsafe {
+            slice::from_raw_parts(output.contents().cast::<f32>(), prepared.requested_rows).to_vec()
+        };
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal gathered projection produced a non-finite output".into(),
+            ));
+        }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_gathered_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalGatheredMatVec,
+        input: &Buffer,
+        input_offset: u64,
+        output: &Buffer,
+        output_base: u64,
+    ) -> Result<()> {
+        encoder.set_buffer(MetalBufferAbi::INPUT as u64, Some(input), input_offset);
         encoder.set_buffer(
             MetalBufferAbi::S_IN as u64,
             Some(&prepared.mapping.inner.buffer),
@@ -6445,8 +6539,14 @@ impl MetalCandidateRuntime {
             );
             encoder.set_buffer(
                 MetalBufferAbi::OUTPUT as u64,
-                Some(&prepared.output_buffer),
-                dispatch.output_offset,
+                Some(output),
+                output_base
+                    .checked_add(dispatch.output_offset)
+                    .ok_or_else(|| {
+                        EngineError::MemoryBudget(
+                            "Metal gathered output binding offset overflows".into(),
+                        )
+                    })?,
             );
             encoder.set_buffer(
                 MetalBufferAbi::PARAMS as u64,
@@ -6473,28 +6573,7 @@ impl MetalCandidateRuntime {
             };
             encoder.dispatch_thread_groups(grid, threads);
         }
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        if command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(EngineError::InvalidState(format!(
-                "Metal gathered command ended with {:?}",
-                command_buffer.status()
-            )));
-        }
-        let output = unsafe {
-            slice::from_raw_parts(
-                prepared.output_buffer.contents().cast::<f32>(),
-                prepared.requested_rows,
-            )
-            .to_vec()
-        };
-        if output.iter().any(|value| !value.is_finite()) {
-            return Err(EngineError::InvalidState(
-                "Metal gathered projection produced a non-finite output".into(),
-            ));
-        }
-        Ok(output)
+        Ok(())
     }
 
     /// Decode one prepared embedding row directly from the no-copy artifact
@@ -10936,6 +11015,7 @@ impl MetalCandidateRuntime {
             || step.reads()[1].slot() != MetalBufferSlot::TargetLogits
             || step.reads()[1].values() != config.vocab_size
             || step.writes()[0].slot() != MetalBufferSlot::MtpDraft
+            || step.writes()[0].values() != prepared.draft_vocabulary_rows()
             || prepared.copied_model_bytes() != 0
             || prepared.vocabulary_rows() != config.vocab_size
             || prepared.hidden_size() != config.hidden_size
@@ -11182,6 +11262,10 @@ impl MetalCandidateRuntime {
             })
             || layer.swiglu_down.columns != config.intermediate_size
             || layer.swiglu_down.rows != config.hidden_size
+            || prepared.lm_head.columns != config.hidden_size
+            || prepared.lm_head.requested_rows == 0
+            || prepared.lm_head.input_buffer.is_some()
+            || prepared.lm_head.output_buffer.is_some()
         {
             return Err(EngineError::InvalidState(
                 "Metal MTP transformer resources or scratch views are incompatible".into(),
@@ -11410,11 +11494,12 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
-    /// Bring-up execution of the complete native MTP frontend plus its one
-    /// transformer layer. It advances the dedicated MTP KV state only after a
-    /// successful command and restores the append metadata on every failure.
-    /// The restricted LM head remains the next boundary.
-    pub fn dispatch_prepared_mapped_mtp_layer_verifier(
+    /// Bring-up execution of the complete native MTP frontend, one transformer
+    /// layer, and canonical restricted LM head. It advances the dedicated MTP
+    /// KV state only after a successful finite draft and restores append
+    /// metadata on every failure. Draft sampling/target verification is the
+    /// next boundary.
+    pub fn dispatch_prepared_mapped_mtp_draft_verifier(
         &self,
         program: &PreparedMetalDecodeProgram<'_>,
         prepared: &mut PreparedMappedMetalMtpCore,
@@ -11442,6 +11527,17 @@ impl MetalCandidateRuntime {
                     &plan,
                     component_values,
                     thread_width,
+                )?;
+                let final_normalized = prepared
+                    .workspace
+                    .buffer_and_offset(MetalMtpBufferSlot::FinalNormalized)?;
+                self.encode_mapped_gathered_between(
+                    encoder,
+                    &prepared.lm_head,
+                    final_normalized.0,
+                    final_normalized.1,
+                    step.writes()[0].buffer(),
+                    step.writes()[0].offset(),
                 )
             })();
             encoder.end_encoding();
@@ -11489,25 +11585,25 @@ impl MetalCandidateRuntime {
                 )?;
             }
             let token = self.read_argmax_result(&prepared.target_selector)?;
-            let output = prepared
-                .workspace
-                .binding(MetalMtpBufferSlot::FinalNormalized)?;
+            let output = &step.writes()[0];
+            let output_offset = usize::try_from(output.offset()).map_err(|_| {
+                EngineError::MemoryBudget("Metal MTP draft offset exceeds usize".into())
+            })?;
             let values = unsafe {
                 slice::from_raw_parts(
-                    prepared
-                        .workspace
-                        .buffer
+                    output
+                        .buffer()
                         .contents()
                         .cast::<u8>()
-                        .add(output.offset)
+                        .add(output_offset)
                         .cast::<f32>(),
-                    output.values,
+                    output.values(),
                 )
                 .to_vec()
             };
             if values.iter().any(|value| !value.is_finite()) {
                 return Err(EngineError::InvalidState(
-                    "Metal MTP transformer produced a non-finite hidden state".into(),
+                    "Metal restricted MTP head produced non-finite draft logits".into(),
                 ));
             }
             prepared.layer.attention.commit_speculative()?;
@@ -13972,6 +14068,70 @@ mod tests {
         assert!(runtime
             .prepare_mapped_gathered_matvec(&mapping, matrix, &input, &[8])
             .is_err());
+        let graph = runtime
+            .prepare_mapped_gathered_matvec_graph_io(&mapping, matrix, &input, &row_ids)
+            .expect("prepare graph-owned gathered LM head");
+        assert_eq!(
+            graph.transient_bytes(),
+            std::mem::size_of::<f32>()
+                + row_ids.len() * std::mem::size_of::<u32>()
+                + 2 * MetalFusedMatVecParams::BYTE_LEN
+        );
+        assert!(graph.write_input(&input).is_err());
+        assert!(runtime.dispatch_mapped_gathered(&graph).is_err());
+        let input_offset = 256_usize;
+        let output_offset = 512_usize;
+        let graph_input = new_zeroed_buffer(
+            &runtime.device,
+            input_offset + input.len() * std::mem::size_of::<f32>(),
+        )
+        .expect("graph gathered input arena");
+        write_buffer_range(
+            &graph_input,
+            input_offset,
+            as_bytes(&input),
+            input_offset + input.len() * std::mem::size_of::<f32>(),
+        )
+        .expect("write graph gathered input view");
+        let graph_output = new_zeroed_buffer(
+            &runtime.device,
+            output_offset + row_ids.len() * std::mem::size_of::<f32>(),
+        )
+        .expect("graph gathered output arena");
+        let command_buffer = runtime.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        runtime
+            .encode_mapped_gathered_between(
+                encoder,
+                &graph,
+                &graph_input,
+                input_offset as u64,
+                &graph_output,
+                output_offset as u64,
+            )
+            .expect("encode graph gathered offsets");
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        let graph_actual = unsafe {
+            slice::from_raw_parts(
+                graph_output
+                    .contents()
+                    .cast::<u8>()
+                    .add(output_offset)
+                    .cast::<f32>(),
+                row_ids.len(),
+            )
+            .to_vec()
+        };
+        for (row, (expected, actual)) in expected.iter().zip(graph_actual).enumerate() {
+            let tolerance = 2.0e-4_f32.max(expected.abs() * 3.0e-5);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "graph gathered row {row}: expected {expected}, got {actual}"
+            );
+        }
         drop(mapping);
         drop(artifact);
         let actual = runtime
@@ -14577,6 +14737,7 @@ mod tests {
                     sink_tokens: 2,
                     recent_tokens: 2,
                 },
+                &[0],
             )
             .is_err());
         let embedding_matrix = artifact
