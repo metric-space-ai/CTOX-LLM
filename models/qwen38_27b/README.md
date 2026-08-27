@@ -291,6 +291,12 @@ resource set, packed MTP KV state, and resident target-selector scratch are
 constructed atomically from the same artifact identity. Execution is still
 pending, but a missing MTP tensor or incompatible cache geometry can no longer
 leave a partially admitted device graph.
+The target-to-MTP token edge is now device-resident as well. Target argmax
+writes one compact result buffer, and paired Q2/Q4 dynamic embedding kernels
+consume that token directly; every mixed-precision segment is dispatched but
+only the owning segment writes the recovered row. The same-command Golden
+selects rows on both sides of a Q2/Q4 boundary and matches the static CPU
+oracle without a token readback or an embedding-table repack.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

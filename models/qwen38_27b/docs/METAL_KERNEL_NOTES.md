@@ -164,6 +164,14 @@ attention/MLP resource set, packed KV state, and target-selector scratch only
 when every tensor and mapping identity matches. The loader still precedes the
 MTP encoder; no draft/verify execution claim is made here.
 
+Target selection can now feed MTP embedding without returning the token to the
+host. `qwen_argmax_f32_final` leaves the selected ID in its compact result
+buffer; `q2_b64_dynamic_embedding_row` and
+`q4_b64_dynamic_embedding_row` consume that buffer directly. Mixed embedding
+segments each carry a fixed 32-byte range/stride parameter block and only the
+segment containing the selected row writes the shared output. A same-command
+Golden crosses the Q2/Q4 boundary and matches loader-resolved static rows.
+
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
 active, appends retain all pre-branch Q4 pages and use the memory-plan boundary

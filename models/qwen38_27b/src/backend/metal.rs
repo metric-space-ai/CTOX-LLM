@@ -27,6 +27,8 @@ pub const Q2_GATHERED_KERNEL_NAME: &str = "q2_b64_gathered_matvec";
 pub const Q4_GATHERED_KERNEL_NAME: &str = "q4_b64_gathered_matvec";
 pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
 pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
+pub const Q2_DYNAMIC_EMBEDDING_KERNEL_NAME: &str = "q2_b64_dynamic_embedding_row";
+pub const Q4_DYNAMIC_EMBEDDING_KERNEL_NAME: &str = "q4_b64_dynamic_embedding_row";
 pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
 pub const RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME: &str = "qwen_rms_norm_1p_head256_inplace_f32";
 pub const RESIDUAL_RMS_NORM_1P_KERNEL_NAME: &str = "qwen_residual_rms_norm_1p_f32";
@@ -276,6 +278,45 @@ pub struct MetalFusedMatVecParams {
     pub has_bias: u32,
     pub activation: u32,
     pub reserved0: u32,
+}
+
+/// Segment-local dynamic embedding lookup parameters. The selected token is
+/// produced by the resident argmax result buffer, so the host never supplies
+/// or reads the row between target and MTP execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalDynamicEmbeddingParams {
+    pub columns: u32,
+    pub blocks_per_row: u32,
+    pub row_start: u32,
+    pub row_end: u32,
+    pub row_bytes: u32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+}
+
+impl MetalDynamicEmbeddingParams {
+    pub const BYTE_LEN: usize = 32;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.columns,
+            self.blocks_per_row,
+            self.row_start,
+            self.row_end,
+            self.row_bytes,
+            self.reserved0,
+            self.reserved1,
+            self.reserved2,
+        ]
+        .iter()
+        .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
 }
 
 /// Packed ABI shared with `RmsNormParams` in the MSL candidate source.
@@ -1149,6 +1190,8 @@ mod tests {
         assert!(Q4_GATHERED_KERNEL_NAME.starts_with("q4_b64"));
         assert!(Q2_RECOVERED_ROW_KERNEL_NAME.starts_with("q2_b64"));
         assert!(Q4_RECOVERED_ROW_KERNEL_NAME.starts_with("q4_b64"));
+        assert!(Q2_DYNAMIC_EMBEDDING_KERNEL_NAME.contains("dynamic_embedding"));
+        assert!(Q4_DYNAMIC_EMBEDDING_KERNEL_NAME.contains("dynamic_embedding"));
         assert!(RMS_NORM_1P_KERNEL_NAME.starts_with("qwen_rms_norm"));
         assert!(RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME.contains("head256_inplace"));
         assert!(PARTIAL_ROPE_KERNEL_NAME.starts_with("qwen_partial_rope"));
@@ -1203,6 +1246,23 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![3, 128, 2, 1, 1, 1, 1, 0]);
+
+        let dynamic_embedding = MetalDynamicEmbeddingParams {
+            columns: 5_120,
+            blocks_per_row: 80,
+            row_start: 1_024,
+            row_end: 2_048,
+            row_bytes: 2_720,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
+        };
+        let words: Vec<u32> = dynamic_embedding
+            .encode()
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![5_120, 80, 1_024, 2_048, 2_720, 0, 0, 0]);
 
         let paged = MetalPagedGqaParams {
             query_heads: 24,

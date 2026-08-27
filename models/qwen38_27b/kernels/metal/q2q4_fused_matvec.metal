@@ -130,6 +130,17 @@ struct ArgMaxParams {
     uint reserved1;
 };
 
+struct DynamicEmbeddingParams {
+    uint columns;
+    uint blocks_per_row;
+    uint row_start;
+    uint row_end;
+    uint row_bytes;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
 struct ArgMaxPartial {
     float value;
     uint index;
@@ -818,6 +829,73 @@ kernel void q4_b64_recovered_row(
     uint byte_in_block = packed_index & 31u;
     device const uchar* block_base = weights + ulong(block) * Q4_BLOCK_BYTES;
     float scale = read_scale(block_base) * float(s_out[0]);
+    uint packed = uint(block_base[2u + byte_in_block]);
+    float normalized0 = (float(packed & 0xfu) - 7.5f) * (1.0f / 7.5f);
+    float normalized1 = (float((packed >> 4u) & 0xfu) - 7.5f) * (1.0f / 7.5f);
+    output[column] = scale * normalized0 * float(s_in[column]);
+    output[column + 1u] = scale * normalized1 * float(s_in[column + 1u]);
+}
+
+// Device-selected embedding lookup used by the target -> MTP edge. Every
+// quant segment is dispatched, but only the segment containing selected[0]
+// writes the output. This permits a mixed Q2/Q4 embedding table without a
+// host token readback or backend-specific repack.
+kernel void q2_b64_dynamic_embedding_row(
+    device const uchar* segment_weights [[buffer(0)]],
+    device const uint* selected [[buffer(1)]],
+    device const half* s_in [[buffer(2)]],
+    device const half* s_out [[buffer(3)]],
+    device float* output [[buffer(5)]],
+    constant DynamicEmbeddingParams& params [[buffer(6)]],
+    uint packed_index [[thread_position_in_grid]]) {
+    uint token = selected[0];
+    if (token < params.row_start || token >= params.row_end) {
+        return;
+    }
+    uint column = packed_index * 4u;
+    if (column >= params.columns) {
+        return;
+    }
+    uint local_row = token - params.row_start;
+    device const uchar* weights = segment_weights
+        + ulong(local_row) * ulong(params.row_bytes);
+    uint block = column / Q2Q4_BLOCK_LEN;
+    uint byte_in_block = packed_index & 15u;
+    device const uchar* block_base = weights + ulong(block) * Q2_BLOCK_BYTES;
+    float scale = read_scale(block_base) * float(s_out[token]);
+    uint packed = uint(block_base[2u + byte_in_block]);
+    output[column] = scale * q2_normalized(packed & 0x3u) * float(s_in[column]);
+    output[column + 1u] = scale * q2_normalized((packed >> 2u) & 0x3u)
+        * float(s_in[column + 1u]);
+    output[column + 2u] = scale * q2_normalized((packed >> 4u) & 0x3u)
+        * float(s_in[column + 2u]);
+    output[column + 3u] = scale * q2_normalized((packed >> 6u) & 0x3u)
+        * float(s_in[column + 3u]);
+}
+
+kernel void q4_b64_dynamic_embedding_row(
+    device const uchar* segment_weights [[buffer(0)]],
+    device const uint* selected [[buffer(1)]],
+    device const half* s_in [[buffer(2)]],
+    device const half* s_out [[buffer(3)]],
+    device float* output [[buffer(5)]],
+    constant DynamicEmbeddingParams& params [[buffer(6)]],
+    uint packed_index [[thread_position_in_grid]]) {
+    uint token = selected[0];
+    if (token < params.row_start || token >= params.row_end) {
+        return;
+    }
+    uint column = packed_index * 2u;
+    if (column >= params.columns) {
+        return;
+    }
+    uint local_row = token - params.row_start;
+    device const uchar* weights = segment_weights
+        + ulong(local_row) * ulong(params.row_bytes);
+    uint block = column / Q2Q4_BLOCK_LEN;
+    uint byte_in_block = packed_index & 31u;
+    device const uchar* block_base = weights + ulong(block) * Q4_BLOCK_BYTES;
+    float scale = read_scale(block_base) * float(s_out[token]);
     uint packed = uint(block_base[2u + byte_in_block]);
     float normalized0 = (float(packed & 0xfu) - 7.5f) * (1.0f / 7.5f);
     float normalized1 = (float((packed >> 4u) & 0xfu) - 7.5f) * (1.0f / 7.5f);

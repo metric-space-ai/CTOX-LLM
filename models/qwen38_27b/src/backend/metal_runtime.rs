@@ -19,20 +19,21 @@ use sha2::{Digest, Sha256};
 use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row,
     MetalArgMaxFinalBufferAbi, MetalArgMaxParams, MetalArgMaxPartialBufferAbi, MetalBufferAbi,
-    MetalCausalConvBufferAbi, MetalCausalConvParams, MetalFusedMatVecParams,
-    MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi,
-    MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalKvPackParams,
-    MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi, MetalPagedGqaParams,
-    MetalPartialRopeBufferAbi, MetalPartialRopeParams, MetalQueryGateBufferAbi,
-    MetalQueryGateParams, MetalResidualRmsNormBufferAbi, MetalRmsNormBufferAbi, MetalRmsNormParams,
-    MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi, ARGMAX_F32_FINAL_KERNEL_NAME,
-    ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME,
-    GATED_DELTA_PREP_F32_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME,
-    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
-    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME,
-    Q2_SIGMOID_GATE_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME,
-    Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
-    QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
+    MetalCausalConvBufferAbi, MetalCausalConvParams, MetalDynamicEmbeddingParams,
+    MetalFusedMatVecParams, MetalGatedDeltaBufferAbi, MetalGatedDeltaParams,
+    MetalGatedDeltaPrepareBufferAbi, MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi,
+    MetalKvPackParams, MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi,
+    MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
+    MetalQueryGateBufferAbi, MetalQueryGateParams, MetalResidualRmsNormBufferAbi,
+    MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi,
+    ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME,
+    GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME,
+    KV_Q4_TO_Q2_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME,
+    PARTIAL_ROPE_KERNEL_NAME, Q2_DYNAMIC_EMBEDDING_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
+    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SIGMOID_GATE_KERNEL_NAME,
+    Q2_SWIGLU_KERNEL_NAME, Q4_DYNAMIC_EMBEDDING_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
+    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME,
+    Q4_SWIGLU_KERNEL_NAME, QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
     RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::metal_graph::{
@@ -77,6 +78,8 @@ pub struct MetalCandidateRuntime {
     q4_gathered_pipeline: ComputePipelineState,
     q2_recovered_row_pipeline: ComputePipelineState,
     q4_recovered_row_pipeline: ComputePipelineState,
+    q2_dynamic_embedding_pipeline: ComputePipelineState,
+    q4_dynamic_embedding_pipeline: ComputePipelineState,
     rms_norm_1p_pipeline: ComputePipelineState,
     rms_norm_1p_head256_inplace_pipeline: ComputePipelineState,
     residual_rms_norm_1p_pipeline: ComputePipelineState,
@@ -313,7 +316,7 @@ pub struct PreparedMappedMetalEmbedding {
     transient_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct MappedMetalEmbeddingSegment {
     dtype: TensorDType,
     row_start: usize,
@@ -321,6 +324,7 @@ struct MappedMetalEmbeddingSegment {
     weights_offset: u64,
     row_bytes: usize,
     thread_width: usize,
+    dynamic_params_buffer: Buffer,
 }
 
 /// Qwen `(1 + weight)` RMSNorm with an mmap-backed FP16 weight vector.
@@ -2626,6 +2630,20 @@ impl MetalCandidateRuntime {
                     "Metal Q4 recovered-row function lookup failed: {message}"
                 ))
             })?;
+        let q2_dynamic_embedding_function = library
+            .get_function(Q2_DYNAMIC_EMBEDDING_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q2 dynamic embedding function lookup failed: {message}"
+                ))
+            })?;
+        let q4_dynamic_embedding_function = library
+            .get_function(Q4_DYNAMIC_EMBEDDING_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 dynamic embedding function lookup failed: {message}"
+                ))
+            })?;
         let rms_norm_1p_function = library
             .get_function(RMS_NORM_1P_KERNEL_NAME, None)
             .map_err(|message| {
@@ -2818,6 +2836,20 @@ impl MetalCandidateRuntime {
                     "Metal Q4 recovered-row pipeline creation failed: {message}"
                 ))
             })?;
+        let q2_dynamic_embedding_pipeline = device
+            .new_compute_pipeline_state_with_function(&q2_dynamic_embedding_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q2 dynamic embedding pipeline creation failed: {message}"
+                ))
+            })?;
+        let q4_dynamic_embedding_pipeline = device
+            .new_compute_pipeline_state_with_function(&q4_dynamic_embedding_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 dynamic embedding pipeline creation failed: {message}"
+                ))
+            })?;
         let rms_norm_1p_pipeline = device
             .new_compute_pipeline_state_with_function(&rms_norm_1p_function)
             .map_err(|message| {
@@ -2989,6 +3021,8 @@ impl MetalCandidateRuntime {
             q4_gathered_pipeline,
             q2_recovered_row_pipeline,
             q4_recovered_row_pipeline,
+            q2_dynamic_embedding_pipeline,
+            q4_dynamic_embedding_pipeline,
             rms_norm_1p_pipeline,
             rms_norm_1p_head256_inplace_pipeline,
             residual_rms_norm_1p_pipeline,
@@ -5017,6 +5051,26 @@ impl MetalCandidateRuntime {
             let row_bytes = blocks_per_row.checked_mul(block_bytes).ok_or_else(|| {
                 EngineError::Shape("Metal embedding row byte size overflows".into())
             })?;
+            let dynamic_params = MetalDynamicEmbeddingParams {
+                columns: u32::try_from(operation.columns).map_err(|_| {
+                    EngineError::Shape("Metal dynamic embedding width exceeds u32".into())
+                })?,
+                blocks_per_row: u32::try_from(blocks_per_row).map_err(|_| {
+                    EngineError::Shape("Metal dynamic embedding block count exceeds u32".into())
+                })?,
+                row_start: u32::try_from(row_start).map_err(|_| {
+                    EngineError::Shape("Metal dynamic embedding row start exceeds u32".into())
+                })?,
+                row_end: u32::try_from(row_end).map_err(|_| {
+                    EngineError::Shape("Metal dynamic embedding row end exceeds u32".into())
+                })?,
+                row_bytes: u32::try_from(row_bytes).map_err(|_| {
+                    EngineError::Shape("Metal dynamic embedding row bytes exceed u32".into())
+                })?,
+                reserved0: 0,
+                reserved1: 0,
+                reserved2: 0,
+            };
             segments.push(MappedMetalEmbeddingSegment {
                 dtype,
                 row_start,
@@ -5026,6 +5080,7 @@ impl MetalCandidateRuntime {
                 })?,
                 row_bytes,
                 thread_width: dispatch_width(pipeline, DEFAULT_SIMDGROUPS)?,
+                dynamic_params_buffer: buffer_with_data(&self.device, &dynamic_params.encode()),
             });
         }
         let output_bytes = operation
@@ -5050,8 +5105,15 @@ impl MetalCandidateRuntime {
             reserved0: 0,
         };
         let params_buffer = buffer_with_data(&self.device, &params.encode());
+        let dynamic_params_bytes = segments
+            .len()
+            .checked_mul(MetalDynamicEmbeddingParams::BYTE_LEN)
+            .ok_or_else(|| {
+                EngineError::Shape("Metal dynamic embedding parameter bytes overflow".into())
+            })?;
         let transient_bytes = (if own_output { output_bytes } else { 0 })
             .checked_add(MetalFusedMatVecParams::BYTE_LEN)
+            .and_then(|bytes| bytes.checked_add(dynamic_params_bytes))
             .ok_or_else(|| EngineError::Shape("Metal embedding transient bytes overflow".into()))?;
         Ok(PreparedMappedMetalEmbedding {
             rows: operation.rows,
@@ -6521,6 +6583,131 @@ impl MetalCandidateRuntime {
             },
         );
         Ok(())
+    }
+
+    fn encode_mapped_embedding_from_selector_to(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMappedMetalEmbedding,
+        selector: &PreparedMetalArgMaxScratch,
+        output_buffer: &Buffer,
+        output_offset: u64,
+    ) -> Result<()> {
+        if selector.values != prepared.rows {
+            return Err(EngineError::InvalidState(format!(
+                "Metal dynamic embedding selector covers {} logits, expected {}",
+                selector.values, prepared.rows
+            )));
+        }
+        for segment in &prepared.segments {
+            let (pipeline, values_per_thread) = match segment.dtype {
+                TensorDType::Q2B64 => (&self.q2_dynamic_embedding_pipeline, 4_usize),
+                TensorDType::Q4B64 => (&self.q4_dynamic_embedding_pipeline, 2_usize),
+                _ => unreachable!("prepared Metal dynamic embedding segment is Q2/Q4"),
+            };
+            let weights_offset = prepared
+                .weights_base
+                .checked_add(segment.weights_offset)
+                .ok_or_else(|| {
+                    EngineError::Shape("Metal dynamic embedding weight binding overflows".into())
+                })?;
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(
+                MetalBufferAbi::WEIGHTS as u64,
+                Some(&prepared.mapping.inner.buffer),
+                weights_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::INPUT as u64,
+                Some(&selector.result_buffer),
+                0,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::S_IN as u64,
+                Some(&prepared.mapping.inner.buffer),
+                prepared.s_in_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::S_OUT as u64,
+                Some(&prepared.mapping.inner.buffer),
+                prepared.s_out_base,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::OUTPUT as u64,
+                Some(output_buffer),
+                output_offset,
+            );
+            encoder.set_buffer(
+                MetalBufferAbi::PARAMS as u64,
+                Some(&segment.dynamic_params_buffer),
+                0,
+            );
+            let work_items = prepared.columns / values_per_thread;
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: work_items.div_ceil(segment.thread_width) as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: segment.thread_width as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Same-command verifier for the production target-selection edge. The
+    /// target token remains in the argmax result buffer and directly selects
+    /// one Q2/Q4 embedding row; only this verifier reads the final token and
+    /// hidden vector after the command buffer completes.
+    pub fn dispatch_mapped_embedding_from_logits(
+        &self,
+        embedding: &PreparedMappedMetalEmbedding,
+        selector: &PreparedMetalArgMax,
+    ) -> Result<(u32, Vec<f32>)> {
+        if selector.scratch.values != embedding.rows {
+            return Err(EngineError::InvalidState(
+                "Metal target logits and embedding vocabulary differ".into(),
+            ));
+        }
+        let output = embedding.owned_output()?;
+        zero_buffer(
+            &selector.scratch.result_buffer,
+            2 * std::mem::size_of::<u32>(),
+        );
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-target-select-dynamic-embedding-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_argmax_f32(encoder, &selector.input_buffer, &selector.scratch);
+        self.encode_mapped_embedding_from_selector_to(
+            encoder,
+            embedding,
+            &selector.scratch,
+            output,
+            0,
+        )?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal target-select/dynamic-embedding command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let token = self.read_argmax_result(&selector.scratch)?;
+        let hidden = unsafe {
+            slice::from_raw_parts(output.contents().cast::<f32>(), embedding.columns).to_vec()
+        };
+        if hidden.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidState(
+                "Metal dynamic embedding produced a non-finite hidden vector".into(),
+            ));
+        }
+        Ok((token, hidden))
     }
 
     /// Select and decode one token from a complete resident embedding table.
@@ -13054,7 +13241,9 @@ mod tests {
         assert_eq!(prepared.copied_model_bytes(), 0);
         assert_eq!(
             prepared.transient_bytes(),
-            columns * std::mem::size_of::<f32>() + MetalFusedMatVecParams::BYTE_LEN
+            columns * std::mem::size_of::<f32>()
+                + MetalFusedMatVecParams::BYTE_LEN
+                + 2 * MetalDynamicEmbeddingParams::BYTE_LEN
         );
         assert!(runtime
             .dispatch_mapped_embedding(&prepared, rows_q2 + rows_q4)
@@ -13062,7 +13251,7 @@ mod tests {
         drop(mapping);
         drop(artifact);
 
-        for (row, expected) in selected_rows.into_iter().zip(expected) {
+        for (row, expected) in selected_rows.iter().copied().zip(&expected) {
             let actual = runtime
                 .dispatch_mapped_embedding(&prepared, row)
                 .expect("dispatch resident embedding after loader drop");
@@ -13071,6 +13260,24 @@ mod tests {
                 assert!(
                     (expected - actual).abs() <= tolerance,
                     "resident embedding row {row} column {column}: expected {expected}, got {actual}"
+                );
+            }
+        }
+        for (row, expected) in selected_rows.iter().copied().zip(&expected) {
+            let mut logits = vec![-20.0_f32; rows_q2 + rows_q4];
+            logits[row] = 7.0;
+            let selector = runtime
+                .prepare_argmax_f32(&logits)
+                .expect("prepare resident target selector");
+            let (selected, actual) = runtime
+                .dispatch_mapped_embedding_from_logits(&prepared, &selector)
+                .expect("select and decode embedding entirely on device");
+            assert_eq!(selected as usize, row);
+            for (column, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 2.0e-5_f32.max(expected.abs() * 3.0e-5);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "dynamic embedding row {row} column {column}: expected {expected}, got {actual}"
                 );
             }
         }
@@ -13667,7 +13874,7 @@ mod tests {
             .is_err());
         assert_eq!(
             embedding.transient_bytes(),
-            MetalFusedMatVecParams::BYTE_LEN
+            MetalFusedMatVecParams::BYTE_LEN + MetalDynamicEmbeddingParams::BYTE_LEN
         );
         assert_eq!(norm.transient_bytes(), MetalRmsNormParams::BYTE_LEN);
         assert_eq!(
