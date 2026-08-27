@@ -220,6 +220,12 @@ validated buffer/offset pairs, and passes write/read plus drop/recreate device
 tests. Exact ten-step accessors now validate both the 48 linear-attention and
 17 target/MTP full-attention layer sequences; a layer of the wrong kind is
 rejected before any kernel encoding.
+The first Full-Attention operation is now executable as well: a canonical
+Layer-3 resource owner loads Q/K/V projections from one CTOXQ mapping, proves
+their separately stored packed `s_in` tensors are byte-identical, consumes the
+shared `Normalized` view, and writes `QueryGate`, `Key`, and `Value` directly
+into their arena slots in one encoder. Its Apple Golden test checks all 14,336
+logical outputs and preserved alias tails without operation-local activations.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first
@@ -250,7 +256,7 @@ and mutable state of a layer; its all-layer entry point admits exactly the 48
 linear layers in canonical order or drops the partial load on the first error.
 These graph preparations retain no operation-local input/output activation
 buffers; separately stored recovery inputs must be byte-identical. The
-remaining 630 schedule steps and the complete executor remain open. A bounded
+remaining 629 schedule steps and the complete executor remain open. A bounded
 f32 checkpoint can now snapshot and restore an
 exact arena slot through a Metal device-to-device blit with no host mirror. It
 is single-use and fail-closed across snapshot/restore/commit, providing the

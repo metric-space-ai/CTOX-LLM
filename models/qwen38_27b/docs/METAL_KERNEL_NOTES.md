@@ -70,6 +70,13 @@ operations. Their Apple-device verifiers prove that a speculative state
 advance restores bit-exactly, while commit preserves the advance; no state
 payload crosses the host.
 
+`PreparedMappedMetalFullAttentionFanout` is the first executable operation of
+the frozen full-attention slice. Its loader binds the layer-specific Q/K/V
+recovered matrices to one mmap and admits separately stored recovery `s_in`
+tensors only when their packed FP16 bytes are identical. The dispatch consumes
+`Normalized` and writes `QueryGate`, `Key`, and `Value` at their shared-arena
+offsets in one encoder; it retains no input or output activation buffers.
+
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
 active, appends retain all pre-branch Q4 pages and use the memory-plan boundary
@@ -446,6 +453,10 @@ This changes neither the logical Q2 codes nor the CTOXQ artifact layout.
   12,345, encodes Q and K in one command, checks every value against the
   scalar oracle, proves every non-rotary tail value is bit-identical, rejects
   invalid contracts, and reuses buffers at position zero.
+- `full_attention_fanout_writes_shared_query_gate_key_and_value_views` loads
+  canonical Layer-3 Q2/Q4 Q/K/V projections, compares every one of the 14,336
+  logical arena outputs with independent recovered-row oracles, proves unused
+  alias tails remain zero, and rejects the Layer-7 schedule view.
 - `paged_q2q4_gqa_decode_matches_quantized_oracle_and_demotes_pages` forces a
   Q4-to-Q2 page transition, compares every decode step with the scalar GQA
   oracle using the identical quantized cache, verifies bounded arena byte
@@ -540,9 +551,9 @@ dequantization array before this source was accepted.
   `Normalized` view, then mixed-Q2/Q4 FFN gate/up fan-out and fused SwiGLU-down
   projection, then fused post-FFN residual-add/next-layer Qwen RMSNorm). The
   complete first linear-attention layer is therefore wired. Full-attention
-  schedule slices, the Layer-3 key-RoPE arena edge, and the combined
-  shared-arena KV-append/paged-GQA edge are also executable. The remaining
-  Full-Attention fan-out, query/gate normalization, gated output projection, and later schedule
+  schedule slices and the shared-arena Layer-3 fan-out, Key-RoPE, and combined
+  KV-append/paged-GQA edges are also executable. The remaining query/gate
+  normalization/RoPE, gated output projection, and later schedule
   steps, the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;

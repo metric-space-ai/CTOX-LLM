@@ -438,6 +438,14 @@ pub struct PreparedMappedMetalCausalConv {
     poisoned: bool,
 }
 
+/// The three immutable recovered projections for one exact target
+/// full-attention fan-out. All projections share one mmap and one packed
+/// recovery input scale; their dynamic I/O is supplied by decode-arena views.
+pub struct PreparedMappedMetalFullAttentionFanout {
+    layer: usize,
+    projections: [PreparedMappedMetalMatVec; 3],
+}
+
 /// Complete immutable resources and persistent state for one target
 /// linear-attention transformer layer. Every projection and parameter remains
 /// bound to one admitted CTOXQ mmap; only the convolution and recurrent state
@@ -1266,6 +1274,24 @@ impl PreparedMappedMetalMatVec {
             && self.s_out_base == self.mapping.byte_offset(s_out, "bound projection s_out")?)
     }
 
+    fn packed_s_in_bytes(&self) -> Result<&[u8]> {
+        let bytes = self
+            .columns
+            .checked_mul(std::mem::size_of::<half::f16>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal s_in byte count overflows".into()))?;
+        let start = usize::try_from(self.s_in_offset)
+            .map_err(|_| EngineError::InvalidArtifact("Metal s_in offset exceeds usize".into()))?;
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| EngineError::InvalidArtifact("Metal s_in range overflows".into()))?;
+        self.mapping
+            .inner
+            .artifact
+            .mapped_bytes()
+            .get(start..end)
+            .ok_or_else(|| EngineError::InvalidArtifact("Metal s_in exceeds mapping".into()))
+    }
+
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
         validate_metal_input(input, self.columns)?;
         let input_buffer = self.input_buffer.as_ref().ok_or_else(|| {
@@ -1974,6 +2000,23 @@ impl PreparedMappedMetalLinearAttentionLayer {
 
     pub fn copied_model_bytes(&self) -> u64 {
         0
+    }
+}
+
+impl PreparedMappedMetalFullAttentionFanout {
+    pub fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn transient_bytes(&self) -> usize {
+        self.projections
+            .iter()
+            .map(PreparedMappedMetalMatVec::transient_bytes)
+            .sum()
     }
 }
 
@@ -3024,6 +3067,62 @@ impl MetalCandidateRuntime {
             )));
         }
         Ok(prepared)
+    }
+
+    /// Prepare the canonical Q/K/V recovered projections for one frozen
+    /// full-attention layer. The three matrices must share the exact packed
+    /// `s_in` tensor so the fan-out has one logical corrected activation.
+    pub fn prepare_mapped_full_attention_fanout(
+        &self,
+        mapping: &MappedMetalArtifact,
+        layer: usize,
+    ) -> Result<PreparedMappedMetalFullAttentionFanout> {
+        let config = Qwen38Config::default();
+        if config.layer_kind(layer) != Some(LayerKind::FullAttention) {
+            return Err(EngineError::InvalidState(format!(
+                "Metal layer {layer} is not a frozen Qwen full-attention layer"
+            )));
+        }
+        let prefix = format!("model.language_model.layers.{layer}.self_attn");
+        let projections = [
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{prefix}.q_proj.weight"),
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{prefix}.k_proj.weight"),
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{prefix}.v_proj.weight"),
+            )?,
+        ];
+        let query_values = config
+            .num_attention_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal query width overflows".into()))?;
+        let key_value_values = config
+            .num_key_value_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal KV width overflows".into()))?;
+        let query_gate_values = query_values
+            .checked_mul(2)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal query/gate width overflows".into()))?;
+        if projections[0].columns != config.hidden_size
+            || projections[1].columns != config.hidden_size
+            || projections[2].columns != config.hidden_size
+            || projections[0].rows != query_gate_values
+            || projections[1].rows != key_value_values
+            || projections[2].rows != key_value_values
+            || projections[1].packed_s_in_bytes()? != projections[0].packed_s_in_bytes()?
+            || projections[2].packed_s_in_bytes()? != projections[0].packed_s_in_bytes()?
+        {
+            return Err(EngineError::InvalidArtifact(format!(
+                "Metal full-attention layer {layer} fan-out has incompatible shape or recovery input"
+            )));
+        }
+        Ok(PreparedMappedMetalFullAttentionFanout { layer, projections })
     }
 
     /// Prepare every immutable tensor and persistent state owner for one exact
@@ -7811,6 +7910,94 @@ impl MetalCandidateRuntime {
         Ok(outputs)
     }
 
+    /// Execute one exact full-attention Q/K/V fan-out from the already
+    /// normalized shared-arena input. All three recovered projections consume
+    /// the same arena view and write their canonical QueryGate/Key/Value views
+    /// in one command encoder without graph-local activation buffers.
+    pub fn dispatch_mapped_full_attention_fanout_views(
+        &self,
+        step: &PreparedMetalDecodeStepView<'_>,
+        prepared: &PreparedMappedMetalFullAttentionFanout,
+    ) -> Result<()> {
+        let layer = prepared.layer;
+        if step.step().layer != Some(layer)
+            || step.step().operation != MetalDecodeOperation::FullAttentionFanout
+            || step.reads().len() != 1
+            || step.writes().len() != 3
+            || step.reads()[0].slot() != MetalBufferSlot::Normalized
+            || step.writes()[0].slot() != MetalBufferSlot::QueryGate
+            || step.writes()[1].slot() != MetalBufferSlot::Key
+            || step.writes()[2].slot() != MetalBufferSlot::Value
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} fan-out does not match its frozen schedule view"
+            )));
+        }
+        let input = &step.reads()[0];
+        let arena = input.buffer();
+        let mapping = &prepared.projections[0].mapping.inner;
+        if step
+            .writes()
+            .iter()
+            .any(|view| !std::ptr::eq(arena, view.buffer()))
+            || prepared.projections.iter().any(|projection| {
+                projection.input_buffer.is_some()
+                    || projection.output_buffer.is_some()
+                    || !Rc::ptr_eq(&projection.mapping.inner, mapping)
+                    || projection.columns != input.values()
+            })
+            || prepared
+                .projections
+                .iter()
+                .zip(step.writes())
+                .any(|(projection, output)| projection.rows > output.values())
+            || prepared.projections[1].packed_s_in_bytes()?
+                != prepared.projections[0].packed_s_in_bytes()?
+            || prepared.projections[2].packed_s_in_bytes()?
+                != prepared.projections[0].packed_s_in_bytes()?
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} fan-out has incompatible arena, mapping, shape, or recovery input"
+            )));
+        }
+        let prefix = format!("model.language_model.layers.{layer}.self_attn");
+        for (projection, name) in prepared.projections.iter().zip([
+            format!("{prefix}.q_proj.weight"),
+            format!("{prefix}.k_proj.weight"),
+            format!("{prefix}.v_proj.weight"),
+        ]) {
+            if !projection.matches_recovered_tensor(&name)? {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal full-attention layer {layer} projection does not match {name}"
+                )));
+            }
+        }
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-shared-arena-full-attention-fanout");
+        let encoder = command_buffer.new_compute_command_encoder();
+        for (projection, output) in prepared.projections.iter().zip(step.writes()) {
+            self.encode_mapped_projection_between(
+                encoder,
+                projection,
+                arena,
+                input.offset(),
+                arena,
+                output.offset(),
+            )?;
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal full-attention layer {layer} fan-out ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        Ok(())
+    }
+
     /// Execute one complete frozen linear-attention transformer layer from an
     /// already-normalized shared-arena input. The ten bound schedule views are
     /// reusable for every linear layer; immutable tensors remain mmap-backed,
@@ -11806,6 +11993,147 @@ mod tests {
             .dispatch_partial_rope(&prepared_query)
             .expect("dispatch position-zero RoPE");
         assert_eq!(identity, query);
+    }
+
+    #[test]
+    fn full_attention_fanout_writes_shared_query_gate_key_and_value_views() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let cpu = CpuBackend::scalar_verifier();
+        let config = Qwen38Config::default();
+        let columns = config.hidden_size;
+        let query_values = config.num_attention_heads * config.head_dim;
+        let key_value_values = config.num_key_value_heads * config.head_dim;
+        let s_in_values: Vec<f32> = (0..columns)
+            .map(|index| 0.875 + 0.015625 * (index % 7) as f32)
+            .collect();
+        let s_in = f16_bytes(&s_in_values);
+        let specs = [
+            (
+                "model.language_model.layers.3.self_attn.q_proj.weight",
+                TensorDType::Q2B64,
+                query_values * 2,
+                0.9375,
+            ),
+            (
+                "model.language_model.layers.3.self_attn.k_proj.weight",
+                TensorDType::Q4B64,
+                key_value_values,
+                1.03125,
+            ),
+            (
+                "model.language_model.layers.3.self_attn.v_proj.weight",
+                TensorDType::Q2B64,
+                key_value_values,
+                1.0625,
+            ),
+        ];
+        let directory = tempdir().expect("temporary full-attention fan-out directory");
+        let path = directory.path().join("full-attention-fanout.ctoxq");
+        let mut tensors = Vec::new();
+        for (name, dtype, rows, s_out) in specs {
+            tensors.extend(repeated_recovered_tensors(
+                name, dtype, rows, columns, &s_in, s_out,
+            ));
+        }
+        ArtifactBuilder {
+            model: "test/qwen38-full-attention-fanout".into(),
+            revision: "0123456789abcdef".into(),
+            target: "canonical-b64".into(),
+            alignment: DEFAULT_ALIGNMENT,
+            tensors,
+        }
+        .write_new(&path)
+        .expect("write full-attention fan-out fixture");
+        let artifact = ModelArtifact::open(&path, ChecksumPolicy::AllTensors)
+            .expect("open full-attention fan-out fixture");
+        let mapping = runtime
+            .map_artifact_no_copy(&artifact)
+            .expect("map full-attention fan-out fixture");
+        let prepared = runtime
+            .prepare_mapped_full_attention_fanout(&mapping, 3)
+            .expect("prepare canonical full-attention fan-out");
+        assert_eq!(prepared.layer(), 3);
+        assert_eq!(prepared.copied_model_bytes(), 0);
+        assert!(prepared.transient_bytes() > 0);
+        assert!(prepared
+            .projections
+            .iter()
+            .all(|projection| projection.input_buffer.is_none()
+                && projection.output_buffer.is_none()));
+        assert!(runtime
+            .prepare_mapped_full_attention_fanout(&mapping, 0)
+            .is_err());
+
+        let input: Vec<f32> = (0..columns)
+            .map(|index| (index as f32 * 0.007).sin() * 0.6)
+            .collect();
+        let corrected_input = input
+            .iter()
+            .zip(&s_in_values)
+            .map(|(value, scale)| value * scale)
+            .collect::<Vec<_>>();
+        let expected = specs.map(|(name, _, _, _)| {
+            let row = artifact
+                .recovered_matrix(name)
+                .expect("resolve fan-out matrix")
+                .row_operation(0)
+                .expect("resolve first fan-out row");
+            cpu.recovered_row_matvec(&RecoveredRowMatVec {
+                dtype: row.dtype,
+                weights: row.weights,
+                corrected_input: &corrected_input,
+                s_out: row.s_out,
+            })
+            .expect("execute one-row fan-out oracle")
+        });
+
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let projection_plan = MetalProjectionPlan::qwen38(&config).expect("Metal projection plan");
+        let binding_plan = MetalDecodeBindingPlan::qwen38(&schedule, &projection_plan, &config)
+            .expect("complete Metal binding plan");
+        let workspace_plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("decode workspace plan");
+        let mut workspace = runtime
+            .prepare_decode_workspace(&workspace_plan)
+            .expect("allocate shared decode arena");
+        workspace
+            .write_f32(MetalBufferSlot::Normalized, &input)
+            .expect("seed normalized full-attention input");
+        let program = workspace
+            .bind_decode_program(&binding_plan)
+            .expect("bind shared-arena decode program");
+        let layer_three = program
+            .full_attention_layer_steps(3)
+            .expect("bind layer-3 full attention");
+        let wrong_layer = program
+            .full_attention_layer_steps(7)
+            .expect("bind layer-7 full attention");
+        assert!(runtime
+            .dispatch_mapped_full_attention_fanout_views(&wrong_layer[0], &prepared)
+            .is_err());
+        runtime
+            .dispatch_mapped_full_attention_fanout_views(&layer_three[0], &prepared)
+            .expect("dispatch full-attention fan-out directly in shared arena");
+        drop(program);
+
+        for ((slot, logical_values), expected) in [
+            (MetalBufferSlot::QueryGate, query_values * 2),
+            (MetalBufferSlot::Key, key_value_values),
+            (MetalBufferSlot::Value, key_value_values),
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            let actual = workspace.read_f32(slot).expect("read fan-out arena slot");
+            for (index, value) in actual[..logical_values].iter().enumerate() {
+                let tolerance = 4.0e-4_f32.max(expected.abs() * 6.0e-5);
+                assert!(
+                    (*value - expected).abs() <= tolerance,
+                    "full-attention {slot:?} row {index}: expected {expected}, got {value}"
+                );
+            }
+            assert!(actual[logical_values..].iter().all(|value| *value == 0.0));
+        }
     }
 
     #[test]
