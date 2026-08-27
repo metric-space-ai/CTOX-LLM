@@ -153,7 +153,8 @@ fn main() -> anyhow::Result<()> {
         ])?;
         let split_staging = runtime.prepare_verifier_f32_tensor(&vec![
             0.0;
-            PAGED_GQA_SPLIT_MAX_QUERY_TOKENS * config.query_heads
+            args.split_query_tokens
+                * config.query_heads
                 * config.head_dim
         ])?;
         verifier_device_staging_bytes = query_staging.resident_bytes()
