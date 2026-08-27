@@ -8,12 +8,17 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 TRAINING = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TRAINING))
 
-from build_release_preparation_plan import build, validate_source_snapshot  # noqa: E402
+from build_release_preparation_plan import (  # noqa: E402
+    build,
+    parse_args,
+    validate_source_snapshot,
+)
 from run_recovery_execution_plan import validate_stages  # noqa: E402
 
 
@@ -49,6 +54,40 @@ def write_jsonl(path: Path, prefix: str, count: int) -> None:
 
 
 class ReleasePreparationPlanTests(unittest.TestCase):
+    def test_cli_parser_exposes_every_build_input(self) -> None:
+        values = {
+            "python": "/python",
+            "source-root": "/source",
+            "source-commit": "a" * 40,
+            "data-root": "/data",
+            "model-source": "/model",
+            "revision": "b" * 40,
+            "local-model-provenance": "/provenance.json",
+            "teacher-provenance-sha256": "c" * 64,
+            "train-input": "/train.jsonl",
+            "train-missing-batch-plan": "/missing-plan.json",
+            "train-missing-prefix": "missing",
+            "evaluation-input": "/evaluation.jsonl",
+            "evaluation-batch-plan": "/evaluation-plan.json",
+            "evaluation-prefix": "evaluation",
+            "activation-batch-plan": "/activation-plan.json",
+            "activation-prefix": "activation",
+            "base-quant-plan": "/quant-plan.json",
+            "ledger": "/ledger.jsonl",
+            "hf-home": "/hf",
+            "smoke-sample-id": "sample-id",
+            "output": "/output.json",
+        }
+        argv = ["build_release_preparation_plan.py"]
+        for option, value in values.items():
+            argv.extend([f"--{option}", value])
+        argv.extend(["--train-existing-verification", "/verification.json"])
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+        for option in values:
+            self.assertTrue(hasattr(args, option.replace("-", "_")), option)
+        self.assertEqual(args.train_existing_verification, [Path("/verification.json")])
+
     def fixture(self, root: Path) -> argparse.Namespace:
         source = root / "source"
         training = source / "training"
