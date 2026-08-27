@@ -274,6 +274,10 @@ Qwen tensor identities back into the admitted mmap and checks weight, `s_in`,
 layer-owned recurrence state. The Golden test proves that a Layer-1 slice with
 Layer-0 resources is rejected before poisoning state, then executes Layer 0
 through the reusable path and matches the complete-layer scalar oracle.
+`prepare_mapped_linear_attention_layer` now resolves that complete canonical
+resource set directly from the admitted artifact. The all-layer loader walks
+the frozen topology and must return exactly 48 owners; one absent tensor drops
+the partial vector and fails the model load rather than leaving a reduced graph.
 
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a

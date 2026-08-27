@@ -238,6 +238,9 @@ The same ten post-input-norm operations are also exposed through one reusable
 linear-layer encoder. It verifies canonical layer-specific projection,
 convolution, GatedDelta-parameter, recurrence-owner, and norm identities before
 encoding, so a shape-compatible tensor from another layer cannot be substituted.
+The corresponding resource loader constructs one closed owner for all tensors
+and mutable state of a layer; its all-layer entry point admits exactly the 48
+linear layers in canonical order or drops the partial load on the first error.
 These graph preparations retain no operation-local input/output activation
 buffers; separately stored recovery inputs must be byte-identical. The
 remaining 633 schedule steps and the complete executor remain open. A bounded

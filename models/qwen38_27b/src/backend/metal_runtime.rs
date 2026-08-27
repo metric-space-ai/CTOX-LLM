@@ -37,11 +37,12 @@ use super::metal_graph::{
 };
 use super::metal_schedule::{MetalBufferSlot, MetalDecodeOperation};
 use super::{Activation, FusedMatVec, ScaleSlice};
+use crate::config::LayerKind;
 use crate::format::TensorDType;
 use crate::kv_cache::{KvPrecision, PagedKvAppendCheckpoint, PagedKvCache};
 use crate::loader::{FloatTensorView, ModelArtifact, RecoveredMatrixView};
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
-use crate::{EngineError, Result};
+use crate::{EngineError, Qwen38Config, Result};
 
 const KERNEL_SOURCE: &str = include_str!("../../kernels/metal/q2q4_fused_matvec.metal");
 const MAX_THREADS_PER_GROUP: usize = MAX_SIMDGROUPS_PER_THREADGROUP * 32;
@@ -430,6 +431,24 @@ pub struct PreparedMappedMetalCausalConv {
     transient_bytes: usize,
     checkpoint_valid: bool,
     poisoned: bool,
+}
+
+/// Complete immutable resources and persistent state for one target
+/// linear-attention transformer layer. Every projection and parameter remains
+/// bound to one admitted CTOXQ mmap; only the convolution and recurrent state
+/// own persistent mutable device memory.
+pub struct PreparedMappedMetalLinearAttentionLayer {
+    layer: usize,
+    projections: [PreparedMappedMetalMatVec; 4],
+    convolution: PreparedMappedMetalCausalConv,
+    gated_delta_prepare: PreparedMappedMetalGatedDeltaPrepare,
+    recurrence: PreparedMetalGatedDelta,
+    gated_rms_norm: PreparedMappedMetalGatedRmsNorm,
+    linear_output_projection: PreparedMappedMetalMatVec,
+    residual_rms_norm: PreparedMappedMetalRmsNorm,
+    ffn_gate_up: [PreparedMappedMetalMatVec; 2],
+    swiglu_down: PreparedMappedMetalMatVec,
+    post_ffn_residual_rms_norm: PreparedMappedMetalRmsNorm,
 }
 
 /// Reusable bounded state for deterministic device-resident target selection.
@@ -1718,6 +1737,20 @@ impl PreparedMappedMetalCausalConv {
     }
 }
 
+impl PreparedMappedMetalLinearAttentionLayer {
+    pub fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub fn resident_state_bytes(&self) -> usize {
+        self.convolution.resident_state_bytes() + self.recurrence.resident_state_bytes()
+    }
+
+    pub fn copied_model_bytes(&self) -> u64 {
+        0
+    }
+}
+
 impl MetalCandidateRuntime {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| EngineError::UnsupportedOperation {
@@ -2711,6 +2744,183 @@ impl MetalCandidateRuntime {
             false,
             false,
         )
+    }
+
+    fn prepare_named_mapped_projection_graph_io(
+        &self,
+        mapping: &MappedMetalArtifact,
+        name: &str,
+    ) -> Result<PreparedMappedMetalMatVec> {
+        let matrix = mapping.inner.artifact.recovered_matrix(name)?;
+        let validation_input = vec![0.0_f32; matrix.matrix.columns];
+        let operation = matrix.operation(&validation_input, Activation::Identity)?;
+        let prepared = self.prepare_mapped_fused_matvec_graph_io(mapping, &operation)?;
+        if !prepared.matches_recovered_tensor(name)? {
+            return Err(EngineError::InvalidState(format!(
+                "Metal prepared projection does not retain canonical tensor identity {name}"
+            )));
+        }
+        Ok(prepared)
+    }
+
+    /// Prepare every immutable tensor and persistent state owner for one exact
+    /// target linear-attention layer. This is the model-specific resource
+    /// loader used by the reusable ten-step layer encoder.
+    pub fn prepare_mapped_linear_attention_layer(
+        &self,
+        mapping: &MappedMetalArtifact,
+        layer: usize,
+    ) -> Result<PreparedMappedMetalLinearAttentionLayer> {
+        let config = Qwen38Config::default();
+        if config.layer_kind(layer) != Some(LayerKind::LinearAttention) {
+            return Err(EngineError::InvalidState(format!(
+                "Metal layer {layer} is not a frozen Qwen linear-attention layer"
+            )));
+        }
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let linear_prefix = format!("{layer_prefix}.linear_attn");
+        let mlp_prefix = format!("{layer_prefix}.mlp");
+        let projections = [
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{linear_prefix}.in_proj_qkv.weight"),
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{linear_prefix}.in_proj_z.weight"),
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{linear_prefix}.in_proj_a.weight"),
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{linear_prefix}.in_proj_b.weight"),
+            )?,
+        ];
+        let convolution_channels = projections[0].rows;
+        let convolution_validation = vec![0.0_f32; convolution_channels];
+        let convolution = self.prepare_mapped_causal_conv_f16_graph_io(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .float_tensor(&format!("{linear_prefix}.conv1d.weight"))?,
+            &convolution_validation,
+            convolution_channels,
+            config.linear_conv_kernel_dim,
+        )?;
+        let gated_delta_prepare = self.prepare_mapped_gated_delta_prepare_graph_io(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .float_tensor(&format!("{linear_prefix}.A_log"))?,
+            mapping
+                .inner
+                .artifact
+                .float_tensor(&format!("{linear_prefix}.dt_bias"))?,
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+        )?;
+        let recurrence =
+            self.prepare_gated_delta_f16_graph_io(MetalGatedDeltaConfig::QWEN38_27B, layer)?;
+        let gated_values = MetalGatedDeltaConfig::QWEN38_27B
+            .heads
+            .checked_mul(MetalGatedDeltaConfig::QWEN38_27B.value_dim)
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal gated RMSNorm values overflow".into())
+            })?;
+        let gated_validation = vec![0.0_f32; gated_values];
+        let gated_rms_norm = self.prepare_mapped_rms_norm_gated_graph_io(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .float_tensor(&format!("{linear_prefix}.norm.weight"))?,
+            &gated_validation,
+            &gated_validation,
+            MetalGatedDeltaConfig::QWEN38_27B.heads,
+            MetalGatedDeltaConfig::QWEN38_27B.value_dim,
+            MetalGatedDeltaConfig::QWEN38_27B.epsilon,
+        )?;
+        let linear_output_projection = self.prepare_named_mapped_projection_graph_io(
+            mapping,
+            &format!("{linear_prefix}.out_proj.weight"),
+        )?;
+        let hidden_validation = vec![0.0_f32; config.hidden_size];
+        let residual_rms_norm = self.prepare_mapped_rms_norm_1p_graph_io(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .float_tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+            &hidden_validation,
+            1,
+            config.hidden_size,
+            config.rms_norm_epsilon,
+        )?;
+        let ffn_gate_up = [
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{mlp_prefix}.gate_proj.weight"),
+            )?,
+            self.prepare_named_mapped_projection_graph_io(
+                mapping,
+                &format!("{mlp_prefix}.up_proj.weight"),
+            )?,
+        ];
+        let swiglu_down = self.prepare_named_mapped_projection_graph_io(
+            mapping,
+            &format!("{mlp_prefix}.down_proj.weight"),
+        )?;
+        let post_ffn_residual_rms_norm = self.prepare_mapped_rms_norm_1p_graph_io(
+            mapping,
+            mapping.inner.artifact.float_tensor(&format!(
+                "model.language_model.layers.{}.input_layernorm.weight",
+                layer + 1
+            ))?,
+            &hidden_validation,
+            1,
+            config.hidden_size,
+            config.rms_norm_epsilon,
+        )?;
+        Ok(PreparedMappedMetalLinearAttentionLayer {
+            layer,
+            projections,
+            convolution,
+            gated_delta_prepare,
+            recurrence,
+            gated_rms_norm,
+            linear_output_projection,
+            residual_rms_norm,
+            ffn_gate_up,
+            swiglu_down,
+            post_ffn_residual_rms_norm,
+        })
+    }
+
+    /// Prepare all 48 target linear-attention layers in canonical layer order.
+    /// Any absent or mismatched tensor aborts the complete load; already
+    /// prepared partial state is dropped instead of admitting a partial graph.
+    pub fn prepare_all_mapped_linear_attention_layers(
+        &self,
+        mapping: &MappedMetalArtifact,
+    ) -> Result<Vec<PreparedMappedMetalLinearAttentionLayer>> {
+        let config = Qwen38Config::default();
+        let layers = (0..config.num_hidden_layers)
+            .filter(|layer| config.layer_kind(*layer) == Some(LayerKind::LinearAttention))
+            .map(|layer| self.prepare_mapped_linear_attention_layer(mapping, layer))
+            .collect::<Result<Vec<_>>>()?;
+        if layers.len() != config.linear_attention_layers() {
+            return Err(EngineError::InvalidState(format!(
+                "Metal prepared {} linear layers, expected {}",
+                layers.len(),
+                config.linear_attention_layers()
+            )));
+        }
+        Ok(layers)
     }
 
     pub fn prepare_mapped_fused_matvec_with_simdgroups(
@@ -7108,6 +7318,48 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    /// Dispatch one fully prepared layer bundle through its exact bound
+    /// schedule slice. The bundle keeps layer ownership and canonical tensor
+    /// identity together so callers cannot accidentally assemble a valid-shape
+    /// but semantically mixed layer at the call site.
+    pub fn dispatch_prepared_mapped_linear_attention_layer(
+        &self,
+        steps: &[PreparedMetalDecodeStepView<'_>],
+        prepared: &mut PreparedMappedMetalLinearAttentionLayer,
+    ) -> Result<()> {
+        let PreparedMappedMetalLinearAttentionLayer {
+            projections,
+            convolution,
+            gated_delta_prepare,
+            recurrence,
+            gated_rms_norm,
+            linear_output_projection,
+            residual_rms_norm,
+            ffn_gate_up,
+            swiglu_down,
+            post_ffn_residual_rms_norm,
+            ..
+        } = prepared;
+        self.dispatch_mapped_linear_attention_layer_views(
+            steps,
+            [
+                &projections[0],
+                &projections[1],
+                &projections[2],
+                &projections[3],
+            ],
+            convolution,
+            gated_delta_prepare,
+            recurrence,
+            gated_rms_norm,
+            linear_output_projection,
+            residual_rms_norm,
+            [&ffn_gate_up[0], &ffn_gate_up[1]],
+            swiglu_down,
+            post_ffn_residual_rms_norm,
+        )
+    }
+
     /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
     /// projection in a single command encoder. The projection consumes the
     /// RMSNorm output buffer directly and therefore owns no second activation
@@ -9370,6 +9622,18 @@ mod tests {
         let mapping = runtime
             .map_artifact_no_copy(&artifact)
             .expect("map shared-arena graph fixture");
+        let mut reusable_layer = runtime
+            .prepare_mapped_linear_attention_layer(&mapping, 0)
+            .expect("prepare complete canonical layer-0 resources");
+        assert_eq!(reusable_layer.layer(), 0);
+        assert_eq!(reusable_layer.copied_model_bytes(), 0);
+        assert!(reusable_layer.resident_state_bytes() > 0);
+        assert!(runtime
+            .prepare_mapped_linear_attention_layer(&mapping, 3)
+            .is_err());
+        assert!(runtime
+            .prepare_all_mapped_linear_attention_layers(&mapping)
+            .is_err());
         let embedding_matrix = artifact
             .recovered_matrix("embedding.weight")
             .expect("resolve graph embedding");
@@ -10278,45 +10542,29 @@ mod tests {
             )
             .expect("reinitialize shared-arena input for reusable layer encoder");
         assert!(runtime
-            .dispatch_mapped_linear_attention_layer_views(
+            .dispatch_prepared_mapped_linear_attention_layer(
                 program
                     .linear_attention_layer_steps(1)
                     .expect("bind layer-1 schedule slice"),
-                projection_refs,
-                &mut convolution,
-                &delta_prepare,
-                &mut recurrence,
-                &gated_norm,
-                &linear_output_projection,
-                &residual_norm,
-                ffn_projection_refs,
-                &ffn_down_projection,
-                &post_ffn_residual_norm,
+                &mut reusable_layer,
             )
             .is_err());
-        assert!(!convolution.poisoned);
-        assert!(!recurrence.poisoned);
-        convolution
+        assert!(!reusable_layer.convolution.poisoned);
+        assert!(!reusable_layer.recurrence.poisoned);
+        reusable_layer
+            .convolution
             .begin_speculative(&runtime)
             .expect("snapshot convolution for reusable layer encoder");
-        recurrence
+        reusable_layer
+            .recurrence
             .begin_speculative(&runtime)
             .expect("snapshot recurrence for reusable layer encoder");
         runtime
-            .dispatch_mapped_linear_attention_layer_views(
+            .dispatch_prepared_mapped_linear_attention_layer(
                 program
                     .linear_attention_layer_steps(0)
                     .expect("bind layer-0 schedule slice"),
-                projection_refs,
-                &mut convolution,
-                &delta_prepare,
-                &mut recurrence,
-                &gated_norm,
-                &linear_output_projection,
-                &residual_norm,
-                ffn_projection_refs,
-                &ffn_down_projection,
-                &post_ffn_residual_norm,
+                &mut reusable_layer,
             )
             .expect("dispatch reusable complete linear-attention layer encoder");
         let reusable_residual = workspace
@@ -10343,10 +10591,12 @@ mod tests {
                 "reusable Metal layer norm {index}: expected {expected_norm}, got {actual_norm}"
             );
         }
-        recurrence
+        reusable_layer
+            .recurrence
             .restore_speculative(&runtime)
             .expect("restore reusable layer recurrence");
-        convolution
+        reusable_layer
+            .convolution
             .restore_speculative(&runtime)
             .expect("restore reusable layer convolution");
     }

@@ -332,8 +332,10 @@ Qwen RMSNorm. The complete first linear-attention transformer layer now runs in
 one command encoder/wait. A reusable ten-step encoder now admits any frozen
 linear-attention layer only after canonical weight/recovery, convolution,
 GatedDelta-parameter, recurrence-owner, and norm identity checks. This is
-verified on Apple Silicon but is not backend promotion: complete per-layer
-resource preparation and iteration, the remaining 633 graph steps, complete
+paired with an atomic all-48 resource loader; each layer becomes one closed
+owner for mmap-backed parameters and its two persistent state classes. This is
+verified on Apple Silicon but is not backend promotion: complete 48-layer
+iteration, the remaining 633 graph steps, complete
 target+MTP execution, prefill arena, lifecycle measurements, and Golden suite
 remain open.
 
