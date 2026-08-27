@@ -191,6 +191,11 @@ path = "src/bin/cuda_executor_verify.rs"
 required-features = ["cuda"]
 
 [[bin]]
+name = "qwen38-cuda-e2e-bench"
+path = "src/bin/cuda_e2e_bench.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "qwen38-cuda-sampling-verify"
 path = "src/bin/cuda_sampling_verify.rs"
 required-features = ["cuda"]

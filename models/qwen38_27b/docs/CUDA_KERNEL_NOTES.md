@@ -697,6 +697,33 @@ The final daemon must drive the context on one dedicated executor thread.
 Complete-model high-watermark and an external unload measurement remain
 promotion gates.
 
+## End-to-end measurement contract
+
+`qwen38-cuda-e2e-bench` is the sole model-throughput measurement entry point.
+It uses the same release loader, `Engine`, and dedicated-thread
+`CudaModelExecutor` ABI as the local server. Every measured repetition performs
+real chunked prefill, incremental decode, optional engine-owned MTP4
+verification/commit, reset, and finally full unload. The immutable output binds
+the release, CUDA module, memory profile, prompt-token file, hashes, resident
+byte counts, generated-token digest, and observed timings. It refuses invalid
+prompts, context oversubscription, hidden fallback, nondeterministic greedy
+output, overwrite of prior evidence, or retained allocations after unload.
+
+Prompt tokens are little-endian `u32` values, allowing the same executable to
+measure the required 512, 4K, 32K, 64K, and 128K fixtures without shell-size
+artifacts. Neither this command nor the repository converts isolated kernel
+timing or a roofline estimate into a model-speed claim; a number is publishable
+only after this full engine run completes on the named device and release.
+
+```text
+cargo run --release --features cuda --bin qwen38-cuda-e2e-bench -- \
+  --release-root <release-root> --release-manifest <release.json> \
+  --pack-id <cuda-pack-id> --memory-profile-id <profile-id> \
+  --module <qwen38-sm86.fatbin> --prompt-token-ids <prompt.u32le> \
+  --decode-output-tokens 128 --measured-repetitions 3 --mtp-enabled \
+  --output <immutable-result.json>
+```
+
 ## Promotion evidence still required (per `docs/PROMOTION_GATES.md`)
 
 1. Full-model A8 activation-quality gates after recovery, including the

@@ -691,6 +691,29 @@ only for greedy sampling: the executor returns unverified draft logits and the
 engine itself compares them with the target argmax, without double-counting
 the accepted token in context state.
 
+CUDA model throughput is measured only through `qwen38-cuda-e2e-bench`. The
+command loads a release-bound pack through the shared `Engine` ABI, executes
+the real chunked prefill graph followed by incremental greedy decode, records
+MTP proposal/verification/acceptance counts, repeats the run deterministically,
+and requires every executor allocation to reach zero after `unload`. It accepts
+prompt IDs as a non-empty little-endian `u32` file so 64K and 128K runs do not
+depend on shell argument limits. Its immutable JSON output binds the exact
+release, module, prompt, profile, byte counts, hashes, and observed timings.
+Kernel microbenchmarks and projected roofline values are not model throughput.
+
+```text
+cargo run --release --features cuda --bin qwen38-cuda-e2e-bench -- \
+  --release-root <release-root> --release-manifest <release.json> \
+  --pack-id <cuda-pack-id> --memory-profile-id <profile-id> \
+  --module <qwen38-sm86.fatbin> --prompt-token-ids <prompt.u32le> \
+  --decode-output-tokens 128 --measured-repetitions 3 --mtp-enabled \
+  --output <immutable-result.json>
+```
+
+This harness does not promote CUDA by itself. The supplied release must still
+pass the BF16/golden quality gates and the same-device reference,
+controlled-clock/thermal, and required-context sweep.
+
 [`docs/MEMORY_PLAN_CORRECTION_V2.json`](docs/MEMORY_PLAN_CORRECTION_V2.json)
 records the 7.5-MiB causal-convolution state that the earlier calculated Fold
 figures omitted. The subsequent active-MTP correction in

@@ -216,6 +216,13 @@ missing-cache plan is active; 217 identities remain.
    dispatch latency on the same device, then close every material gap reported
    by `ROOFLINE_GATES.md` across the required shape/residue sweep.
 
+`qwen38-cuda-e2e-bench` now implements the release-bound measurement contract
+for item 3 through the production `Engine`/executor ABI, including real prompt
+prefill, incremental decode, MTP accounting, deterministic repetition, and
+zero-residue unload. Results remain pending until it runs against the final
+trained CUDA pack; no kernel microbenchmark or projection substitutes for that
+evidence.
+
 **Exit evidence**
 
 - Same-device scalar/BF16 verifier and full golden suite pass.
