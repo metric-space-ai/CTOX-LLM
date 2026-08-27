@@ -562,6 +562,15 @@ pub struct MetalGreedyMtpVerification {
     pub accepted: bool,
 }
 
+/// One causally aligned target/MTP transition admitted by the complete
+/// 645-step decode contract. `committed_tokens` advances only after the sole
+/// Metal command buffer completed and the compact verifier passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalCompletedToken {
+    pub verification: MetalGreedyMtpVerification,
+    pub committed_tokens: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetalGreedyMtpPrefix {
     pub accepted_prefix: u32,
@@ -12976,12 +12985,71 @@ impl MetalCandidateRuntime {
         mtp: &mut PreparedMappedMetalMtpCore,
         token: u32,
     ) -> Result<MetalGreedyMtpVerification> {
+        self.dispatch_prepared_mapped_initial_mtp_target(program, target, mtp, token, None)
+            .map(|(verification, _)| verification)
+    }
+
+    /// Execute one complete bound decode token. The target/MTP kernels retain
+    /// their dependency-safe physical encoder order, while the execution
+    /// cursor proves that the resulting encoder contains every logical step
+    /// 0..643. Step 644 is consumed only after the command buffer completed;
+    /// the returned position is therefore safe to publish to the scheduler.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_prepared_mapped_complete_token_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+        token: u32,
+        token_position: usize,
+        committed_tokens: usize,
+        admitted_context: usize,
+    ) -> Result<MetalCompletedToken> {
+        let (verification, next_position) = self.dispatch_prepared_mapped_initial_mtp_target(
+            program,
+            target,
+            mtp,
+            token,
+            Some((token_position, committed_tokens, admitted_context)),
+        )?;
+        Ok(MetalCompletedToken {
+            verification,
+            committed_tokens: next_position.ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal complete-token dispatch omitted its execution cursor".into(),
+                )
+            })?,
+        })
+    }
+
+    fn dispatch_prepared_mapped_initial_mtp_target(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+        token: u32,
+        cursor_contract: Option<(usize, usize, usize)>,
+    ) -> Result<(MetalGreedyMtpVerification, Option<usize>)> {
         let mtp_step = self.validate_prepared_mapped_mtp_frontend(program, mtp)?;
         let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(mtp)?;
         let [embedding, initial_norm, target_lm_head] =
             self.validate_prepared_mapped_target_core(program, target)?;
         let target_tokens = target.cached_tokens()?;
         let mtp_tokens = mtp.cached_tokens();
+        let mut execution_cursor = cursor_contract
+            .map(|(token_position, committed_tokens, admitted_context)| {
+                if committed_tokens != target_tokens {
+                    return Err(EngineError::InvalidState(format!(
+                        "Metal complete-token cursor reports {committed_tokens} committed tokens but target state contains {target_tokens}"
+                    )));
+                }
+                program.plan.execution_cursor(
+                    token_position,
+                    committed_tokens,
+                    admitted_context,
+                )
+            })
+            .transpose()?;
         if token as usize >= target.vocabulary_rows()
             || target_tokens == 0
             || target_tokens != mtp_tokens.saturating_add(1)
@@ -13069,6 +13137,10 @@ impl MetalCandidateRuntime {
             })();
             encoder.end_encoding();
             let target_plans = encoded?;
+            let final_schedule_index = execution_cursor
+                .as_mut()
+                .map(record_complete_encoded_token)
+                .transpose()?;
             command_buffer.commit();
             command_buffer.wait_until_completed();
             if command_buffer.status() != MTLCommandBufferStatus::Completed {
@@ -13077,6 +13149,19 @@ impl MetalCandidateRuntime {
                     command_buffer.status()
                 )));
             }
+
+            let next_position = match (execution_cursor.take(), final_schedule_index) {
+                (Some(mut cursor), Some(schedule_index)) => {
+                    cursor.commit_after_completion(schedule_index)?;
+                    Some(cursor.finish()?)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(EngineError::InvalidState(
+                        "Metal complete-token cursor lost its final barrier".into(),
+                    ));
+                }
+            };
 
             self.validate_completed_mapped_mtp_layer(mtp, &mtp_dispatch, component_values)?;
             self.validate_completed_mapped_target_core(target, &target_plans)?;
@@ -13094,11 +13179,11 @@ impl MetalCandidateRuntime {
             }
             target.layers.commit_speculative()?;
             mtp.layer.attention.commit_speculative()?;
-            Ok(verified)
+            Ok((verified, next_position))
         })();
 
         match result {
-            Ok(verified) => Ok(verified),
+            Ok(completed) => Ok(completed),
             Err(primary) => match self.restore_mapped_greedy_mtp_target(target, mtp) {
                 Ok(()) => Err(primary),
                 Err(rollback) => Err(EngineError::InvalidState(format!(
@@ -14665,6 +14750,37 @@ impl MetalCandidateRuntime {
     }
 }
 
+/// Record the complete logical operation set after the caller has encoded the
+/// one-token graph but before it commits the command buffer. The final barrier
+/// deliberately remains pending for `commit_after_completion`.
+fn record_complete_encoded_token(cursor: &mut MetalDecodeExecutionCursor<'_>) -> Result<usize> {
+    let first = cursor.next_step().ok_or_else(|| {
+        EngineError::InvalidState("Metal complete-token cursor has no operations".into())
+    })?;
+    if first.schedule_index != 0 {
+        return Err(EngineError::InvalidState(format!(
+            "Metal complete-token cursor starts at step {}, expected 0",
+            first.schedule_index
+        )));
+    }
+    loop {
+        let step = cursor.next_step().cloned().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal complete-token cursor omitted its final barrier".into(),
+            )
+        })?;
+        if step.operation == MetalDecodeOperation::TokenCommandBufferCommit {
+            if step.layer.is_some() {
+                return Err(EngineError::InvalidState(
+                    "Metal complete-token final barrier unexpectedly belongs to a layer".into(),
+                ));
+            }
+            return Ok(step.schedule_index);
+        }
+        cursor.advance(step.schedule_index, step.layer, step.operation)?;
+    }
+}
+
 fn partial_rope_params(
     heads: usize,
     head_dim: usize,
@@ -15389,6 +15505,49 @@ mod tests {
             vec![MetalBufferSlot::TargetLogits, MetalBufferSlot::MtpDraft]
         );
         assert!(final_step.writes().is_empty());
+    }
+
+    #[test]
+    fn complete_token_cursor_leaves_only_the_post_gpu_barrier() {
+        let config = Qwen38Config::default();
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let projections = MetalProjectionPlan::qwen38(&config).expect("Metal projection plan");
+        let bindings = MetalDecodeBindingPlan::qwen38(&schedule, &projections, &config)
+            .expect("complete Metal binding plan");
+
+        let mut cursor = bindings
+            .execution_cursor(37, 37, 128 * 1024)
+            .expect("begin complete token cursor");
+        let barrier = record_complete_encoded_token(&mut cursor)
+            .expect("record every encoded logical operation");
+        assert_eq!(barrier, 644);
+        let pending = cursor.next_step().expect("pending completion barrier");
+        assert_eq!(pending.schedule_index, barrier);
+        assert_eq!(pending.layer, None);
+        assert_eq!(
+            pending.operation,
+            MetalDecodeOperation::TokenCommandBufferCommit
+        );
+        assert!(cursor.finish().is_err());
+
+        let mut cursor = bindings
+            .execution_cursor(37, 37, 128 * 1024)
+            .expect("rebuild complete token cursor");
+        let barrier = record_complete_encoded_token(&mut cursor)
+            .expect("record complete encoder after rebuild");
+        cursor
+            .commit_after_completion(barrier)
+            .expect("consume barrier only after GPU completion");
+        assert_eq!(cursor.finish().expect("publish next position"), 38);
+
+        let mut partial = bindings
+            .execution_cursor(37, 37, 128 * 1024)
+            .expect("begin partial token cursor");
+        let first = partial.next_step().expect("first step").clone();
+        partial
+            .advance(first.schedule_index, first.layer, first.operation)
+            .expect("advance one operation");
+        assert!(record_complete_encoded_token(&mut partial).is_err());
     }
 
     #[test]

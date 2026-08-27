@@ -233,6 +233,19 @@ the mandatory initial transition even when its draft was rejected, and then
 replays only the accepted tail; every replay record must match the speculative
 record exactly.
 
+`dispatch_prepared_mapped_complete_token_verifier` now joins the ordinary
+causal Target+MTP transition to the complete 645-step execution contract. The
+resident target-KV count must match the caller's committed position. After the
+dependency-ordered encoder has been built, the cursor proves the full logical
+step 0..643 set and leaves only `TokenCommandBufferCommit` pending. Step 644 is
+consumed after the sole command-buffer wait and before model state is committed;
+only then is the next scheduler-visible token position returned. Cursor,
+encoding, GPU, and compact-verifier failures use the same joint target/MTP
+rollback. The corresponding regression proves that a partial cursor is
+rejected and that no new position can be published before the final barrier.
+This is the complete single-token boundary; the fused MTP4 branch still needs
+multi-position executor integration and full-artifact device evidence.
+
 The continuation path now preserves each canonical mapped draft in a distinct
 full-vocabulary candidate selector with a two-word device copy before the
 restricted selector is overwritten. MTP embedding and target embedding both

@@ -342,12 +342,21 @@ to record zero, returning the exact fixed-size records needed by the bounded
 accepted-prefix replay path. `dispatch_prepared_mapped_greedy_mtp4_verifier`
 then replays only records 1 through `accepted_prefix - 1` via the same full
 causal verifier. Any replay mismatch poisons both graphs fail-closed. Production
-executor wiring remains open. The additional
+MTP4 executor wiring remains open. The additional
 `dispatch_prepared_mapped_greedy_mtp4_from_token_verifier` path removes the
 separate initial-record completion wait from the fully accepted case: all four
 records plus prefix reduction share one command buffer. A shorter prefix rolls
 back to the pre-initial state, replays the mandatory initial transition, and
 then replays only its accepted tail; replay divergence poisons both graphs.
+The ordinary one-token path is now wired to the complete decode contract:
+`dispatch_prepared_mapped_complete_token_verifier` requires the caller's
+committed position to equal the resident target-KV position, records all 644
+logical compute steps only after their encoder was built, and consumes the sole
+step-644 barrier only after the Metal command buffer completed. It returns the
+next publishable position together with the compact target/MTP verification;
+an encoding, cursor, GPU, or verification failure retains the existing joint
+state rollback. This closes the single-token cursor boundary, not the MTP4,
+prefill, full-artifact Golden, or production promotion gates.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those
