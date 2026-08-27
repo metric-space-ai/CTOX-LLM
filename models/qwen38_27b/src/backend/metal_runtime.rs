@@ -19,22 +19,23 @@ use sha2::{Digest, Sha256};
 use super::metal::{
     validate_mixed_operation, validate_operation, validate_recovered_row,
     MetalArgMaxFinalBufferAbi, MetalArgMaxParams, MetalArgMaxPartialBufferAbi, MetalBufferAbi,
-    MetalCausalConvBufferAbi, MetalCausalConvParams, MetalDynamicEmbeddingParams,
-    MetalFusedMatVecParams, MetalGatedDeltaBufferAbi, MetalGatedDeltaParams,
-    MetalGatedDeltaPrepareBufferAbi, MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi,
-    MetalKvPackParams, MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi,
-    MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
+    MetalCausalConvBufferAbi, MetalCausalConvParams, MetalConcatBufferAbi, MetalConcatParams,
+    MetalDynamicEmbeddingParams, MetalFusedMatVecParams, MetalGatedDeltaBufferAbi,
+    MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi, MetalGatedDeltaPrepareParams,
+    MetalGatedRmsNormBufferAbi, MetalKvPackParams, MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi,
+    MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
     MetalQueryGateBufferAbi, MetalQueryGateParams, MetalResidualRmsNormBufferAbi,
     MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi,
     ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME,
-    GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME,
-    KV_Q4_TO_Q2_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME,
-    PARTIAL_ROPE_KERNEL_NAME, Q2_DYNAMIC_EMBEDDING_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
-    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SIGMOID_GATE_KERNEL_NAME,
-    Q2_SWIGLU_KERNEL_NAME, Q4_DYNAMIC_EMBEDDING_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
-    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SIGMOID_GATE_KERNEL_NAME,
-    Q4_SWIGLU_KERNEL_NAME, QUERY_GATE_NORM_ROPE_KERNEL_NAME, RESIDUAL_RMS_NORM_1P_KERNEL_NAME,
-    RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
+    CONCAT_F32_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME,
+    KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP,
+    PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME, Q2_DYNAMIC_EMBEDDING_KERNEL_NAME,
+    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME,
+    Q2_SIGMOID_GATE_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME, Q4_DYNAMIC_EMBEDDING_KERNEL_NAME,
+    Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME,
+    Q4_SIGMOID_GATE_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME, QUERY_GATE_NORM_ROPE_KERNEL_NAME,
+    RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME,
+    RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
@@ -80,6 +81,7 @@ pub struct MetalCandidateRuntime {
     q4_recovered_row_pipeline: ComputePipelineState,
     q2_dynamic_embedding_pipeline: ComputePipelineState,
     q4_dynamic_embedding_pipeline: ComputePipelineState,
+    concat_f32_pipeline: ComputePipelineState,
     rms_norm_1p_pipeline: ComputePipelineState,
     rms_norm_1p_head256_inplace_pipeline: ComputePipelineState,
     residual_rms_norm_1p_pipeline: ComputePipelineState,
@@ -2644,6 +2646,14 @@ impl MetalCandidateRuntime {
                     "Metal Q4 dynamic embedding function lookup failed: {message}"
                 ))
             })?;
+        let concat_f32_function =
+            library
+                .get_function(CONCAT_F32_KERNEL_NAME, None)
+                .map_err(|message| {
+                    EngineError::InvalidState(format!(
+                        "Metal f32 concat function lookup failed: {message}"
+                    ))
+                })?;
         let rms_norm_1p_function = library
             .get_function(RMS_NORM_1P_KERNEL_NAME, None)
             .map_err(|message| {
@@ -2850,6 +2860,13 @@ impl MetalCandidateRuntime {
                     "Metal Q4 dynamic embedding pipeline creation failed: {message}"
                 ))
             })?;
+        let concat_f32_pipeline = device
+            .new_compute_pipeline_state_with_function(&concat_f32_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal f32 concat pipeline creation failed: {message}"
+                ))
+            })?;
         let rms_norm_1p_pipeline = device
             .new_compute_pipeline_state_with_function(&rms_norm_1p_function)
             .map_err(|message| {
@@ -3023,6 +3040,7 @@ impl MetalCandidateRuntime {
             q4_recovered_row_pipeline,
             q2_dynamic_embedding_pipeline,
             q4_dynamic_embedding_pipeline,
+            concat_f32_pipeline,
             rms_norm_1p_pipeline,
             rms_norm_1p_head256_inplace_pipeline,
             residual_rms_norm_1p_pipeline,
@@ -6708,6 +6726,97 @@ impl MetalCandidateRuntime {
             ));
         }
         Ok((token, hidden))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_concat_f32_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        first: &Buffer,
+        first_offset: u64,
+        second: &Buffer,
+        second_offset: u64,
+        output: &Buffer,
+        output_offset: u64,
+        params: &Buffer,
+        total_values: usize,
+    ) {
+        encoder.set_compute_pipeline_state(&self.concat_f32_pipeline);
+        for (binding, buffer, offset) in [
+            (MetalConcatBufferAbi::FIRST, first, first_offset),
+            (MetalConcatBufferAbi::SECOND, second, second_offset),
+            (MetalConcatBufferAbi::OUTPUT, output, output_offset),
+            (MetalConcatBufferAbi::PARAMS, params, 0),
+        ] {
+            encoder.set_buffer(binding as u64, Some(buffer), offset);
+        }
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: total_values.div_ceil(256) as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    pub fn dispatch_concat_f32(&self, first: &[f32], second: &[f32]) -> Result<Vec<f32>> {
+        validate_metal_input(first, first.len())?;
+        validate_metal_input(second, second.len())?;
+        if first.is_empty() || second.is_empty() {
+            return Err(EngineError::Shape(
+                "Metal concat requires two non-empty inputs".into(),
+            ));
+        }
+        let total_values = first
+            .len()
+            .checked_add(second.len())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal concat width overflows".into()))?;
+        let output_bytes = total_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal concat bytes overflow".into()))?;
+        let params = MetalConcatParams {
+            first_values: usize_to_u32(first.len(), "Metal concat first width")?,
+            second_values: usize_to_u32(second.len(), "Metal concat second width")?,
+            reserved0: 0,
+            reserved1: 0,
+        };
+        let first_buffer = buffer_with_data(&self.device, as_bytes(first));
+        let second_buffer = buffer_with_data(&self.device, as_bytes(second));
+        let output = new_zeroed_buffer(&self.device, output_bytes)?;
+        let params_buffer = buffer_with_data(&self.device, &params.encode());
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-f32-concat-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_concat_f32_between(
+            encoder,
+            &first_buffer,
+            0,
+            &second_buffer,
+            0,
+            &output,
+            0,
+            &params_buffer,
+            total_values,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal concat ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        Ok(
+            unsafe {
+                slice::from_raw_parts(output.contents().cast::<f32>(), total_values).to_vec()
+            },
+        )
     }
 
     /// Select and decode one token from a complete resident embedding table.
@@ -13281,6 +13390,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn concat_f32_matches_cpu_and_rejects_invalid_inputs() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let first = [-3.25_f32, 0.0, 1.5, 9.75];
+        let second = [4.0_f32, -8.5, 0.125];
+        let actual = runtime
+            .dispatch_concat_f32(&first, &second)
+            .expect("dispatch f32 concat");
+        assert_eq!(actual, first.into_iter().chain(second).collect::<Vec<_>>());
+
+        assert!(runtime.dispatch_concat_f32(&[], &second).is_err());
+        assert!(runtime.dispatch_concat_f32(&first, &[]).is_err());
+        assert!(runtime.dispatch_concat_f32(&[f32::NAN], &second).is_err());
+        assert!(runtime
+            .dispatch_concat_f32(&first, &[f32::INFINITY])
+            .is_err());
     }
 
     #[test]

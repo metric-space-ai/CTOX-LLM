@@ -29,6 +29,7 @@ pub const Q2_RECOVERED_ROW_KERNEL_NAME: &str = "q2_b64_recovered_row";
 pub const Q4_RECOVERED_ROW_KERNEL_NAME: &str = "q4_b64_recovered_row";
 pub const Q2_DYNAMIC_EMBEDDING_KERNEL_NAME: &str = "q2_b64_dynamic_embedding_row";
 pub const Q4_DYNAMIC_EMBEDDING_KERNEL_NAME: &str = "q4_b64_dynamic_embedding_row";
+pub const CONCAT_F32_KERNEL_NAME: &str = "qwen_concat_f32";
 pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
 pub const RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME: &str = "qwen_rms_norm_1p_head256_inplace_f32";
 pub const RESIDUAL_RMS_NORM_1P_KERNEL_NAME: &str = "qwen_residual_rms_norm_1p_f32";
@@ -72,6 +73,16 @@ impl MetalBufferAbi {
     pub const OUTPUT: u32 = 5;
     pub const PARAMS: u32 = 6;
     pub const ROW_IDS: u32 = 7;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalConcatBufferAbi;
+
+impl MetalConcatBufferAbi {
+    pub const FIRST: u32 = 0;
+    pub const SECOND: u32 = 1;
+    pub const OUTPUT: u32 = 2;
+    pub const PARAMS: u32 = 3;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +304,34 @@ pub struct MetalDynamicEmbeddingParams {
     pub reserved0: u32,
     pub reserved1: u32,
     pub reserved2: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalConcatParams {
+    pub first_values: u32,
+    pub second_values: u32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+}
+
+impl MetalConcatParams {
+    pub const BYTE_LEN: usize = 16;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.first_values,
+            self.second_values,
+            self.reserved0,
+            self.reserved1,
+        ]
+        .iter()
+        .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
 }
 
 impl MetalDynamicEmbeddingParams {
@@ -1192,6 +1231,7 @@ mod tests {
         assert!(Q4_RECOVERED_ROW_KERNEL_NAME.starts_with("q4_b64"));
         assert!(Q2_DYNAMIC_EMBEDDING_KERNEL_NAME.contains("dynamic_embedding"));
         assert!(Q4_DYNAMIC_EMBEDDING_KERNEL_NAME.contains("dynamic_embedding"));
+        assert_eq!(CONCAT_F32_KERNEL_NAME, "qwen_concat_f32");
         assert!(RMS_NORM_1P_KERNEL_NAME.starts_with("qwen_rms_norm"));
         assert!(RMS_NORM_1P_HEAD256_INPLACE_KERNEL_NAME.contains("head256_inplace"));
         assert!(PARTIAL_ROPE_KERNEL_NAME.starts_with("qwen_partial_rope"));
@@ -1263,6 +1303,19 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![5_120, 80, 1_024, 2_048, 2_720, 0, 0, 0]);
+
+        let concat = MetalConcatParams {
+            first_values: 5_120,
+            second_values: 5_120,
+            reserved0: 0,
+            reserved1: 0,
+        };
+        let words: Vec<u32> = concat
+            .encode()
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![5_120, 5_120, 0, 0]);
 
         let paged = MetalPagedGqaParams {
             query_heads: 24,

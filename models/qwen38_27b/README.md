@@ -297,6 +297,10 @@ consume that token directly; every mixed-precision segment is dispatched but
 only the owning segment writes the recovered row. The same-command Golden
 selects rows on both sides of a Q2/Q4 boundary and matches the static CPU
 oracle without a token readback or an embedding-table repack.
+A native f32 concatenate kernel now also joins the normalized selected-token
+embedding and retained target hidden state directly in caller-owned Metal
+storage. Its fixed ABI and exact-order Golden close the standalone primitive;
+the graph-owned MTP scratch arena and chained frontend execution are next.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

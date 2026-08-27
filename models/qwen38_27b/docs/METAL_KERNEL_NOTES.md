@@ -171,6 +171,11 @@ buffer; `q2_b64_dynamic_embedding_row` and
 segments each carry a fixed 32-byte range/stride parameter block and only the
 segment containing the selected row writes the shared output. A same-command
 Golden crosses the Q2/Q4 boundary and matches loader-resolved static rows.
+`qwen_concat_f32` now supplies the next native MTP frontend primitive: it joins
+the normalized selected-token embedding and retained target hidden state into
+one caller-owned device view, with a fixed 16-byte ABI and no host staging.
+The standalone verifier checks exact ordering and fails closed on empty or
+non-finite inputs; graph-owned scratch and the full MTP encoder remain pending.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

@@ -141,6 +141,13 @@ struct DynamicEmbeddingParams {
     uint reserved2;
 };
 
+struct ConcatParams {
+    uint first_values;
+    uint second_values;
+    uint reserved0;
+    uint reserved1;
+};
+
 struct ArgMaxPartial {
     float value;
     uint index;
@@ -901,6 +908,21 @@ kernel void q4_b64_dynamic_embedding_row(
     float normalized1 = (float((packed >> 4u) & 0xfu) - 7.5f) * (1.0f / 7.5f);
     output[column] = scale * normalized0 * float(s_in[column]);
     output[column + 1u] = scale * normalized1 * float(s_in[column + 1u]);
+}
+
+kernel void qwen_concat_f32(
+    device const float* first [[buffer(0)]],
+    device const float* second [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ConcatParams& params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    uint total = params.first_values + params.second_values;
+    if (index >= total) {
+        return;
+    }
+    output[index] = index < params.first_values
+        ? first[index]
+        : second[index - params.first_values];
 }
 
 // Qwen RMSNorm uses normalized * (1 + weight), unlike Llama's direct weight
