@@ -5653,11 +5653,12 @@ impl MetalCandidateRuntime {
             .collect()
     }
 
-    /// Dispatch up to the exact first nine operations of the frozen decode graph:
+    /// Dispatch up to the exact first ten operations of the frozen decode graph:
     /// embedding, layer-0 RMSNorm, four-way linear-attention fan-out, in-place
     /// convolution, five-output GatedDelta preparation, recurrent update, and
     /// direct-weight gated RMSNorm, the recovered linear output projection, and
-    /// fused residual-add plus Qwen RMSNorm into the next hidden/normalized views.
+    /// fused residual-add plus Qwen RMSNorm into the next hidden/normalized views,
+    /// and the mixed-Q2/Q4 two-way FFN gate/up fan-out.
     /// All activations are typed views into one schedule-derived arena. The
     /// prepared graph resources own only immutable parameters and tiny command
     /// metadata; no operation-local input or output activation is allocated.
@@ -5687,6 +5688,10 @@ impl MetalCandidateRuntime {
         )>,
         residual_rms_norm: Option<(
             &PreparedMappedMetalRmsNorm,
+            &PreparedMetalDecodeStepView<'_>,
+        )>,
+        ffn_gate_up: Option<(
+            [&PreparedMappedMetalMatVec; 2],
             &PreparedMetalDecodeStepView<'_>,
         )>,
         embedding_output: &PreparedMetalDecodeBufferView<'_>,
@@ -6048,9 +6053,49 @@ impl MetalCandidateRuntime {
                 ));
             }
         }
+        if let Some((projections, step)) = ffn_gate_up.as_ref() {
+            let reads = step.reads();
+            let writes = step.writes();
+            let (_, residual_norm_step) = residual_rms_norm.as_ref().ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal graph FFN gate/up fan-out requires residual RMSNorm".into(),
+                )
+            })?;
+            let normalized = &residual_norm_step.writes()[1];
+            if step.step().schedule_index != 9
+                || step.step().layer != Some(0)
+                || step.step().operation != MetalDecodeOperation::FfnGateUpFanout
+                || reads.len() != 1
+                || writes.len() != 2
+                || reads[0].slot() != MetalBufferSlot::Normalized
+                || reads[0].offset() != normalized.offset()
+                || reads[0].values() != embedding.columns
+                || writes[0].slot() != MetalBufferSlot::FfnGate
+                || writes[1].slot() != MetalBufferSlot::FfnUp
+                || !std::ptr::eq(arena, reads[0].buffer())
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal graph FFN gate/up fan-out does not match frozen schedule step 9".into(),
+                ));
+            }
+            for (projection, output) in projections.iter().zip(writes) {
+                if projection.input_buffer.is_some()
+                    || projection.output_buffer.is_some()
+                    || !Rc::ptr_eq(&projection.mapping.inner, &embedding.mapping.inner)
+                    || projection.columns != embedding.columns
+                    || projection.rows != output.values()
+                    || !std::ptr::eq(arena, output.buffer())
+                {
+                    return Err(EngineError::InvalidState(
+                        "Metal graph FFN gate/up projection resource or output view is incompatible"
+                            .into(),
+                    ));
+                }
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
-        command_buffer.set_label("ctox-qwen38-shared-arena-embedding-norm-linear-fanout");
+        command_buffer.set_label("ctox-qwen38-shared-arena-decode-prefix");
         let encoder = command_buffer.new_compute_command_encoder();
         self.encode_mapped_embedding_to(
             encoder,
@@ -6155,6 +6200,18 @@ impl MetalCandidateRuntime {
                 step.writes()[1].offset(),
             );
         }
+        if let Some((projections, step)) = ffn_gate_up.as_ref() {
+            for (projection, output) in projections.iter().zip(step.writes()) {
+                self.encode_mapped_projection_between(
+                    encoder,
+                    projection,
+                    arena,
+                    step.reads()[0].offset(),
+                    arena,
+                    output.offset(),
+                )?;
+            }
+        }
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -6212,21 +6269,23 @@ impl MetalCandidateRuntime {
                 }
             }
         }
-        if let Some((_, step)) = recurrence.as_ref() {
-            let output = &step.writes()[0];
-            let offset = usize::try_from(output.offset()).map_err(|_| {
-                EngineError::MemoryBudget("Metal recurrence output offset exceeds usize".into())
-            })?;
-            let values = unsafe {
-                slice::from_raw_parts(
-                    arena.contents().cast::<u8>().add(offset).cast::<f32>(),
-                    output.values(),
-                )
-            };
-            if values.iter().any(|value| !value.is_finite()) {
-                return Err(EngineError::InvalidState(
-                    "Metal graph recurrence produced non-finite output".into(),
-                ));
+        if gated_rms_norm.is_none() {
+            if let Some((_, step)) = recurrence.as_ref() {
+                let output = &step.writes()[0];
+                let offset = usize::try_from(output.offset()).map_err(|_| {
+                    EngineError::MemoryBudget("Metal recurrence output offset exceeds usize".into())
+                })?;
+                let values = unsafe {
+                    slice::from_raw_parts(
+                        arena.contents().cast::<u8>().add(offset).cast::<f32>(),
+                        output.values(),
+                    )
+                };
+                if values.iter().any(|value| !value.is_finite()) {
+                    return Err(EngineError::InvalidState(
+                        "Metal graph recurrence produced non-finite output".into(),
+                    ));
+                }
             }
         }
         if let Some(convolution) = convolution {
@@ -8359,6 +8418,20 @@ mod tests {
             &linear_output_s_in,
             1.03125,
         ));
+        let ffn_specs = [
+            ("layer0.mlp.gate.weight", TensorDType::Q2B64),
+            ("layer0.mlp.up.weight", TensorDType::Q4B64),
+        ];
+        for (name, dtype) in ffn_specs {
+            tensors.extend(repeated_recovered_tensors(
+                name,
+                dtype,
+                config.intermediate_size,
+                columns,
+                &s_in,
+                0.984375,
+            ));
+        }
         ArtifactBuilder {
             model: "test/qwen38-shared-arena".into(),
             revision: "0123456789abcdef".into(),
@@ -8481,6 +8554,21 @@ mod tests {
         let linear_output_projection = runtime
             .prepare_mapped_fused_matvec_graph_io(&mapping, &linear_output_operation)
             .expect("prepare graph linear output projection without activation buffers");
+        let ffn_matrices = ffn_specs.map(|(name, _)| {
+            artifact
+                .recovered_matrix(name)
+                .expect("resolve graph FFN gate/up projection")
+        });
+        let ffn_contracts = ffn_matrices.map(|matrix| {
+            matrix
+                .operation(&validation_input, Activation::Identity)
+                .expect("build graph FFN gate/up projection contract")
+        });
+        let ffn_projections = ffn_contracts.map(|operation| {
+            runtime
+                .prepare_mapped_fused_matvec_graph_io(&mapping, &operation)
+                .expect("prepare graph FFN gate/up projection without activation buffers")
+        });
         assert!(runtime
             .prepare_mapped_gated_delta_prepare_graph_io(
                 &mapping,
@@ -8545,6 +8633,13 @@ mod tests {
         assert!(linear_output_projection
             .write_input(&linear_output_validation)
             .is_err());
+        for projection in &ffn_projections {
+            assert_eq!(
+                projection.transient_bytes(),
+                std::mem::size_of::<f32>() + MetalFusedMatVecParams::BYTE_LEN
+            );
+            assert!(projection.write_input(&validation_input).is_err());
+        }
         assert!(!gated_norm.has_owned_io());
         assert!(gated_norm
             .write_inputs(
@@ -8594,18 +8689,21 @@ mod tests {
         let gated_norm_step = &program.steps()[6];
         let linear_output_step = &program.steps()[7];
         let residual_norm_step = &program.steps()[8];
+        let ffn_gate_up_step = &program.steps()[9];
         let projection_refs = [
             &prepared_projections[0],
             &prepared_projections[1],
             &prepared_projections[2],
             &prepared_projections[3],
         ];
+        let ffn_projection_refs = [&ffn_projections[0], &ffn_projections[1]];
         assert!(runtime
             .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
                 &embedding,
                 1,
                 &norm,
                 projection_refs,
+                None,
                 None,
                 None,
                 None,
@@ -8643,6 +8741,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8659,6 +8758,7 @@ mod tests {
                 Some((&delta_prepare, delta_outputs)),
                 Some((&mut recurrence, recurrence_step)),
                 Some((&gated_norm, recurrence_step)),
+                None,
                 None,
                 None,
                 embedding_output,
@@ -8680,6 +8780,7 @@ mod tests {
                 Some((&gated_norm, gated_norm_step)),
                 Some((&linear_output_projection, gated_norm_step)),
                 None,
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8699,6 +8800,27 @@ mod tests {
                 Some((&gated_norm, gated_norm_step)),
                 Some((&linear_output_projection, linear_output_step)),
                 Some((&residual_norm, linear_output_step)),
+                None,
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .is_err());
+        assert!(!convolution.poisoned);
+        assert!(!recurrence.poisoned);
+        assert!(runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, gated_norm_step)),
+                Some((&linear_output_projection, linear_output_step)),
+                Some((&residual_norm, residual_norm_step)),
+                Some((ffn_projection_refs, residual_norm_step)),
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8767,6 +8889,7 @@ mod tests {
                 Some((&gated_norm, gated_norm_step)),
                 Some((&linear_output_projection, linear_output_step)),
                 Some((&residual_norm, residual_norm_step)),
+                None,
                 embedding_output,
                 normalized_output,
                 linear_outputs,
@@ -8904,7 +9027,7 @@ mod tests {
                 .zip(
                     expected_post_attention_norm
                         .iter()
-                        .zip(actual_post_attention_norm),
+                        .zip(&actual_post_attention_norm),
                 )
                 .enumerate()
         {
@@ -8934,6 +9057,64 @@ mod tests {
             .verifier_read_state()
             .iter()
             .all(|value| *value == f16::ZERO));
+
+        convolution
+            .begin_speculative(&runtime)
+            .expect("snapshot graph convolution state for FFN prefix");
+        recurrence
+            .begin_speculative(&runtime)
+            .expect("snapshot graph recurrence state for FFN prefix");
+        runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                Some(&mut convolution),
+                Some((&delta_prepare, delta_outputs)),
+                Some((&mut recurrence, recurrence_step)),
+                Some((&gated_norm, gated_norm_step)),
+                Some((&linear_output_projection, linear_output_step)),
+                Some((&residual_norm, residual_norm_step)),
+                Some((ffn_projection_refs, ffn_gate_up_step)),
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .expect("dispatch first ten decode steps through shared arena");
+        let ffn_input = workspace
+            .read_f32(MetalBufferSlot::Normalized)
+            .expect("read graph FFN normalized input");
+        let actual_ffn = [
+            workspace
+                .read_f32(MetalBufferSlot::FfnGate)
+                .expect("read graph FFN gate projection"),
+            workspace
+                .read_f32(MetalBufferSlot::FfnUp)
+                .expect("read graph FFN up projection"),
+        ];
+        for (branch, (matrix, actual)) in ffn_matrices.iter().zip(actual_ffn).enumerate() {
+            let expected = cpu
+                .fused_matvec(
+                    &matrix
+                        .operation(&ffn_input, Activation::Identity)
+                        .expect("build graph FFN gate/up oracle operation"),
+                )
+                .expect("execute graph FFN gate/up oracle");
+            for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 8.0e-4_f32.max(expected.abs() * 5.0e-4);
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "graph FFN branch {branch} row {row}: expected {expected}, got {actual}"
+                );
+            }
+        }
+        recurrence
+            .restore_speculative(&runtime)
+            .expect("restore graph recurrence after FFN prefix");
+        convolution
+            .restore_speculative(&runtime)
+            .expect("restore graph convolution after FFN prefix");
     }
 
     #[test]

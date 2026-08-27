@@ -247,8 +247,11 @@ without owning either activation endpoint. A fused residual-add/Qwen-RMSNorm
 kernel consumes `HiddenA`, `MixerOutput`, and the mmap-backed post-attention
 norm weight, writes the exact `HiddenB` residual, and writes the next
 `Normalized` view without allocating activation endpoints. The Apple-device
-Golden test executes steps 0-8 with one command encoder and one wait; failure
-leaves state poisoned and recoverable through the active device checkpoint.
+Golden test then executes the mixed-Q2/Q4 FFN gate/up fan-out from that exact
+view into `FfnGate` and `FfnUp`. Steps 0-9 use one command encoder and one wait;
+failure leaves state poisoned and recoverable through the active device
+checkpoint. Because the arena intentionally aliases dead slots, the verifier
+uses a second checkpointed run when inspecting both earlier and final views.
 
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
@@ -465,12 +468,13 @@ dequantization array before this source was accepted.
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
   target+MTP state transaction. All 645 steps have real shared-buffer views;
-  exact kernel dispatch now covers steps 0-8 (embedding, layer-0 RMSNorm, all
+  exact kernel dispatch now covers steps 0-9 (embedding, layer-0 RMSNorm, all
   four linear-attention projections, in-place causal convolution, and the
   five-output GatedDelta preparation, recurrent FP16-state update, and in-place
   direct-weight gated RMSNorm followed by the recovered Q2/Q4 linear output
   projection, then fused residual-add/Qwen RMSNorm into `HiddenB` and the next
-  `Normalized` view). The remaining 636 schedule steps,
+  `Normalized` view, then mixed-Q2/Q4 FFN gate/up fan-out). The remaining 635
+  schedule steps,
   the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
