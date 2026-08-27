@@ -9879,6 +9879,204 @@ impl MetalCandidateRuntime {
         prepared.commit_speculative()
     }
 
+    /// Execute target embedding, initial norm, all 64 transformer layers, and
+    /// the full LM head in one shared-arena command buffer. Target logits stay
+    /// resident for the following MTP draft/verify stage; this method performs
+    /// no sampling and never reads the vocabulary tensor on the host.
+    pub fn dispatch_prepared_mapped_target_core(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetCore,
+        token: usize,
+    ) -> Result<()> {
+        let config = Qwen38Config::default();
+        if token >= prepared.embedding.rows
+            || prepared.copied_model_bytes() != 0
+            || prepared.vocabulary_rows() != config.vocab_size
+            || prepared.hidden_size() != config.hidden_size
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target core token or frozen dimensions are invalid".into(),
+            ));
+        }
+        let embedding = program.steps.first().ok_or_else(|| {
+            EngineError::InvalidState("Metal target core has no embedding step".into())
+        })?;
+        let initial_norm = program.steps.get(1).ok_or_else(|| {
+            EngineError::InvalidState("Metal target core has no initial norm step".into())
+        })?;
+        let lm_head = program.steps.get(642).ok_or_else(|| {
+            EngineError::InvalidState("Metal target core has no LM-head step".into())
+        })?;
+        if embedding.step().schedule_index != 0
+            || embedding.step().layer.is_some()
+            || embedding.step().operation != MetalDecodeOperation::Embedding
+            || !embedding.reads().is_empty()
+            || embedding.writes().len() != 1
+            || embedding.writes()[0].slot() != MetalBufferSlot::HiddenA
+            || embedding.writes()[0].values() != config.hidden_size
+            || initial_norm.step().schedule_index != 1
+            || initial_norm.step().layer != Some(0)
+            || initial_norm.step().operation != MetalDecodeOperation::RmsNorm
+            || initial_norm.reads().len() != 1
+            || initial_norm.writes().len() != 1
+            || initial_norm.reads()[0].slot() != MetalBufferSlot::HiddenA
+            || initial_norm.writes()[0].slot() != MetalBufferSlot::Normalized
+            || lm_head.step().schedule_index != 642
+            || lm_head.step().layer.is_some()
+            || lm_head.step().operation != MetalDecodeOperation::LmHead
+            || lm_head.reads().len() != 1
+            || lm_head.writes().len() != 1
+            || lm_head.reads()[0].slot() != MetalBufferSlot::Normalized
+            || lm_head.writes()[0].slot() != MetalBufferSlot::TargetLogits
+            || lm_head.writes()[0].values() != config.vocab_size
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target core frontend or LM-head views diverge from the frozen schedule"
+                    .into(),
+            ));
+        }
+        let arena = embedding.writes()[0].buffer();
+        if [initial_norm, lm_head]
+            .iter()
+            .flat_map(|step| step.reads().iter().chain(step.writes()))
+            .any(|view| !std::ptr::eq(view.buffer(), arena))
+            || !prepared
+                .initial_norm
+                .matches_weight_tensor("model.language_model.layers.0.input_layernorm.weight")?
+            || !prepared
+                .lm_head
+                .matches_recovered_tensor("lm_head.weight")?
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target core does not share one canonical arena or tensor identity".into(),
+            ));
+        }
+        self.validate_prepared_mapped_target_layers(program, &prepared.layers)?;
+        prepared.layers.begin_speculative(self)?;
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-complete-target-core");
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoded = (|| {
+            self.encode_mapped_embedding_to(
+                encoder,
+                &prepared.embedding,
+                token,
+                arena,
+                embedding.writes()[0].offset(),
+            )?;
+            self.encode_mapped_norm_between(
+                encoder,
+                &prepared.initial_norm,
+                arena,
+                initial_norm.reads()[0].offset(),
+                arena,
+                initial_norm.writes()[0].offset(),
+            );
+            let full_plans =
+                self.encode_prepared_mapped_target_layers(encoder, program, &mut prepared.layers)?;
+            self.encode_mapped_projection_between(
+                encoder,
+                &prepared.lm_head,
+                arena,
+                lm_head.reads()[0].offset(),
+                arena,
+                lm_head.writes()[0].offset(),
+            )?;
+            Ok(full_plans)
+        })();
+        let full_plans = match encoded {
+            Ok(plans) => plans,
+            Err(primary) => {
+                encoder.end_encoding();
+                return match prepared.layers.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal target core encoding failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            }
+        };
+        #[cfg(not(test))]
+        let _ = &full_plans;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            let primary = EngineError::InvalidState(format!(
+                "Metal target core ended with {:?}",
+                command_buffer.status()
+            ));
+            return match prepared.layers.restore_speculative(self) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal target core failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            };
+        }
+        for layer in &mut prepared.layers.layers {
+            match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    layer.convolution.poisoned = false;
+                    layer.recurrence.poisoned = false;
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    layer.attention.poisoned = false;
+                }
+            }
+        }
+        #[cfg(test)]
+        for (layer_index, plan) in &full_plans {
+            let PreparedMappedMetalTargetLayer::FullAttention(layer) =
+                &mut prepared.layers.layers[*layer_index]
+            else {
+                let primary = EngineError::InvalidState(
+                    "Metal target-core verifier plan diverged from topology".into(),
+                );
+                return match prepared.layers.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal target-core verification failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            };
+            let component_values = layer.attention.key_value_heads * layer.attention.head_dim;
+            let key = unsafe {
+                slice::from_raw_parts(
+                    layer
+                        .attention
+                        .verifier_key_snapshot_buffer
+                        .contents()
+                        .cast::<f32>(),
+                    component_values,
+                )
+                .to_vec()
+            };
+            let value = unsafe {
+                slice::from_raw_parts(
+                    layer
+                        .attention
+                        .verifier_value_snapshot_buffer
+                        .contents()
+                        .cast::<f32>(),
+                    component_values,
+                )
+                .to_vec()
+            };
+            if let Err(primary) =
+                self.commit_paged_gqa_verifier_append(&mut layer.attention, plan, &key, &value)
+            {
+                return match prepared.layers.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal target-core verification failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            }
+        }
+        prepared.layers.commit_speculative()
+    }
+
     fn encode_prepared_mapped_full_attention_layer(
         &self,
         encoder: &ComputeCommandEncoderRef,

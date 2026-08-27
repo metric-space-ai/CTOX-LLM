@@ -138,6 +138,16 @@ encoder and returns the 16 append plans without committing or waiting. The
 public layer-graph dispatcher now wraps that primitive with transaction,
 completion, verifier, and rollback handling.
 
+`dispatch_prepared_mapped_target_core` is the first complete target-side graph
+execution boundary. It validates the schedule frontend and target head, opens
+one transaction across every target-layer state owner, and encodes recovered
+embedding, initial RMSNorm, all 64 target layers, and the full LM head into one
+compute encoder. One commit/wait produces resident `TargetLogits`; no
+vocabulary-sized host readback occurs. Encoding, command-buffer, and test-only
+KV-verifier failures restore the complete target-layer transaction. This does
+not yet execute the MTP transition, draft/verify loop, sampler, or final
+barrier, so it is not the complete 645-step token executor.
+
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
 active, appends retain all pre-branch Q4 pages and use the memory-plan boundary
@@ -615,8 +625,10 @@ dequantization array before this source was accepted.
   decode GQA, causal convolution, and FP16 recurrent GatedDeltaNet exist as
   verifier candidates. GQA release builds now keep only metadata plus packed
   device arenas, while tests retain an independent CPU oracle; neither attention
-  path has controlled performance evidence. The MTP block and sampling do not
-  exist yet. A deterministic shared decode arena and its single Metal buffer
+  path has controlled performance evidence. Target-side embedding through the
+  full LM head now executes in one command buffer; the MTP block and sampling
+  do not exist yet. A deterministic shared decode arena and its single Metal
+  buffer
   exist, and target-hidden plus per-owner linear-state checkpoint/restore is
   available together with bounded paged-KV rollback and one graph-wide atomic
   target+MTP state transaction. All 645 steps have real shared-buffer views;

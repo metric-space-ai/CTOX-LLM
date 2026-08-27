@@ -276,6 +276,14 @@ The 64-layer graph itself now also exposes a commit-free encoder stage returning
 the exact 16 KV append plans. Its existing transactional dispatcher is only a
 wrapper, so the Target-Core frontend and LM head can share the same final
 command buffer without duplicating any layer encoding logic.
+`dispatch_prepared_mapped_target_core` now uses that boundary to execute the
+recovered embedding, Layer-0 input RMSNorm, all 640 transformer-layer steps,
+and the full recovered target LM head in one compute encoder, one command
+buffer, and one wait. It keeps target logits resident for MTP, never reads the
+vocabulary tensor on the host, and treats all 16 KV caches plus all 48
+convolution/recurrent-state pairs as one rollback unit across encode, GPU, and
+test-verifier failures. The native MTP transition, draft/verify loop, sampling,
+and final barrier remain to be joined before this is a complete token executor.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first
