@@ -213,9 +213,11 @@ commit both checkpoint sets only after `qwen_greedy_mtp_verify` has written a
 four-u32 target/draft/accept/status record and the single completion wait
 validates it. The host no longer reads or compares separate selector buffers.
 Encoding, GPU, non-finite, alignment, and verifier failures restore both
-branches. This is one completion wait per pair; a four-candidate device branch,
-partial-prefix restore/replay, full-artifact device evidence, and production
-executor integration remain pending.
+branches. This is one completion wait per pair, but its compact result
+allocation and offset-safe verifier dispatch now retain four independent
+16-byte records for the eventual causal-prefix decision. The four-candidate
+device branch, partial-prefix restore/replay, full-artifact device evidence,
+and production executor integration remain pending.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

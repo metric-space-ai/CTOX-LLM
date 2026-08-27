@@ -62,6 +62,10 @@ const MAX_THREADS_PER_GROUP: usize = MAX_SIMDGROUPS_PER_THREADGROUP * 32;
 const DEFAULT_SIMDGROUPS: usize = 2;
 const ROWS_PER_SIMDGROUP: usize = 4;
 const METAL_PAGED_KV_DESCRIPTOR_BYTES: usize = 16;
+const METAL_GREEDY_MTP_RECORD_WORDS: usize = 4;
+const MAXIMUM_METAL_GREEDY_MTP_DRAFTS: usize = 4;
+const METAL_GREEDY_MTP_HISTORY_BYTES: usize =
+    MAXIMUM_METAL_GREEDY_MTP_DRAFTS * METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>();
 
 /// An explicitly verifier-only Metal runtime owning compiled MSL pipelines.
 ///
@@ -3852,7 +3856,36 @@ impl MetalCandidateRuntime {
         target: &PreparedMetalArgMaxScratch,
         draft: &PreparedMetalArgMaxScratch,
         result: &Buffer,
-    ) {
+    ) -> Result<()> {
+        self.encode_greedy_mtp_verify_at(encoder, target, draft, result, 0)
+    }
+
+    fn encode_greedy_mtp_verify_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        target: &PreparedMetalArgMaxScratch,
+        draft: &PreparedMetalArgMaxScratch,
+        result: &Buffer,
+        record_index: usize,
+    ) -> Result<()> {
+        if record_index >= MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
+            return Err(EngineError::InvalidState(format!(
+                "Metal greedy MTP record index {record_index} exceeds depth {MAXIMUM_METAL_GREEDY_MTP_DRAFTS}"
+            )));
+        }
+        let byte_offset = record_index
+            .checked_mul(METAL_GREEDY_MTP_RECORD_WORDS)
+            .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP record offset overflows".into()))?;
+        let byte_end = byte_offset
+            .checked_add(METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>())
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP record range overflows".into()))?;
+        if u64::try_from(byte_end).map_or(true, |required| required > result.length()) {
+            return Err(EngineError::MemoryBudget(format!(
+                "Metal greedy MTP record {record_index} exceeds {}-byte result buffer",
+                result.length()
+            )));
+        }
         encoder.set_compute_pipeline_state(&self.greedy_mtp_verify_pipeline);
         encoder.set_buffer(
             MetalGreedyMtpVerifyBufferAbi::TARGET as u64,
@@ -3867,7 +3900,7 @@ impl MetalCandidateRuntime {
         encoder.set_buffer(
             MetalGreedyMtpVerifyBufferAbi::RESULT as u64,
             Some(result),
-            0,
+            byte_offset as u64,
         );
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -3881,6 +3914,7 @@ impl MetalCandidateRuntime {
                 depth: 1,
             },
         );
+        Ok(())
     }
 
     fn read_argmax_result(&self, scratch: &PreparedMetalArgMaxScratch) -> Result<u32> {
@@ -3935,7 +3969,43 @@ impl MetalCandidateRuntime {
         result_buffer: &Buffer,
         vocabulary_rows: usize,
     ) -> Result<MetalGreedyMtpVerification> {
-        let result = unsafe { slice::from_raw_parts(result_buffer.contents().cast::<u32>(), 4) };
+        self.read_greedy_mtp_verification_block(result_buffer, 1, vocabulary_rows)?
+            .pop()
+            .ok_or_else(|| {
+                EngineError::InvalidState("Metal greedy MTP block lost its first record".into())
+            })
+    }
+
+    fn read_greedy_mtp_verification_at(
+        &self,
+        result_buffer: &Buffer,
+        record_index: usize,
+        vocabulary_rows: usize,
+    ) -> Result<MetalGreedyMtpVerification> {
+        if record_index >= MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
+            return Err(EngineError::InvalidState(format!(
+                "Metal greedy MTP record index {record_index} exceeds depth {MAXIMUM_METAL_GREEDY_MTP_DRAFTS}"
+            )));
+        }
+        let word_offset = record_index
+            .checked_mul(METAL_GREEDY_MTP_RECORD_WORDS)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP record offset overflows".into()))?;
+        let byte_end = word_offset
+            .checked_add(METAL_GREEDY_MTP_RECORD_WORDS)
+            .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal MTP record range overflows".into()))?;
+        if u64::try_from(byte_end).map_or(true, |required| required > result_buffer.length()) {
+            return Err(EngineError::MemoryBudget(format!(
+                "Metal greedy MTP record {record_index} exceeds {}-byte result buffer",
+                result_buffer.length()
+            )));
+        }
+        let result = unsafe {
+            slice::from_raw_parts(
+                result_buffer.contents().cast::<u32>().add(word_offset),
+                METAL_GREEDY_MTP_RECORD_WORDS,
+            )
+        };
         if result[3] != 0 {
             return Err(EngineError::InvalidArtifact(format!(
                 "Metal greedy MTP verification rejected selector status 0x{:08x}",
@@ -3967,6 +4037,24 @@ impl MetalCandidateRuntime {
             draft_token: result[1],
             accepted,
         })
+    }
+
+    fn read_greedy_mtp_verification_block(
+        &self,
+        result_buffer: &Buffer,
+        records: usize,
+        vocabulary_rows: usize,
+    ) -> Result<Vec<MetalGreedyMtpVerification>> {
+        if records == 0 || records > MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
+            return Err(EngineError::InvalidState(format!(
+                "Metal greedy MTP block has {records} records, expected 1..={MAXIMUM_METAL_GREEDY_MTP_DRAFTS}"
+            )));
+        }
+        (0..records)
+            .map(|record| {
+                self.read_greedy_mtp_verification_at(result_buffer, record, vocabulary_rows)
+            })
+            .collect()
     }
 
     /// Import the complete immutable CTOXQ mmap once through Metal shared
@@ -4856,7 +4944,7 @@ impl MetalCandidateRuntime {
         )?;
         let target_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
         let draft_selector = self.prepare_argmax_f32_scratch(draft_token_ids.len())?;
-        let verification_buffer = new_zeroed_buffer(&self.device, 4 * std::mem::size_of::<u32>())?;
+        let verification_buffer = new_zeroed_buffer(&self.device, METAL_GREEDY_MTP_HISTORY_BYTES)?;
         let workspace_plan = MetalMtpWorkspacePlan::qwen38(&config)?;
         let workspace = self.prepare_mtp_workspace(&workspace_plan)?;
 
@@ -12228,7 +12316,7 @@ impl MetalCandidateRuntime {
                 &mtp.draft_selector.result_buffer,
                 2 * std::mem::size_of::<u32>(),
             );
-            zero_buffer(&mtp.verification_buffer, 4 * std::mem::size_of::<u32>());
+            zero_buffer(&mtp.verification_buffer, METAL_GREEDY_MTP_HISTORY_BYTES);
 
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-initial-mtp-target-verifier");
@@ -12274,7 +12362,7 @@ impl MetalCandidateRuntime {
                     &mtp.target_selector,
                     &mtp.draft_selector,
                     &mtp.verification_buffer,
-                );
+                )?;
                 Ok(target_plans)
             })();
             encoder.end_encoding();
@@ -12376,7 +12464,7 @@ impl MetalCandidateRuntime {
                 &mtp.draft_selector.result_buffer,
                 2 * std::mem::size_of::<u32>(),
             );
-            zero_buffer(&mtp.verification_buffer, 4 * std::mem::size_of::<u32>());
+            zero_buffer(&mtp.verification_buffer, METAL_GREEDY_MTP_HISTORY_BYTES);
 
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-greedy-mtp-target-verifier");
@@ -12407,7 +12495,7 @@ impl MetalCandidateRuntime {
                     &mtp.target_selector,
                     &mtp.draft_selector,
                     &mtp.verification_buffer,
-                );
+                )?;
                 Ok(target_plans)
             })();
             encoder.end_encoding();
@@ -14527,7 +14615,9 @@ mod tests {
             zero_buffer(&result, 4 * std::mem::size_of::<u32>());
             let command_buffer = runtime.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            runtime.encode_greedy_mtp_verify(encoder, target, draft, &result);
+            runtime
+                .encode_greedy_mtp_verify(encoder, target, draft, &result)
+                .expect("encode greedy verification");
             encoder.end_encoding();
             command_buffer.commit();
             command_buffer.wait_until_completed();
@@ -14577,6 +14667,83 @@ mod tests {
             runtime.read_greedy_mtp_verification(&result, crate::tokenizer::TOKENIZER_VOCAB_SIZE,),
             Err(EngineError::InvalidArtifact(_))
         ));
+    }
+
+    #[test]
+    fn greedy_mtp_verification_retains_four_device_records() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let pairs = [
+            (101_u32, 101_u32),
+            (202_u32, 202_u32),
+            (303_u32, 313_u32),
+            (404_u32, 404_u32),
+        ];
+        let selectors: Vec<(PreparedMetalArgMaxScratch, PreparedMetalArgMaxScratch)> = pairs
+            .iter()
+            .map(|(target_token, draft_token)| {
+                let target = runtime
+                    .prepare_argmax_f32_scratch(4)
+                    .expect("target selector scratch");
+                let draft = runtime
+                    .prepare_argmax_f32_scratch(4)
+                    .expect("draft selector scratch");
+                write_buffer_range(
+                    &target.result_buffer,
+                    0,
+                    as_bytes(&[*target_token, 0]),
+                    2 * std::mem::size_of::<u32>(),
+                )
+                .expect("write target selector");
+                write_buffer_range(
+                    &draft.result_buffer,
+                    0,
+                    as_bytes(&[*draft_token, 0]),
+                    2 * std::mem::size_of::<u32>(),
+                )
+                .expect("write draft selector");
+                (target, draft)
+            })
+            .collect();
+        let history = new_zeroed_buffer(&runtime.device, METAL_GREEDY_MTP_HISTORY_BYTES)
+            .expect("greedy verification history");
+        let command_buffer = runtime.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        for (record, (target, draft)) in selectors.iter().enumerate() {
+            runtime
+                .encode_greedy_mtp_verify_at(encoder, target, draft, &history, record)
+                .expect("encode greedy history record");
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+
+        let block = runtime
+            .read_greedy_mtp_verification_block(
+                &history,
+                MAXIMUM_METAL_GREEDY_MTP_DRAFTS,
+                crate::tokenizer::TOKENIZER_VOCAB_SIZE,
+            )
+            .expect("read greedy verification block");
+        assert_eq!(block.len(), MAXIMUM_METAL_GREEDY_MTP_DRAFTS);
+        for (record, ((target_token, draft_token), verified)) in
+            pairs.into_iter().zip(block).enumerate()
+        {
+            assert_eq!(verified.target_token, target_token, "record {record}");
+            assert_eq!(verified.draft_token, draft_token, "record {record}");
+            assert_eq!(
+                verified.accepted,
+                target_token == draft_token,
+                "record {record}"
+            );
+        }
+        assert!(runtime
+            .read_greedy_mtp_verification_at(
+                &history,
+                MAXIMUM_METAL_GREEDY_MTP_DRAFTS,
+                crate::tokenizer::TOKENIZER_VOCAB_SIZE,
+            )
+            .is_err());
     }
 
     #[test]

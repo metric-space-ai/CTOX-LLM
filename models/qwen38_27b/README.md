@@ -336,6 +336,9 @@ device results and writes one four-word target/draft/accept/status record
 before the sole wait; both state graphs commit only if that record and the
 restored target-one-token-ahead contract validate, otherwise both roll back.
 This is still one completion wait per pair, not the final MTP4 speedup.
+The compact verifier allocation now reserves four fixed 16-byte records and
+can retain every target/draft/accept/status tuple of an MTP4 block without
+overwriting an earlier decision.
 Full-artifact same-device evidence, a four-candidate device branch,
 partial-prefix restore/replay, and production executor wiring remain pending.
 Every logical read and write of all 645 bound decode steps now resolves
