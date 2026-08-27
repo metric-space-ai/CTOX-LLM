@@ -1967,7 +1967,7 @@ void ctox_paged_q2q4_gqa_split_partial_f32_sm86(
     unsigned segments) {
     const CtoxPagedGqaParams params = *params_ptr;
     const unsigned lane = threadIdx.x;
-    if (query_tokens < 2u || query_tokens > 5u || segments == 0u
+    if (query_tokens == 0u || query_tokens > 5u || segments == 0u
         || segments > 32u || params.tokens < query_tokens
         || params.query_heads != 24u || params.key_value_heads != 4u
         || params.head_dim != 256u || params.page_tokens == 0u) {
@@ -2065,7 +2065,7 @@ void ctox_paged_q2q4_gqa_split_combine_f32_sm86(
     unsigned segments) {
     const CtoxPagedGqaParams params = *params_ptr;
     const unsigned lane = threadIdx.x;
-    if (query_tokens < 2u || query_tokens > 5u || segments == 0u
+    if (query_tokens == 0u || query_tokens > 5u || segments == 0u
         || segments > 32u || params.query_heads != 24u
         || params.head_dim != 256u) {
         return;
