@@ -679,6 +679,13 @@ struct MetalPagedGqaAppendPlan {
     verifier_update: MetalPagedKvUpdate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatedMetalFullAttentionLayer {
+    layer: usize,
+    component_values: usize,
+    thread_width: usize,
+}
+
 impl MetalPagedKvMetadata {
     fn new(
         maximum_tokens: usize,
@@ -9047,15 +9054,13 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
-    /// Execute one complete target full-attention layer through its exact ten
-    /// schedule views in one command encoder and one wait. CPU cache metadata
-    /// is planned before encoding; K/V projection output is consumed only by
-    /// later kernels in the same command buffer.
-    pub fn dispatch_prepared_mapped_full_attention_layer(
+    /// Validate one complete target full-attention layer before cache metadata
+    /// is advanced or any command is encoded.
+    fn validate_prepared_mapped_full_attention_layer(
         &self,
         steps: &[PreparedMetalDecodeStepView<'_>],
-        prepared: &mut PreparedMappedMetalFullAttentionLayer,
-    ) -> Result<()> {
+        prepared: &PreparedMappedMetalFullAttentionLayer,
+    ) -> Result<ValidatedMetalFullAttentionLayer> {
         const OPERATIONS: [MetalDecodeOperation; 10] = [
             MetalDecodeOperation::FullAttentionFanout,
             MetalDecodeOperation::QueryGateNormRope,
@@ -9243,6 +9248,23 @@ impl MetalCandidateRuntime {
             )));
         }
         let thread_width = dispatch_width(&self.partial_rope_pipeline, DEFAULT_SIMDGROUPS)?;
+        Ok(ValidatedMetalFullAttentionLayer {
+            layer,
+            component_values,
+            thread_width,
+        })
+    }
+
+    /// Execute one admitted target full-attention layer through its exact ten
+    /// schedule views in one command encoder and one wait. CPU cache metadata
+    /// is planned before encoding; K/V projection output is consumed only by
+    /// later kernels in the same command buffer.
+    pub fn dispatch_prepared_mapped_full_attention_layer(
+        &self,
+        steps: &[PreparedMetalDecodeStepView<'_>],
+        prepared: &mut PreparedMappedMetalFullAttentionLayer,
+    ) -> Result<()> {
+        let validated = self.validate_prepared_mapped_full_attention_layer(steps, prepared)?;
         prepared.attention.poisoned = true;
         let result = (|| {
             let plan = self.plan_paged_gqa_append(&mut prepared.attention)?;
@@ -9256,15 +9278,16 @@ impl MetalCandidateRuntime {
                 steps,
                 prepared,
                 &plan,
-                thread_width,
-                component_values,
+                validated.thread_width,
+                validated.component_values,
             )?;
             encoder.end_encoding();
             command_buffer.commit();
             command_buffer.wait_until_completed();
             if command_buffer.status() != MTLCommandBufferStatus::Completed {
                 return Err(EngineError::InvalidState(format!(
-                    "Metal full-attention layer {layer} ended with {:?}",
+                    "Metal full-attention layer {} ended with {:?}",
+                    validated.layer,
                     command_buffer.status()
                 )));
             }
@@ -9277,7 +9300,7 @@ impl MetalCandidateRuntime {
                             .verifier_key_snapshot_buffer
                             .contents()
                             .cast::<f32>(),
-                        component_values,
+                        validated.component_values,
                     )
                     .to_vec()
                 };
@@ -9288,7 +9311,7 @@ impl MetalCandidateRuntime {
                             .verifier_value_snapshot_buffer
                             .contents()
                             .cast::<f32>(),
-                        component_values,
+                        validated.component_values,
                     )
                     .to_vec()
                 };
@@ -9305,6 +9328,107 @@ impl MetalCandidateRuntime {
             prepared.attention.poisoned = false;
         }
         result
+    }
+
+    /// Validate the entire topology-ordered target layer set before a graph
+    /// encoder advances any cache metadata or touches persistent device state.
+    /// Every layer reuses the exact standalone admission contract, and all 64
+    /// owners must point at one canonical artifact mapping.
+    pub fn validate_prepared_mapped_target_layers(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &PreparedMappedMetalTargetLayers,
+    ) -> Result<()> {
+        let config = Qwen38Config::default();
+        if prepared.layers.len() != config.num_hidden_layers
+            || prepared.copied_model_bytes() != 0
+            || prepared.resident_state_bytes()? == 0
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target graph does not own one complete 64-layer state set".into(),
+            ));
+        }
+        let canonical_mapping = match &prepared.layers[0] {
+            PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                &layer.projections[0].mapping.inner
+            }
+            PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                &layer.fanout.projections[0].mapping.inner
+            }
+        };
+        let mut linear_layers = 0_usize;
+        let mut full_layers = 0_usize;
+        for (expected_layer, layer) in prepared.layers.iter().enumerate() {
+            if layer.layer() != expected_layer
+                || Some(layer.kind()) != config.layer_kind(expected_layer)
+            {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal target graph layer {expected_layer} has the wrong topology identity"
+                )));
+            }
+            match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    if !Rc::ptr_eq(&layer.projections[0].mapping.inner, canonical_mapping) {
+                        return Err(EngineError::InvalidState(format!(
+                            "Metal target graph linear layer {expected_layer} uses a different artifact mapping"
+                        )));
+                    }
+                    let steps = program.linear_attention_layer_steps(expected_layer)?;
+                    let validated = self.validate_mapped_linear_attention_layer_views(
+                        steps,
+                        [
+                            &layer.projections[0],
+                            &layer.projections[1],
+                            &layer.projections[2],
+                            &layer.projections[3],
+                        ],
+                        &layer.convolution,
+                        &layer.gated_delta_prepare,
+                        &layer.recurrence,
+                        &layer.gated_rms_norm,
+                        &layer.linear_output_projection,
+                        &layer.residual_rms_norm,
+                        [&layer.ffn_gate_up[0], &layer.ffn_gate_up[1]],
+                        &layer.swiglu_down,
+                        &layer.post_ffn_residual_rms_norm,
+                    )?;
+                    if validated != expected_layer {
+                        return Err(EngineError::InvalidState(format!(
+                            "Metal target graph linear layer {expected_layer} validated as {validated}"
+                        )));
+                    }
+                    linear_layers += 1;
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    if !Rc::ptr_eq(
+                        &layer.fanout.projections[0].mapping.inner,
+                        canonical_mapping,
+                    ) {
+                        return Err(EngineError::InvalidState(format!(
+                            "Metal target graph full-attention layer {expected_layer} uses a different artifact mapping"
+                        )));
+                    }
+                    let steps = program.full_attention_layer_steps(expected_layer)?;
+                    let validated =
+                        self.validate_prepared_mapped_full_attention_layer(steps, layer)?;
+                    if validated.layer != expected_layer {
+                        return Err(EngineError::InvalidState(format!(
+                            "Metal target graph full-attention layer {expected_layer} validated as {}",
+                            validated.layer
+                        )));
+                    }
+                    full_layers += 1;
+                }
+            }
+        }
+        if linear_layers != config.linear_attention_layers()
+            || full_layers != config.full_attention_layers()
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal target graph has {linear_layers} linear and {full_layers} full-attention layers"
+            )));
+        }
+        Ok(())
     }
 
     fn encode_prepared_mapped_full_attention_layer(
@@ -9462,26 +9586,23 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
-    /// Execute one complete frozen linear-attention transformer layer from an
-    /// already-normalized shared-arena input. The ten bound schedule views are
-    /// reusable for every linear layer; immutable tensors remain mmap-backed,
-    /// stateful resources must have active device checkpoints, and no
-    /// activation is copied through the host.
+    /// Validate one complete frozen linear-attention transformer layer before
+    /// any command is encoded or persistent state is mutated.
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_mapped_linear_attention_layer_views(
+    fn validate_mapped_linear_attention_layer_views(
         &self,
         steps: &[PreparedMetalDecodeStepView<'_>],
         projections: [&PreparedMappedMetalMatVec; 4],
-        convolution: &mut PreparedMappedMetalCausalConv,
+        convolution: &PreparedMappedMetalCausalConv,
         gated_delta_prepare: &PreparedMappedMetalGatedDeltaPrepare,
-        recurrence: &mut PreparedMetalGatedDelta,
+        recurrence: &PreparedMetalGatedDelta,
         gated_rms_norm: &PreparedMappedMetalGatedRmsNorm,
         linear_output_projection: &PreparedMappedMetalMatVec,
         residual_rms_norm: &PreparedMappedMetalRmsNorm,
         ffn_gate_up: [&PreparedMappedMetalMatVec; 2],
         swiglu_down: &PreparedMappedMetalMatVec,
         post_ffn_residual_rms_norm: &PreparedMappedMetalRmsNorm,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         const OPERATIONS: [MetalDecodeOperation; 10] = [
             MetalDecodeOperation::LinearFanout,
             MetalDecodeOperation::CausalConvolution,
@@ -9617,8 +9738,6 @@ impl MetalCandidateRuntime {
             || convolution.input_buffer.is_some()
             || convolution.output_buffer.is_some()
             || recurrence.has_owned_io()
-            || !convolution.checkpoint_valid
-            || !recurrence.checkpoint_valid
             || recurrence.config != MetalGatedDeltaConfig::QWEN38_27B
             || gated_rms_norm.has_owned_io()
             || residual_rms_norm.input_buffer.is_some()
@@ -9712,6 +9831,45 @@ impl MetalCandidateRuntime {
             ));
         }
 
+        Ok(layer)
+    }
+
+    /// Execute one admitted linear-attention layer in one command encoder and
+    /// one wait. The separate validator is reusable by the complete graph
+    /// encoder before it mutates any of the 64 layer states.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_mapped_linear_attention_layer_views(
+        &self,
+        steps: &[PreparedMetalDecodeStepView<'_>],
+        projections: [&PreparedMappedMetalMatVec; 4],
+        convolution: &mut PreparedMappedMetalCausalConv,
+        gated_delta_prepare: &PreparedMappedMetalGatedDeltaPrepare,
+        recurrence: &mut PreparedMetalGatedDelta,
+        gated_rms_norm: &PreparedMappedMetalGatedRmsNorm,
+        linear_output_projection: &PreparedMappedMetalMatVec,
+        residual_rms_norm: &PreparedMappedMetalRmsNorm,
+        ffn_gate_up: [&PreparedMappedMetalMatVec; 2],
+        swiglu_down: &PreparedMappedMetalMatVec,
+        post_ffn_residual_rms_norm: &PreparedMappedMetalRmsNorm,
+    ) -> Result<()> {
+        let layer = self.validate_mapped_linear_attention_layer_views(
+            steps,
+            projections,
+            convolution,
+            gated_delta_prepare,
+            recurrence,
+            gated_rms_norm,
+            linear_output_projection,
+            residual_rms_norm,
+            ffn_gate_up,
+            swiglu_down,
+            post_ffn_residual_rms_norm,
+        )?;
+        if !convolution.checkpoint_valid || !recurrence.checkpoint_valid {
+            return Err(EngineError::InvalidState(format!(
+                "Metal linear layer {layer} requires active device checkpoints"
+            )));
+        }
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-linear-layer");
         let encoder = command_buffer.new_compute_command_encoder();
@@ -14236,6 +14394,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn target_layer_validator_rejects_partial_graph_before_state_mutation() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let config = Qwen38Config::default();
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let projections = MetalProjectionPlan::qwen38(&config).expect("Metal projection plan");
+        let bindings = MetalDecodeBindingPlan::qwen38(&schedule, &projections, &config)
+            .expect("Metal binding plan");
+        let workspace_plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("Metal workspace plan");
+        let workspace = runtime
+            .prepare_decode_workspace(&workspace_plan)
+            .expect("allocate Metal workspace");
+        let program = workspace
+            .bind_decode_program(&bindings)
+            .expect("bind Metal decode program");
+        let partial = PreparedMappedMetalTargetLayers { layers: Vec::new() };
+        assert!(runtime
+            .validate_prepared_mapped_target_layers(&program, &partial)
+            .is_err());
+        assert!(partial.is_empty());
+        assert_eq!(partial.copied_model_bytes(), 0);
     }
 
     #[test]

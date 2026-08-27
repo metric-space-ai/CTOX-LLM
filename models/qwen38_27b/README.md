@@ -256,6 +256,11 @@ command encoding: their internal encoder functions append all ten operations
 to a caller-owned compute encoder, while the existing public verifier wrappers
 retain the one-layer commit/wait boundary. This removes the architectural need
 for 64 per-layer command buffers in the forthcoming complete target executor.
+The target owner also has one graph-wide preflight that walks all 64 bound
+schedule slices, reuses both exact layer validators, proves layer order and the
+48/16 split, and requires every resource to reference the same mmap identity.
+An empty, partial, reordered, or cross-artifact graph is rejected before cache
+metadata or persistent device state can change.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

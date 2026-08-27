@@ -114,6 +114,11 @@ stage; the encoder-only functions append the frozen ten operations to a
 caller-owned compute encoder and never commit or wait themselves. Standalone
 Golden wrappers still commit once per layer, while the model executor can reuse
 the same code to encode all target layers into one command buffer.
+`validate_prepared_mapped_target_layers` performs the model-wide admission pass
+over all 64 schedule slices. It invokes the exact per-kind validator, checks
+canonical layer indices and the 48/16 topology, uses checked aggregate state
+accounting, and rejects cross-artifact owners. Device checkpoint readiness is
+kept as an execution concern, so this preflight itself performs no mutation.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
