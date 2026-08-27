@@ -9712,6 +9712,65 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    fn encode_prepared_mapped_target_layers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetLayers,
+    ) -> Result<Vec<(usize, MetalPagedGqaAppendPlan)>> {
+        if !prepared.transaction_active {
+            return Err(EngineError::InvalidState(
+                "Metal target graph encoding requires an active state transaction".into(),
+            ));
+        }
+        let mut full_plans = Vec::with_capacity(Qwen38Config::default().full_attention_layers());
+        for (layer_index, layer) in prepared.layers.iter_mut().enumerate() {
+            match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    let steps = program.linear_attention_layer_steps(layer_index)?;
+                    self.encode_mapped_linear_attention_layer_views(
+                        encoder,
+                        steps,
+                        [
+                            &layer.projections[0],
+                            &layer.projections[1],
+                            &layer.projections[2],
+                            &layer.projections[3],
+                        ],
+                        &mut layer.convolution,
+                        &layer.gated_delta_prepare,
+                        &mut layer.recurrence,
+                        &layer.gated_rms_norm,
+                        &layer.linear_output_projection,
+                        &layer.residual_rms_norm,
+                        [&layer.ffn_gate_up[0], &layer.ffn_gate_up[1]],
+                        &layer.swiglu_down,
+                        &layer.post_ffn_residual_rms_norm,
+                    )?;
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    let steps = program.full_attention_layer_steps(layer_index)?;
+                    let validated =
+                        self.validate_prepared_mapped_full_attention_layer(steps, layer)?;
+                    layer.attention.poisoned = true;
+                    let plan = self.plan_paged_gqa_append(&mut layer.attention)?;
+                    write_metal_paged_gqa_descriptors(&layer.attention)?;
+                    write_metal_paged_gqa_params(&layer.attention)?;
+                    self.encode_prepared_mapped_full_attention_layer(
+                        encoder,
+                        steps,
+                        layer,
+                        &plan,
+                        validated.thread_width,
+                        validated.component_values,
+                    )?;
+                    full_plans.push((layer_index, plan));
+                }
+            }
+        }
+        Ok(full_plans)
+    }
+
     /// Execute all 64 target transformer layers in topology order through one
     /// shared activation arena, one compute encoder, one command buffer, and
     /// one completion wait. Persistent KV/convolution/recurrent state is
@@ -9727,63 +9786,21 @@ impl MetalCandidateRuntime {
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-complete-target-layers");
         let encoder = command_buffer.new_compute_command_encoder();
-        let mut full_plans = Vec::with_capacity(Qwen38Config::default().full_attention_layers());
-        let encoded = (|| {
-            for (layer_index, layer) in prepared.layers.iter_mut().enumerate() {
-                match layer {
-                    PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
-                        let steps = program.linear_attention_layer_steps(layer_index)?;
-                        self.encode_mapped_linear_attention_layer_views(
-                            encoder,
-                            steps,
-                            [
-                                &layer.projections[0],
-                                &layer.projections[1],
-                                &layer.projections[2],
-                                &layer.projections[3],
-                            ],
-                            &mut layer.convolution,
-                            &layer.gated_delta_prepare,
-                            &mut layer.recurrence,
-                            &layer.gated_rms_norm,
-                            &layer.linear_output_projection,
-                            &layer.residual_rms_norm,
-                            [&layer.ffn_gate_up[0], &layer.ffn_gate_up[1]],
-                            &layer.swiglu_down,
-                            &layer.post_ffn_residual_rms_norm,
-                        )?;
-                    }
-                    PreparedMappedMetalTargetLayer::FullAttention(layer) => {
-                        let steps = program.full_attention_layer_steps(layer_index)?;
-                        let validated =
-                            self.validate_prepared_mapped_full_attention_layer(steps, layer)?;
-                        layer.attention.poisoned = true;
-                        let plan = self.plan_paged_gqa_append(&mut layer.attention)?;
-                        write_metal_paged_gqa_descriptors(&layer.attention)?;
-                        write_metal_paged_gqa_params(&layer.attention)?;
-                        self.encode_prepared_mapped_full_attention_layer(
-                            encoder,
-                            steps,
-                            layer,
-                            &plan,
-                            validated.thread_width,
-                            validated.component_values,
-                        )?;
-                        full_plans.push((layer_index, plan));
-                    }
-                }
-            }
-            Ok(())
-        })();
-        if let Err(primary) = encoded {
-            encoder.end_encoding();
-            return match prepared.restore_speculative(self) {
-                Ok(()) => Err(primary),
-                Err(rollback) => Err(EngineError::InvalidState(format!(
+        let full_plans = match self.encode_prepared_mapped_target_layers(encoder, program, prepared)
+        {
+            Ok(plans) => plans,
+            Err(primary) => {
+                encoder.end_encoding();
+                return match prepared.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
                     "Metal target graph encoding failed ({primary}) and rollback failed: {rollback}"
                 ))),
-            };
-        }
+                };
+            }
+        };
+        #[cfg(not(test))]
+        let _ = &full_plans;
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();

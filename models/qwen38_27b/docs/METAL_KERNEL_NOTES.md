@@ -132,6 +132,11 @@ Layer-0 input RMSNorm, all 64 target layers, and `lm_head.weight` from one
 canonical mapping. It rejects any vocabulary/hidden-size mismatch, owned graph
 I/O buffer, tensor-identity drift, or cross-artifact resource and never returns
 a partial core.
+The 64-layer implementation is split once more at the graph boundary:
+`encode_prepared_mapped_target_layers` appends all layer kernels to a supplied
+encoder and returns the 16 append plans without committing or waiting. The
+public layer-graph dispatcher now wraps that primitive with transaction,
+completion, verifier, and rollback handling.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

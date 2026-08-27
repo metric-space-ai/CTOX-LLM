@@ -272,6 +272,10 @@ around this target-layer core before it is a complete token executor.
 the canonical embedding table, Layer-0 input norm, ordered 64-layer owner, and
 full LM head. All four sections must have exact frozen dimensions and one mmap
 identity; construction is all-or-nothing and reports zero copied model bytes.
+The 64-layer graph itself now also exposes a commit-free encoder stage returning
+the exact 16 KV append plans. Its existing transactional dispatcher is only a
+wrapper, so the Target-Core frontend and LM head can share the same final
+command buffer without duplicating any layer encoding logic.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first
