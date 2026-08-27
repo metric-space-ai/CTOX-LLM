@@ -567,6 +567,16 @@ pub struct MetalGreedyMtpPrefix {
     pub verified_records: u32,
 }
 
+/// Result of one four-record Metal MTP branch. A fully accepted branch is
+/// already committed. Any shorter prefix has been restored to the state after
+/// record zero; `records` then supplies the exact compact replay contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGreedyMtp4Branch {
+    pub prefix: MetalGreedyMtpPrefix,
+    pub records: [MetalGreedyMtpVerification; MAXIMUM_METAL_GREEDY_MTP_DRAFTS],
+    pub branch_committed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetalTargetCheckpointKind {
     FullAttention,
@@ -11916,6 +11926,33 @@ impl MetalCandidateRuntime {
         }
     }
 
+    fn restore_mapped_greedy_mtp_selectors(
+        &self,
+        mtp: &PreparedMappedMetalMtpCore,
+        verification: MetalGreedyMtpVerification,
+    ) -> Result<()> {
+        let target = [verification.target_token, 0];
+        let draft = [verification.draft_token, 0];
+        write_buffer_range(
+            &mtp.target_selector.result_buffer,
+            0,
+            as_bytes(&target),
+            2 * std::mem::size_of::<u32>(),
+        )?;
+        write_buffer_range(
+            &mtp.draft_selector.result_buffer,
+            0,
+            as_bytes(&draft),
+            2 * std::mem::size_of::<u32>(),
+        )?;
+        write_buffer_range(
+            &mtp.candidate_selector.result_buffer,
+            0,
+            as_bytes(&draft),
+            2 * std::mem::size_of::<u32>(),
+        )
+    }
+
     fn validate_prepared_mapped_mtp_frontend<'program, 'arena>(
         &self,
         program: &'program PreparedMetalDecodeProgram<'arena>,
@@ -13000,6 +13037,199 @@ impl MetalCandidateRuntime {
                 Ok(()) => Err(primary),
                 Err(rollback) => Err(EngineError::InvalidState(format!(
                     "Metal joint target/MTP verification failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            },
+        }
+    }
+
+    /// Queue the remaining three records of a greedy MTP4 block behind one
+    /// already accepted initial record. Draft, target, verification, and
+    /// prefix reduction stay in one command buffer and incur one completion
+    /// wait. Full acceptance commits all three causal transitions. A shorter
+    /// prefix restores the complete tail transaction and resets compact
+    /// selectors to record zero; the returned records are then the bounded
+    /// replay contract for committing only the accepted tail.
+    pub fn dispatch_prepared_mapped_greedy_mtp4_tail_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+    ) -> Result<MetalGreedyMtp4Branch> {
+        let mtp_step = self.validate_prepared_mapped_mtp_frontend(program, mtp)?;
+        let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(mtp)?;
+        let [embedding, initial_norm, target_lm_head] =
+            self.validate_prepared_mapped_target_core(program, target)?;
+        let target_tokens = target.cached_tokens()?;
+        let mtp_tokens = mtp.cached_tokens();
+        let previous =
+            self.read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
+        if target_tokens == 0
+            || target_tokens != mtp_tokens.saturating_add(1)
+            || !previous.accepted
+            || mtp.target_selector.values != target.vocabulary_rows()
+            || !Rc::ptr_eq(
+                &target.embedding.mapping.inner,
+                &mtp.embedding.mapping.inner,
+            )
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal MTP4 tail requires one accepted canonical target-one-ahead record, observed accepted={} and target/MTP tokens {target_tokens}/{mtp_tokens}",
+                previous.accepted
+            )));
+        }
+
+        target.layers.begin_speculative(self)?;
+        if let Err(primary) = mtp.layer.attention.begin_speculative() {
+            return match self.restore_mapped_greedy_mtp_target(target, mtp) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal MTP4 checkpoint failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            };
+        }
+
+        let result = (|| {
+            zero_buffer(
+                &mtp.prefix_result_buffer,
+                METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>(),
+            );
+            let prefix_params = MetalGreedyMtpPrefixParams {
+                records: MAXIMUM_METAL_GREEDY_MTP_DRAFTS as u32,
+                vocabulary_rows: u32::try_from(target.vocabulary_rows())
+                    .map_err(|_| EngineError::Shape("Metal MTP4 vocabulary exceeds u32".into()))?,
+                reserved0: 0,
+                reserved1: 0,
+            };
+            let command_buffer = self.queue.new_command_buffer();
+            command_buffer.set_label("ctox-qwen38-greedy-mtp4-tail-verifier");
+            let encoder = command_buffer.new_compute_command_encoder();
+            let mut mtp_dispatches = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS - 1);
+            let mut target_dispatches = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS - 1);
+            let encoded = (|| {
+                for record_index in 1..MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
+                    let mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
+                    mtp.layer.attention.poisoned = true;
+                    self.encode_copy_argmax_result(
+                        encoder,
+                        &mtp.draft_selector,
+                        &mtp.candidate_selector,
+                    )?;
+                    self.encode_prepared_mapped_mtp_draft_from_selector(
+                        encoder,
+                        mtp_step,
+                        mtp,
+                        &mtp.candidate_selector,
+                        &mtp_dispatch,
+                        component_values,
+                        thread_width,
+                    )?;
+                    let target_plans = self.encode_prevalidated_mapped_target_core_from_selector(
+                        encoder,
+                        program,
+                        target,
+                        &mtp.candidate_selector,
+                        embedding,
+                        initial_norm,
+                        target_lm_head,
+                    )?;
+                    self.encode_argmax_f32_at(
+                        encoder,
+                        target_lm_head.writes()[0].buffer(),
+                        target_lm_head.writes()[0].offset(),
+                        &mtp.target_selector,
+                    );
+                    self.encode_greedy_mtp_verify_at(
+                        encoder,
+                        &mtp.target_selector,
+                        &mtp.draft_selector,
+                        &mtp.verification_buffer,
+                        record_index,
+                    )?;
+                    mtp_dispatches.push(mtp_dispatch);
+                    target_dispatches.push(target_plans);
+                }
+                self.encode_greedy_mtp_prefix(
+                    encoder,
+                    &mtp.verification_buffer,
+                    &mtp.target_selector,
+                    &mtp.prefix_result_buffer,
+                    &mtp.prefix_params_buffer,
+                    prefix_params,
+                )
+            })();
+            encoder.end_encoding();
+            encoded?;
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal MTP4 tail command ended with {:?}",
+                    command_buffer.status()
+                )));
+            }
+
+            for dispatch in &mtp_dispatches {
+                self.validate_completed_mapped_mtp_layer(mtp, dispatch, component_values)?;
+            }
+            for plans in &target_dispatches {
+                self.validate_completed_mapped_target_core(target, plans)?;
+            }
+            let records = self.read_greedy_mtp_verification_block(
+                &mtp.verification_buffer,
+                MAXIMUM_METAL_GREEDY_MTP_DRAFTS,
+                target.vocabulary_rows(),
+            )?;
+            let records: [MetalGreedyMtpVerification; MAXIMUM_METAL_GREEDY_MTP_DRAFTS] =
+                records.try_into().map_err(|_| {
+                    EngineError::InvalidState("Metal MTP4 verifier lost one record".into())
+                })?;
+            if records[0] != previous {
+                return Err(EngineError::InvalidState(
+                    "Metal MTP4 tail modified its admitted initial record".into(),
+                ));
+            }
+            let prefix = self.read_greedy_mtp_prefix(
+                &mtp.prefix_result_buffer,
+                MAXIMUM_METAL_GREEDY_MTP_DRAFTS,
+                target.vocabulary_rows(),
+            )?;
+            if prefix.accepted_prefix == 0
+                || target.cached_tokens()? != mtp.cached_tokens().saturating_add(1)
+                || !target.layers.commit_ready()
+                || mtp.layer.attention.poisoned
+                || mtp.layer.attention.speculative_checkpoint.is_none()
+            {
+                return Err(EngineError::InvalidState(
+                    "Metal MTP4 completion broke prefix, one-ahead, or commit readiness".into(),
+                ));
+            }
+            let branch_committed =
+                prefix.accepted_prefix as usize == MAXIMUM_METAL_GREEDY_MTP_DRAFTS;
+            if branch_committed {
+                target.layers.commit_speculative()?;
+                mtp.layer.attention.commit_speculative()?;
+            } else {
+                self.restore_mapped_greedy_mtp_target(target, mtp)?;
+                self.restore_mapped_greedy_mtp_selectors(mtp, previous)?;
+            }
+            Ok(MetalGreedyMtp4Branch {
+                prefix,
+                records,
+                branch_committed,
+            })
+        })();
+
+        match result {
+            Ok(branch) => Ok(branch),
+            Err(primary) => match self.restore_mapped_greedy_mtp_target(target, mtp) {
+                Ok(()) => match self.restore_mapped_greedy_mtp_selectors(mtp, previous) {
+                    Ok(()) => Err(primary),
+                    Err(selector_rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal MTP4 tail failed ({primary}) and selector rollback failed: {selector_rollback}"
+                    ))),
+                },
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal MTP4 tail failed ({primary}) and rollback failed: {rollback}"
                 ))),
             },
         }

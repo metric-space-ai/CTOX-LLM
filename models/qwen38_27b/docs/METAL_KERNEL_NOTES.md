@@ -218,9 +218,13 @@ allocation and offset-safe verifier dispatch now retain four independent
 16-byte records for the causal-prefix decision. A one-lane
 `qwen_greedy_mtp_prefix` kernel validates all records, returns the accepted
 prefix, and selects the first mismatching target token or the final resident
-bonus token without separate selector reads. The four-candidate device branch,
-partial-prefix restore/replay, full-artifact device evidence, and production
-executor integration remain pending.
+bonus token without separate selector reads. The native MTP4 tail dispatcher
+now queues records 1–3 plus that reduction in one command buffer after the
+accepted initial record. Full acceptance commits the three-step state branch;
+partial acceptance restores the entire tail and returns four exact replay
+records while resetting selectors to record zero. Accepted-prefix replay,
+full-artifact device evidence, eliminating the initial-record wait, and
+production executor integration remain pending.
 
 The continuation path now preserves each canonical mapped draft in a distinct
 full-vocabulary candidate selector with a two-word device copy before the

@@ -311,8 +311,7 @@ entry point, and state commits only after GPU completion plus compact selector
 status validation. `dispatch_prepared_mapped_initial_mtp_target_verifier`
 forms the causally aligned first speculative pair: MTP and target both consume
 the same real input token, while MTP reads the retained pre-target hidden state
-before the target transition overwrites the main arena. Chained MTP4 remains
-separate work.
+before the target transition overwrites the main arena.
 A native f32 concatenate kernel now also joins the normalized selected-token
 embedding and retained target hidden state directly in caller-owned Metal
 storage. A dedicated liveness-derived MTP arena backs the complete frontend in
@@ -335,7 +334,13 @@ draft was accepted. `qwen_greedy_mtp_verify` compares the two new compact
 device results and writes one four-word target/draft/accept/status record
 before the sole wait; both state graphs commit only if that record and the
 restored target-one-token-ahead contract validate, otherwise both roll back.
-This is still one completion wait per pair, not the final MTP4 speedup.
+`dispatch_prepared_mapped_greedy_mtp4_tail_verifier` now queues records 1–3,
+their target verification, and the four-record prefix reduction in one command
+buffer after the accepted initial record. A 4/4 branch commits atomically. A
+shorter prefix restores every target/MTP tail state and the compact selectors
+to record zero, returning the exact fixed-size records needed by the bounded
+accepted-prefix replay path. Wiring that replay into the production executor
+and eliminating the separate initial-record wait remain open.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those
