@@ -92,7 +92,10 @@ language strata pass independent train/evaluation gates. The earlier v3
 candidate is retained only as superseded evidence because its Nemotron-v1
 `chat` portion contained empty user turns. Five verified teacher batches cover
 593 final identities; the missing 1,735 BF16/MTP targets, end-to-end recovery,
-and held-out model-quality gates remain pending.
+and held-out model-quality gates remain pending. The resumable missing-cache
+run has verified batches 0–13, bringing current final-corpus coverage to
+2,111/2,328 identities; batch 14 is active on GPU1+2 and 217 identities remain
+as of 2026-08-27.
 
 The exact final-cache subtraction and disk-admitted execution plan are frozen
 in [`docs/TEACHER_CACHE_FINAL_PLAN_V1.json`](docs/TEACHER_CACHE_FINAL_PLAN_V1.json).

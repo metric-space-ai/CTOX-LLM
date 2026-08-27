@@ -38,10 +38,10 @@ not fit. The MTP correction is recorded in
 correction in `models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V4.json`. Likewise,
 the planned 9.6976-GiB vision phase is not yet Android device evidence.
 
-The five reused release teacher-cache batches plus missing-plan batches 0-10
-currently cover 1,796 of the 2,328 final training identities. Every reusable
+The five reused release teacher-cache batches plus missing-plan batches 0-13
+currently cover 2,111 of the 2,328 final training identities. Every reusable
 identity is content-bound to the same BF16 teacher revision and provenance.
-Batch 11 is active on GPU1+2; 532 records remain at the 2026-08-26 snapshot.
+Batch 14 is active on GPU1+2; 217 records remain at the 2026-08-27 snapshot.
 No smoke cache or failed/OOM directory counts toward those numbers.
 
 The exact missing cohort and its 16-batch execution plan are frozen in
@@ -95,9 +95,9 @@ These constraints apply to every phase:
 
 ## Phase 1: freeze the recovery corpus and finish teacher evidence
 
-**Status:** corpus selection and held-out disjointness are complete; 1,796 of
-2,328 final teacher identities are verified as of 2026-08-26. Batch 11 of the
-missing-cache plan is active; 532 identities remain.
+**Status:** corpus selection and held-out disjointness are complete; 2,111 of
+2,328 final teacher identities are verified as of 2026-08-27. Batch 14 of the
+missing-cache plan is active; 217 identities remain.
 
 **Work**
 
