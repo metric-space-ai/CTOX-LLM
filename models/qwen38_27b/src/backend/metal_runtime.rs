@@ -496,6 +496,16 @@ pub struct PreparedMappedMetalTargetLayers {
     poisoned: bool,
 }
 
+/// Closed no-copy resource owner for target embedding, initial norm, all 64
+/// transformer layers, and the full target LM head. MTP remains a separate
+/// resource package until its native Metal draft/verify graph is complete.
+pub struct PreparedMappedMetalTargetCore {
+    embedding: PreparedMappedMetalEmbedding,
+    initial_norm: PreparedMappedMetalRmsNorm,
+    layers: PreparedMappedMetalTargetLayers,
+    lm_head: PreparedMappedMetalMatVec,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetalTargetCheckpointKind {
     FullAttention,
@@ -2372,6 +2382,41 @@ impl PreparedMappedMetalTargetLayers {
     }
 }
 
+impl PreparedMappedMetalTargetCore {
+    pub fn copied_model_bytes(&self) -> u64 {
+        self.embedding.copied_model_bytes()
+            + self.initial_norm.copied_model_bytes()
+            + self.layers.copied_model_bytes()
+            + self.lm_head.copied_model_bytes()
+    }
+
+    pub fn resident_state_bytes(&self) -> Result<usize> {
+        self.layers.resident_state_bytes()
+    }
+
+    pub fn target_layers(&self) -> &PreparedMappedMetalTargetLayers {
+        &self.layers
+    }
+
+    pub fn target_layers_mut(&mut self) -> &mut PreparedMappedMetalTargetLayers {
+        &mut self.layers
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        self.layers.write_position(position)
+    }
+
+    pub fn vocabulary_rows(&self) -> usize {
+        debug_assert_eq!(self.embedding.rows, self.lm_head.rows);
+        self.lm_head.rows
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        debug_assert_eq!(self.embedding.columns, self.initial_norm.columns);
+        self.initial_norm.columns
+    }
+}
+
 impl PreparedMappedMetalQueryGate {
     pub fn layer(&self) -> usize {
         self.layer
@@ -4029,6 +4074,76 @@ impl MetalCandidateRuntime {
             layers,
             transaction_active: false,
             poisoned: false,
+        })
+    }
+
+    /// Load the complete target-side model core from one admitted CTOXQ mmap.
+    /// A missing or mismatched frontend, layer, or LM-head tensor drops every
+    /// resource already created and returns no partial core.
+    pub fn prepare_mapped_target_core(
+        &self,
+        mapping: &MappedMetalArtifact,
+        position: u64,
+        cache: MetalPagedGqaConfig,
+    ) -> Result<PreparedMappedMetalTargetCore> {
+        let config = Qwen38Config::default();
+        let embedding = self.prepare_mapped_embedding_graph_output(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .recovered_matrix("model.language_model.embed_tokens.weight")?,
+        )?;
+        let validation_hidden = vec![0.0_f32; config.hidden_size];
+        let initial_norm = self.prepare_mapped_rms_norm_1p_graph_io(
+            mapping,
+            mapping
+                .inner
+                .artifact
+                .float_tensor("model.language_model.layers.0.input_layernorm.weight")?,
+            &validation_hidden,
+            1,
+            config.hidden_size,
+            config.rms_norm_epsilon,
+        )?;
+        let layers = self.prepare_all_mapped_target_layers(mapping, position, cache)?;
+        let lm_head = self.prepare_named_mapped_projection_graph_io(mapping, "lm_head.weight")?;
+        let canonical = &mapping.inner;
+        if embedding.rows != config.vocab_size
+            || embedding.columns != config.hidden_size
+            || embedding.output_buffer.is_some()
+            || initial_norm.rows != 1
+            || initial_norm.columns != config.hidden_size
+            || initial_norm.input_buffer.is_some()
+            || initial_norm.output_buffer.is_some()
+            || lm_head.rows != config.vocab_size
+            || lm_head.columns != config.hidden_size
+            || lm_head.input_buffer.is_some()
+            || lm_head.output_buffer.is_some()
+            || !Rc::ptr_eq(&embedding.mapping.inner, canonical)
+            || !Rc::ptr_eq(&initial_norm.mapping.inner, canonical)
+            || !Rc::ptr_eq(&lm_head.mapping.inner, canonical)
+            || layers.layers.iter().any(|layer| match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    !Rc::ptr_eq(&layer.projections[0].mapping.inner, canonical)
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    !Rc::ptr_eq(&layer.fanout.projections[0].mapping.inner, canonical)
+                }
+            })
+            || !lm_head.matches_recovered_tensor("lm_head.weight")?
+            || !initial_norm
+                .matches_weight_tensor("model.language_model.layers.0.input_layernorm.weight")?
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target core resources are not one canonical frozen model".into(),
+            ));
+        }
+        Ok(PreparedMappedMetalTargetCore {
+            embedding,
+            initial_norm,
+            layers,
+            lm_head,
         })
     }
 
@@ -12657,6 +12772,21 @@ mod tests {
             .is_err());
         assert!(runtime
             .prepare_all_mapped_target_layers(
+                &mapping,
+                0,
+                MetalPagedGqaConfig {
+                    query_heads: config.num_attention_heads,
+                    key_value_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                    maximum_tokens: 8,
+                    page_tokens: 2,
+                    sink_tokens: 2,
+                    recent_tokens: 2,
+                },
+            )
+            .is_err());
+        assert!(runtime
+            .prepare_mapped_target_core(
                 &mapping,
                 0,
                 MetalPagedGqaConfig {

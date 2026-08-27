@@ -268,6 +268,10 @@ compute encoder. It performs exactly one graph command-buffer commit and wait;
 any encode, GPU, or verifier failure restores the complete state transaction.
 Embedding, the final target head, and MTP verification still have to be joined
 around this target-layer core before it is a complete token executor.
+`PreparedMappedMetalTargetCore` now closes the target-side load boundary around
+the canonical embedding table, Layer-0 input norm, ordered 64-layer owner, and
+full LM head. All four sections must have exact frozen dimensions and one mmap
+identity; construction is all-or-nothing and reports zero copied model bytes.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first
