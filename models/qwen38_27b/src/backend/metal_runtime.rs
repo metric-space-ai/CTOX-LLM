@@ -502,6 +502,8 @@ pub struct PreparedMappedMetalFullAttentionLayer {
     ffn_gate_up: [PreparedMappedMetalMatVec; 2],
     swiglu_down: PreparedMappedMetalMatVec,
     post_ffn_residual_rms_norm: PreparedMappedMetalRmsNorm,
+    dispatch_pool: Vec<MetalFullAttentionDispatchSlot>,
+    dispatch_pool_bytes: usize,
 }
 
 /// One exact target transformer layer in frozen model order. The enum keeps
@@ -789,6 +791,23 @@ struct MetalPartialRopeDispatchPlan {
     cosine_buffer: Buffer,
     sine_buffer: Buffer,
     params_buffer: Buffer,
+}
+
+/// One of four persistent metadata slots owned by every full-attention layer.
+/// Slots retain only compact dispatch descriptors/parameters and test-only
+/// K/V verifier snapshots; packed KV payloads remain in the single cache.
+struct MetalFullAttentionDispatchSlot {
+    gqa_descriptors_buffer: Buffer,
+    gqa_params_buffer: Buffer,
+    query_cosine_buffer: Buffer,
+    query_sine_buffer: Buffer,
+    key_cosine_buffer: Buffer,
+    key_sine_buffer: Buffer,
+    key_params_buffer: Buffer,
+    #[cfg(test)]
+    verifier_key_snapshot_buffer: Buffer,
+    #[cfg(test)]
+    verifier_value_snapshot_buffer: Buffer,
 }
 
 struct MetalFullAttentionDispatchPlan {
@@ -2285,7 +2304,14 @@ impl PreparedMappedMetalFullAttentionLayer {
     }
 
     pub fn resident_state_bytes(&self) -> usize {
-        self.attention.packed_device_bytes()
+        self.attention
+            .packed_device_bytes()
+            .checked_add(self.dispatch_pool_bytes)
+            .expect("validated Metal attention residency")
+    }
+
+    pub fn dispatch_pool_bytes(&self) -> usize {
+        self.dispatch_pool_bytes
     }
 
     pub fn copied_model_bytes(&self) -> u64 {
@@ -4539,9 +4565,84 @@ impl MetalCandidateRuntime {
         Ok(PreparedMappedMetalAttentionOutput { layer, projection })
     }
 
+    /// Preallocate the four immutable metadata slots required by one MTP4
+    /// branch. No decode-time path may allocate a replacement slot.
+    fn prepare_full_attention_dispatch_pool(
+        &self,
+        query_gate: &PreparedMappedMetalQueryGate,
+        key_rope: &PreparedMetalPartialRope,
+        attention: &PreparedMetalPagedGqa,
+    ) -> Result<(Vec<MetalFullAttentionDispatchSlot>, usize)> {
+        let descriptor_bytes =
+            usize::try_from(attention.descriptors_buffer.length()).map_err(|_| {
+                EngineError::MemoryBudget("Metal dispatch descriptor pool exceeds usize".into())
+            })?;
+        let query_table_bytes = query_gate
+            .rotary_dim
+            .checked_div(2)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal query RoPE pool overflows".into()))?;
+        let key_table_bytes = key_rope
+            .rotary_dim
+            .checked_div(2)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal key RoPE pool overflows".into()))?;
+        #[cfg(test)]
+        let verifier_snapshot_bytes = attention
+            .key_value_heads
+            .checked_mul(attention.head_dim)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal verifier snapshot pool overflows".into())
+            })?;
+        let base_bytes_per_slot = descriptor_bytes
+            .checked_add(MetalPagedGqaParams::BYTE_LEN)
+            .and_then(|bytes| bytes.checked_add(2 * query_table_bytes))
+            .and_then(|bytes| bytes.checked_add(2 * key_table_bytes))
+            .and_then(|bytes| bytes.checked_add(MetalPartialRopeParams::BYTE_LEN))
+            .ok_or_else(|| EngineError::MemoryBudget("Metal dispatch slot overflows".into()))?;
+        #[cfg(test)]
+        let bytes_per_slot = base_bytes_per_slot
+            .checked_add(2 * verifier_snapshot_bytes)
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal verifier dispatch slot overflows".into())
+            })?;
+        #[cfg(not(test))]
+        let bytes_per_slot = base_bytes_per_slot;
+        let pool_bytes = bytes_per_slot
+            .checked_mul(MAXIMUM_METAL_GREEDY_MTP_DRAFTS)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal dispatch pool overflows".into()))?;
+        let mut slots = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS);
+        for _ in 0..MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
+            slots.push(MetalFullAttentionDispatchSlot {
+                gqa_descriptors_buffer: new_zeroed_buffer(&self.device, descriptor_bytes)?,
+                gqa_params_buffer: new_zeroed_buffer(&self.device, MetalPagedGqaParams::BYTE_LEN)?,
+                query_cosine_buffer: new_zeroed_buffer(&self.device, query_table_bytes)?,
+                query_sine_buffer: new_zeroed_buffer(&self.device, query_table_bytes)?,
+                key_cosine_buffer: new_zeroed_buffer(&self.device, key_table_bytes)?,
+                key_sine_buffer: new_zeroed_buffer(&self.device, key_table_bytes)?,
+                key_params_buffer: new_zeroed_buffer(
+                    &self.device,
+                    MetalPartialRopeParams::BYTE_LEN,
+                )?,
+                #[cfg(test)]
+                verifier_key_snapshot_buffer: new_zeroed_buffer(
+                    &self.device,
+                    verifier_snapshot_bytes,
+                )?,
+                #[cfg(test)]
+                verifier_value_snapshot_buffer: new_zeroed_buffer(
+                    &self.device,
+                    verifier_snapshot_bytes,
+                )?,
+            });
+        }
+        Ok((slots, pool_bytes))
+    }
+
     /// Prepare one closed full-attention layer owner. All immutable tensors
-    /// must come from the same admitted mapping; only the packed Q2/Q4 KV
-    /// cache owns persistent mutable device memory.
+    /// must come from the same admitted mapping; only packed Q2/Q4 KV and the
+    /// bounded four-slot dispatch pool own persistent mutable device memory.
     pub fn prepare_mapped_full_attention_layer(
         &self,
         mapping: &MappedMetalArtifact,
@@ -4612,10 +4713,27 @@ impl MetalCandidateRuntime {
             config.hidden_size,
             config.rms_norm_epsilon,
         )?;
+        let query_gate = self.prepare_mapped_query_gate_norm_rope(mapping, layer, position)?;
+        let key_rope = self.prepare_partial_rope_graph(
+            config.num_key_value_heads,
+            config.head_dim,
+            config.rotary_dim,
+            position,
+            config.rope_theta,
+        )?;
+        let attention = self.prepare_paged_gqa_decode_graph(layer, cache)?;
+        let (dispatch_pool, dispatch_pool_bytes) =
+            self.prepare_full_attention_dispatch_pool(&query_gate, &key_rope, &attention)?;
+        attention
+            .packed_device_bytes()
+            .checked_add(dispatch_pool_bytes)
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal attention plus dispatch pool overflows".into())
+            })?;
         Ok(PreparedMappedMetalFullAttentionLayer {
             layer,
             fanout: self.prepare_mapped_full_attention_fanout(mapping, layer)?,
-            query_gate: self.prepare_mapped_query_gate_norm_rope(mapping, layer, position)?,
+            query_gate,
             key_norm: self.prepare_mapped_rms_norm_1p_graph_io(
                 mapping,
                 mapping
@@ -4627,20 +4745,16 @@ impl MetalCandidateRuntime {
                 config.head_dim,
                 config.rms_norm_epsilon,
             )?,
-            key_rope: self.prepare_partial_rope_graph(
-                config.num_key_value_heads,
-                config.head_dim,
-                config.rotary_dim,
-                position,
-                config.rope_theta,
-            )?,
-            attention: self.prepare_paged_gqa_decode_graph(layer, cache)?,
+            key_rope,
+            attention,
             attention_output: self
                 .prepare_mapped_attention_gate_output_projection(mapping, layer)?,
             residual_rms_norm,
             ffn_gate_up,
             swiglu_down,
             post_ffn_residual_rms_norm,
+            dispatch_pool,
+            dispatch_pool_bytes,
         })
     }
 
@@ -5093,18 +5207,35 @@ impl MetalCandidateRuntime {
             mapping,
             "mtp.layers.0.mlp.down_proj.weight",
         )?;
+        let query_gate = self.prepare_named_mapped_query_gate_norm_rope(
+            mapping,
+            layer_index,
+            &format!("{attention_prefix}.q_norm.weight"),
+            position,
+        )?;
+        let key_rope = self.prepare_partial_rope_graph(
+            config.num_key_value_heads,
+            config.head_dim,
+            config.rotary_dim,
+            position,
+            config.rope_theta,
+        )?;
+        let attention = self.prepare_paged_gqa_decode_internal(Some(layer_index), cache, false)?;
+        let (dispatch_pool, dispatch_pool_bytes) =
+            self.prepare_full_attention_dispatch_pool(&query_gate, &key_rope, &attention)?;
+        attention
+            .packed_device_bytes()
+            .checked_add(dispatch_pool_bytes)
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal MTP attention plus dispatch pool overflows".into())
+            })?;
         let layer = PreparedMappedMetalFullAttentionLayer {
             layer: layer_index,
             fanout: PreparedMappedMetalFullAttentionFanout {
                 layer: layer_index,
                 projections: fanout_projections,
             },
-            query_gate: self.prepare_named_mapped_query_gate_norm_rope(
-                mapping,
-                layer_index,
-                &format!("{attention_prefix}.q_norm.weight"),
-                position,
-            )?,
+            query_gate,
             key_norm: self.prepare_mapped_rms_norm_1p_graph_io(
                 mapping,
                 mapping
@@ -5116,14 +5247,8 @@ impl MetalCandidateRuntime {
                 config.head_dim,
                 config.rms_norm_epsilon,
             )?,
-            key_rope: self.prepare_partial_rope_graph(
-                config.num_key_value_heads,
-                config.head_dim,
-                config.rotary_dim,
-                position,
-                config.rope_theta,
-            )?,
-            attention: self.prepare_paged_gqa_decode_internal(Some(layer_index), cache, false)?,
+            key_rope,
+            attention,
             attention_output: PreparedMappedMetalAttentionOutput {
                 layer: layer_index,
                 projection: attention_output_projection,
@@ -5149,6 +5274,8 @@ impl MetalCandidateRuntime {
                 hidden,
                 config.rms_norm_epsilon,
             )?,
+            dispatch_pool,
+            dispatch_pool_bytes,
         };
         let lm_head = self.prepare_mapped_gathered_matvec_graph_io(
             mapping,
@@ -8173,6 +8300,7 @@ impl MetalCandidateRuntime {
         })
     }
 
+    #[cfg(test)]
     fn plan_partial_rope_dispatch_at(
         &self,
         prepared: &PreparedMetalPartialRope,
@@ -8208,15 +8336,6 @@ impl MetalCandidateRuntime {
         prepared: &mut PreparedMappedMetalFullAttentionLayer,
         position: u64,
     ) -> Result<MetalFullAttentionDispatchPlan> {
-        #[cfg(test)]
-        let verifier_snapshot_bytes = prepared
-            .attention
-            .key_value_heads
-            .checked_mul(prepared.attention.head_dim)
-            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| {
-                EngineError::MemoryBudget("Metal verifier snapshot size overflows".into())
-            })?;
         partial_rope_params(
             prepared.query_gate.heads,
             prepared.query_gate.head_dim,
@@ -8229,18 +8348,87 @@ impl MetalCandidateRuntime {
             position,
             prepared.query_gate.theta,
         )?;
+        let key_params = partial_rope_params(
+            prepared.key_rope.heads,
+            prepared.key_rope.head_dim,
+            prepared.key_rope.rotary_dim,
+            position,
+            prepared.key_rope.theta,
+        )?;
+        let (key_cosine, key_sine) = partial_rope_tables(
+            prepared.key_rope.rotary_dim,
+            position,
+            prepared.key_rope.theta,
+        )?;
+        let append = self.plan_paged_gqa_append(&mut prepared.attention)?;
+        let descriptors = metal_paged_gqa_descriptor_bytes(&prepared.attention)?;
+        let gqa_params = metal_paged_gqa_params_bytes(&prepared.attention)?;
+        let slot_index = usize::try_from(position % MAXIMUM_METAL_GREEDY_MTP_DRAFTS as u64)
+            .map_err(|_| EngineError::Shape("Metal dispatch slot exceeds usize".into()))?;
+        let slot = prepared.dispatch_pool.get(slot_index).ok_or_else(|| {
+            EngineError::InvalidState(format!(
+                "Metal attention dispatch pool has no slot {slot_index}"
+            ))
+        })?;
+        write_buffer_range(
+            &slot.gqa_descriptors_buffer,
+            0,
+            &descriptors,
+            descriptors.len(),
+        )?;
+        write_buffer_range(
+            &slot.gqa_params_buffer,
+            0,
+            &gqa_params,
+            MetalPagedGqaParams::BYTE_LEN,
+        )?;
+        write_buffer_range(
+            &slot.query_cosine_buffer,
+            0,
+            as_bytes(&query_cosine),
+            query_cosine.len() * std::mem::size_of::<f32>(),
+        )?;
+        write_buffer_range(
+            &slot.query_sine_buffer,
+            0,
+            as_bytes(&query_sine),
+            query_sine.len() * std::mem::size_of::<f32>(),
+        )?;
+        write_buffer_range(
+            &slot.key_cosine_buffer,
+            0,
+            as_bytes(&key_cosine),
+            key_cosine.len() * std::mem::size_of::<f32>(),
+        )?;
+        write_buffer_range(
+            &slot.key_sine_buffer,
+            0,
+            as_bytes(&key_sine),
+            key_sine.len() * std::mem::size_of::<f32>(),
+        )?;
+        write_buffer_range(
+            &slot.key_params_buffer,
+            0,
+            &key_params.encode(),
+            MetalPartialRopeParams::BYTE_LEN,
+        )?;
         Ok(MetalFullAttentionDispatchPlan {
-            gqa: self.plan_paged_gqa_dispatch(&mut prepared.attention)?,
-            query_cosine_buffer: buffer_with_data(&self.device, as_bytes(&query_cosine)),
-            query_sine_buffer: buffer_with_data(&self.device, as_bytes(&query_sine)),
-            key_rope: self.plan_partial_rope_dispatch_at(&prepared.key_rope, position)?,
+            gqa: MetalPagedGqaDispatchPlan {
+                append,
+                descriptors_buffer: slot.gqa_descriptors_buffer.to_owned(),
+                params_buffer: slot.gqa_params_buffer.to_owned(),
+            },
+            query_cosine_buffer: slot.query_cosine_buffer.to_owned(),
+            query_sine_buffer: slot.query_sine_buffer.to_owned(),
+            key_rope: MetalPartialRopeDispatchPlan {
+                cosine_buffer: slot.key_cosine_buffer.to_owned(),
+                sine_buffer: slot.key_sine_buffer.to_owned(),
+                params_buffer: slot.key_params_buffer.to_owned(),
+            },
             #[cfg(test)]
-            verifier_key_snapshot_buffer: new_zeroed_buffer(&self.device, verifier_snapshot_bytes)?,
+            verifier_key_snapshot_buffer: slot.verifier_key_snapshot_buffer.to_owned(),
             #[cfg(test)]
-            verifier_value_snapshot_buffer: new_zeroed_buffer(
-                &self.device,
-                verifier_snapshot_bytes,
-            )?,
+            verifier_value_snapshot_buffer: slot.verifier_value_snapshot_buffer.to_owned(),
         })
     }
 
@@ -11056,6 +11244,8 @@ impl MetalCandidateRuntime {
             || prepared.attention.query_buffer.is_some()
             || prepared.attention.output_buffer.is_some()
             || prepared.key_rope.has_owned_values()
+            || prepared.dispatch_pool.len() != MAXIMUM_METAL_GREEDY_MTP_DRAFTS
+            || prepared.dispatch_pool_bytes == 0
             || prepared.attention.cache.tokens() >= prepared.attention.maximum_tokens
         {
             return Err(EngineError::InvalidState(format!(
@@ -12230,6 +12420,8 @@ impl MetalCandidateRuntime {
             || layer.attention.owner_layer != Some(config.num_hidden_layers)
             || layer.attention.poisoned
             || layer.attention.speculative_checkpoint.is_some()
+            || layer.dispatch_pool.len() != MAXIMUM_METAL_GREEDY_MTP_DRAFTS
+            || layer.dispatch_pool_bytes == 0
             || layer.fanout.projections[0].rows != query_values * 2
             || layer.fanout.projections[1].rows != component_values
             || layer.fanout.projections[2].rows != component_values
@@ -18682,6 +18874,50 @@ mod tests {
         assert_eq!(prepared.layer(), 3);
         assert_eq!(prepared.copied_model_bytes(), 0);
         assert!(prepared.resident_state_bytes() > 0);
+        assert_eq!(
+            prepared.dispatch_pool.len(),
+            MAXIMUM_METAL_GREEDY_MTP_DRAFTS
+        );
+        assert!(prepared.dispatch_pool_bytes() > 0);
+        assert_eq!(prepared.cached_tokens(), 0);
+
+        let resident_state_bytes = prepared.resident_state_bytes();
+        prepared
+            .attention
+            .begin_speculative()
+            .expect("checkpoint full-attention metadata for pool verification");
+        let plans: Vec<_> = (0..MAXIMUM_METAL_GREEDY_MTP_DRAFTS)
+            .map(|_| {
+                runtime
+                    .plan_full_attention_dispatch(&mut prepared)
+                    .expect("plan pooled full-attention dispatch")
+            })
+            .collect();
+        for (slot_index, plan) in plans.iter().enumerate() {
+            assert_eq!(
+                plan.gqa.descriptors_buffer.contents(),
+                prepared.dispatch_pool[slot_index]
+                    .gqa_descriptors_buffer
+                    .contents()
+            );
+            assert_eq!(
+                plan.key_rope.params_buffer.contents(),
+                prepared.dispatch_pool[slot_index]
+                    .key_params_buffer
+                    .contents()
+            );
+            for earlier in &plans[..slot_index] {
+                assert_ne!(
+                    plan.gqa.descriptors_buffer.contents(),
+                    earlier.gqa.descriptors_buffer.contents()
+                );
+            }
+        }
+        assert_eq!(prepared.resident_state_bytes(), resident_state_bytes);
+        prepared
+            .attention
+            .restore_speculative()
+            .expect("restore full-attention metadata after pool verification");
         assert_eq!(prepared.cached_tokens(), 0);
         assert!(runtime
             .prepare_mapped_full_attention_layer(&mapping, 0, 0, cache)

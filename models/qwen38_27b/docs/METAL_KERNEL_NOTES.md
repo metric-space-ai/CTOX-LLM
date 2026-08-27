@@ -252,9 +252,13 @@ position from the pre-append KV token count rather than mutable owner tables,
 so successive queued branch steps receive distinct causal positions. A device
 regression changes the reusable owner to position zero after planning a
 nonzero position and proves the queued dispatch still matches the nonzero
-scalar oracle. Candidate-branch promotion still requires replacing these
-temporary per-dispatch allocations with a bounded preallocated four-depth
-metadata pool.
+scalar oracle. Every prepared full-attention layer now owns a bounded
+four-slot metadata pool for exactly one MTP4 branch. Planning fills the slot at
+`position % 4` and retains its existing MTLBuffer handles in the immutable
+dispatch plan; it performs no replacement GPU allocation. Resident-state
+accounting includes the pool, and a regression proves consecutive speculative
+positions use distinct preallocated slots before rollback restores the exact
+KV prefix.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
