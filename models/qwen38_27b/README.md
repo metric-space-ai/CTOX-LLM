@@ -339,8 +339,10 @@ their target verification, and the four-record prefix reduction in one command
 buffer after the accepted initial record. A 4/4 branch commits atomically. A
 shorter prefix restores every target/MTP tail state and the compact selectors
 to record zero, returning the exact fixed-size records needed by the bounded
-accepted-prefix replay path. Wiring that replay into the production executor
-and eliminating the separate initial-record wait remain open.
+accepted-prefix replay path. `dispatch_prepared_mapped_greedy_mtp4_verifier`
+then replays only records 1 through `accepted_prefix - 1` via the same full
+causal verifier. Any replay mismatch poisons both graphs fail-closed. Production
+executor wiring and eliminating the separate initial-record wait remain open.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those

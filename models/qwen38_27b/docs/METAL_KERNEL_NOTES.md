@@ -222,9 +222,11 @@ bonus token without separate selector reads. The native MTP4 tail dispatcher
 now queues records 1–3 plus that reduction in one command buffer after the
 accepted initial record. Full acceptance commits the three-step state branch;
 partial acceptance restores the entire tail and returns four exact replay
-records while resetting selectors to record zero. Accepted-prefix replay,
-full-artifact device evidence, eliminating the initial-record wait, and
-production executor integration remain pending.
+records while resetting selectors to record zero. The complete MTP4 wrapper
+replays only the accepted tail through the ordinary full target/MTP verifier
+and rejects any record divergence by poisoning both graphs. Full-artifact
+device evidence, eliminating the initial-record wait, and production executor
+integration remain pending.
 
 The continuation path now preserves each canonical mapped draft in a distinct
 full-vocabulary candidate selector with a two-word device copy before the

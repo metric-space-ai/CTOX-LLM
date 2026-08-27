@@ -577,6 +577,16 @@ pub struct MetalGreedyMtp4Branch {
     pub branch_committed: bool,
 }
 
+/// Production-facing MTP4 result after either a full branch commit or bounded
+/// replay of the accepted tail. On success, model state always represents the
+/// complete accepted prefix and no rejected candidate transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGreedyMtp4Outcome {
+    pub prefix: MetalGreedyMtpPrefix,
+    pub records: [MetalGreedyMtpVerification; MAXIMUM_METAL_GREEDY_MTP_DRAFTS],
+    pub replayed_tail_records: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetalTargetCheckpointKind {
     FullAttention,
@@ -13233,6 +13243,70 @@ impl MetalCandidateRuntime {
                 ))),
             },
         }
+    }
+
+    /// Execute one complete greedy MTP4 cycle. The initial record must already
+    /// be accepted and committed. Records 1–3 run as one speculative tail; a
+    /// partial prefix is rolled back and only its accepted tail records are
+    /// replayed through the ordinary causally verified transition.
+    pub fn dispatch_prepared_mapped_greedy_mtp4_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+    ) -> Result<MetalGreedyMtp4Outcome> {
+        let branch =
+            self.dispatch_prepared_mapped_greedy_mtp4_tail_verifier(program, target, mtp)?;
+        if branch.branch_committed {
+            return Ok(MetalGreedyMtp4Outcome {
+                prefix: branch.prefix,
+                records: branch.records,
+                replayed_tail_records: 0,
+            });
+        }
+
+        let replayed_tail_records = branch.prefix.accepted_prefix.saturating_sub(1);
+        for record_index in 1..=replayed_tail_records as usize {
+            let expected = branch.records[record_index];
+            if !expected.accepted {
+                target.layers.poisoned = true;
+                mtp.layer.attention.poisoned = true;
+                return Err(EngineError::InvalidState(format!(
+                    "Metal MTP4 prefix admitted rejected replay record {record_index}"
+                )));
+            }
+            let replayed = match self
+                .dispatch_prepared_mapped_greedy_mtp_target_verifier(program, target, mtp)
+            {
+                Ok(replayed) => replayed,
+                Err(error) => {
+                    target.layers.poisoned = true;
+                    mtp.layer.attention.poisoned = true;
+                    return Err(EngineError::InvalidState(format!(
+                        "Metal MTP4 replay record {record_index} failed after earlier accepted state: {error}"
+                    )));
+                }
+            };
+            if replayed != expected {
+                target.layers.poisoned = true;
+                mtp.layer.attention.poisoned = true;
+                return Err(EngineError::InvalidState(format!(
+                    "Metal MTP4 replay record {record_index} diverged: expected {expected:?}, observed {replayed:?}"
+                )));
+            }
+        }
+        if target.cached_tokens()? != mtp.cached_tokens().saturating_add(1) {
+            target.layers.poisoned = true;
+            mtp.layer.attention.poisoned = true;
+            return Err(EngineError::InvalidState(
+                "Metal MTP4 accepted-prefix replay broke target-one-ahead state".into(),
+            ));
+        }
+        Ok(MetalGreedyMtp4Outcome {
+            prefix: branch.prefix,
+            records: branch.records,
+            replayed_tail_records,
+        })
     }
 
     fn encode_prepared_mapped_full_attention_layer(
