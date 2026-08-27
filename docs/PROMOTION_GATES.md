@@ -33,6 +33,9 @@ material roofline gap is unmeasured or unexplained.
 - weighted quality >= 95% of BF16;
 - no primary category below 90% of BF16;
 - recovery closes >= 30% of the direct-quantization gap;
+- agentic tool-error recovery immediately converts an actionable diagnostic
+  into the exact corrected call (for example a qualified symbol or the
+  repository's actual filename) without an unrelated search branch;
 - 128K retrieval >= 90% of BF16;
 - Fold text+MTP pack <= 7.8 GiB;
 - Fold visible-process target <= 9.7 GiB, hard ceiling 10 GiB;

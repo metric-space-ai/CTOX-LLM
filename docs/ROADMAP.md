@@ -158,6 +158,9 @@ missing-cache plan is active; 217 identities remain.
 - Weighted benchmark score at least 95% of BF16; no primary category below 90%.
 - Recovery closes at least 30% of the direct-Q2/Q4-to-BF16 quality gap.
 - Agentic/tool-calling, German, code, and MTP gates pass on held-out samples.
+- Held-out agent traces include actionable tool failures and require immediate
+  exact recovery: qualify an ambiguous symbol or use the observed repository
+  filename, then resume the original task without speculative search fan-out.
 - 128K retrieval reaches at least 90% of the BF16 reference.
 
 ## Phase 3: complete the model-local Rust reference engine
