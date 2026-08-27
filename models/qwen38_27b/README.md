@@ -342,7 +342,8 @@ to record zero, returning the exact fixed-size records needed by the bounded
 accepted-prefix replay path. `dispatch_prepared_mapped_greedy_mtp4_verifier`
 then replays only records 1 through `accepted_prefix - 1` via the same full
 causal verifier. Any replay mismatch poisons both graphs fail-closed. Production
-MTP4 executor wiring remains open. The additional
+executor wiring must use the cursor-bound fused entry point below; this older
+tail-only entry remains a verifier. The additional
 `dispatch_prepared_mapped_greedy_mtp4_from_token_verifier` path removes the
 separate initial-record completion wait from the fully accepted case: all four
 records plus prefix reduction share one command buffer. A shorter prefix rolls
@@ -355,11 +356,13 @@ logical compute steps only after their encoder was built, and consumes the sole
 step-644 barrier only after the Metal command buffer completed. It returns the
 next publishable position together with the compact target/MTP verification;
 an encoding, cursor, GPU, or verification failure retains the existing joint
-state rollback. The accepted continuation/replay path now exposes the same
-cursor-bound complete-token entry point, so it also cannot advance the
-scheduler before its final GPU barrier. This closes both one-record cursor
-boundaries, not the block-level MTP4 cursor, prefill, full-artifact Golden, or
-production promotion gates.
+state rollback. The accepted continuation/replay path exposes the same
+cursor-bound complete-token entry point. The fused four-record branch now owns
+a block cursor that keeps all four logical positions provisional until its one
+shared GPU barrier completes; a partial prefix discards that cursor and
+publishes only the cursor-bound replay positions. This closes the Metal runtime
+MTP4 cursor contract, not `ModelExecutor` integration, prefill, full-artifact
+Golden, or production promotion gates.
 The compact verifier allocation now reserves four fixed 16-byte records and
 can retain every target/draft/accept/status tuple of an MTP4 block without
 overwriting an earlier decision. `qwen_greedy_mtp_prefix` reduces those

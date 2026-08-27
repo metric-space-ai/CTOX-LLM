@@ -247,9 +247,15 @@ rejected and that no new position can be published before the final barrier.
 contract to every accepted continuation replay: it rejects a caller position
 that differs from resident target KV, records steps 0..643 only after the
 continuation encoder exists, and publishes its next position only after the
-sole completed step-644 barrier. These are the complete one-record boundaries;
-the fused MTP4 branch still needs a block-level cursor that can publish the
-accepted multi-position prefix and full-artifact device evidence.
+sole completed step-644 barrier. `MetalMtp4ExecutionCursor` extends that
+contract across all four logical records in the fused command buffer: records
+must be encoded in order, each leaves its logical final barrier pending, and a
+4/4 branch publishes the fourth position only after the shared physical GPU
+completion consumes all four barriers. A shorter prefix drops the provisional
+block cursor after rollback; its mandatory initial transition and accepted
+tail are rebuilt exclusively through the cursor-bound one-record entry points.
+The remaining MTP4 gates are `ModelExecutor` integration and full-artifact
+device evidence, not the runtime's scheduler cursor contract.
 
 The continuation path now preserves each canonical mapped draft in a distinct
 full-vocabulary candidate selector with a two-word device copy before the

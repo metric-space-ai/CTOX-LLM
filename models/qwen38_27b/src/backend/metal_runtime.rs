@@ -42,8 +42,8 @@ use super::metal::{
 };
 use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
-    MetalDecodeExecutionCursor, MetalDecodeWorkspacePlan, MetalMtpBufferBinding,
-    MetalMtpBufferSlot, MetalMtpWorkspacePlan,
+    MetalDecodeExecutionCursor, MetalDecodeWorkspacePlan, MetalMtp4ExecutionCursor,
+    MetalMtpBufferBinding, MetalMtpBufferSlot, MetalMtpWorkspacePlan, METAL_MTP4_RECORDS,
 };
 use super::metal_schedule::{MetalBufferSlot, MetalDecodeOperation};
 use super::{Activation, FusedMatVec, ScaleSlice};
@@ -63,7 +63,7 @@ const DEFAULT_SIMDGROUPS: usize = 2;
 const ROWS_PER_SIMDGROUP: usize = 4;
 const METAL_PAGED_KV_DESCRIPTOR_BYTES: usize = 16;
 const METAL_GREEDY_MTP_RECORD_WORDS: usize = 4;
-const MAXIMUM_METAL_GREEDY_MTP_DRAFTS: usize = 4;
+const MAXIMUM_METAL_GREEDY_MTP_DRAFTS: usize = METAL_MTP4_RECORDS;
 const METAL_GREEDY_MTP_HISTORY_BYTES: usize =
     MAXIMUM_METAL_GREEDY_MTP_DRAFTS * METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>();
 
@@ -596,6 +596,15 @@ pub struct MetalGreedyMtp4Outcome {
     pub prefix: MetalGreedyMtpPrefix,
     pub records: [MetalGreedyMtpVerification; MAXIMUM_METAL_GREEDY_MTP_DRAFTS],
     pub replayed_tail_records: u32,
+}
+
+/// Cursor-bound MTP4 result. `committed_tokens` is the only position safe to
+/// publish: four on a fully accepted shared-buffer branch, otherwise the
+/// mandatory initial transition plus its cursor-bound accepted replays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalCompletedMtp4Outcome {
+    pub outcome: MetalGreedyMtp4Outcome,
+    pub committed_tokens: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13415,12 +13424,71 @@ impl MetalCandidateRuntime {
         mtp: &mut PreparedMappedMetalMtpCore,
         token: u32,
     ) -> Result<MetalGreedyMtp4Outcome> {
+        self.dispatch_prepared_mapped_greedy_mtp4_from_token(program, target, mtp, token, None)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Execute one complete MTP4 block under a single scheduler contract.
+    /// Full acceptance publishes all four positions only after the shared GPU
+    /// barrier. A partial branch discards those provisional cursors and
+    /// advances solely through complete-token initial/continuation replays.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_prepared_mapped_complete_greedy_mtp4_from_token_verifier(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+        token: u32,
+        token_position: usize,
+        committed_tokens: usize,
+        admitted_context: usize,
+    ) -> Result<MetalCompletedMtp4Outcome> {
+        let (outcome, next_position) = self.dispatch_prepared_mapped_greedy_mtp4_from_token(
+            program,
+            target,
+            mtp,
+            token,
+            Some((token_position, committed_tokens, admitted_context)),
+        )?;
+        Ok(MetalCompletedMtp4Outcome {
+            outcome,
+            committed_tokens: next_position.ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal complete MTP4 dispatch omitted its block cursor".into(),
+                )
+            })?,
+        })
+    }
+
+    fn dispatch_prepared_mapped_greedy_mtp4_from_token(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        target: &mut PreparedMappedMetalTargetCore,
+        mtp: &mut PreparedMappedMetalMtpCore,
+        token: u32,
+        cursor_contract: Option<(usize, usize, usize)>,
+    ) -> Result<(MetalGreedyMtp4Outcome, Option<usize>)> {
         let mtp_step = self.validate_prepared_mapped_mtp_frontend(program, mtp)?;
         let (component_values, thread_width) = self.validate_prepared_mapped_mtp_layer(mtp)?;
         let [embedding, initial_norm, target_lm_head] =
             self.validate_prepared_mapped_target_core(program, target)?;
         let target_tokens = target.cached_tokens()?;
         let mtp_tokens = mtp.cached_tokens();
+        let mut execution_cursor: Option<MetalMtp4ExecutionCursor<'_>> = cursor_contract
+            .map(|(token_position, committed_tokens, admitted_context)| {
+                if committed_tokens != target_tokens {
+                    return Err(EngineError::InvalidState(format!(
+                        "Metal complete MTP4 cursor reports {committed_tokens} committed tokens but target state contains {target_tokens}"
+                    )));
+                }
+                program.plan.mtp4_execution_cursor(
+                    token_position,
+                    committed_tokens,
+                    admitted_context,
+                )
+            })
+            .transpose()?;
+        let mut final_schedule_indices = [0_usize; MAXIMUM_METAL_GREEDY_MTP_DRAFTS];
         if token as usize >= target.vocabulary_rows()
             || target_tokens == 0
             || target_tokens != mtp_tokens.saturating_add(1)
@@ -13520,8 +13588,13 @@ impl MetalCandidateRuntime {
                 )?;
                 mtp_dispatches.push(initial_mtp_dispatch);
                 target_dispatches.push(initial_target_dispatch);
+                if let Some(cursor) = execution_cursor.as_mut() {
+                    final_schedule_indices[0] = cursor.record_complete_encoded_record(0)?;
+                }
 
-                for record_index in 1..MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
+                for (record_index, final_schedule_index) in
+                    final_schedule_indices.iter_mut().enumerate().skip(1)
+                {
                     let mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
                     mtp.layer.attention.poisoned = true;
                     self.encode_copy_argmax_result(
@@ -13562,6 +13635,10 @@ impl MetalCandidateRuntime {
                     )?;
                     mtp_dispatches.push(mtp_dispatch);
                     target_dispatches.push(target_plans);
+                    if let Some(cursor) = execution_cursor.as_mut() {
+                        *final_schedule_index =
+                            cursor.record_complete_encoded_record(record_index)?;
+                    }
                 }
                 self.encode_greedy_mtp_prefix(
                     encoder,
@@ -13613,24 +13690,39 @@ impl MetalCandidateRuntime {
                 ));
             }
             if prefix.accepted_prefix as usize == MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
+                let next_position = execution_cursor
+                    .take()
+                    .map(|cursor| cursor.commit_after_shared_completion(final_schedule_indices))
+                    .transpose()?;
                 target.layers.commit_speculative()?;
                 mtp.layer.attention.commit_speculative()?;
-                Ok(MetalGreedyMtp4Branch {
-                    prefix,
-                    records,
-                    branch_committed: true,
-                })
+                Ok((
+                    MetalGreedyMtp4Branch {
+                        prefix,
+                        records,
+                        branch_committed: true,
+                    },
+                    next_position,
+                ))
             } else {
                 self.restore_mapped_greedy_mtp_target(target, mtp)?;
-                Ok(MetalGreedyMtp4Branch {
-                    prefix,
-                    records,
-                    branch_committed: false,
-                })
+                // Dropping the provisional block cursor with its four final
+                // barriers still pending makes the speculative positions
+                // unpublishable. Accepted state is rebuilt below with one
+                // ordinary complete-token cursor per replayed transition.
+                execution_cursor = None;
+                Ok((
+                    MetalGreedyMtp4Branch {
+                        prefix,
+                        records,
+                        branch_committed: false,
+                    },
+                    None,
+                ))
             }
         })();
 
-        let branch = match branch {
+        let (branch, speculative_next_position) = match branch {
             Ok(branch) => branch,
             Err(primary) => {
                 return match self.restore_mapped_greedy_mtp_target(target, mtp) {
@@ -13642,15 +13734,24 @@ impl MetalCandidateRuntime {
             }
         };
         if branch.branch_committed {
-            return Ok(MetalGreedyMtp4Outcome {
-                prefix: branch.prefix,
-                records: branch.records,
-                replayed_tail_records: 0,
-            });
+            return Ok((
+                MetalGreedyMtp4Outcome {
+                    prefix: branch.prefix,
+                    records: branch.records,
+                    replayed_tail_records: 0,
+                },
+                speculative_next_position,
+            ));
         }
 
-        let replayed_initial = self
-            .dispatch_prepared_mapped_initial_mtp_target_verifier(program, target, mtp, token)
+        let (replayed_initial, mut replay_next_position) = self
+            .dispatch_prepared_mapped_initial_mtp_target(
+                program,
+                target,
+                mtp,
+                token,
+                cursor_contract,
+            )
             .map_err(|error| {
                 target.layers.poisoned = true;
                 mtp.layer.attention.poisoned = true;
@@ -13676,9 +13777,24 @@ impl MetalCandidateRuntime {
                     "Metal fused MTP4 prefix admitted rejected replay record {record_index}"
                 )));
             }
-            let replayed = match self
-                .dispatch_prepared_mapped_greedy_mtp_target_verifier(program, target, mtp)
-            {
+            let continuation_cursor = cursor_contract
+                .map(|(_, _, admitted_context)| {
+                    replay_next_position
+                        .map(|position| (position, position, admitted_context))
+                        .ok_or_else(|| {
+                            EngineError::InvalidState(
+                                "Metal MTP4 replay lost its scheduler position".into(),
+                            )
+                        })
+                })
+                .transpose()?;
+            let (replayed, continued_position) = match self
+                .dispatch_prepared_mapped_greedy_mtp_target(
+                    program,
+                    target,
+                    mtp,
+                    continuation_cursor,
+                ) {
                 Ok(replayed) => replayed,
                 Err(error) => {
                     target.layers.poisoned = true;
@@ -13688,6 +13804,7 @@ impl MetalCandidateRuntime {
                     )));
                 }
             };
+            replay_next_position = continued_position;
             if replayed != expected {
                 target.layers.poisoned = true;
                 mtp.layer.attention.poisoned = true;
@@ -13703,11 +13820,14 @@ impl MetalCandidateRuntime {
                 "Metal fused MTP4 replay broke target-one-token-ahead state".into(),
             ));
         }
-        Ok(MetalGreedyMtp4Outcome {
-            prefix: branch.prefix,
-            records: branch.records,
-            replayed_tail_records,
-        })
+        Ok((
+            MetalGreedyMtp4Outcome {
+                prefix: branch.prefix,
+                records: branch.records,
+                replayed_tail_records,
+            },
+            replay_next_position,
+        ))
     }
 
     /// Queue the remaining three records of a greedy MTP4 block behind one
