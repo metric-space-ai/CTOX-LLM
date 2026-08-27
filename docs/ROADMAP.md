@@ -329,8 +329,11 @@ one fused residual-add/Qwen-RMSNorm dispatch writing `HiddenB` and the next
 fan-out, then fuse SwiGLU directly into the Q2/Q4 down projection without a
 materialized product vector, then fuse the post-FFN residual add and next-layer
 Qwen RMSNorm. The complete first linear-attention transformer layer now runs in
-one command encoder/wait. This is verified on Apple Silicon but is not backend
-promotion: the remaining 633 steps, complete
+one command encoder/wait. A reusable ten-step encoder now admits any frozen
+linear-attention layer only after canonical weight/recovery, convolution,
+GatedDelta-parameter, recurrence-owner, and norm identity checks. This is
+verified on Apple Silicon but is not backend promotion: complete per-layer
+resource preparation and iteration, the remaining 633 graph steps, complete
 target+MTP execution, prefill arena, lifecycle measurements, and Golden suite
 remain open.
 

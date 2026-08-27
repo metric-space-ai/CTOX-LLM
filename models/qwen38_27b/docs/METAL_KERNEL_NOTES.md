@@ -266,6 +266,15 @@ leaves state poisoned and recoverable through the active device checkpoint.
 Because the arena intentionally aliases dead slots, the verifier uses
 checkpointed reruns when inspecting earlier and final views.
 
+The same ten layer operations are now encoded by a reusable linear-attention
+layer entry point. Its input is the exact schedule slice returned by
+`linear_attention_layer_steps(layer)`. Before encoding it resolves canonical
+Qwen tensor identities back into the admitted mmap and checks weight, `s_in`,
+`s_out`, convolution, `A_log`, `dt_bias`, both RMSNorm weights, and the
+layer-owned recurrence state. The Golden test proves that a Layer-1 slice with
+Layer-0 resources is rejected before poisoning state, then executes Layer 0
+through the reusable path and matches the complete-layer scalar oracle.
+
 The Qwen RMSNorm candidate implements the model-specific `(1 + weight)`
 convention rather than Llama's direct-weight convention. One simdgroup owns a
 complete row, reduces the f32 sum of squares without threadgroup scratch, and

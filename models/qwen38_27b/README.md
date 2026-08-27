@@ -234,6 +234,10 @@ both views and writes `FfnDown` without allocating a 17,408-value SwiGLU
 product; a second fused residual-add/Qwen-RMSNorm dispatch writes the complete
 layer residual to `HiddenA` and the next layer input to `Normalized` before the
 final wait. `A_log`, `dt_bias`, and the FP16 norm weights remain mmap-backed.
+The same ten post-input-norm operations are also exposed through one reusable
+linear-layer encoder. It verifies canonical layer-specific projection,
+convolution, GatedDelta-parameter, recurrence-owner, and norm identities before
+encoding, so a shape-compatible tensor from another layer cannot be substituted.
 These graph preparations retain no operation-local input/output activation
 buffers; separately stored recovery inputs must be byte-identical. The
 remaining 633 schedule steps and the complete executor remain open. A bounded

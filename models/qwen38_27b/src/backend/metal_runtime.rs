@@ -214,7 +214,9 @@ pub struct PreparedMappedMetalMatVec {
     dtype: TensorDType,
     rows: usize,
     columns: usize,
+    weights_base: u64,
     s_in_offset: u64,
+    s_out_base: u64,
     dispatches: Vec<MappedMetalDispatch>,
     mapping: MappedMetalArtifact,
     input_buffer: Option<Buffer>,
@@ -381,6 +383,7 @@ impl MetalGatedDeltaConfig {
 /// State never has an f32 device duplicate.
 pub struct PreparedMetalGatedDelta {
     config: MetalGatedDeltaConfig,
+    owner_layer: Option<usize>,
     query_buffer: Option<Buffer>,
     key_buffer: Option<Buffer>,
     value_buffer: Option<Buffer>,
@@ -969,6 +972,19 @@ impl MappedMetalArtifact {
         u64::try_from(start)
             .map_err(|_| EngineError::Shape(format!("Metal {label} offset exceeds u64")))
     }
+
+    fn float_tensor_binding(&self, name: &str) -> Result<(TensorDType, u64, usize)> {
+        let tensor = self.inner.artifact.float_tensor(name)?;
+        let (dtype, bytes) = match tensor {
+            FloatTensorView::F16Le(bytes) => (TensorDType::F16, bytes),
+            FloatTensorView::F32Le(bytes) => (TensorDType::F32, bytes),
+        };
+        Ok((
+            dtype,
+            self.byte_offset(bytes, "bound float tensor")?,
+            tensor.len(),
+        ))
+    }
 }
 
 impl PreparedMappedMetalMatVec {
@@ -994,6 +1010,35 @@ impl PreparedMappedMetalMatVec {
 
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
+    }
+
+    fn matches_recovered_tensor(&self, name: &str) -> Result<bool> {
+        let recovered = self.mapping.inner.artifact.recovered_matrix(name)?;
+        let weights_base = self
+            .mapping
+            .byte_offset(recovered.matrix.weights, "bound projection weights")?;
+        let s_in = match recovered.s_in {
+            FloatTensorView::F16Le(bytes) => bytes,
+            FloatTensorView::F32Le(_) => {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "Metal bound projection {name} has non-FP16 s_in"
+                )))
+            }
+        };
+        let s_out = match recovered.s_out {
+            FloatTensorView::F16Le(bytes) => bytes,
+            FloatTensorView::F32Le(_) => {
+                return Err(EngineError::InvalidArtifact(format!(
+                    "Metal bound projection {name} has non-FP16 s_out"
+                )))
+            }
+        };
+        Ok(self.dtype == recovered.matrix.dtype
+            && self.rows == recovered.matrix.rows
+            && self.columns == recovered.matrix.columns
+            && self.weights_base == weights_base
+            && self.s_in_offset == self.mapping.byte_offset(s_in, "bound projection s_in")?
+            && self.s_out_base == self.mapping.byte_offset(s_out, "bound projection s_out")?)
     }
 
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
@@ -1113,6 +1158,11 @@ impl PreparedMappedMetalRmsNorm {
         self.transient_bytes
     }
 
+    fn matches_weight_tensor(&self, name: &str) -> Result<bool> {
+        let (dtype, offset, values) = self.mapping.float_tensor_binding(name)?;
+        Ok(dtype == TensorDType::F16 && offset == self.weight_offset && values == self.columns)
+    }
+
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
         let expected = self
             .rows
@@ -1160,6 +1210,11 @@ impl PreparedMappedMetalGatedRmsNorm {
 
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
+    }
+
+    fn matches_weight_tensor(&self, name: &str) -> Result<bool> {
+        let (dtype, offset, values) = self.mapping.float_tensor_binding(name)?;
+        Ok(dtype == TensorDType::F16 && offset == self.weight_offset && values == self.columns)
     }
 
     pub fn has_owned_io(&self) -> bool {
@@ -1519,6 +1574,17 @@ impl PreparedMappedMetalGatedDeltaPrepare {
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
     }
+
+    fn matches_parameter_tensors(&self, a_log: &str, dt_bias: &str) -> Result<bool> {
+        let (a_dtype, a_offset, a_values) = self.mapping.float_tensor_binding(a_log)?;
+        let (dt_dtype, dt_offset, dt_values) = self.mapping.float_tensor_binding(dt_bias)?;
+        Ok(a_dtype == TensorDType::F32
+            && dt_dtype == TensorDType::F32
+            && a_offset == self.a_log_offset
+            && dt_offset == self.dt_bias_offset
+            && a_values == self.value_heads
+            && dt_values == self.value_heads)
+    }
 }
 
 impl PreparedMappedMetalCausalConv {
@@ -1592,6 +1658,13 @@ impl PreparedMappedMetalCausalConv {
 
     pub fn transient_bytes(&self) -> usize {
         self.transient_bytes
+    }
+
+    fn matches_weight_tensor(&self, name: &str) -> Result<bool> {
+        let (dtype, offset, values) = self.mapping.float_tensor_binding(name)?;
+        Ok(dtype == TensorDType::F16
+            && offset == self.weight_offset
+            && values == self.channels * self.kernel)
     }
 
     pub fn write_input(&self, input: &[f32]) -> Result<()> {
@@ -2769,7 +2842,9 @@ impl MetalCandidateRuntime {
             dtype: operation.dtype,
             rows: operation.rows,
             columns: operation.columns,
+            weights_base,
             s_in_offset,
+            s_out_base,
             dispatches,
             mapping: mapping.clone(),
             input_buffer,
@@ -3743,7 +3818,7 @@ impl MetalCandidateRuntime {
         &self,
         config: MetalGatedDeltaConfig,
     ) -> Result<PreparedMetalGatedDelta> {
-        self.prepare_gated_delta_f16_internal(config, true)
+        self.prepare_gated_delta_f16_internal(config, true, None)
     }
 
     /// Allocate only persistent FP16 recurrence/checkpoint state for graph
@@ -3751,19 +3826,21 @@ impl MetalCandidateRuntime {
     pub fn prepare_gated_delta_f16_graph_io(
         &self,
         config: MetalGatedDeltaConfig,
+        layer: usize,
     ) -> Result<PreparedMetalGatedDelta> {
         if config != MetalGatedDeltaConfig::QWEN38_27B {
             return Err(EngineError::Shape(
                 "Metal graph recurrence requires exact Qwen3.8-27B geometry".into(),
             ));
         }
-        self.prepare_gated_delta_f16_internal(config, false)
+        self.prepare_gated_delta_f16_internal(config, false, Some(layer))
     }
 
     fn prepare_gated_delta_f16_internal(
         &self,
         config: MetalGatedDeltaConfig,
         own_io: bool,
+        owner_layer: Option<usize>,
     ) -> Result<PreparedMetalGatedDelta> {
         if config.heads == 0
             || config.key_dim == 0
@@ -3831,6 +3908,7 @@ impl MetalCandidateRuntime {
         };
         Ok(PreparedMetalGatedDelta {
             config,
+            owner_layer,
             query_buffer: own_io
                 .then(|| new_zeroed_buffer(&self.device, qk_bytes))
                 .transpose()?,
@@ -6657,6 +6735,379 @@ impl MetalCandidateRuntime {
         Ok(outputs)
     }
 
+    /// Execute one complete frozen linear-attention transformer layer from an
+    /// already-normalized shared-arena input. The ten bound schedule views are
+    /// reusable for every linear layer; immutable tensors remain mmap-backed,
+    /// stateful resources must have active device checkpoints, and no
+    /// activation is copied through the host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_mapped_linear_attention_layer_views(
+        &self,
+        steps: &[PreparedMetalDecodeStepView<'_>],
+        projections: [&PreparedMappedMetalMatVec; 4],
+        convolution: &mut PreparedMappedMetalCausalConv,
+        gated_delta_prepare: &PreparedMappedMetalGatedDeltaPrepare,
+        recurrence: &mut PreparedMetalGatedDelta,
+        gated_rms_norm: &PreparedMappedMetalGatedRmsNorm,
+        linear_output_projection: &PreparedMappedMetalMatVec,
+        residual_rms_norm: &PreparedMappedMetalRmsNorm,
+        ffn_gate_up: [&PreparedMappedMetalMatVec; 2],
+        swiglu_down: &PreparedMappedMetalMatVec,
+        post_ffn_residual_rms_norm: &PreparedMappedMetalRmsNorm,
+    ) -> Result<()> {
+        const OPERATIONS: [MetalDecodeOperation; 10] = [
+            MetalDecodeOperation::LinearFanout,
+            MetalDecodeOperation::CausalConvolution,
+            MetalDecodeOperation::GatedDeltaPrepare,
+            MetalDecodeOperation::GatedDeltaRecurrent,
+            MetalDecodeOperation::GatedRmsNorm,
+            MetalDecodeOperation::LinearOutputProjection,
+            MetalDecodeOperation::ResidualRmsNorm,
+            MetalDecodeOperation::FfnGateUpFanout,
+            MetalDecodeOperation::SwiGluDownProjection,
+            MetalDecodeOperation::ResidualRmsNorm,
+        ];
+        if steps.len() != OPERATIONS.len() {
+            return Err(EngineError::InvalidState(format!(
+                "Metal linear layer has {} bound steps, expected {}",
+                steps.len(),
+                OPERATIONS.len()
+            )));
+        }
+        let layer = steps[0].step().layer.ok_or_else(|| {
+            EngineError::InvalidState("Metal linear layer has no layer identity".into())
+        })?;
+        let expected_start = layer
+            .checked_mul(OPERATIONS.len())
+            .and_then(|offset| offset.checked_add(2))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal linear layer schedule index overflows".into())
+            })?;
+        if steps
+            .iter()
+            .zip(OPERATIONS)
+            .enumerate()
+            .any(|(offset, (step, operation))| {
+                step.step().schedule_index != expected_start + offset
+                    || step.step().layer != Some(layer)
+                    || step.step().operation != operation
+            })
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal linear layer {layer} does not match its frozen ten-step schedule"
+            )));
+        }
+
+        let input = steps[0].reads().first().ok_or_else(|| {
+            EngineError::InvalidState("Metal linear layer has no normalized input view".into())
+        })?;
+        let arena = input.buffer();
+        if steps
+            .iter()
+            .flat_map(|step| step.reads().iter().chain(step.writes()))
+            .any(|view| !std::ptr::eq(arena, view.buffer()))
+        {
+            return Err(EngineError::InvalidState(
+                "Metal linear layer does not use one shared activation arena".into(),
+            ));
+        }
+        let hidden = input.values();
+        let mapping = &projections[0].mapping.inner;
+        let all_projections = [
+            projections[0],
+            projections[1],
+            projections[2],
+            projections[3],
+            linear_output_projection,
+            ffn_gate_up[0],
+            ffn_gate_up[1],
+            swiglu_down,
+        ];
+        if all_projections.iter().any(|projection| {
+            projection.input_buffer.is_some()
+                || projection.output_buffer.is_some()
+                || !Rc::ptr_eq(&projection.mapping.inner, mapping)
+        }) || !Rc::ptr_eq(&convolution.mapping.inner, mapping)
+            || !Rc::ptr_eq(&gated_delta_prepare.mapping.inner, mapping)
+            || !Rc::ptr_eq(&gated_rms_norm.mapping.inner, mapping)
+            || !Rc::ptr_eq(&residual_rms_norm.mapping.inner, mapping)
+            || !Rc::ptr_eq(&post_ffn_residual_rms_norm.mapping.inner, mapping)
+        {
+            return Err(EngineError::InvalidState(
+                "Metal linear layer resources do not share one artifact mapping".into(),
+            ));
+        }
+        let linear_prefix = format!("model.language_model.layers.{layer}.linear_attn");
+        for (projection, name) in projections.iter().zip([
+            format!("{linear_prefix}.in_proj_qkv.weight"),
+            format!("{linear_prefix}.in_proj_z.weight"),
+            format!("{linear_prefix}.in_proj_a.weight"),
+            format!("{linear_prefix}.in_proj_b.weight"),
+        ]) {
+            if !projection.matches_recovered_tensor(&name)? {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal linear layer {layer} projection does not match {name}"
+                )));
+            }
+        }
+        let mlp_prefix = format!("model.language_model.layers.{layer}.mlp");
+        for (projection, name) in [
+            (
+                linear_output_projection,
+                format!("{linear_prefix}.out_proj.weight"),
+            ),
+            (ffn_gate_up[0], format!("{mlp_prefix}.gate_proj.weight")),
+            (ffn_gate_up[1], format!("{mlp_prefix}.up_proj.weight")),
+            (swiglu_down, format!("{mlp_prefix}.down_proj.weight")),
+        ] {
+            if !projection.matches_recovered_tensor(&name)? {
+                return Err(EngineError::InvalidState(format!(
+                    "Metal linear layer {layer} projection does not match {name}"
+                )));
+            }
+        }
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        if !convolution.matches_weight_tensor(&format!("{linear_prefix}.conv1d.weight"))?
+            || !gated_delta_prepare.matches_parameter_tensors(
+                &format!("{linear_prefix}.A_log"),
+                &format!("{linear_prefix}.dt_bias"),
+            )?
+            || recurrence.owner_layer != Some(layer)
+            || !gated_rms_norm.matches_weight_tensor(&format!("{linear_prefix}.norm.weight"))?
+            || !residual_rms_norm
+                .matches_weight_tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?
+            || !post_ffn_residual_rms_norm.matches_weight_tensor(&format!(
+                "model.language_model.layers.{}.input_layernorm.weight",
+                layer + 1
+            ))?
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal linear layer {layer} state or norm identity is incompatible"
+            )));
+        }
+        if convolution.poisoned
+            || recurrence.poisoned
+            || convolution.input_buffer.is_some()
+            || convolution.output_buffer.is_some()
+            || recurrence.has_owned_io()
+            || !convolution.checkpoint_valid
+            || !recurrence.checkpoint_valid
+            || recurrence.config != MetalGatedDeltaConfig::QWEN38_27B
+            || gated_rms_norm.has_owned_io()
+            || residual_rms_norm.input_buffer.is_some()
+            || residual_rms_norm.output_buffer.is_some()
+            || post_ffn_residual_rms_norm.input_buffer.is_some()
+            || post_ffn_residual_rms_norm.output_buffer.is_some()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal linear layer state or graph-owned I/O is not ready".into(),
+            ));
+        }
+
+        let linear = &steps[0];
+        if linear.reads().len() != 1
+            || linear.writes().len() != 4
+            || linear.reads()[0].slot() != MetalBufferSlot::Normalized
+            || projections
+                .iter()
+                .zip(linear.writes())
+                .any(|(projection, output)| {
+                    projection.columns != hidden || projection.rows != output.values()
+                })
+            || convolution.channels != linear.writes()[0].values()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal linear fan-out or convolution shape is incompatible".into(),
+            ));
+        }
+        let prepare = &steps[2];
+        let recurrent = &steps[3];
+        let gated = &steps[4];
+        if prepare.reads().len() != 3
+            || prepare.writes().len() != 5
+            || recurrent.reads().len() != 5
+            || recurrent.writes().len() != 1
+            || gated.reads().len() != 2
+            || gated.writes().len() != 1
+            || prepare
+                .writes()
+                .iter()
+                .zip(recurrent.reads())
+                .any(|(output, input)| {
+                    output.slot() != input.slot()
+                        || output.offset() != input.offset()
+                        || output.values() != input.values()
+                })
+            || recurrent.writes()[0].values()
+                != recurrence.config.heads * recurrence.config.value_dim
+            || gated_rms_norm.rows != recurrence.config.heads
+            || gated_rms_norm.columns != recurrence.config.value_dim
+            || gated.reads()[0].offset() != recurrent.writes()[0].offset()
+            || gated.writes()[0].offset() != gated.reads()[0].offset()
+        {
+            return Err(EngineError::InvalidState(
+                "Metal GatedDelta layer views or resources are incompatible".into(),
+            ));
+        }
+        let output_projection = &steps[5];
+        let residual = &steps[6];
+        let ffn = &steps[7];
+        let down = &steps[8];
+        let post_ffn = &steps[9];
+        if output_projection.reads().len() != 1
+            || output_projection.writes().len() != 1
+            || linear_output_projection.columns != output_projection.reads()[0].values()
+            || linear_output_projection.rows != hidden
+            || residual.reads().len() != 2
+            || residual.writes().len() != 2
+            || residual_rms_norm.rows != 1
+            || residual_rms_norm.columns != hidden
+            || ffn.reads().len() != 1
+            || ffn.writes().len() != 2
+            || ffn_gate_up
+                .iter()
+                .zip(ffn.writes())
+                .any(|(projection, output)| {
+                    projection.columns != hidden || projection.rows != output.values()
+                })
+            || down.reads().len() != 2
+            || down.writes().len() != 1
+            || swiglu_down.columns != down.reads()[0].values()
+            || down.reads()[1].values() != swiglu_down.columns
+            || swiglu_down.rows != hidden
+            || post_ffn.reads().len() != 2
+            || post_ffn.writes().len() != 2
+            || post_ffn_residual_rms_norm.rows != 1
+            || post_ffn_residual_rms_norm.columns != hidden
+        {
+            return Err(EngineError::InvalidState(
+                "Metal linear output, FFN, or residual resources are incompatible".into(),
+            ));
+        }
+
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-shared-arena-linear-layer");
+        let encoder = command_buffer.new_compute_command_encoder();
+        for (projection, output) in projections.iter().zip(linear.writes()) {
+            self.encode_mapped_projection_between(
+                encoder,
+                projection,
+                arena,
+                linear.reads()[0].offset(),
+                arena,
+                output.offset(),
+            )?;
+        }
+        self.encode_mapped_causal_conv_between(
+            encoder,
+            convolution,
+            arena,
+            steps[1].reads()[0].offset(),
+            arena,
+            steps[1].writes()[0].offset(),
+        )?;
+        convolution.poisoned = true;
+        self.encode_mapped_gated_delta_prepare_between(
+            encoder,
+            gated_delta_prepare,
+            arena,
+            prepare.reads()[0].offset(),
+            prepare.reads()[1].offset(),
+            prepare.reads()[2].offset(),
+            prepare.writes()[0].offset(),
+            prepare.writes()[1].offset(),
+            prepare.writes()[2].offset(),
+            prepare.writes()[3].offset(),
+            prepare.writes()[4].offset(),
+        )?;
+        self.encode_gated_delta_f16_between(
+            encoder,
+            recurrence,
+            arena,
+            recurrent.reads()[0].offset(),
+            recurrent.reads()[1].offset(),
+            recurrent.reads()[2].offset(),
+            recurrent.reads()[3].offset(),
+            recurrent.reads()[4].offset(),
+            recurrent.writes()[0].offset(),
+        );
+        recurrence.poisoned = true;
+        self.encode_mapped_gated_rms_norm_between(
+            encoder,
+            gated_rms_norm,
+            arena,
+            gated.reads()[0].offset(),
+            arena,
+            gated.reads()[1].offset(),
+            arena,
+            gated.writes()[0].offset(),
+        );
+        self.encode_mapped_projection_between(
+            encoder,
+            linear_output_projection,
+            arena,
+            output_projection.reads()[0].offset(),
+            arena,
+            output_projection.writes()[0].offset(),
+        )?;
+        self.encode_mapped_residual_rms_norm_between(
+            encoder,
+            residual_rms_norm,
+            arena,
+            residual.reads()[0].offset(),
+            arena,
+            residual.reads()[1].offset(),
+            arena,
+            residual.writes()[0].offset(),
+            arena,
+            residual.writes()[1].offset(),
+        );
+        for (projection, output) in ffn_gate_up.iter().zip(ffn.writes()) {
+            self.encode_mapped_projection_between(
+                encoder,
+                projection,
+                arena,
+                ffn.reads()[0].offset(),
+                arena,
+                output.offset(),
+            )?;
+        }
+        self.encode_mapped_swiglu_projection_between(
+            encoder,
+            swiglu_down,
+            arena,
+            down.reads()[0].offset(),
+            arena,
+            down.reads()[1].offset(),
+            arena,
+            down.writes()[0].offset(),
+        )?;
+        self.encode_mapped_residual_rms_norm_between(
+            encoder,
+            post_ffn_residual_rms_norm,
+            arena,
+            post_ffn.reads()[0].offset(),
+            arena,
+            post_ffn.reads()[1].offset(),
+            arena,
+            post_ffn.writes()[0].offset(),
+            arena,
+            post_ffn.writes()[1].offset(),
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal linear layer {layer} ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        convolution.poisoned = false;
+        recurrence.poisoned = false;
+        Ok(())
+    }
+
     /// Encode one decode-row RMSNorm followed by a recovered Q2/Q4
     /// projection in a single command encoder. The projection consumes the
     /// RMSNorm output buffer directly and therefore owns no second activation
@@ -8781,42 +9232,42 @@ mod tests {
             0.875,
         );
         tensors.push(PackedTensor {
-            name: "layer0.input_norm.weight".into(),
+            name: "model.language_model.layers.0.input_layernorm.weight".into(),
             dtype: TensorDType::F16,
             shape: vec![columns as u64],
             bytes: f16_bytes(&norm_values),
         });
         tensors.push(PackedTensor {
-            name: "layer0.post_attention_norm.weight".into(),
+            name: "model.language_model.layers.0.post_attention_layernorm.weight".into(),
             dtype: TensorDType::F16,
             shape: vec![columns as u64],
             bytes: f16_bytes(&post_attention_norm_values),
         });
         tensors.push(PackedTensor {
-            name: "layer1.input_norm.weight".into(),
+            name: "model.language_model.layers.1.input_layernorm.weight".into(),
             dtype: TensorDType::F16,
             shape: vec![columns as u64],
             bytes: f16_bytes(&next_layer_norm_values),
         });
         let projection_specs = [
             (
-                "layer0.linear.qkv.weight",
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
                 TensorDType::Q2B64,
                 2 * config.linear_num_key_heads * config.linear_key_head_dim
                     + config.linear_num_value_heads * config.linear_value_head_dim,
             ),
             (
-                "layer0.linear.z.weight",
+                "model.language_model.layers.0.linear_attn.in_proj_z.weight",
                 TensorDType::Q4B64,
                 config.linear_num_value_heads * config.linear_value_head_dim,
             ),
             (
-                "layer0.linear.a.weight",
+                "model.language_model.layers.0.linear_attn.in_proj_a.weight",
                 TensorDType::Q2B64,
                 config.linear_num_value_heads,
             ),
             (
-                "layer0.linear.b.weight",
+                "model.language_model.layers.0.linear_attn.in_proj_b.weight",
                 TensorDType::Q4B64,
                 config.linear_num_value_heads,
             ),
@@ -8844,31 +9295,31 @@ mod tests {
             ));
         }
         tensors.push(PackedTensor {
-            name: "layer0.linear.conv.weight".into(),
+            name: "model.language_model.layers.0.linear_attn.conv1d.weight".into(),
             dtype: TensorDType::F16,
-            shape: vec![convolution_channels as u64, convolution_kernel as u64],
+            shape: vec![convolution_channels as u64, 1, convolution_kernel as u64],
             bytes: f16_bytes(&convolution_weight_values),
         });
         tensors.push(PackedTensor {
-            name: "layer0.linear.A_log".into(),
+            name: "model.language_model.layers.0.linear_attn.A_log".into(),
             dtype: TensorDType::F32,
             shape: vec![config.linear_num_value_heads as u64],
             bytes: f32_bytes(&a_log_values),
         });
         tensors.push(PackedTensor {
-            name: "layer0.linear.dt_bias".into(),
+            name: "model.language_model.layers.0.linear_attn.dt_bias".into(),
             dtype: TensorDType::F32,
             shape: vec![config.linear_num_value_heads as u64],
             bytes: f32_bytes(&dt_bias_values),
         });
         tensors.push(PackedTensor {
-            name: "layer0.linear.norm.weight".into(),
+            name: "model.language_model.layers.0.linear_attn.norm.weight".into(),
             dtype: TensorDType::F16,
             shape: vec![config.linear_value_head_dim as u64],
             bytes: f16_bytes(&gated_norm_values),
         });
         tensors.extend(repeated_recovered_tensors(
-            "layer0.linear.out.weight",
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
             TensorDType::Q2B64,
             columns,
             linear_output_columns,
@@ -8876,8 +9327,14 @@ mod tests {
             1.03125,
         ));
         let ffn_specs = [
-            ("layer0.mlp.gate.weight", TensorDType::Q2B64),
-            ("layer0.mlp.up.weight", TensorDType::Q4B64),
+            (
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                TensorDType::Q2B64,
+            ),
+            (
+                "model.language_model.layers.0.mlp.up_proj.weight",
+                TensorDType::Q4B64,
+            ),
         ];
         for (name, dtype) in ffn_specs {
             tensors.extend(repeated_recovered_tensors(
@@ -8892,7 +9349,7 @@ mod tests {
         let ffn_down_s_in_values = vec![0.953125_f32; config.intermediate_size];
         let ffn_down_s_in = f16_bytes(&ffn_down_s_in_values);
         tensors.extend(repeated_recovered_tensors(
-            "layer0.mlp.down.weight",
+            "model.language_model.layers.0.mlp.down_proj.weight",
             TensorDType::Q2B64,
             columns,
             config.intermediate_size,
@@ -8917,7 +9374,7 @@ mod tests {
             .recovered_matrix("embedding.weight")
             .expect("resolve graph embedding");
         let norm_weight = artifact
-            .float_tensor("layer0.input_norm.weight")
+            .float_tensor("model.language_model.layers.0.input_layernorm.weight")
             .expect("resolve graph RMSNorm");
         let validation_input = vec![0.0_f32; columns];
         let embedding = runtime
@@ -8937,7 +9394,7 @@ mod tests {
             .prepare_mapped_rms_norm_1p_graph_io(
                 &mapping,
                 artifact
-                    .float_tensor("layer0.post_attention_norm.weight")
+                    .float_tensor("model.language_model.layers.0.post_attention_layernorm.weight")
                     .expect("resolve graph post-attention RMSNorm"),
                 &validation_input,
                 1,
@@ -8949,7 +9406,7 @@ mod tests {
             .prepare_mapped_rms_norm_1p_graph_io(
                 &mapping,
                 artifact
-                    .float_tensor("layer1.input_norm.weight")
+                    .float_tensor("model.language_model.layers.1.input_layernorm.weight")
                     .expect("resolve graph next-layer RMSNorm"),
                 &validation_input,
                 1,
@@ -8973,7 +9430,7 @@ mod tests {
                 .expect("prepare graph projection without activation buffers")
         });
         let convolution_weight = artifact
-            .float_tensor("layer0.linear.conv.weight")
+            .float_tensor("model.language_model.layers.0.linear_attn.conv1d.weight")
             .expect("resolve graph convolution weight");
         let convolution_weight_f32 = convolution_weight
             .to_f32_vec()
@@ -8991,10 +9448,10 @@ mod tests {
             .prepare_mapped_gated_delta_prepare_graph_io(
                 &mapping,
                 artifact
-                    .float_tensor("layer0.linear.A_log")
+                    .float_tensor("model.language_model.layers.0.linear_attn.A_log")
                     .expect("resolve graph A_log"),
                 artifact
-                    .float_tensor("layer0.linear.dt_bias")
+                    .float_tensor("model.language_model.layers.0.linear_attn.dt_bias")
                     .expect("resolve graph dt_bias"),
                 config.linear_num_key_heads,
                 config.linear_num_value_heads,
@@ -9008,13 +9465,13 @@ mod tests {
             epsilon: config.rms_norm_epsilon,
         };
         let mut recurrence = runtime
-            .prepare_gated_delta_f16_graph_io(recurrence_config)
+            .prepare_gated_delta_f16_graph_io(recurrence_config, 0)
             .expect("prepare graph recurrence without activation buffers");
         let gated_norm = runtime
             .prepare_mapped_rms_norm_gated_graph_io(
                 &mapping,
                 artifact
-                    .float_tensor("layer0.linear.norm.weight")
+                    .float_tensor("model.language_model.layers.0.linear_attn.norm.weight")
                     .expect("resolve graph gated RMSNorm weight"),
                 &vec![0.0; recurrence_config.heads * recurrence_config.value_dim],
                 &vec![0.0; recurrence_config.heads * recurrence_config.value_dim],
@@ -9024,7 +9481,7 @@ mod tests {
             )
             .expect("prepare graph gated RMSNorm without activation buffers");
         let linear_output_matrix = artifact
-            .recovered_matrix("layer0.linear.out.weight")
+            .recovered_matrix("model.language_model.layers.0.linear_attn.out_proj.weight")
             .expect("resolve graph linear output projection");
         let linear_output_validation = vec![0.0_f32; linear_output_columns];
         let linear_output_operation = linear_output_matrix
@@ -9049,7 +9506,7 @@ mod tests {
                 .expect("prepare graph FFN gate/up projection without activation buffers")
         });
         let ffn_down_matrix = artifact
-            .recovered_matrix("layer0.mlp.down.weight")
+            .recovered_matrix("model.language_model.layers.0.mlp.down_proj.weight")
             .expect("resolve graph FFN down projection");
         let ffn_down_validation = vec![0.0; config.intermediate_size];
         let ffn_down_operation = ffn_down_matrix
@@ -9063,7 +9520,7 @@ mod tests {
                 &mapping,
                 norm_weight,
                 artifact
-                    .float_tensor("layer0.linear.dt_bias")
+                    .float_tensor("model.language_model.layers.0.linear_attn.dt_bias")
                     .expect("resolve graph dt_bias"),
                 config.linear_num_key_heads,
                 config.linear_num_value_heads,
@@ -9074,10 +9531,10 @@ mod tests {
             .prepare_mapped_gated_delta_prepare_graph_io(
                 &mapping,
                 artifact
-                    .float_tensor("layer0.linear.A_log")
+                    .float_tensor("model.language_model.layers.0.linear_attn.A_log")
                     .expect("resolve graph A_log"),
                 artifact
-                    .float_tensor("layer0.linear.dt_bias")
+                    .float_tensor("model.language_model.layers.0.linear_attn.dt_bias")
                     .expect("resolve graph dt_bias"),
                 8,
                 config.linear_num_value_heads,
@@ -9799,6 +10256,99 @@ mod tests {
         convolution
             .restore_speculative(&runtime)
             .expect("restore graph convolution after complete layer");
+
+        runtime
+            .dispatch_mapped_embedding_rms_norm_linear_fanout_views(
+                &embedding,
+                1,
+                &norm,
+                projection_refs,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                embedding_output,
+                normalized_output,
+                linear_outputs,
+            )
+            .expect("reinitialize shared-arena input for reusable layer encoder");
+        assert!(runtime
+            .dispatch_mapped_linear_attention_layer_views(
+                program
+                    .linear_attention_layer_steps(1)
+                    .expect("bind layer-1 schedule slice"),
+                projection_refs,
+                &mut convolution,
+                &delta_prepare,
+                &mut recurrence,
+                &gated_norm,
+                &linear_output_projection,
+                &residual_norm,
+                ffn_projection_refs,
+                &ffn_down_projection,
+                &post_ffn_residual_norm,
+            )
+            .is_err());
+        assert!(!convolution.poisoned);
+        assert!(!recurrence.poisoned);
+        convolution
+            .begin_speculative(&runtime)
+            .expect("snapshot convolution for reusable layer encoder");
+        recurrence
+            .begin_speculative(&runtime)
+            .expect("snapshot recurrence for reusable layer encoder");
+        runtime
+            .dispatch_mapped_linear_attention_layer_views(
+                program
+                    .linear_attention_layer_steps(0)
+                    .expect("bind layer-0 schedule slice"),
+                projection_refs,
+                &mut convolution,
+                &delta_prepare,
+                &mut recurrence,
+                &gated_norm,
+                &linear_output_projection,
+                &residual_norm,
+                ffn_projection_refs,
+                &ffn_down_projection,
+                &post_ffn_residual_norm,
+            )
+            .expect("dispatch reusable complete linear-attention layer encoder");
+        let reusable_residual = workspace
+            .read_f32(MetalBufferSlot::HiddenA)
+            .expect("read reusable layer residual");
+        let reusable_norm = workspace
+            .read_f32(MetalBufferSlot::Normalized)
+            .expect("read reusable layer next norm");
+        for (index, ((expected_residual, actual_residual), (expected_norm, actual_norm))) in
+            expected_post_ffn_residual
+                .iter()
+                .zip(reusable_residual)
+                .zip(expected_next_norm.iter().zip(reusable_norm))
+                .enumerate()
+        {
+            let residual_tolerance = 8.0e-5_f32.max(expected_residual.abs() * 2.0e-6);
+            let norm_tolerance = 8.0e-4_f32.max(expected_norm.abs() * 5.0e-4);
+            assert!(
+                (expected_residual - actual_residual).abs() <= residual_tolerance,
+                "reusable Metal layer residual {index}: expected {expected_residual}, got {actual_residual}"
+            );
+            assert!(
+                (expected_norm - actual_norm).abs() <= norm_tolerance,
+                "reusable Metal layer norm {index}: expected {expected_norm}, got {actual_norm}"
+            );
+        }
+        recurrence
+            .restore_speculative(&runtime)
+            .expect("restore reusable layer recurrence");
+        convolution
+            .restore_speculative(&runtime)
+            .expect("restore reusable layer convolution");
     }
 
     #[test]
