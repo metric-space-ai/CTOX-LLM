@@ -340,15 +340,19 @@ buffer after the accepted initial record. A 4/4 branch commits atomically. A
 shorter prefix restores every target/MTP tail state and the compact selectors
 to record zero, returning the exact fixed-size records needed by the bounded
 accepted-prefix replay path. `dispatch_prepared_mapped_greedy_mtp4_verifier`
-then replays only records 1 through `accepted_prefix - 1` via the same full
-causal verifier. Any replay mismatch poisons both graphs fail-closed. Production
+then replays records 1 through `accepted_prefix` via the same full causal
+verifier: the last replay consumes the final accepted draft and may itself be
+the first mismatching verification record. Any replay mismatch poisons both
+graphs fail-closed. Production
 executor wiring must use the cursor-bound fused entry point below; this older
 tail-only entry remains a verifier. The additional
 `dispatch_prepared_mapped_greedy_mtp4_from_token_verifier` path removes the
 separate initial-record completion wait from the fully accepted case: all four
-records plus prefix reduction share one command buffer. A shorter prefix rolls
-back to the pre-initial state, replays the mandatory initial transition, and
-then replays only its accepted tail; replay divergence poisons both graphs.
+verification records, the fifth transition that consumes draft four and
+produces the true bonus token, plus prefix reduction share one command buffer.
+A shorter prefix rolls back to the pre-initial state, replays the mandatory
+input transition, and then one continuation per accepted draft; replay
+divergence poisons both graphs.
 The ordinary one-token path is now wired to the complete decode contract:
 `dispatch_prepared_mapped_complete_token_verifier` requires the caller's
 committed position to equal the resident target-KV position, records all 644
@@ -358,9 +362,10 @@ next publishable position together with the compact target/MTP verification;
 an encoding, cursor, GPU, or verification failure retains the existing joint
 state rollback. The accepted continuation/replay path exposes the same
 cursor-bound complete-token entry point. The fused four-record branch now owns
-a block cursor that keeps all four logical positions provisional until its one
-shared GPU barrier completes; a partial prefix discards that cursor and
-publishes only the cursor-bound replay positions. This closes the Metal runtime
+a block cursor that keeps all five logical positions (input plus four drafts)
+provisional until its one shared GPU barrier completes; a partial prefix
+discards that cursor and publishes only the cursor-bound
+input-plus-accepted-draft replay positions. This closes the Metal runtime
 MTP4 cursor contract, not `ModelExecutor` integration, prefill, full-artifact
 Golden, or production promotion gates.
 The compact verifier allocation now reserves four fixed 16-byte records and

@@ -44,6 +44,7 @@ use super::metal_graph::{
     MetalBoundDecodeStep, MetalDecodeBindingPlan, MetalDecodeBufferBinding,
     MetalDecodeExecutionCursor, MetalDecodeWorkspacePlan, MetalMtp4ExecutionCursor,
     MetalMtpBufferBinding, MetalMtpBufferSlot, MetalMtpWorkspacePlan, METAL_MTP4_RECORDS,
+    METAL_MTP4_TRANSITIONS,
 };
 use super::metal_schedule::{MetalBufferSlot, MetalDecodeOperation};
 use super::{Activation, FusedMatVec, ScaleSlice};
@@ -64,6 +65,7 @@ const ROWS_PER_SIMDGROUP: usize = 4;
 const METAL_PAGED_KV_DESCRIPTOR_BYTES: usize = 16;
 const METAL_GREEDY_MTP_RECORD_WORDS: usize = 4;
 const MAXIMUM_METAL_GREEDY_MTP_DRAFTS: usize = METAL_MTP4_RECORDS;
+const METAL_GREEDY_MTP_TRANSITIONS: usize = METAL_MTP4_TRANSITIONS;
 const METAL_GREEDY_MTP_HISTORY_BYTES: usize =
     MAXIMUM_METAL_GREEDY_MTP_DRAFTS * METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>();
 
@@ -599,8 +601,8 @@ pub struct MetalGreedyMtp4Outcome {
 }
 
 /// Cursor-bound MTP4 result. `committed_tokens` is the only position safe to
-/// publish: four on a fully accepted shared-buffer branch, otherwise the
-/// mandatory initial transition plus its cursor-bound accepted replays.
+/// publish: five on a fully accepted shared-buffer branch, otherwise the
+/// mandatory input transition plus one transition per accepted draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetalCompletedMtp4Outcome {
     pub outcome: MetalGreedyMtp4Outcome,
@@ -4583,7 +4585,7 @@ impl MetalCandidateRuntime {
         Ok(PreparedMappedMetalAttentionOutput { layer, projection })
     }
 
-    /// Preallocate the four immutable metadata slots required by one MTP4
+    /// Preallocate the five immutable metadata slots required by one MTP4
     /// branch. No decode-time path may allocate a replacement slot.
     fn prepare_full_attention_dispatch_pool(
         &self,
@@ -4628,10 +4630,10 @@ impl MetalCandidateRuntime {
         #[cfg(not(test))]
         let bytes_per_slot = base_bytes_per_slot;
         let pool_bytes = bytes_per_slot
-            .checked_mul(MAXIMUM_METAL_GREEDY_MTP_DRAFTS)
+            .checked_mul(METAL_GREEDY_MTP_TRANSITIONS)
             .ok_or_else(|| EngineError::MemoryBudget("Metal dispatch pool overflows".into()))?;
-        let mut slots = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS);
-        for _ in 0..MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
+        let mut slots = Vec::with_capacity(METAL_GREEDY_MTP_TRANSITIONS);
+        for _ in 0..METAL_GREEDY_MTP_TRANSITIONS {
             slots.push(MetalFullAttentionDispatchSlot {
                 gqa_descriptors_buffer: new_zeroed_buffer(&self.device, descriptor_bytes)?,
                 gqa_params_buffer: new_zeroed_buffer(&self.device, MetalPagedGqaParams::BYTE_LEN)?,
@@ -8381,7 +8383,7 @@ impl MetalCandidateRuntime {
         let append = self.plan_paged_gqa_append(&mut prepared.attention)?;
         let descriptors = metal_paged_gqa_descriptor_bytes(&prepared.attention)?;
         let gqa_params = metal_paged_gqa_params_bytes(&prepared.attention)?;
-        let slot_index = usize::try_from(position % MAXIMUM_METAL_GREEDY_MTP_DRAFTS as u64)
+        let slot_index = usize::try_from(position % METAL_GREEDY_MTP_TRANSITIONS as u64)
             .map_err(|_| EngineError::Shape("Metal dispatch slot exceeds usize".into()))?;
         let slot = prepared.dispatch_pool.get(slot_index).ok_or_else(|| {
             EngineError::InvalidState(format!(
@@ -11262,7 +11264,7 @@ impl MetalCandidateRuntime {
             || prepared.attention.query_buffer.is_some()
             || prepared.attention.output_buffer.is_some()
             || prepared.key_rope.has_owned_values()
-            || prepared.dispatch_pool.len() != MAXIMUM_METAL_GREEDY_MTP_DRAFTS
+            || prepared.dispatch_pool.len() != METAL_GREEDY_MTP_TRANSITIONS
             || prepared.dispatch_pool_bytes == 0
             || prepared.attention.cache.tokens() >= prepared.attention.maximum_tokens
         {
@@ -12438,7 +12440,7 @@ impl MetalCandidateRuntime {
             || layer.attention.owner_layer != Some(config.num_hidden_layers)
             || layer.attention.poisoned
             || layer.attention.speculative_checkpoint.is_some()
-            || layer.dispatch_pool.len() != MAXIMUM_METAL_GREEDY_MTP_DRAFTS
+            || layer.dispatch_pool.len() != METAL_GREEDY_MTP_TRANSITIONS
             || layer.dispatch_pool_bytes == 0
             || layer.fanout.projections[0].rows != query_values * 2
             || layer.fanout.projections[1].rows != component_values
@@ -13429,9 +13431,10 @@ impl MetalCandidateRuntime {
     }
 
     /// Execute one complete MTP4 block under a single scheduler contract.
-    /// Full acceptance publishes all four positions only after the shared GPU
-    /// barrier. A partial branch discards those provisional cursors and
-    /// advances solely through complete-token initial/continuation replays.
+    /// Full acceptance publishes the input plus four accepted-draft positions
+    /// only after the shared GPU barrier. A partial branch discards those
+    /// provisional cursors and advances solely through complete-token
+    /// initial/continuation replays.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_prepared_mapped_complete_greedy_mtp4_from_token_verifier(
         &self,
@@ -13488,7 +13491,7 @@ impl MetalCandidateRuntime {
                 )
             })
             .transpose()?;
-        let mut final_schedule_indices = [0_usize; MAXIMUM_METAL_GREEDY_MTP_DRAFTS];
+        let mut final_schedule_indices = [0_usize; METAL_GREEDY_MTP_TRANSITIONS];
         if token as usize >= target.vocabulary_rows()
             || target_tokens == 0
             || target_tokens != mtp_tokens.saturating_add(1)
@@ -13538,8 +13541,8 @@ impl MetalCandidateRuntime {
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-greedy-mtp4-from-token-verifier");
             let encoder = command_buffer.new_compute_command_encoder();
-            let mut mtp_dispatches = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS);
-            let mut target_dispatches = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS);
+            let mut mtp_dispatches = Vec::with_capacity(METAL_GREEDY_MTP_TRANSITIONS);
+            let mut target_dispatches = Vec::with_capacity(METAL_GREEDY_MTP_TRANSITIONS);
             let encoded = (|| {
                 let initial_mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
                 mtp.layer.attention.poisoned = true;
@@ -13589,11 +13592,14 @@ impl MetalCandidateRuntime {
                 mtp_dispatches.push(initial_mtp_dispatch);
                 target_dispatches.push(initial_target_dispatch);
                 if let Some(cursor) = execution_cursor.as_mut() {
-                    final_schedule_indices[0] = cursor.record_complete_encoded_record(0)?;
+                    final_schedule_indices[0] = cursor.record_complete_encoded_transition(0)?;
                 }
 
-                for (record_index, final_schedule_index) in
-                    final_schedule_indices.iter_mut().enumerate().skip(1)
+                for (record_index, final_schedule_index) in final_schedule_indices
+                    .iter_mut()
+                    .enumerate()
+                    .take(MAXIMUM_METAL_GREEDY_MTP_DRAFTS)
+                    .skip(1)
                 {
                     let mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
                     mtp.layer.attention.poisoned = true;
@@ -13637,8 +13643,52 @@ impl MetalCandidateRuntime {
                     target_dispatches.push(target_plans);
                     if let Some(cursor) = execution_cursor.as_mut() {
                         *final_schedule_index =
-                            cursor.record_complete_encoded_record(record_index)?;
+                            cursor.record_complete_encoded_transition(record_index)?;
                     }
+                }
+
+                // Four accepted drafts require one final causal transition:
+                // consume draft[3] in both MTP and target, then expose the
+                // target argmax as the true post-draft bonus token. This fifth
+                // transition carries no verification record of its own.
+                let bonus_transition = MAXIMUM_METAL_GREEDY_MTP_DRAFTS;
+                let bonus_mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
+                mtp.layer.attention.poisoned = true;
+                self.encode_copy_argmax_result(
+                    encoder,
+                    &mtp.draft_selector,
+                    &mtp.candidate_selector,
+                )?;
+                self.encode_prepared_mapped_mtp_draft_from_selector(
+                    encoder,
+                    mtp_step,
+                    mtp,
+                    &mtp.candidate_selector,
+                    &bonus_mtp_dispatch,
+                    component_values,
+                    thread_width,
+                )?;
+                let bonus_target_plans = self
+                    .encode_prevalidated_mapped_target_core_from_selector(
+                        encoder,
+                        program,
+                        target,
+                        &mtp.candidate_selector,
+                        embedding,
+                        initial_norm,
+                        target_lm_head,
+                    )?;
+                self.encode_argmax_f32_at(
+                    encoder,
+                    target_lm_head.writes()[0].buffer(),
+                    target_lm_head.writes()[0].offset(),
+                    &mtp.target_selector,
+                );
+                mtp_dispatches.push(bonus_mtp_dispatch);
+                target_dispatches.push(bonus_target_plans);
+                if let Some(cursor) = execution_cursor.as_mut() {
+                    final_schedule_indices[bonus_transition] =
+                        cursor.record_complete_encoded_transition(bonus_transition)?;
                 }
                 self.encode_greedy_mtp_prefix(
                     encoder,
@@ -13706,10 +13756,10 @@ impl MetalCandidateRuntime {
                 ))
             } else {
                 self.restore_mapped_greedy_mtp_target(target, mtp)?;
-                // Dropping the provisional block cursor with its four final
+                // Dropping the provisional block cursor with its five final
                 // barriers still pending makes the speculative positions
-                // unpublishable. Accepted state is rebuilt below with one
-                // ordinary complete-token cursor per replayed transition.
+                // unpublishable. Accepted state is rebuilt below from the real
+                // input plus one ordinary transition per accepted draft.
                 execution_cursor = None;
                 Ok((
                     MetalGreedyMtp4Branch {
@@ -13767,16 +13817,9 @@ impl MetalCandidateRuntime {
                 branch.records[0]
             )));
         }
-        let replayed_tail_records = branch.prefix.accepted_prefix.saturating_sub(1);
+        let replayed_tail_records = branch.prefix.accepted_prefix;
         for record_index in 1..=replayed_tail_records as usize {
             let expected = branch.records[record_index];
-            if !expected.accepted {
-                target.layers.poisoned = true;
-                mtp.layer.attention.poisoned = true;
-                return Err(EngineError::InvalidState(format!(
-                    "Metal fused MTP4 prefix admitted rejected replay record {record_index}"
-                )));
-            }
             let continuation_cursor = cursor_contract
                 .map(|(_, _, admitted_context)| {
                     replay_next_position
@@ -13891,8 +13934,8 @@ impl MetalCandidateRuntime {
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-greedy-mtp4-tail-verifier");
             let encoder = command_buffer.new_compute_command_encoder();
-            let mut mtp_dispatches = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS - 1);
-            let mut target_dispatches = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS - 1);
+            let mut mtp_dispatches = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS);
+            let mut target_dispatches = Vec::with_capacity(MAXIMUM_METAL_GREEDY_MTP_DRAFTS);
             let encoded = (|| {
                 for record_index in 1..MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
                     let mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
@@ -13936,6 +13979,45 @@ impl MetalCandidateRuntime {
                     mtp_dispatches.push(mtp_dispatch);
                     target_dispatches.push(target_plans);
                 }
+
+                // The three verification transitions above consume drafts
+                // zero through two. Consume draft three as a fourth tail
+                // transition so target_selector contains the actual bonus
+                // token after a fully accepted MTP4 block.
+                let bonus_mtp_dispatch = self.plan_full_attention_dispatch(&mut mtp.layer)?;
+                mtp.layer.attention.poisoned = true;
+                self.encode_copy_argmax_result(
+                    encoder,
+                    &mtp.draft_selector,
+                    &mtp.candidate_selector,
+                )?;
+                self.encode_prepared_mapped_mtp_draft_from_selector(
+                    encoder,
+                    mtp_step,
+                    mtp,
+                    &mtp.candidate_selector,
+                    &bonus_mtp_dispatch,
+                    component_values,
+                    thread_width,
+                )?;
+                let bonus_target_plans = self
+                    .encode_prevalidated_mapped_target_core_from_selector(
+                        encoder,
+                        program,
+                        target,
+                        &mtp.candidate_selector,
+                        embedding,
+                        initial_norm,
+                        target_lm_head,
+                    )?;
+                self.encode_argmax_f32_at(
+                    encoder,
+                    target_lm_head.writes()[0].buffer(),
+                    target_lm_head.writes()[0].offset(),
+                    &mtp.target_selector,
+                );
+                mtp_dispatches.push(bonus_mtp_dispatch);
+                target_dispatches.push(bonus_target_plans);
                 self.encode_greedy_mtp_prefix(
                     encoder,
                     &mtp.verification_buffer,
@@ -14043,16 +14125,9 @@ impl MetalCandidateRuntime {
             });
         }
 
-        let replayed_tail_records = branch.prefix.accepted_prefix.saturating_sub(1);
+        let replayed_tail_records = branch.prefix.accepted_prefix;
         for record_index in 1..=replayed_tail_records as usize {
             let expected = branch.records[record_index];
-            if !expected.accepted {
-                target.layers.poisoned = true;
-                mtp.layer.attention.poisoned = true;
-                return Err(EngineError::InvalidState(format!(
-                    "Metal MTP4 prefix admitted rejected replay record {record_index}"
-                )));
-            }
             let replayed = match self
                 .dispatch_prepared_mapped_greedy_mtp_target_verifier(program, target, mtp)
             {
@@ -19534,10 +19609,7 @@ mod tests {
         assert_eq!(prepared.layer(), 3);
         assert_eq!(prepared.copied_model_bytes(), 0);
         assert!(prepared.resident_state_bytes() > 0);
-        assert_eq!(
-            prepared.dispatch_pool.len(),
-            MAXIMUM_METAL_GREEDY_MTP_DRAFTS
-        );
+        assert_eq!(prepared.dispatch_pool.len(), METAL_GREEDY_MTP_TRANSITIONS);
         assert!(prepared.dispatch_pool_bytes() > 0);
         assert_eq!(prepared.cached_tokens(), 0);
 
@@ -19546,7 +19618,7 @@ mod tests {
             .attention
             .begin_speculative()
             .expect("checkpoint full-attention metadata for pool verification");
-        let plans: Vec<_> = (0..MAXIMUM_METAL_GREEDY_MTP_DRAFTS)
+        let plans: Vec<_> = (0..METAL_GREEDY_MTP_TRANSITIONS)
             .map(|_| {
                 runtime
                     .plan_full_attention_dispatch(&mut prepared)

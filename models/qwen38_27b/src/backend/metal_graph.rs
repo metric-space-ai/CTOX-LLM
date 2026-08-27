@@ -18,6 +18,9 @@ use crate::{EngineError, Qwen38Config, Result};
 
 const EMBEDDING_MATRIX: &str = "model.language_model.embed_tokens.weight";
 pub const METAL_MTP4_RECORDS: usize = 4;
+/// One real input transition plus the four accepted draft transitions needed
+/// to leave the target state behind a genuine post-draft bonus token.
+pub const METAL_MTP4_TRANSITIONS: usize = METAL_MTP4_RECORDS + 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetalProjectionGroupPlan {
@@ -145,15 +148,16 @@ pub struct MetalDecodeExecutionCursor<'a> {
     next_step: usize,
 }
 
-/// Four provisional one-token cursors sharing one physical Metal completion
-/// barrier. Encoding a record never publishes its provisional position; only
-/// consuming all four final barriers after the shared command buffer completed
+/// Five provisional one-token cursors sharing one physical Metal completion
+/// barrier: the real input transition plus four accepted draft transitions.
+/// Encoding a transition never publishes its provisional position; only
+/// consuming all five final barriers after the shared command buffer completed
 /// can return the block's new scheduler-visible position.
 #[derive(Debug)]
 pub struct MetalMtp4ExecutionCursor<'a> {
-    records: [MetalDecodeExecutionCursor<'a>; METAL_MTP4_RECORDS],
+    transitions: [MetalDecodeExecutionCursor<'a>; METAL_MTP4_TRANSITIONS],
     start_position: usize,
-    next_record: usize,
+    next_transition: usize,
 }
 
 impl MetalProjectionPlan {
@@ -871,27 +875,28 @@ impl MetalDecodeBindingPlan {
             )));
         }
         let block_end = token_position
-            .checked_add(METAL_MTP4_RECORDS)
+            .checked_add(METAL_MTP4_TRANSITIONS)
             .ok_or_else(|| EngineError::MemoryBudget("Metal MTP4 position overflows".into()))?;
         if block_end > admitted_context {
             return Err(EngineError::MemoryBudget(format!(
                 "Metal MTP4 block {token_position}..{block_end} exceeds admitted context {admitted_context}"
             )));
         }
-        let records: [MetalDecodeExecutionCursor<'_>; METAL_MTP4_RECORDS] = (0..METAL_MTP4_RECORDS)
-            .map(|record| {
-                let position = token_position + record;
+        let transitions: [MetalDecodeExecutionCursor<'_>; METAL_MTP4_TRANSITIONS] = (0
+            ..METAL_MTP4_TRANSITIONS)
+            .map(|transition| {
+                let position = token_position + transition;
                 self.execution_cursor(position, position, admitted_context)
             })
             .collect::<Result<Vec<_>>>()?
             .try_into()
             .map_err(|_| {
-                EngineError::InvalidState("Metal MTP4 cursor lost a logical record".into())
+                EngineError::InvalidState("Metal MTP4 cursor lost a logical transition".into())
             })?;
         Ok(MetalMtp4ExecutionCursor {
-            records,
+            transitions,
             start_position: token_position,
-            next_record: 0,
+            next_transition: 0,
         })
     }
 
@@ -1102,59 +1107,62 @@ impl<'a> MetalDecodeExecutionCursor<'a> {
 
 impl MetalMtp4ExecutionCursor<'_> {
     /// Records the complete logical operation sequence for exactly the next
-    /// MTP4 record while deliberately leaving that record's final barrier
-    /// pending. Records cannot be skipped or encoded out of order.
-    pub fn record_complete_encoded_record(&mut self, record_index: usize) -> Result<usize> {
-        if record_index != self.next_record || record_index >= METAL_MTP4_RECORDS {
+    /// MTP4 transition while deliberately leaving that transition's final
+    /// barrier pending. Transitions cannot be skipped or encoded out of order.
+    pub fn record_complete_encoded_transition(&mut self, transition_index: usize) -> Result<usize> {
+        if transition_index != self.next_transition || transition_index >= METAL_MTP4_TRANSITIONS {
             return Err(EngineError::InvalidState(format!(
-                "Metal MTP4 encoded record {record_index}, expected {}",
-                self.next_record
+                "Metal MTP4 encoded transition {transition_index}, expected {}",
+                self.next_transition
             )));
         }
-        let cursor = &mut self.records[record_index];
+        let cursor = &mut self.transitions[transition_index];
         loop {
             let step = cursor.next_step().cloned().ok_or_else(|| {
                 EngineError::InvalidState(format!(
-                    "Metal MTP4 record {record_index} omitted its final barrier"
+                    "Metal MTP4 transition {transition_index} omitted its final barrier"
                 ))
             })?;
             if step.operation == MetalDecodeOperation::TokenCommandBufferCommit {
                 if step.layer.is_some() {
                     return Err(EngineError::InvalidState(format!(
-                        "Metal MTP4 record {record_index} final barrier belongs to a layer"
+                        "Metal MTP4 transition {transition_index} final barrier belongs to a layer"
                     )));
                 }
-                self.next_record += 1;
+                self.next_transition += 1;
                 return Ok(step.schedule_index);
             }
             cursor.advance(step.schedule_index, step.layer, step.operation)?;
         }
     }
 
-    /// Consumes all four pending logical barriers after the one shared physical
+    /// Consumes all five pending logical barriers after the one shared physical
     /// command buffer completed. This method is valid only for a fully accepted
-    /// block; partial branches drop this cursor and replay accepted records via
-    /// ordinary complete-token cursors.
+    /// block; partial branches drop this cursor and replay the input plus
+    /// accepted drafts via ordinary complete-token cursors.
     pub fn commit_after_shared_completion(
         self,
-        barrier_indices: [usize; METAL_MTP4_RECORDS],
+        barrier_indices: [usize; METAL_MTP4_TRANSITIONS],
     ) -> Result<usize> {
-        if self.next_record != METAL_MTP4_RECORDS {
+        if self.next_transition != METAL_MTP4_TRANSITIONS {
             return Err(EngineError::InvalidState(format!(
-                "Metal MTP4 encoded {} of {METAL_MTP4_RECORDS} records",
-                self.next_record
+                "Metal MTP4 encoded {} of {METAL_MTP4_TRANSITIONS} transitions",
+                self.next_transition
             )));
         }
         let mut final_position = self.start_position;
-        for (record, (mut cursor, barrier)) in
-            self.records.into_iter().zip(barrier_indices).enumerate()
+        for (transition, (mut cursor, barrier)) in self
+            .transitions
+            .into_iter()
+            .zip(barrier_indices)
+            .enumerate()
         {
             cursor.commit_after_completion(barrier)?;
             let finished = cursor.finish()?;
-            let expected = self.start_position + record + 1;
+            let expected = self.start_position + transition + 1;
             if finished != expected {
                 return Err(EngineError::InvalidState(format!(
-                    "Metal MTP4 record {record} finished at {finished}, expected {expected}"
+                    "Metal MTP4 transition {transition} finished at {finished}, expected {expected}"
                 )));
             }
             final_position = finished;
@@ -1547,22 +1555,27 @@ mod tests {
         let bindings = MetalDecodeBindingPlan::qwen38(&schedule, &projections, &config).unwrap();
 
         assert!(bindings.mtp4_execution_cursor(37, 36, 128).is_err());
-        assert!(bindings.mtp4_execution_cursor(37, 37, 40).is_err());
+        assert!(bindings.mtp4_execution_cursor(37, 37, 41).is_err());
 
-        let mut cursor = bindings.mtp4_execution_cursor(37, 37, 41).unwrap();
-        assert!(cursor.record_complete_encoded_record(1).is_err());
-        let mut barriers = [0_usize; METAL_MTP4_RECORDS];
-        for (record, barrier) in barriers.iter_mut().enumerate() {
-            *barrier = cursor.record_complete_encoded_record(record).unwrap();
+        let mut cursor = bindings.mtp4_execution_cursor(37, 37, 42).unwrap();
+        assert!(cursor.record_complete_encoded_transition(1).is_err());
+        let mut barriers = [0_usize; METAL_MTP4_TRANSITIONS];
+        for (transition, barrier) in barriers.iter_mut().enumerate() {
+            *barrier = cursor
+                .record_complete_encoded_transition(transition)
+                .unwrap();
             assert_eq!(*barrier, 644);
         }
-        let wrong = [644, 644, 643, 644];
-        let mut invalid = bindings.mtp4_execution_cursor(37, 37, 41).unwrap();
-        for record in 0..METAL_MTP4_RECORDS {
-            invalid.record_complete_encoded_record(record).unwrap();
+        let mut invalid = bindings.mtp4_execution_cursor(37, 37, 42).unwrap();
+        for transition in 0..METAL_MTP4_TRANSITIONS {
+            invalid
+                .record_complete_encoded_transition(transition)
+                .unwrap();
         }
-        assert!(invalid.commit_after_shared_completion(wrong).is_err());
-        assert_eq!(cursor.commit_after_shared_completion(barriers).unwrap(), 41);
+        assert!(invalid
+            .commit_after_shared_completion([644, 644, 643, 644, 644])
+            .is_err());
+        assert_eq!(cursor.commit_after_shared_completion(barriers).unwrap(), 42);
     }
 
     #[test]
