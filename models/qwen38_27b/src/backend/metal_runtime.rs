@@ -492,6 +492,15 @@ pub enum PreparedMappedMetalTargetLayer {
 /// an error drops the partial vector and exposes no incomplete target graph.
 pub struct PreparedMappedMetalTargetLayers {
     layers: Vec<PreparedMappedMetalTargetLayer>,
+    transaction_active: bool,
+    poisoned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalTargetCheckpointKind {
+    FullAttention,
+    LinearConvolution,
+    LinearRecurrence,
 }
 
 /// Mmap-backed query RMSNorm plus reusable partial-RoPE tables for one exact
@@ -2208,6 +2217,159 @@ impl PreparedMappedMetalTargetLayers {
         }
         Ok(())
     }
+
+    pub fn transaction_active(&self) -> bool {
+        self.transaction_active
+    }
+
+    pub fn begin_speculative(&mut self, runtime: &MetalCandidateRuntime) -> Result<()> {
+        let config = Qwen38Config::default();
+        if self.layers.len() != config.num_hidden_layers
+            || self.layers.iter().enumerate().any(|(index, layer)| {
+                layer.layer() != index || config.layer_kind(index) != Some(layer.kind())
+            })
+            || self.transaction_active
+            || self.poisoned
+            || self.layers.iter().any(|layer| match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    layer.convolution.poisoned
+                        || layer.convolution.checkpoint_valid
+                        || layer.recurrence.poisoned
+                        || layer.recurrence.checkpoint_valid
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    layer.attention.poisoned || layer.attention.speculative_checkpoint.is_some()
+                }
+            })
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target-layer transaction requires healthy idle state".into(),
+            ));
+        }
+        let mut started = Vec::with_capacity(self.layers.len() * 2);
+        let begun = (|| {
+            for (index, layer) in self.layers.iter_mut().enumerate() {
+                match layer {
+                    PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                        layer.convolution.begin_speculative(runtime)?;
+                        started.push((index, MetalTargetCheckpointKind::LinearConvolution));
+                        layer.recurrence.begin_speculative(runtime)?;
+                        started.push((index, MetalTargetCheckpointKind::LinearRecurrence));
+                    }
+                    PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                        layer.attention.begin_speculative()?;
+                        started.push((index, MetalTargetCheckpointKind::FullAttention));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(primary) = begun {
+            let mut rollback_errors = Vec::new();
+            for (index, kind) in started.into_iter().rev() {
+                let restored = match (&mut self.layers[index], kind) {
+                    (
+                        PreparedMappedMetalTargetLayer::LinearAttention(layer),
+                        MetalTargetCheckpointKind::LinearConvolution,
+                    ) => layer.convolution.restore_speculative(runtime),
+                    (
+                        PreparedMappedMetalTargetLayer::LinearAttention(layer),
+                        MetalTargetCheckpointKind::LinearRecurrence,
+                    ) => layer.recurrence.restore_speculative(runtime),
+                    (
+                        PreparedMappedMetalTargetLayer::FullAttention(layer),
+                        MetalTargetCheckpointKind::FullAttention,
+                    ) => layer.attention.restore_speculative(),
+                    _ => Err(EngineError::InvalidState(
+                        "Metal target-layer checkpoint kind diverged from topology".into(),
+                    )),
+                };
+                if let Err(error) = restored {
+                    rollback_errors.push(error.to_string());
+                }
+            }
+            if rollback_errors.is_empty() {
+                return Err(primary);
+            }
+            self.poisoned = true;
+            return Err(EngineError::InvalidState(format!(
+                "Metal target-layer checkpoint failed ({primary}) and rollback failed: {}",
+                rollback_errors.join("; ")
+            )));
+        }
+        self.transaction_active = true;
+        Ok(())
+    }
+
+    pub fn restore_speculative(&mut self, runtime: &MetalCandidateRuntime) -> Result<()> {
+        if !self.transaction_active {
+            return Err(EngineError::InvalidState(
+                "Metal target-layer transaction is not active".into(),
+            ));
+        }
+        let mut errors = Vec::new();
+        for layer in self.layers.iter_mut().rev() {
+            match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    if let Err(error) = layer.recurrence.restore_speculative(runtime) {
+                        errors.push(error.to_string());
+                    }
+                    if let Err(error) = layer.convolution.restore_speculative(runtime) {
+                        errors.push(error.to_string());
+                    }
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    if let Err(error) = layer.attention.restore_speculative() {
+                        errors.push(error.to_string());
+                    }
+                }
+            }
+        }
+        self.transaction_active = false;
+        if !errors.is_empty() {
+            self.poisoned = true;
+            return Err(EngineError::InvalidState(format!(
+                "Metal target-layer rollback failed: {}",
+                errors.join("; ")
+            )));
+        }
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn commit_speculative(&mut self) -> Result<()> {
+        if !self.transaction_active
+            || self.poisoned
+            || self.layers.iter().any(|layer| match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    layer.convolution.poisoned
+                        || !layer.convolution.checkpoint_valid
+                        || layer.recurrence.poisoned
+                        || !layer.recurrence.checkpoint_valid
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    layer.attention.poisoned || layer.attention.speculative_checkpoint.is_none()
+                }
+            })
+        {
+            return Err(EngineError::InvalidState(
+                "Metal target-layer commit requires one complete healthy transaction".into(),
+            ));
+        }
+        for layer in &mut self.layers {
+            match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    layer.convolution.commit_speculative()?;
+                    layer.recurrence.commit_speculative()?;
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    layer.attention.commit_speculative()?;
+                }
+            }
+        }
+        self.transaction_active = false;
+        Ok(())
+    }
 }
 
 impl PreparedMappedMetalQueryGate {
@@ -3863,7 +4025,11 @@ impl MetalCandidateRuntime {
                 "Metal target-layer resource set does not match the frozen 48/16 topology".into(),
             ));
         }
-        Ok(PreparedMappedMetalTargetLayers { layers })
+        Ok(PreparedMappedMetalTargetLayers {
+            layers,
+            transaction_active: false,
+            poisoned: false,
+        })
     }
 
     pub fn prepare_mapped_fused_matvec_with_simdgroups(
@@ -9431,6 +9597,156 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
+    /// Execute all 64 target transformer layers in topology order through one
+    /// shared activation arena, one compute encoder, one command buffer, and
+    /// one completion wait. Persistent KV/convolution/recurrent state is
+    /// checkpointed as one target-layer transaction and restored on every
+    /// encoding, GPU, or verifier failure.
+    pub fn dispatch_prepared_mapped_target_layers(
+        &self,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetLayers,
+    ) -> Result<()> {
+        self.validate_prepared_mapped_target_layers(program, prepared)?;
+        prepared.begin_speculative(self)?;
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-complete-target-layers");
+        let encoder = command_buffer.new_compute_command_encoder();
+        let mut full_plans = Vec::with_capacity(Qwen38Config::default().full_attention_layers());
+        let encoded = (|| {
+            for (layer_index, layer) in prepared.layers.iter_mut().enumerate() {
+                match layer {
+                    PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                        let steps = program.linear_attention_layer_steps(layer_index)?;
+                        self.encode_mapped_linear_attention_layer_views(
+                            encoder,
+                            steps,
+                            [
+                                &layer.projections[0],
+                                &layer.projections[1],
+                                &layer.projections[2],
+                                &layer.projections[3],
+                            ],
+                            &mut layer.convolution,
+                            &layer.gated_delta_prepare,
+                            &mut layer.recurrence,
+                            &layer.gated_rms_norm,
+                            &layer.linear_output_projection,
+                            &layer.residual_rms_norm,
+                            [&layer.ffn_gate_up[0], &layer.ffn_gate_up[1]],
+                            &layer.swiglu_down,
+                            &layer.post_ffn_residual_rms_norm,
+                        )?;
+                    }
+                    PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                        let steps = program.full_attention_layer_steps(layer_index)?;
+                        let validated =
+                            self.validate_prepared_mapped_full_attention_layer(steps, layer)?;
+                        layer.attention.poisoned = true;
+                        let plan = self.plan_paged_gqa_append(&mut layer.attention)?;
+                        write_metal_paged_gqa_descriptors(&layer.attention)?;
+                        write_metal_paged_gqa_params(&layer.attention)?;
+                        self.encode_prepared_mapped_full_attention_layer(
+                            encoder,
+                            steps,
+                            layer,
+                            &plan,
+                            validated.thread_width,
+                            validated.component_values,
+                        )?;
+                        full_plans.push((layer_index, plan));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(primary) = encoded {
+            encoder.end_encoding();
+            return match prepared.restore_speculative(self) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal target graph encoding failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            };
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            let primary = EngineError::InvalidState(format!(
+                "Metal target graph ended with {:?}",
+                command_buffer.status()
+            ));
+            return match prepared.restore_speculative(self) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(EngineError::InvalidState(format!(
+                    "Metal target graph failed ({primary}) and rollback failed: {rollback}"
+                ))),
+            };
+        }
+        for layer in &mut prepared.layers {
+            match layer {
+                PreparedMappedMetalTargetLayer::LinearAttention(layer) => {
+                    layer.convolution.poisoned = false;
+                    layer.recurrence.poisoned = false;
+                }
+                PreparedMappedMetalTargetLayer::FullAttention(layer) => {
+                    layer.attention.poisoned = false;
+                }
+            }
+        }
+        #[cfg(test)]
+        for (layer_index, plan) in &full_plans {
+            let PreparedMappedMetalTargetLayer::FullAttention(layer) =
+                &mut prepared.layers[*layer_index]
+            else {
+                let primary = EngineError::InvalidState(
+                    "Metal target graph verifier plan diverged from topology".into(),
+                );
+                return match prepared.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal target graph verification failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            };
+            let component_values = layer.attention.key_value_heads * layer.attention.head_dim;
+            let key = unsafe {
+                slice::from_raw_parts(
+                    layer
+                        .attention
+                        .verifier_key_snapshot_buffer
+                        .contents()
+                        .cast::<f32>(),
+                    component_values,
+                )
+                .to_vec()
+            };
+            let value = unsafe {
+                slice::from_raw_parts(
+                    layer
+                        .attention
+                        .verifier_value_snapshot_buffer
+                        .contents()
+                        .cast::<f32>(),
+                    component_values,
+                )
+                .to_vec()
+            };
+            if let Err(primary) =
+                self.commit_paged_gqa_verifier_append(&mut layer.attention, plan, &key, &value)
+            {
+                return match prepared.restore_speculative(self) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(EngineError::InvalidState(format!(
+                        "Metal target graph verification failed ({primary}) and rollback failed: {rollback}"
+                    ))),
+                };
+            }
+        }
+        prepared.commit_speculative()
+    }
+
     fn encode_prepared_mapped_full_attention_layer(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -14412,10 +14728,16 @@ mod tests {
         let program = workspace
             .bind_decode_program(&bindings)
             .expect("bind Metal decode program");
-        let partial = PreparedMappedMetalTargetLayers { layers: Vec::new() };
+        let mut partial = PreparedMappedMetalTargetLayers {
+            layers: Vec::new(),
+            transaction_active: false,
+            poisoned: false,
+        };
         assert!(runtime
             .validate_prepared_mapped_target_layers(&program, &partial)
             .is_err());
+        assert!(partial.begin_speculative(&runtime).is_err());
+        assert!(!partial.transaction_active());
         assert!(partial.is_empty());
         assert_eq!(partial.copied_model_bytes(), 0);
     }

@@ -261,6 +261,13 @@ schedule slices, reuses both exact layer validators, proves layer order and the
 48/16 split, and requires every resource to reference the same mmap identity.
 An empty, partial, reordered, or cross-artifact graph is rejected before cache
 metadata or persistent device state can change.
+The first complete target-layer dispatcher now uses that preflight, snapshots
+all 16 paged-KV, 48 convolution, and 48 GatedDelta state owners as one
+transaction, and appends all 640 transformer-layer schedule steps to one Metal
+compute encoder. It performs exactly one graph command-buffer commit and wait;
+any encode, GPU, or verifier failure restores the complete state transaction.
+Embedding, the final target head, and MTP verification still have to be joined
+around this target-layer core before it is a complete token executor.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

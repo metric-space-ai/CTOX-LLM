@@ -119,6 +119,14 @@ over all 64 schedule slices. It invokes the exact per-kind validator, checks
 canonical layer indices and the 48/16 topology, uses checked aggregate state
 accounting, and rejects cross-artifact owners. Device checkpoint readiness is
 kept as an execution concern, so this preflight itself performs no mutation.
+`dispatch_prepared_mapped_target_layers` is the corresponding graph core. It
+opens one owner-level transaction over all KV, convolution, and recurrent
+states, encodes all 64 ten-operation slices into one compute encoder, and
+performs one commit/wait. Encoding errors, command-buffer failures, and
+test-oracle mismatches restore every checkpoint; success commits the transaction
+only after all layers complete. The current checkpoint creation uses the
+existing synchronous state-copy primitives and remains a tuning target even
+though the target-layer compute itself has no per-layer command boundary.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
