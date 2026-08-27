@@ -23,13 +23,14 @@ use super::metal::{
     MetalConcatBufferAbi, MetalConcatParams, MetalDynamicEmbeddingParams, MetalFusedMatVecParams,
     MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi,
     MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalGatheredMatVecParams,
-    MetalGreedyMtpVerifyBufferAbi, MetalKvPackParams, MetalKvQ4PackBufferAbi,
-    MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi, MetalPagedGqaParams, MetalPartialRopeBufferAbi,
-    MetalPartialRopeParams, MetalQueryGateBufferAbi, MetalQueryGateParams,
-    MetalResidualRmsNormBufferAbi, MetalRmsNormBufferAbi, MetalRmsNormParams,
-    MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi, ARGMAX_F32_FINAL_KERNEL_NAME,
-    ARGMAX_F32_PARTIAL_KERNEL_NAME, ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME,
-    CONCAT_F32_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME,
+    MetalGreedyMtpPrefixBufferAbi, MetalGreedyMtpPrefixParams, MetalGreedyMtpVerifyBufferAbi,
+    MetalKvPackParams, MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi,
+    MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
+    MetalQueryGateBufferAbi, MetalQueryGateParams, MetalResidualRmsNormBufferAbi,
+    MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSigmoidGateBufferAbi, MetalSwiGluBufferAbi,
+    ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME,
+    ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, CONCAT_F32_KERNEL_NAME,
+    GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME, GREEDY_MTP_PREFIX_KERNEL_NAME,
     GREEDY_MTP_VERIFY_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME,
     MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
     Q2_DYNAMIC_EMBEDDING_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME,
@@ -107,6 +108,7 @@ pub struct MetalCandidateRuntime {
     argmax_f32_final_pipeline: ComputePipelineState,
     argmax_index_to_token_pipeline: ComputePipelineState,
     greedy_mtp_verify_pipeline: ComputePipelineState,
+    greedy_mtp_prefix_pipeline: ComputePipelineState,
 }
 
 /// Device buffers for one prepared projection. Weight and recovery buffers
@@ -541,6 +543,8 @@ pub struct PreparedMappedMetalMtpCore {
     target_selector: PreparedMetalArgMaxScratch,
     draft_selector: PreparedMetalArgMaxScratch,
     verification_buffer: Buffer,
+    prefix_result_buffer: Buffer,
+    prefix_params_buffer: Buffer,
     pre_embedding_norm: PreparedMappedMetalRmsNorm,
     pre_hidden_norm: PreparedMappedMetalRmsNorm,
     fc: PreparedMappedMetalMatVec,
@@ -555,6 +559,13 @@ pub struct MetalGreedyMtpVerification {
     pub target_token: u32,
     pub draft_token: u32,
     pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGreedyMtpPrefix {
+    pub accepted_prefix: u32,
+    pub next_token: u32,
+    pub verified_records: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2563,7 +2574,9 @@ impl PreparedMappedMetalMtpCore {
             self.embedding.transient_bytes(),
             self.target_selector.transient_bytes(),
             self.draft_selector.transient_bytes(),
-            4 * std::mem::size_of::<u32>(),
+            METAL_GREEDY_MTP_HISTORY_BYTES,
+            METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>(),
+            MetalGreedyMtpPrefixParams::BYTE_LEN,
             self.pre_embedding_norm.transient_bytes(),
             self.pre_hidden_norm.transient_bytes(),
             self.fc.transient_bytes(),
@@ -2888,6 +2901,13 @@ impl MetalCandidateRuntime {
                     "Metal greedy MTP verification function lookup failed: {message}"
                 ))
             })?;
+        let greedy_mtp_prefix_function = library
+            .get_function(GREEDY_MTP_PREFIX_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal greedy MTP prefix function lookup failed: {message}"
+                ))
+            })?;
         let q2_pipeline = device
             .new_compute_pipeline_state_with_function(&q2_function)
             .map_err(|message| {
@@ -3155,6 +3175,13 @@ impl MetalCandidateRuntime {
                     "Metal greedy MTP verification pipeline creation failed: {message}"
                 ))
             })?;
+        let greedy_mtp_prefix_pipeline = device
+            .new_compute_pipeline_state_with_function(&greedy_mtp_prefix_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal greedy MTP prefix pipeline creation failed: {message}"
+                ))
+            })?;
         if argmax_f32_partial_pipeline.max_total_threads_per_threadgroup() < 256
             || argmax_f32_final_pipeline.max_total_threads_per_threadgroup() < 256
         {
@@ -3199,6 +3226,7 @@ impl MetalCandidateRuntime {
             argmax_f32_final_pipeline,
             argmax_index_to_token_pipeline,
             greedy_mtp_verify_pipeline,
+            greedy_mtp_prefix_pipeline,
         })
     }
 
@@ -4055,6 +4083,120 @@ impl MetalCandidateRuntime {
                 self.read_greedy_mtp_verification_at(result_buffer, record, vocabulary_rows)
             })
             .collect()
+    }
+
+    fn encode_greedy_mtp_prefix(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        history: &Buffer,
+        bonus: &PreparedMetalArgMaxScratch,
+        result: &Buffer,
+        params_buffer: &Buffer,
+        params: MetalGreedyMtpPrefixParams,
+    ) -> Result<()> {
+        let records = usize::try_from(params.records)
+            .map_err(|_| EngineError::Shape("Metal MTP prefix records exceed usize".into()))?;
+        let history_bytes = records
+            .checked_mul(METAL_GREEDY_MTP_RECORD_WORDS)
+            .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal MTP prefix history overflows".into())
+            })?;
+        if records == 0
+            || records > MAXIMUM_METAL_GREEDY_MTP_DRAFTS
+            || params.vocabulary_rows == 0
+            || bonus.values != params.vocabulary_rows as usize
+            || u64::try_from(history_bytes).map_or(true, |bytes| bytes > history.length())
+            || result.length() < (METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>()) as u64
+            || params_buffer.length() < MetalGreedyMtpPrefixParams::BYTE_LEN as u64
+        {
+            return Err(EngineError::InvalidState(
+                "Metal greedy MTP prefix buffers or dimensions are invalid".into(),
+            ));
+        }
+        write_buffer_range(
+            params_buffer,
+            0,
+            &params.encode(),
+            MetalGreedyMtpPrefixParams::BYTE_LEN,
+        )?;
+        encoder.set_compute_pipeline_state(&self.greedy_mtp_prefix_pipeline);
+        encoder.set_buffer(
+            MetalGreedyMtpPrefixBufferAbi::HISTORY as u64,
+            Some(history),
+            0,
+        );
+        encoder.set_buffer(
+            MetalGreedyMtpPrefixBufferAbi::BONUS as u64,
+            Some(&bonus.result_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalGreedyMtpPrefixBufferAbi::RESULT as u64,
+            Some(result),
+            0,
+        );
+        encoder.set_buffer(
+            MetalGreedyMtpPrefixBufferAbi::PARAMS as u64,
+            Some(params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn read_greedy_mtp_prefix(
+        &self,
+        result: &Buffer,
+        expected_records: usize,
+        vocabulary_rows: usize,
+    ) -> Result<MetalGreedyMtpPrefix> {
+        if result.length() < (METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>()) as u64 {
+            return Err(EngineError::MemoryBudget(
+                "Metal greedy MTP prefix result is truncated".into(),
+            ));
+        }
+        let words = unsafe {
+            slice::from_raw_parts(
+                result.contents().cast::<u32>(),
+                METAL_GREEDY_MTP_RECORD_WORDS,
+            )
+        };
+        if words[3] != 0 {
+            return Err(EngineError::InvalidArtifact(format!(
+                "Metal greedy MTP prefix rejected status 0x{:08x}",
+                words[3]
+            )));
+        }
+        let records = usize::try_from(words[2])
+            .map_err(|_| EngineError::Shape("Metal MTP prefix records exceed usize".into()))?;
+        if records != expected_records
+            || records == 0
+            || records > MAXIMUM_METAL_GREEDY_MTP_DRAFTS
+            || words[0] as usize > records
+            || words[1] as usize >= vocabulary_rows
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal greedy MTP prefix result {}/{}/{records} violates expected depth {expected_records} or vocabulary {vocabulary_rows}",
+                words[0], words[1]
+            )));
+        }
+        Ok(MetalGreedyMtpPrefix {
+            accepted_prefix: words[0],
+            next_token: words[1],
+            verified_records: words[2],
+        })
     }
 
     /// Import the complete immutable CTOXQ mmap once through Metal shared
@@ -4945,6 +5087,12 @@ impl MetalCandidateRuntime {
         let target_selector = self.prepare_argmax_f32_scratch(config.vocab_size)?;
         let draft_selector = self.prepare_argmax_f32_scratch(draft_token_ids.len())?;
         let verification_buffer = new_zeroed_buffer(&self.device, METAL_GREEDY_MTP_HISTORY_BYTES)?;
+        let prefix_result_buffer = new_zeroed_buffer(
+            &self.device,
+            METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>(),
+        )?;
+        let prefix_params_buffer =
+            new_zeroed_buffer(&self.device, MetalGreedyMtpPrefixParams::BYTE_LEN)?;
         let workspace_plan = MetalMtpWorkspacePlan::qwen38(&config)?;
         let workspace = self.prepare_mtp_workspace(&workspace_plan)?;
 
@@ -5017,6 +5165,8 @@ impl MetalCandidateRuntime {
             target_selector,
             draft_selector,
             verification_buffer,
+            prefix_result_buffer,
+            prefix_params_buffer,
             pre_embedding_norm,
             pre_hidden_norm,
             fc,
@@ -12260,6 +12410,61 @@ impl MetalCandidateRuntime {
         }
     }
 
+    /// Bring-up reduction for a populated MTP4 verification history. The
+    /// final target selector is the bonus-token fallback when every retained
+    /// draft was accepted; on the first mismatch the device returns that
+    /// record's target token instead. Production will append this kernel to
+    /// the final speculative command rather than waiting separately.
+    pub fn dispatch_prepared_mapped_greedy_mtp_prefix_verifier(
+        &self,
+        prepared: &PreparedMappedMetalMtpCore,
+        records: usize,
+    ) -> Result<MetalGreedyMtpPrefix> {
+        if records == 0 || records > MAXIMUM_METAL_GREEDY_MTP_DRAFTS {
+            return Err(EngineError::InvalidState(format!(
+                "Metal greedy MTP prefix depth {records} is outside 1..={MAXIMUM_METAL_GREEDY_MTP_DRAFTS}"
+            )));
+        }
+        zero_buffer(
+            &prepared.prefix_result_buffer,
+            METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>(),
+        );
+        let params = MetalGreedyMtpPrefixParams {
+            records: u32::try_from(records)
+                .map_err(|_| EngineError::Shape("Metal MTP prefix depth exceeds u32".into()))?,
+            vocabulary_rows: u32::try_from(prepared.vocabulary_rows())
+                .map_err(|_| EngineError::Shape("Metal vocabulary exceeds u32".into()))?,
+            reserved0: 0,
+            reserved1: 0,
+        };
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-greedy-mtp-prefix-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        let encoded = self.encode_greedy_mtp_prefix(
+            encoder,
+            &prepared.verification_buffer,
+            &prepared.target_selector,
+            &prepared.prefix_result_buffer,
+            &prepared.prefix_params_buffer,
+            params,
+        );
+        encoder.end_encoding();
+        encoded?;
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal greedy MTP prefix command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        self.read_greedy_mtp_prefix(
+            &prepared.prefix_result_buffer,
+            records,
+            prepared.vocabulary_rows(),
+        )
+    }
+
     /// Advance MTP and target from the same real input token, producing the
     /// first causally aligned draft/target pair for a speculative block. MTP
     /// reads the retained pre-target hidden state before the target transition
@@ -14706,6 +14911,24 @@ mod tests {
             .collect();
         let history = new_zeroed_buffer(&runtime.device, METAL_GREEDY_MTP_HISTORY_BYTES)
             .expect("greedy verification history");
+        let bonus = runtime
+            .prepare_argmax_f32_scratch(crate::tokenizer::TOKENIZER_VOCAB_SIZE)
+            .expect("bonus selector scratch");
+        write_buffer_range(
+            &bonus.result_buffer,
+            0,
+            as_bytes(&[505_u32, 0]),
+            2 * std::mem::size_of::<u32>(),
+        )
+        .expect("write bonus selector");
+        let prefix_result = new_zeroed_buffer(
+            &runtime.device,
+            METAL_GREEDY_MTP_RECORD_WORDS * std::mem::size_of::<u32>(),
+        )
+        .expect("greedy prefix result");
+        let prefix_params =
+            new_zeroed_buffer(&runtime.device, MetalGreedyMtpPrefixParams::BYTE_LEN)
+                .expect("greedy prefix params");
         let command_buffer = runtime.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         for (record, (target, draft)) in selectors.iter().enumerate() {
@@ -14713,6 +14936,21 @@ mod tests {
                 .encode_greedy_mtp_verify_at(encoder, target, draft, &history, record)
                 .expect("encode greedy history record");
         }
+        runtime
+            .encode_greedy_mtp_prefix(
+                encoder,
+                &history,
+                &bonus,
+                &prefix_result,
+                &prefix_params,
+                MetalGreedyMtpPrefixParams {
+                    records: MAXIMUM_METAL_GREEDY_MTP_DRAFTS as u32,
+                    vocabulary_rows: crate::tokenizer::TOKENIZER_VOCAB_SIZE as u32,
+                    reserved0: 0,
+                    reserved1: 0,
+                },
+            )
+            .expect("encode greedy prefix reduction");
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -14744,6 +14982,20 @@ mod tests {
                 crate::tokenizer::TOKENIZER_VOCAB_SIZE,
             )
             .is_err());
+        assert_eq!(
+            runtime
+                .read_greedy_mtp_prefix(
+                    &prefix_result,
+                    MAXIMUM_METAL_GREEDY_MTP_DRAFTS,
+                    crate::tokenizer::TOKENIZER_VOCAB_SIZE,
+                )
+                .expect("read greedy prefix decision"),
+            MetalGreedyMtpPrefix {
+                accepted_prefix: 2,
+                next_token: 303,
+                verified_records: 4,
+            }
+        );
     }
 
     #[test]

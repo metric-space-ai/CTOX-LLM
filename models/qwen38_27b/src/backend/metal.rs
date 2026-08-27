@@ -46,6 +46,7 @@ pub const ARGMAX_F32_PARTIAL_KERNEL_NAME: &str = "qwen_argmax_f32_partial";
 pub const ARGMAX_F32_FINAL_KERNEL_NAME: &str = "qwen_argmax_f32_final";
 pub const ARGMAX_INDEX_TO_TOKEN_KERNEL_NAME: &str = "qwen_argmax_index_to_token";
 pub const GREEDY_MTP_VERIFY_KERNEL_NAME: &str = "qwen_greedy_mtp_verify";
+pub const GREEDY_MTP_PREFIX_KERNEL_NAME: &str = "qwen_greedy_mtp_prefix";
 /// Vendored candidate kernel source, relative to the crate root.
 pub const KERNEL_SOURCE_PATH: &str = "kernels/metal/q2q4_fused_matvec.metal";
 
@@ -278,6 +279,16 @@ impl MetalGreedyMtpVerifyBufferAbi {
     pub const TARGET: u32 = 0;
     pub const DRAFT: u32 = 1;
     pub const RESULT: u32 = 2;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGreedyMtpPrefixBufferAbi;
+
+impl MetalGreedyMtpPrefixBufferAbi {
+    pub const HISTORY: u32 = 0;
+    pub const BONUS: u32 = 1;
+    pub const RESULT: u32 = 2;
+    pub const PARAMS: u32 = 3;
 }
 
 /// Activation codes consumed by `apply_activation` in the MSL source.
@@ -651,6 +662,34 @@ impl MetalArgMaxParams {
         for (index, word) in [self.values, self.threads, self.groups, self.reserved1]
             .iter()
             .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalGreedyMtpPrefixParams {
+    pub records: u32,
+    pub vocabulary_rows: u32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+}
+
+impl MetalGreedyMtpPrefixParams {
+    pub const BYTE_LEN: usize = 16;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.records,
+            self.vocabulary_rows,
+            self.reserved0,
+            self.reserved1,
+        ]
+        .iter()
+        .enumerate()
         {
             encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
@@ -1282,6 +1321,15 @@ mod tests {
             ],
             [0, 1, 2]
         );
+        assert_eq!(
+            [
+                MetalGreedyMtpPrefixBufferAbi::HISTORY,
+                MetalGreedyMtpPrefixBufferAbi::BONUS,
+                MetalGreedyMtpPrefixBufferAbi::RESULT,
+                MetalGreedyMtpPrefixBufferAbi::PARAMS,
+            ],
+            [0, 1, 2, 3]
+        );
     }
 
     #[test]
@@ -1321,6 +1369,7 @@ mod tests {
             "qwen_argmax_index_to_token"
         );
         assert_eq!(GREEDY_MTP_VERIFY_KERNEL_NAME, "qwen_greedy_mtp_verify");
+        assert_eq!(GREEDY_MTP_PREFIX_KERNEL_NAME, "qwen_greedy_mtp_prefix");
     }
 
     #[test]
@@ -1506,6 +1555,22 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(words, vec![248_320, 256, 256, 0]);
+    }
+
+    #[test]
+    fn greedy_mtp_prefix_params_encode_matches_msl_struct() {
+        let encoded = MetalGreedyMtpPrefixParams {
+            records: 4,
+            vocabulary_rows: 248_320,
+            reserved0: 0,
+            reserved1: 0,
+        }
+        .encode();
+        let words: Vec<u32> = encoded
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![4, 248_320, 0, 0]);
     }
 
     #[test]

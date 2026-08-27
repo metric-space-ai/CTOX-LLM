@@ -141,6 +141,13 @@ struct ArgMaxParams {
     uint reserved1;
 };
 
+struct GreedyMtpPrefixParams {
+    uint records;
+    uint vocabulary_rows;
+    uint reserved0;
+    uint reserved1;
+};
+
 struct DynamicEmbeddingParams {
     uint columns;
     uint blocks_per_row;
@@ -1555,5 +1562,61 @@ kernel void qwen_greedy_mtp_verify(
     result[0] = target[0];
     result[1] = draft[0];
     result[2] = status == 0u && target[0] == draft[0] ? 1u : 0u;
+    result[3] = status;
+}
+
+// Reduce up to four retained verification records to the causal accepted
+// prefix and the next target token. Result layout:
+// {accepted_prefix, next_token, verified_records, combined_status}.
+kernel void qwen_greedy_mtp_prefix(
+    device const uint* history [[buffer(0)]],
+    device const uint* bonus [[buffer(1)]],
+    device uint* result [[buffer(2)]],
+    constant GreedyMtpPrefixParams& params [[buffer(3)]],
+    uint lane [[thread_position_in_grid]]) {
+    if (lane != 0u) {
+        return;
+    }
+    uint status = bonus[1];
+    if (params.records == 0u || params.records > 4u || params.vocabulary_rows == 0u) {
+        result[0] = 0u;
+        result[1] = 0u;
+        result[2] = params.records;
+        result[3] = status | 0x40000000u;
+        return;
+    }
+    if (bonus[0] >= params.vocabulary_rows) {
+        status |= 0x20000000u;
+    }
+
+    uint accepted_prefix = 0u;
+    uint next_token = bonus[0];
+    bool mismatch = false;
+    for (uint record = 0u; record < params.records; ++record) {
+        uint offset = record * 4u;
+        uint target_token = history[offset];
+        uint draft_token = history[offset + 1u];
+        uint accepted = history[offset + 2u];
+        uint record_status = history[offset + 3u];
+        status |= record_status;
+        if (target_token >= params.vocabulary_rows || draft_token >= params.vocabulary_rows) {
+            status |= 0x20000000u;
+        }
+        uint expected = record_status == 0u && target_token == draft_token ? 1u : 0u;
+        if (accepted > 1u || accepted != expected) {
+            status |= 0x10000000u;
+        }
+        if (!mismatch) {
+            if (accepted == 1u) {
+                accepted_prefix += 1u;
+            } else {
+                next_token = target_token;
+                mismatch = true;
+            }
+        }
+    }
+    result[0] = accepted_prefix;
+    result[1] = next_token;
+    result[2] = params.records;
     result[3] = status;
 }
