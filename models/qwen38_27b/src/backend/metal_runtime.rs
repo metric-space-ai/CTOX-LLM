@@ -776,6 +776,10 @@ struct MetalFullAttentionDispatchPlan {
     query_cosine_buffer: Buffer,
     query_sine_buffer: Buffer,
     key_rope: MetalPartialRopeDispatchPlan,
+    #[cfg(test)]
+    verifier_key_snapshot_buffer: Buffer,
+    #[cfg(test)]
+    verifier_value_snapshot_buffer: Buffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8164,6 +8168,15 @@ impl MetalCandidateRuntime {
         &self,
         prepared: &mut PreparedMappedMetalFullAttentionLayer,
     ) -> Result<MetalFullAttentionDispatchPlan> {
+        #[cfg(test)]
+        let verifier_snapshot_bytes = prepared
+            .attention
+            .key_value_heads
+            .checked_mul(prepared.attention.head_dim)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal verifier snapshot size overflows".into())
+            })?;
         Ok(MetalFullAttentionDispatchPlan {
             gqa: self.plan_paged_gqa_dispatch(&mut prepared.attention)?,
             query_cosine_buffer: clone_shared_buffer(
@@ -8172,7 +8185,42 @@ impl MetalCandidateRuntime {
             )?,
             query_sine_buffer: clone_shared_buffer(&self.device, &prepared.query_gate.sine_buffer)?,
             key_rope: self.snapshot_partial_rope_dispatch(&prepared.key_rope)?,
+            #[cfg(test)]
+            verifier_key_snapshot_buffer: new_zeroed_buffer(&self.device, verifier_snapshot_bytes)?,
+            #[cfg(test)]
+            verifier_value_snapshot_buffer: new_zeroed_buffer(
+                &self.device,
+                verifier_snapshot_bytes,
+            )?,
         })
+    }
+
+    #[cfg(test)]
+    fn read_full_attention_verifier_snapshot(
+        dispatch: &MetalFullAttentionDispatchPlan,
+        component_values: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let key = unsafe {
+            slice::from_raw_parts(
+                dispatch
+                    .verifier_key_snapshot_buffer
+                    .contents()
+                    .cast::<f32>(),
+                component_values,
+            )
+            .to_vec()
+        };
+        let value = unsafe {
+            slice::from_raw_parts(
+                dispatch
+                    .verifier_value_snapshot_buffer
+                    .contents()
+                    .cast::<f32>(),
+                component_values,
+            )
+            .to_vec()
+        };
+        (key, value)
     }
 
     #[cfg(test)]
@@ -11133,28 +11181,10 @@ impl MetalCandidateRuntime {
             }
             #[cfg(test)]
             {
-                let key = unsafe {
-                    slice::from_raw_parts(
-                        prepared
-                            .attention
-                            .verifier_key_snapshot_buffer
-                            .contents()
-                            .cast::<f32>(),
-                        validated.component_values,
-                    )
-                    .to_vec()
-                };
-                let value = unsafe {
-                    slice::from_raw_parts(
-                        prepared
-                            .attention
-                            .verifier_value_snapshot_buffer
-                            .contents()
-                            .cast::<f32>(),
-                        validated.component_values,
-                    )
-                    .to_vec()
-                };
+                let (key, value) = Self::read_full_attention_verifier_snapshot(
+                    &dispatch,
+                    validated.component_values,
+                );
                 self.commit_paged_gqa_verifier_append(
                     &mut prepared.attention,
                     &dispatch.gqa.append,
@@ -11271,7 +11301,11 @@ impl MetalCandidateRuntime {
         Ok(())
     }
 
-    fn encode_prepared_mapped_target_layers(
+    /// Encode one target step after the caller has validated the complete
+    /// graph and opened its state transaction. This boundary intentionally
+    /// does not re-run poison-sensitive admission checks, so a bounded MTP4
+    /// branch can queue later causal steps behind earlier GPU work.
+    fn encode_prevalidated_mapped_target_layers(
         &self,
         encoder: &ComputeCommandEncoderRef,
         program: &PreparedMetalDecodeProgram<'_>,
@@ -11309,8 +11343,17 @@ impl MetalCandidateRuntime {
                 }
                 PreparedMappedMetalTargetLayer::FullAttention(layer) => {
                     let steps = program.full_attention_layer_steps(layer_index)?;
-                    let validated =
-                        self.validate_prepared_mapped_full_attention_layer(steps, layer)?;
+                    let component_values = layer
+                        .attention
+                        .key_value_heads
+                        .checked_mul(layer.attention.head_dim)
+                        .ok_or_else(|| {
+                            EngineError::MemoryBudget(
+                                "Metal target KV verifier width overflows".into(),
+                            )
+                        })?;
+                    let thread_width =
+                        dispatch_width(&self.partial_rope_pipeline, DEFAULT_SIMDGROUPS)?;
                     layer.attention.poisoned = true;
                     let dispatch = self.plan_full_attention_dispatch(layer)?;
                     self.encode_prepared_mapped_full_attention_layer(
@@ -11318,8 +11361,8 @@ impl MetalCandidateRuntime {
                         steps,
                         layer,
                         &dispatch,
-                        validated.thread_width,
-                        validated.component_values,
+                        thread_width,
+                        component_values,
                     )?;
                     full_plans.push((layer_index, dispatch));
                 }
@@ -11343,19 +11386,19 @@ impl MetalCandidateRuntime {
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-complete-target-layers");
         let encoder = command_buffer.new_compute_command_encoder();
-        let full_plans = match self.encode_prepared_mapped_target_layers(encoder, program, prepared)
-        {
-            Ok(plans) => plans,
-            Err(primary) => {
-                encoder.end_encoding();
-                return match prepared.restore_speculative(self) {
-                    Ok(()) => Err(primary),
-                    Err(rollback) => Err(EngineError::InvalidState(format!(
+        let full_plans =
+            match self.encode_prevalidated_mapped_target_layers(encoder, program, prepared) {
+                Ok(plans) => plans,
+                Err(primary) => {
+                    encoder.end_encoding();
+                    return match prepared.restore_speculative(self) {
+                        Ok(()) => Err(primary),
+                        Err(rollback) => Err(EngineError::InvalidState(format!(
                     "Metal target graph encoding failed ({primary}) and rollback failed: {rollback}"
                 ))),
-                };
-            }
-        };
+                    };
+                }
+            };
         #[cfg(not(test))]
         let _ = &full_plans;
         encoder.end_encoding();
@@ -11400,28 +11443,8 @@ impl MetalCandidateRuntime {
                 };
             };
             let component_values = layer.attention.key_value_heads * layer.attention.head_dim;
-            let key = unsafe {
-                slice::from_raw_parts(
-                    layer
-                        .attention
-                        .verifier_key_snapshot_buffer
-                        .contents()
-                        .cast::<f32>(),
-                    component_values,
-                )
-                .to_vec()
-            };
-            let value = unsafe {
-                slice::from_raw_parts(
-                    layer
-                        .attention
-                        .verifier_value_snapshot_buffer
-                        .contents()
-                        .cast::<f32>(),
-                    component_values,
-                )
-                .to_vec()
-            };
+            let (key, value) =
+                Self::read_full_attention_verifier_snapshot(dispatch, component_values);
             if let Err(primary) = self.commit_paged_gqa_verifier_append(
                 &mut layer.attention,
                 &dispatch.gqa.append,
@@ -11522,7 +11545,7 @@ impl MetalCandidateRuntime {
             initial_norm.writes()[0].offset(),
         );
         let full_plans =
-            self.encode_prepared_mapped_target_layers(encoder, program, &mut prepared.layers)?;
+            self.encode_prevalidated_mapped_target_layers(encoder, program, &mut prepared.layers)?;
         self.encode_mapped_projection_between(
             encoder,
             &prepared.lm_head,
@@ -11543,6 +11566,31 @@ impl MetalCandidateRuntime {
     ) -> Result<Vec<(usize, MetalFullAttentionDispatchPlan)>> {
         let [embedding, initial_norm, lm_head] =
             self.validate_prepared_mapped_target_core(program, prepared)?;
+        self.encode_prevalidated_mapped_target_core_from_selector(
+            encoder,
+            program,
+            prepared,
+            selector,
+            embedding,
+            initial_norm,
+            lm_head,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Selector-fed counterpart for an already admitted target graph. The
+    /// frozen views must come from the single validation performed before the
+    /// surrounding speculative transaction starts.
+    fn encode_prevalidated_mapped_target_core_from_selector(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        program: &PreparedMetalDecodeProgram<'_>,
+        prepared: &mut PreparedMappedMetalTargetCore,
+        selector: &PreparedMetalArgMaxScratch,
+        embedding: &PreparedMetalDecodeStepView<'_>,
+        initial_norm: &PreparedMetalDecodeStepView<'_>,
+        lm_head: &PreparedMetalDecodeStepView<'_>,
+    ) -> Result<Vec<(usize, MetalFullAttentionDispatchPlan)>> {
         self.encode_mapped_embedding_from_selector_to(
             encoder,
             &prepared.embedding,
@@ -11653,28 +11701,8 @@ impl MetalCandidateRuntime {
                 };
             };
             let component_values = layer.attention.key_value_heads * layer.attention.head_dim;
-            let key = unsafe {
-                slice::from_raw_parts(
-                    layer
-                        .attention
-                        .verifier_key_snapshot_buffer
-                        .contents()
-                        .cast::<f32>(),
-                    component_values,
-                )
-                .to_vec()
-            };
-            let value = unsafe {
-                slice::from_raw_parts(
-                    layer
-                        .attention
-                        .verifier_value_snapshot_buffer
-                        .contents()
-                        .cast::<f32>(),
-                    component_values,
-                )
-                .to_vec()
-            };
+            let (key, value) =
+                Self::read_full_attention_verifier_snapshot(dispatch, component_values);
             if let Err(primary) = self.commit_paged_gqa_verifier_append(
                 &mut layer.attention,
                 &dispatch.gqa.append,
@@ -11791,28 +11819,8 @@ impl MetalCandidateRuntime {
                 };
             };
             let component_values = layer.attention.key_value_heads * layer.attention.head_dim;
-            let key = unsafe {
-                slice::from_raw_parts(
-                    layer
-                        .attention
-                        .verifier_key_snapshot_buffer
-                        .contents()
-                        .cast::<f32>(),
-                    component_values,
-                )
-                .to_vec()
-            };
-            let value = unsafe {
-                slice::from_raw_parts(
-                    layer
-                        .attention
-                        .verifier_value_snapshot_buffer
-                        .contents()
-                        .cast::<f32>(),
-                    component_values,
-                )
-                .to_vec()
-            };
+            let (key, value) =
+                Self::read_full_attention_verifier_snapshot(dispatch, component_values);
             if let Err(primary) = self.commit_paged_gqa_verifier_append(
                 &mut layer.attention,
                 &dispatch.gqa.append,
@@ -11833,41 +11841,19 @@ impl MetalCandidateRuntime {
     fn validate_completed_mapped_mtp_layer(
         &self,
         prepared: &mut PreparedMappedMetalMtpCore,
-        plan: &MetalPagedGqaAppendPlan,
+        dispatch: &MetalFullAttentionDispatchPlan,
         component_values: usize,
     ) -> Result<()> {
         prepared.layer.attention.poisoned = false;
         #[cfg(not(test))]
-        let _ = (plan, component_values);
+        let _ = (dispatch, component_values);
         #[cfg(test)]
         {
-            let key = unsafe {
-                slice::from_raw_parts(
-                    prepared
-                        .layer
-                        .attention
-                        .verifier_key_snapshot_buffer
-                        .contents()
-                        .cast::<f32>(),
-                    component_values,
-                )
-                .to_vec()
-            };
-            let value = unsafe {
-                slice::from_raw_parts(
-                    prepared
-                        .layer
-                        .attention
-                        .verifier_value_snapshot_buffer
-                        .contents()
-                        .cast::<f32>(),
-                    component_values,
-                )
-                .to_vec()
-            };
+            let (key, value) =
+                Self::read_full_attention_verifier_snapshot(dispatch, component_values);
             self.commit_paged_gqa_verifier_append(
                 &mut prepared.layer.attention,
-                plan,
+                &dispatch.gqa.append,
                 &key,
                 &value,
             )?;
@@ -12336,12 +12322,38 @@ impl MetalCandidateRuntime {
                     depth: 1,
                 },
             );
+            encoder.set_buffer(1, Some(&dispatch.verifier_key_snapshot_buffer), 0);
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: component_values as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
             encoder.set_buffer(0, Some(arena), value);
             encoder.set_buffer(
                 1,
                 Some(&prepared.layer.attention.verifier_value_snapshot_buffer),
                 0,
             );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: component_values as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.set_buffer(1, Some(&dispatch.verifier_value_snapshot_buffer), 0);
             encoder.dispatch_thread_groups(
                 MTLSize {
                     width: component_values as u64,
@@ -12798,11 +12810,7 @@ impl MetalCandidateRuntime {
                 )));
             }
 
-            self.validate_completed_mapped_mtp_layer(
-                mtp,
-                &mtp_dispatch.gqa.append,
-                component_values,
-            )?;
+            self.validate_completed_mapped_mtp_layer(mtp, &mtp_dispatch, component_values)?;
             self.validate_completed_mapped_target_core(target, &target_plans)?;
             let verified = self
                 .read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
@@ -12939,11 +12947,7 @@ impl MetalCandidateRuntime {
                 )));
             }
 
-            self.validate_completed_mapped_mtp_layer(
-                mtp,
-                &mtp_dispatch.gqa.append,
-                component_values,
-            )?;
+            self.validate_completed_mapped_mtp_layer(mtp, &mtp_dispatch, component_values)?;
             self.validate_completed_mapped_target_core(target, &target_plans)?;
             let verified = self
                 .read_greedy_mtp_verification(&mtp.verification_buffer, target.vocabulary_rows())?;
@@ -13049,12 +13053,38 @@ impl MetalCandidateRuntime {
                     depth: 1,
                 },
             );
+            encoder.set_buffer(1, Some(&dispatch.verifier_key_snapshot_buffer), 0);
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: component_values as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
             encoder.set_buffer(0, Some(arena), append.reads()[1].offset());
             encoder.set_buffer(
                 1,
                 Some(&prepared.attention.verifier_value_snapshot_buffer),
                 0,
             );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: component_values as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.set_buffer(1, Some(&dispatch.verifier_value_snapshot_buffer), 0);
             encoder.dispatch_thread_groups(
                 MTLSize {
                     width: component_values as u64,
