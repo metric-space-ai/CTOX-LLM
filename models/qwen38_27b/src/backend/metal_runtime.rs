@@ -8153,20 +8153,40 @@ impl MetalCandidateRuntime {
         })
     }
 
-    fn snapshot_partial_rope_dispatch(
+    fn plan_partial_rope_dispatch_at(
         &self,
         prepared: &PreparedMetalPartialRope,
+        position: u64,
     ) -> Result<MetalPartialRopeDispatchPlan> {
+        let params = partial_rope_params(
+            prepared.heads,
+            prepared.head_dim,
+            prepared.rotary_dim,
+            position,
+            prepared.theta,
+        )?;
+        let (cosine, sine) = partial_rope_tables(prepared.rotary_dim, position, prepared.theta)?;
         Ok(MetalPartialRopeDispatchPlan {
-            cosine_buffer: clone_shared_buffer(&self.device, &prepared.cosine_buffer)?,
-            sine_buffer: clone_shared_buffer(&self.device, &prepared.sine_buffer)?,
-            params_buffer: clone_shared_buffer(&self.device, &prepared.params_buffer)?,
+            cosine_buffer: buffer_with_data(&self.device, as_bytes(&cosine)),
+            sine_buffer: buffer_with_data(&self.device, as_bytes(&sine)),
+            params_buffer: buffer_with_data(&self.device, &params.encode()),
         })
     }
 
     fn plan_full_attention_dispatch(
         &self,
         prepared: &mut PreparedMappedMetalFullAttentionLayer,
+    ) -> Result<MetalFullAttentionDispatchPlan> {
+        let position = u64::try_from(prepared.attention.tokens()).map_err(|_| {
+            EngineError::MemoryBudget("Metal attention position exceeds u64".into())
+        })?;
+        self.plan_full_attention_dispatch_at(prepared, position)
+    }
+
+    fn plan_full_attention_dispatch_at(
+        &self,
+        prepared: &mut PreparedMappedMetalFullAttentionLayer,
+        position: u64,
     ) -> Result<MetalFullAttentionDispatchPlan> {
         #[cfg(test)]
         let verifier_snapshot_bytes = prepared
@@ -8177,14 +8197,23 @@ impl MetalCandidateRuntime {
             .ok_or_else(|| {
                 EngineError::MemoryBudget("Metal verifier snapshot size overflows".into())
             })?;
+        partial_rope_params(
+            prepared.query_gate.heads,
+            prepared.query_gate.head_dim,
+            prepared.query_gate.rotary_dim,
+            position,
+            prepared.query_gate.theta,
+        )?;
+        let (query_cosine, query_sine) = partial_rope_tables(
+            prepared.query_gate.rotary_dim,
+            position,
+            prepared.query_gate.theta,
+        )?;
         Ok(MetalFullAttentionDispatchPlan {
             gqa: self.plan_paged_gqa_dispatch(&mut prepared.attention)?,
-            query_cosine_buffer: clone_shared_buffer(
-                &self.device,
-                &prepared.query_gate.cosine_buffer,
-            )?,
-            query_sine_buffer: clone_shared_buffer(&self.device, &prepared.query_gate.sine_buffer)?,
-            key_rope: self.snapshot_partial_rope_dispatch(&prepared.key_rope)?,
+            query_cosine_buffer: buffer_with_data(&self.device, as_bytes(&query_cosine)),
+            query_sine_buffer: buffer_with_data(&self.device, as_bytes(&query_sine)),
+            key_rope: self.plan_partial_rope_dispatch_at(&prepared.key_rope, position)?,
             #[cfg(test)]
             verifier_key_snapshot_buffer: new_zeroed_buffer(&self.device, verifier_snapshot_bytes)?,
             #[cfg(test)]
@@ -14022,18 +14051,6 @@ fn buffer_with_data(device: &Device, bytes: &[u8]) -> metal_driver::Buffer {
     )
 }
 
-fn clone_shared_buffer(device: &Device, source: &Buffer) -> Result<Buffer> {
-    let length = usize::try_from(source.length())
-        .map_err(|_| EngineError::MemoryBudget("Metal buffer length exceeds usize".into()))?;
-    if length == 0 {
-        return Err(EngineError::Shape(
-            "Metal cannot snapshot a zero-length buffer".into(),
-        ));
-    }
-    let bytes = unsafe { slice::from_raw_parts(source.contents().cast::<u8>(), length) };
-    Ok(buffer_with_data(device, bytes))
-}
-
 fn write_metal_paged_gqa_descriptors(prepared: &PreparedMetalPagedGqa) -> Result<()> {
     let descriptors = metal_paged_gqa_descriptor_bytes(prepared)?;
     write_buffer_range(
@@ -17750,8 +17767,8 @@ mod tests {
             assert_eq!(&actual_query[tail.clone()], &query[tail]);
         }
         let dispatch = runtime
-            .snapshot_partial_rope_dispatch(&prepared_query)
-            .expect("snapshot current RoPE dispatch");
+            .plan_partial_rope_dispatch_at(&prepared_query, position)
+            .expect("plan position-bound RoPE dispatch");
         prepared_query
             .write_values(&query)
             .expect("restore query values");
@@ -17771,12 +17788,12 @@ mod tests {
                 values_buffer,
                 0,
                 dispatch_width(&runtime.partial_rope_pipeline, DEFAULT_SIMDGROUPS)
-                    .expect("snapshot RoPE width"),
+                    .expect("position-bound RoPE width"),
                 &dispatch.cosine_buffer,
                 &dispatch.sine_buffer,
                 &dispatch.params_buffer,
             )
-            .expect("encode immutable RoPE snapshot");
+            .expect("encode immutable position-bound RoPE dispatch");
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();

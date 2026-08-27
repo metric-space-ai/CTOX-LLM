@@ -348,6 +348,11 @@ a separate full-vocabulary candidate selector on device before the next MTP
 argmax overwrites its source. Both MTP and target consume that preserved
 candidate, eliminating the last implicit dependency on the previous target
 selector from the future wait-free branch.
+Full-attention dispatch planning now derives each Query/Key RoPE position from
+the pre-append KV token count and materializes immutable per-dispatch tables.
+Queued causal steps therefore cannot observe a later mutation of a reusable
+layer owner, while every target layer and the MTP layer advance at the exact
+position represented by their own cache metadata.
 Paged-GQA encoding now binds immutable per-dispatch descriptor and parameter
 buffers independently of the persistent KV owner. Standalone, all 16 target
 full-attention layers, and the MTP layer use the same dispatch-plan boundary

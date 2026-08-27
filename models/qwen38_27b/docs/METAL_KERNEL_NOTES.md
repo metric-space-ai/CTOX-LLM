@@ -241,11 +241,14 @@ planning the second append without copying KV payloads.
 
 Each full-attention dispatch plan now owns immutable Query/Key RoPE tables and
 the key-RoPE parameter block together with its GQA metadata. The ordinary
-target and MTP graphs bind those snapshots directly. A device regression
-changes the reusable owner to position zero after snapshotting a nonzero
-position and proves the queued snapshot still matches the nonzero scalar
-oracle. Candidate-branch promotion still requires replacing these temporary
-per-dispatch allocations with a bounded preallocated four-depth metadata pool.
+target and MTP graphs bind those snapshots directly. Planning derives the
+position from the pre-append KV token count rather than mutable owner tables,
+so successive queued branch steps receive distinct causal positions. A device
+regression changes the reusable owner to position zero after planning a
+nonzero position and proves the queued dispatch still matches the nonzero
+scalar oracle. Candidate-branch promotion still requires replacing these
+temporary per-dispatch allocations with a bounded preallocated four-depth
+metadata pool.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While
