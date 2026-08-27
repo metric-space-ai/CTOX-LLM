@@ -21,14 +21,15 @@ use super::metal::{
     MetalArgMaxFinalBufferAbi, MetalArgMaxParams, MetalArgMaxPartialBufferAbi, MetalBufferAbi,
     MetalCausalConvBufferAbi, MetalCausalConvParams, MetalFusedMatVecParams,
     MetalGatedDeltaBufferAbi, MetalGatedDeltaParams, MetalGatedDeltaPrepareBufferAbi,
-    MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalPagedGqaBufferAbi,
-    MetalPagedGqaParams, MetalPartialRopeBufferAbi, MetalPartialRopeParams,
-    MetalResidualRmsNormBufferAbi, MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSwiGluBufferAbi,
-    ARGMAX_F32_FINAL_KERNEL_NAME, ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME,
-    GATED_DELTA_F16_KERNEL_NAME, GATED_DELTA_PREP_F32_KERNEL_NAME, MAX_SIMDGROUPS_PER_THREADGROUP,
-    PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME, Q2_GATHERED_KERNEL_NAME,
-    Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME, Q4_GATHERED_KERNEL_NAME,
-    Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
+    MetalGatedDeltaPrepareParams, MetalGatedRmsNormBufferAbi, MetalKvPackParams,
+    MetalKvQ4PackBufferAbi, MetalKvQ4ToQ2BufferAbi, MetalPagedGqaBufferAbi, MetalPagedGqaParams,
+    MetalPartialRopeBufferAbi, MetalPartialRopeParams, MetalResidualRmsNormBufferAbi,
+    MetalRmsNormBufferAbi, MetalRmsNormParams, MetalSwiGluBufferAbi, ARGMAX_F32_FINAL_KERNEL_NAME,
+    ARGMAX_F32_PARTIAL_KERNEL_NAME, CAUSAL_CONV_F16_KERNEL_NAME, GATED_DELTA_F16_KERNEL_NAME,
+    GATED_DELTA_PREP_F32_KERNEL_NAME, KV_Q4_PACK_KERNEL_NAME, KV_Q4_TO_Q2_KERNEL_NAME,
+    MAX_SIMDGROUPS_PER_THREADGROUP, PAGED_GQA_DECODE_KERNEL_NAME, PARTIAL_ROPE_KERNEL_NAME,
+    Q2_GATHERED_KERNEL_NAME, Q2_KERNEL_NAME, Q2_RECOVERED_ROW_KERNEL_NAME, Q2_SWIGLU_KERNEL_NAME,
+    Q4_GATHERED_KERNEL_NAME, Q4_KERNEL_NAME, Q4_RECOVERED_ROW_KERNEL_NAME, Q4_SWIGLU_KERNEL_NAME,
     RESIDUAL_RMS_NORM_1P_KERNEL_NAME, RMS_NORM_1P_KERNEL_NAME, RMS_NORM_GATED_KERNEL_NAME,
 };
 use super::metal_graph::{
@@ -71,6 +72,8 @@ pub struct MetalCandidateRuntime {
     residual_rms_norm_1p_pipeline: ComputePipelineState,
     rms_norm_gated_pipeline: ComputePipelineState,
     partial_rope_pipeline: ComputePipelineState,
+    kv_q4_pack_pipeline: ComputePipelineState,
+    kv_q4_to_q2_pipeline: ComputePipelineState,
     paged_gqa_decode_pipeline: ComputePipelineState,
     gated_delta_f16_pipeline: ComputePipelineState,
     gated_delta_prepare_f32_pipeline: ComputePipelineState,
@@ -1910,6 +1913,21 @@ impl MetalCandidateRuntime {
                     "Metal Qwen partial-RoPE function lookup failed: {message}"
                 ))
             })?;
+        let kv_q4_pack_function =
+            library
+                .get_function(KV_Q4_PACK_KERNEL_NAME, None)
+                .map_err(|message| {
+                    EngineError::InvalidState(format!(
+                        "Metal Q4 KV pack function lookup failed: {message}"
+                    ))
+                })?;
+        let kv_q4_to_q2_function = library
+            .get_function(KV_Q4_TO_Q2_KERNEL_NAME, None)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4-to-Q2 KV function lookup failed: {message}"
+                ))
+            })?;
         let paged_gqa_decode_function = library
             .get_function(PAGED_GQA_DECODE_KERNEL_NAME, None)
             .map_err(|message| {
@@ -2059,6 +2077,26 @@ impl MetalCandidateRuntime {
                     "Metal Qwen partial-RoPE pipeline creation failed: {message}"
                 ))
             })?;
+        let kv_q4_pack_pipeline = device
+            .new_compute_pipeline_state_with_function(&kv_q4_pack_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4 KV pack pipeline creation failed: {message}"
+                ))
+            })?;
+        let kv_q4_to_q2_pipeline = device
+            .new_compute_pipeline_state_with_function(&kv_q4_to_q2_function)
+            .map_err(|message| {
+                EngineError::InvalidState(format!(
+                    "Metal Q4-to-Q2 KV pipeline creation failed: {message}"
+                ))
+            })?;
+        if kv_q4_pack_pipeline.thread_execution_width() != 32 {
+            return Err(EngineError::InvalidState(format!(
+                "Metal Q4 KV pack requires a 32-wide simdgroup, device reports {}",
+                kv_q4_pack_pipeline.thread_execution_width()
+            )));
+        }
         let paged_gqa_decode_pipeline = device
             .new_compute_pipeline_state_with_function(&paged_gqa_decode_function)
             .map_err(|message| {
@@ -2132,6 +2170,8 @@ impl MetalCandidateRuntime {
             residual_rms_norm_1p_pipeline,
             rms_norm_gated_pipeline,
             partial_rope_pipeline,
+            kv_q4_pack_pipeline,
+            kv_q4_to_q2_pipeline,
             paged_gqa_decode_pipeline,
             gated_delta_f16_pipeline,
             gated_delta_prepare_f32_pipeline,
@@ -5257,6 +5297,108 @@ impl MetalCandidateRuntime {
             },
         );
         Ok(())
+    }
+
+    /// Verifier for the device-only KV transition used by the production
+    /// paged cache: pack one resident K/V token to Q4, then demote that packed
+    /// representation to Q2 in the same command encoder. Returned bytes are
+    /// verifier evidence only; the graph path binds page-arena offsets instead.
+    pub fn dispatch_kv_q4_pack_and_demote(
+        &self,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        if key.len() != value.len() || key.is_empty() || !(key.len() * 2).is_multiple_of(BLOCK_LEN)
+        {
+            return Err(EngineError::Shape(
+                "Metal KV pack requires equal non-empty K/V widths divisible by 32".into(),
+            ));
+        }
+        if key.iter().chain(value).any(|value| !value.is_finite()) {
+            return Err(EngineError::InvalidArtifact(
+                "Metal KV pack input contains a non-finite value".into(),
+            ));
+        }
+        let combined_values = key
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal KV width overflows".into()))?;
+        let blocks = combined_values / BLOCK_LEN;
+        let q4_bytes = blocks
+            .checked_mul(Q4_BLOCK_BYTES)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q4 KV bytes overflow".into()))?;
+        let q2_bytes = blocks
+            .checked_mul(Q2_BLOCK_BYTES)
+            .ok_or_else(|| EngineError::MemoryBudget("Metal Q2 KV bytes overflow".into()))?;
+        let params = MetalKvPackParams {
+            component_values: u32::try_from(key.len())
+                .map_err(|_| EngineError::Shape("Metal KV component width exceeds u32".into()))?,
+            blocks: u32::try_from(blocks)
+                .map_err(|_| EngineError::Shape("Metal KV block count exceeds u32".into()))?,
+            reserved0: 0,
+            reserved1: 0,
+        };
+        let key_buffer = buffer_with_data(&self.device, as_bytes(key));
+        let value_buffer = buffer_with_data(&self.device, as_bytes(value));
+        let q4_buffer = new_zeroed_buffer(&self.device, q4_bytes)?;
+        let q2_buffer = new_zeroed_buffer(&self.device, q2_bytes)?;
+        let params_buffer = buffer_with_data(&self.device, &params.encode());
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-kv-q4-pack-demote-verifier");
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.kv_q4_pack_pipeline);
+        encoder.set_buffer(MetalKvQ4PackBufferAbi::KEY as u64, Some(&key_buffer), 0);
+        encoder.set_buffer(MetalKvQ4PackBufferAbi::VALUE as u64, Some(&value_buffer), 0);
+        encoder.set_buffer(MetalKvQ4PackBufferAbi::OUTPUT as u64, Some(&q4_buffer), 0);
+        encoder.set_buffer(
+            MetalKvQ4PackBufferAbi::PARAMS as u64,
+            Some(&params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: blocks as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.set_compute_pipeline_state(&self.kv_q4_to_q2_pipeline);
+        encoder.set_buffer(MetalKvQ4ToQ2BufferAbi::Q4 as u64, Some(&q4_buffer), 0);
+        encoder.set_buffer(MetalKvQ4ToQ2BufferAbi::Q2 as u64, Some(&q2_buffer), 0);
+        encoder.set_buffer(
+            MetalKvQ4ToQ2BufferAbi::PARAMS as u64,
+            Some(&params_buffer),
+            0,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: blocks as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal KV pack/demotion command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        let q4 = unsafe { slice::from_raw_parts(q4_buffer.contents().cast::<u8>(), q4_bytes) };
+        let q2 = unsafe { slice::from_raw_parts(q2_buffer.contents().cast::<u8>(), q2_bytes) };
+        Ok((q4.to_vec(), q2.to_vec()))
     }
 
     /// Append one K/V token to the persistent packed cache and execute one
@@ -11217,6 +11359,43 @@ mod tests {
             );
         }
         assert!(actual[key.len()..].iter().all(|value| *value == -17.0));
+    }
+
+    #[test]
+    fn device_kv_pack_and_demotion_match_canonical_q4_q2_bytes() {
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let component_values = 2 * BLOCK_LEN;
+        let key: Vec<f32> = (0..component_values)
+            .map(|index| (index as f32 * 0.071).sin() * 2.3)
+            .collect();
+        let value: Vec<f32> = (0..component_values)
+            .map(|index| (index as f32 * 0.113).cos() * 1.7)
+            .collect();
+        let combined = key.iter().chain(&value).copied().collect::<Vec<_>>();
+        let mut expected_q4 = Vec::new();
+        let mut expected_q2 = Vec::new();
+        for values in combined.chunks_exact(BLOCK_LEN) {
+            let q4 = crate::quant::Q4Block64::quantize(values).expect("quantize Q4 oracle");
+            expected_q4.extend_from_slice(&q4.encode());
+            expected_q2.extend_from_slice(
+                &crate::quant::Q2Block64::quantize(&q4.dequantize())
+                    .expect("demote Q4 oracle to Q2")
+                    .encode(),
+            );
+        }
+        let (actual_q4, actual_q2) = runtime
+            .dispatch_kv_q4_pack_and_demote(&key, &value)
+            .expect("pack and demote KV entirely on Metal");
+        assert_eq!(actual_q4, expected_q4);
+        assert_eq!(actual_q2, expected_q2);
+        assert!(runtime
+            .dispatch_kv_q4_pack_and_demote(&key[..BLOCK_LEN], &value)
+            .is_err());
+        let mut non_finite = key.clone();
+        non_finite[3] = f32::NAN;
+        assert!(runtime
+            .dispatch_kv_q4_pack_and_demote(&non_finite, &value)
+            .is_err());
     }
 
     #[test]

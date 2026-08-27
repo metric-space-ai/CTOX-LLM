@@ -313,6 +313,13 @@ arena and physical slot. Stable three-pass softmax decodes Q2/Q4 blocks
 directly into registers and never creates an f32 K/V device cache. An append
 uploads only its changed page plus any page crossing the Q4-to-Q2 boundary.
 
+A device-only transition candidate now packs resident K/V inputs directly to
+canonical Q4_B64 and demotes Q4 blocks to canonical Q2_B64 in the same command
+encoder. Its Apple-device Golden test compares every output byte against the
+Rust Q4 quantizer and the exact Q4-dequantize-to-Q2 oracle. The paged-cache
+host path has not yet been switched to these kernels, so the CPU packed mirror
+remains an explicit promotion blocker rather than being hidden by this result.
+
 For the frozen 24-query-head/4-KV-head/256-wide topology, a token contains
 2,048 combined K/V values: 576 Q2 bytes or 1,088 Q4 bytes. A 128K layer with
 128-token pages, 128 sink tokens, and 256 recent tokens reserves 75,497,472

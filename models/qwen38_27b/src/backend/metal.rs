@@ -29,6 +29,8 @@ pub const RMS_NORM_1P_KERNEL_NAME: &str = "qwen_rms_norm_1p_f32";
 pub const RESIDUAL_RMS_NORM_1P_KERNEL_NAME: &str = "qwen_residual_rms_norm_1p_f32";
 pub const RMS_NORM_GATED_KERNEL_NAME: &str = "qwen_rms_norm_gated_f32";
 pub const PARTIAL_ROPE_KERNEL_NAME: &str = "qwen_partial_rope_f32";
+pub const KV_Q4_PACK_KERNEL_NAME: &str = "qwen_kv_q4_pack_f32";
+pub const KV_Q4_TO_Q2_KERNEL_NAME: &str = "qwen_kv_q4_to_q2";
 pub const PAGED_GQA_DECODE_KERNEL_NAME: &str = "qwen_paged_q2q4_gqa_decode_f32";
 pub const GATED_DELTA_F16_KERNEL_NAME: &str = "qwen_gated_delta_recurrent_f16";
 pub const GATED_DELTA_PREP_F32_KERNEL_NAME: &str = "qwen_gated_delta_prepare_f32";
@@ -121,6 +123,25 @@ impl MetalPartialRopeBufferAbi {
     pub const COSINE: u32 = 1;
     pub const SINE: u32 = 2;
     pub const PARAMS: u32 = 3;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalKvQ4PackBufferAbi;
+
+impl MetalKvQ4PackBufferAbi {
+    pub const KEY: u32 = 0;
+    pub const VALUE: u32 = 1;
+    pub const OUTPUT: u32 = 2;
+    pub const PARAMS: u32 = 3;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalKvQ4ToQ2BufferAbi;
+
+impl MetalKvQ4ToQ2BufferAbi {
+    pub const Q4: u32 = 0;
+    pub const Q2: u32 = 1;
+    pub const PARAMS: u32 = 2;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +279,34 @@ pub struct MetalPartialRopeParams {
     pub reserved0: u32,
     pub reserved1: u32,
     pub reserved2: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalKvPackParams {
+    pub component_values: u32,
+    pub blocks: u32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+}
+
+impl MetalKvPackParams {
+    pub const BYTE_LEN: usize = 16;
+
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut encoded = [0_u8; Self::BYTE_LEN];
+        for (index, word) in [
+            self.component_values,
+            self.blocks,
+            self.reserved0,
+            self.reserved1,
+        ]
+        .iter()
+        .enumerate()
+        {
+            encoded[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        encoded
+    }
 }
 
 impl MetalPartialRopeParams {
@@ -1199,6 +1248,21 @@ mod tests {
             words,
             vec![24, 256, 64, 131_071, 10_000_000.0_f32.to_bits(), 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn kv_pack_params_encode_matches_msl_struct() {
+        let words = MetalKvPackParams {
+            component_values: 1_024,
+            blocks: 32,
+            reserved0: 0,
+            reserved1: 0,
+        }
+        .encode()
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+        assert_eq!(words, vec![1_024, 32, 0, 0]);
     }
 
     #[test]

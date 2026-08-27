@@ -62,6 +62,13 @@ struct PartialRopeParams {
     uint reserved2;
 };
 
+struct KvPackParams {
+    uint component_values;
+    uint blocks;
+    uint reserved0;
+    uint reserved1;
+};
+
 struct PagedKvDescriptor {
     uint precision;             // 0 = Q2_B64, 1 = Q4_B64
     uint physical_slot;         // arena slot for this logical page
@@ -779,6 +786,87 @@ kernel void qwen_partial_rope_f32(
     float right = values[base + index + half_dim];
     values[base + index] = left * cosine[index] - right * sine[index];
     values[base + index + half_dim] = right * cosine[index] + left * sine[index];
+}
+
+// Pack one device-resident [K,V] token directly into canonical Q4_B64. One
+// 32-wide simdgroup owns a 64-value block; every lane packs two nibbles after
+// the shared absolute maximum has been reduced. No host staging or expanded
+// persistent KV representation is involved.
+kernel void qwen_kv_q4_pack_f32(
+    device const float* key [[buffer(0)]],
+    device const float* value [[buffer(1)]],
+    device uchar* output [[buffer(2)]],
+    constant KvPackParams& params [[buffer(3)]],
+    uint block [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (block >= params.blocks) {
+        return;
+    }
+    uint first = block * Q2Q4_BLOCK_LEN + lane * 2u;
+    float left = first < params.component_values
+        ? key[first]
+        : value[first - params.component_values];
+    uint second = first + 1u;
+    float right = second < params.component_values
+        ? key[second]
+        : value[second - params.component_values];
+    float maximum = simd_max(max(abs(left), abs(right)));
+    device uchar* block_base = output + ulong(block) * Q4_BLOCK_BYTES;
+    if (lane == 0u) {
+        ushort bits = as_type<ushort>(half(maximum));
+        block_base[0] = uchar(bits & 0xffu);
+        block_base[1] = uchar(bits >> 8u);
+    }
+    uint left_code = 0u;
+    uint right_code = 0u;
+    if (maximum != 0.0f) {
+        left_code = uint(clamp(round(clamp(left / maximum, -1.0f, 1.0f) * 7.5f + 7.5f), 0.0f, 15.0f));
+        right_code = uint(clamp(round(clamp(right / maximum, -1.0f, 1.0f) * 7.5f + 7.5f), 0.0f, 15.0f));
+    }
+    block_base[2u + lane] = uchar(left_code | (right_code << 4u));
+}
+
+inline uint q4_code_to_q2(uint code) {
+    if (code <= 2u) {
+        return 0u;
+    }
+    if (code <= 7u) {
+        return 1u;
+    }
+    if (code <= 12u) {
+        return 2u;
+    }
+    return 3u;
+}
+
+// Demote a canonical Q4 token page to Q2 without widening it. Q4's endpoint
+// code always preserves the FP16 block scale, so demotion copies that scale
+// and maps four source nibbles to one Q2 code byte exactly like the Rust
+// Q4-dequantize -> Q2-quantize oracle.
+kernel void qwen_kv_q4_to_q2(
+    device const uchar* q4 [[buffer(0)]],
+    device uchar* q2 [[buffer(1)]],
+    constant KvPackParams& params [[buffer(2)]],
+    uint block [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (block >= params.blocks || lane >= 16u) {
+        return;
+    }
+    device const uchar* q4_block = q4 + ulong(block) * Q4_BLOCK_BYTES;
+    device uchar* q2_block = q2 + ulong(block) * Q2_BLOCK_BYTES;
+    if (lane == 0u) {
+        q2_block[0] = q4_block[0];
+        q2_block[1] = q4_block[1];
+    }
+    uint first = lane * 4u;
+    uint packed = 0u;
+    for (uint offset = 0u; offset < 4u; ++offset) {
+        uint index = first + offset;
+        uint source = uint(q4_block[2u + index / 2u]);
+        uint code = (source >> ((index & 1u) * 4u)) & 15u;
+        packed |= q4_code_to_q2(code) << (offset * 2u);
+    }
+    q2_block[2u + lane] = uchar(packed);
 }
 
 // Decode-only grouped-query attention over a persistent mixed Q2/Q4 paged
