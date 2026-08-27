@@ -108,6 +108,12 @@ any identity or topology drift, aggregates persistent state with checked
 arithmetic, and updates all Full-Attention position tables without exposing a
 partially admitted graph. The weights in every variant remain views of the same
 canonical no-copy artifact mapping.
+The complete linear- and full-attention paths now each expose an internal
+encoder-only stage. Admission and tensor-identity checks happen before that
+stage; the encoder-only functions append the frozen ten operations to a
+caller-owned compute encoder and never commit or wait themselves. Standalone
+Golden wrappers still commit once per layer, while the model executor can reuse
+the same code to encode all target layers into one command buffer.
 
 Paged GQA now has a bounded append-only transaction as well. Begin records a
 constant-size cache prefix marker and small page-to-Q4/free-slot vectors. While

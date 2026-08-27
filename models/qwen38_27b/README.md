@@ -251,6 +251,11 @@ linear-attention layers into one ordered 64-layer enum. It validates the exact
 48/16 topology, reports aggregate persistent state without counting mmap-backed
 weights as copied bytes, updates every Full-Attention RoPE position together,
 and exposes no partial graph when any tensor or allocation fails.
+Both complete layer implementations now separate fail-closed admission from
+command encoding: their internal encoder functions append all ten operations
+to a caller-owned compute encoder, while the existing public verifier wrappers
+retain the one-layer commit/wait boundary. This removes the architectural need
+for 64 per-layer command buffers in the forthcoming complete target executor.
 Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first

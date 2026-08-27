@@ -9251,136 +9251,14 @@ impl MetalCandidateRuntime {
             let command_buffer = self.queue.new_command_buffer();
             command_buffer.set_label("ctox-qwen38-shared-arena-full-attention-layer");
             let encoder = command_buffer.new_compute_command_encoder();
-            for (projection, output) in prepared.fanout.projections.iter().zip(fanout.writes()) {
-                self.encode_mapped_projection_between(
-                    encoder,
-                    projection,
-                    arena,
-                    fanout.reads()[0].offset(),
-                    arena,
-                    output.offset(),
-                )?;
-            }
-            self.encode_mapped_query_gate_norm_rope_between(
+            self.encode_prepared_mapped_full_attention_layer(
                 encoder,
-                &prepared.query_gate,
-                arena,
-                query_gate.reads()[0].offset(),
-                arena,
-                query_gate.writes()[0].offset(),
-                arena,
-                query_gate.writes()[1].offset(),
-            );
-            self.encode_partial_rope_between(
-                encoder,
-                &prepared.key_rope,
-                arena,
-                key_rope.writes()[0].offset(),
-                thread_width,
-            )?;
-            #[cfg(test)]
-            {
-                encoder.set_compute_pipeline_state(&self.copy_f32_pipeline);
-                encoder.set_buffer(0, Some(arena), append.reads()[0].offset());
-                encoder.set_buffer(1, Some(&prepared.attention.verifier_key_snapshot_buffer), 0);
-                encoder.dispatch_thread_groups(
-                    MTLSize {
-                        width: component_values as u64,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 1,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-                encoder.set_buffer(0, Some(arena), append.reads()[1].offset());
-                encoder.set_buffer(
-                    1,
-                    Some(&prepared.attention.verifier_value_snapshot_buffer),
-                    0,
-                );
-                encoder.dispatch_thread_groups(
-                    MTLSize {
-                        width: component_values as u64,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 1,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
-            self.encode_paged_gqa_append_and_attention(
-                encoder,
-                &prepared.attention,
+                steps,
+                prepared,
                 &plan,
-                arena,
-                gqa.reads()[0].offset(),
-                arena,
-                append.reads()[0].offset(),
-                arena,
-                append.reads()[1].offset(),
-                arena,
-                gqa.writes()[0].offset(),
+                thread_width,
+                component_values,
             )?;
-            self.encode_mapped_sigmoid_gate_projection_between(
-                encoder,
-                &prepared.attention_output.projection,
-                arena,
-                attention_output.reads()[0].offset(),
-                arena,
-                attention_output.reads()[1].offset(),
-                arena,
-                attention_output.writes()[0].offset(),
-            )?;
-            self.encode_mapped_residual_rms_norm_between(
-                encoder,
-                &prepared.residual_rms_norm,
-                arena,
-                residual.reads()[0].offset(),
-                arena,
-                residual.reads()[1].offset(),
-                arena,
-                residual.writes()[0].offset(),
-                arena,
-                residual.writes()[1].offset(),
-            );
-            for (projection, output) in prepared.ffn_gate_up.iter().zip(ffn.writes()) {
-                self.encode_mapped_projection_between(
-                    encoder,
-                    projection,
-                    arena,
-                    ffn.reads()[0].offset(),
-                    arena,
-                    output.offset(),
-                )?;
-            }
-            self.encode_mapped_swiglu_projection_between(
-                encoder,
-                &prepared.swiglu_down,
-                arena,
-                down.reads()[0].offset(),
-                arena,
-                down.reads()[1].offset(),
-                arena,
-                down.writes()[0].offset(),
-            )?;
-            self.encode_mapped_residual_rms_norm_between(
-                encoder,
-                &prepared.post_ffn_residual_rms_norm,
-                arena,
-                post_ffn.reads()[0].offset(),
-                arena,
-                post_ffn.reads()[1].offset(),
-                arena,
-                post_ffn.writes()[0].offset(),
-                arena,
-                post_ffn.writes()[1].offset(),
-            );
             encoder.end_encoding();
             command_buffer.commit();
             command_buffer.wait_until_completed();
@@ -9427,6 +9305,161 @@ impl MetalCandidateRuntime {
             prepared.attention.poisoned = false;
         }
         result
+    }
+
+    fn encode_prepared_mapped_full_attention_layer(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        steps: &[PreparedMetalDecodeStepView<'_>],
+        prepared: &PreparedMappedMetalFullAttentionLayer,
+        plan: &MetalPagedGqaAppendPlan,
+        thread_width: usize,
+        component_values: usize,
+    ) -> Result<()> {
+        #[cfg(not(test))]
+        let _ = component_values;
+        let arena = steps[0].reads()[0].buffer();
+        let fanout = &steps[0];
+        let query_gate = &steps[1];
+        let key_rope = &steps[2];
+        let append = &steps[3];
+        let gqa = &steps[4];
+        let attention_output = &steps[5];
+        let residual = &steps[6];
+        let ffn = &steps[7];
+        let down = &steps[8];
+        let post_ffn = &steps[9];
+        for (projection, output) in prepared.fanout.projections.iter().zip(fanout.writes()) {
+            self.encode_mapped_projection_between(
+                encoder,
+                projection,
+                arena,
+                fanout.reads()[0].offset(),
+                arena,
+                output.offset(),
+            )?;
+        }
+        self.encode_mapped_query_gate_norm_rope_between(
+            encoder,
+            &prepared.query_gate,
+            arena,
+            query_gate.reads()[0].offset(),
+            arena,
+            query_gate.writes()[0].offset(),
+            arena,
+            query_gate.writes()[1].offset(),
+        );
+        self.encode_partial_rope_between(
+            encoder,
+            &prepared.key_rope,
+            arena,
+            key_rope.writes()[0].offset(),
+            thread_width,
+        )?;
+        #[cfg(test)]
+        {
+            encoder.set_compute_pipeline_state(&self.copy_f32_pipeline);
+            encoder.set_buffer(0, Some(arena), append.reads()[0].offset());
+            encoder.set_buffer(1, Some(&prepared.attention.verifier_key_snapshot_buffer), 0);
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: component_values as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.set_buffer(0, Some(arena), append.reads()[1].offset());
+            encoder.set_buffer(
+                1,
+                Some(&prepared.attention.verifier_value_snapshot_buffer),
+                0,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: component_values as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        self.encode_paged_gqa_append_and_attention(
+            encoder,
+            &prepared.attention,
+            plan,
+            arena,
+            gqa.reads()[0].offset(),
+            arena,
+            append.reads()[0].offset(),
+            arena,
+            append.reads()[1].offset(),
+            arena,
+            gqa.writes()[0].offset(),
+        )?;
+        self.encode_mapped_sigmoid_gate_projection_between(
+            encoder,
+            &prepared.attention_output.projection,
+            arena,
+            attention_output.reads()[0].offset(),
+            arena,
+            attention_output.reads()[1].offset(),
+            arena,
+            attention_output.writes()[0].offset(),
+        )?;
+        self.encode_mapped_residual_rms_norm_between(
+            encoder,
+            &prepared.residual_rms_norm,
+            arena,
+            residual.reads()[0].offset(),
+            arena,
+            residual.reads()[1].offset(),
+            arena,
+            residual.writes()[0].offset(),
+            arena,
+            residual.writes()[1].offset(),
+        );
+        for (projection, output) in prepared.ffn_gate_up.iter().zip(ffn.writes()) {
+            self.encode_mapped_projection_between(
+                encoder,
+                projection,
+                arena,
+                ffn.reads()[0].offset(),
+                arena,
+                output.offset(),
+            )?;
+        }
+        self.encode_mapped_swiglu_projection_between(
+            encoder,
+            &prepared.swiglu_down,
+            arena,
+            down.reads()[0].offset(),
+            arena,
+            down.reads()[1].offset(),
+            arena,
+            down.writes()[0].offset(),
+        )?;
+        self.encode_mapped_residual_rms_norm_between(
+            encoder,
+            &prepared.post_ffn_residual_rms_norm,
+            arena,
+            post_ffn.reads()[0].offset(),
+            arena,
+            post_ffn.reads()[1].offset(),
+            arena,
+            post_ffn.writes()[0].offset(),
+            arena,
+            post_ffn.writes()[1].offset(),
+        );
+        Ok(())
     }
 
     /// Execute one complete frozen linear-attention transformer layer from an
@@ -9682,6 +9715,60 @@ impl MetalCandidateRuntime {
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-shared-arena-linear-layer");
         let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_mapped_linear_attention_layer_views(
+            encoder,
+            steps,
+            projections,
+            convolution,
+            gated_delta_prepare,
+            recurrence,
+            gated_rms_norm,
+            linear_output_projection,
+            residual_rms_norm,
+            ffn_gate_up,
+            swiglu_down,
+            post_ffn_residual_rms_norm,
+        )?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal linear layer {layer} ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        convolution.poisoned = false;
+        recurrence.poisoned = false;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mapped_linear_attention_layer_views(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        steps: &[PreparedMetalDecodeStepView<'_>],
+        projections: [&PreparedMappedMetalMatVec; 4],
+        convolution: &mut PreparedMappedMetalCausalConv,
+        gated_delta_prepare: &PreparedMappedMetalGatedDeltaPrepare,
+        recurrence: &mut PreparedMetalGatedDelta,
+        gated_rms_norm: &PreparedMappedMetalGatedRmsNorm,
+        linear_output_projection: &PreparedMappedMetalMatVec,
+        residual_rms_norm: &PreparedMappedMetalRmsNorm,
+        ffn_gate_up: [&PreparedMappedMetalMatVec; 2],
+        swiglu_down: &PreparedMappedMetalMatVec,
+        post_ffn_residual_rms_norm: &PreparedMappedMetalRmsNorm,
+    ) -> Result<()> {
+        let arena = steps[0].reads()[0].buffer();
+        let linear = &steps[0];
+        let prepare = &steps[2];
+        let recurrent = &steps[3];
+        let gated = &steps[4];
+        let output_projection = &steps[5];
+        let residual = &steps[6];
+        let ffn = &steps[7];
+        let down = &steps[8];
+        let post_ffn = &steps[9];
         for (projection, output) in projections.iter().zip(linear.writes()) {
             self.encode_mapped_projection_between(
                 encoder,
@@ -9788,17 +9875,6 @@ impl MetalCandidateRuntime {
             arena,
             post_ffn.writes()[1].offset(),
         );
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        if command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(EngineError::InvalidState(format!(
-                "Metal linear layer {layer} ended with {:?}",
-                command_buffer.status()
-            )));
-        }
-        convolution.poisoned = false;
-        recurrence.poisoned = false;
         Ok(())
     }
 
