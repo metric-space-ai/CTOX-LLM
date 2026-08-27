@@ -185,7 +185,11 @@ one command encoder: the projection reads the norm output directly and omits
 its otherwise duplicated activation allocation.
 Qwen's non-interleaved partial RoPE is a native in-place Metal candidate for
 the exact 24-query/4-key-head, 256-wide, 64-rotary-dimension topology. Query
-and key transforms share one command encoder and one synchronization.
+and key transforms share one command encoder and one synchronization. A
+graph-only preparation mode now retains just the reusable trigonometric tables
+and parameter block, then rotates `Query` or `Key` directly at its offset in
+the shared decode arena. The Layer-3 Golden test proves the logical 1,024-value
+key extent is updated while the larger aliased slot tail remains unchanged.
 Complete-graph residency and unload measurements on the 7.8-GiB artifact are
 still required before this changes backend promotion state.
 Metal target selection now also has a finite-checking full-vocabulary argmax
@@ -213,7 +217,10 @@ only for non-overlapping produced-value intervals; target and MTP logits remain
 simultaneously live and therefore distinct. `MetalCandidateRuntime` now
 materializes that plan as exactly one shared Metal buffer, exposes only the
 validated buffer/offset pairs, and passes write/read plus drop/recreate device
-tests. Every logical read and write of all 645 bound decode steps now resolves
+tests. Exact ten-step accessors now validate both the 48 linear-attention and
+17 target/MTP full-attention layer sequences; a layer of the wrong kind is
+rejected before any kernel encoding.
+Every logical read and write of all 645 bound decode steps now resolves
 to a typed view of that same real buffer and its exact schedule-derived offset;
 the final barrier retains target and MTP logits as explicit reads. The first
 exact decode chain now binds those views directly: embedding writes `HiddenA`,

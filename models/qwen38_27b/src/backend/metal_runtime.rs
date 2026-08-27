@@ -344,7 +344,7 @@ pub struct PreparedMetalPartialRope {
     head_dim: usize,
     rotary_dim: usize,
     theta: f32,
-    values_buffer: Buffer,
+    values_buffer: Option<Buffer>,
     cosine_buffer: Buffer,
     sine_buffer: Buffer,
     params_buffer: Buffer,
@@ -819,6 +819,58 @@ impl<'a> PreparedMetalDecodeProgram<'a> {
         }
         Ok(steps)
     }
+
+    /// Return the exact ten-step slice for one frozen full-attention layer.
+    /// This is the graph-side contract used while binding query/gate RoPE,
+    /// packed KV append, paged GQA, and the gated output projection to the
+    /// same shared activation arena as the surrounding transformer layers.
+    pub fn full_attention_layer_steps(
+        &self,
+        layer: usize,
+    ) -> Result<&[PreparedMetalDecodeStepView<'a>]> {
+        const STEPS_PER_LAYER: usize = 10;
+        const OPERATIONS: [MetalDecodeOperation; STEPS_PER_LAYER] = [
+            MetalDecodeOperation::FullAttentionFanout,
+            MetalDecodeOperation::QueryGateNormRope,
+            MetalDecodeOperation::KeyRope,
+            MetalDecodeOperation::PagedKvAppend,
+            MetalDecodeOperation::PagedGqa,
+            MetalDecodeOperation::AttentionGateOutputProjection,
+            MetalDecodeOperation::ResidualRmsNorm,
+            MetalDecodeOperation::FfnGateUpFanout,
+            MetalDecodeOperation::SwiGluDownProjection,
+            MetalDecodeOperation::ResidualRmsNorm,
+        ];
+        let start = layer
+            .checked_mul(STEPS_PER_LAYER)
+            .and_then(|offset| offset.checked_add(2))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("Metal layer schedule index overflows".into())
+            })?;
+        let end = start.checked_add(STEPS_PER_LAYER).ok_or_else(|| {
+            EngineError::MemoryBudget("Metal layer schedule range overflows".into())
+        })?;
+        let steps = self.steps.get(start..end).ok_or_else(|| {
+            EngineError::InvalidState(format!(
+                "Metal decode program does not contain complete layer {layer}"
+            ))
+        })?;
+        if steps
+            .iter()
+            .zip(OPERATIONS)
+            .enumerate()
+            .any(|(offset, (step, operation))| {
+                step.step().schedule_index != start + offset
+                    || step.step().layer != Some(layer)
+                    || step.step().operation != operation
+            })
+        {
+            return Err(EngineError::InvalidState(format!(
+                "Metal decode program layer {layer} is not the frozen full-attention sequence"
+            )));
+        }
+        Ok(steps)
+    }
 }
 
 impl PreparedMetalDecodeAttempt<'_> {
@@ -1289,16 +1341,25 @@ impl PreparedMetalPartialRope {
         self.transient_bytes
     }
 
+    pub fn has_owned_values(&self) -> bool {
+        self.values_buffer.is_some()
+    }
+
     pub fn write_values(&self, values: &[f32]) -> Result<()> {
         let expected = self
             .heads
             .checked_mul(self.head_dim)
             .ok_or_else(|| EngineError::Shape("Metal RoPE value shape overflows".into()))?;
         validate_metal_input(values, expected)?;
+        let values_buffer = self.values_buffer.as_ref().ok_or_else(|| {
+            EngineError::InvalidState(
+                "Metal graph RoPE has no operation-local activation buffer".into(),
+            )
+        })?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr(),
-                self.values_buffer.contents().cast::<f32>(),
+                values_buffer.contents().cast::<f32>(),
                 values.len(),
             );
         }
@@ -3894,10 +3955,44 @@ impl MetalCandidateRuntime {
             head_dim,
             rotary_dim,
             theta,
-            values_buffer,
+            values_buffer: Some(values_buffer),
             cosine_buffer,
             sine_buffer,
             params_buffer,
+            transient_bytes,
+        })
+    }
+
+    /// Prepare only immutable/tiny RoPE tables and parameters. The activation
+    /// itself is supplied as a view into the schedule-derived decode arena.
+    pub fn prepare_partial_rope_graph(
+        &self,
+        heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        position: u64,
+        theta: f32,
+    ) -> Result<PreparedMetalPartialRope> {
+        heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| EngineError::Shape("Metal graph RoPE value shape overflows".into()))?;
+        let params = partial_rope_params(heads, head_dim, rotary_dim, position, theta)?;
+        let (cosine, sine) = partial_rope_tables(rotary_dim, position, theta)?;
+        let transient_bytes = size_of_val(cosine.as_slice())
+            .checked_add(size_of_val(sine.as_slice()))
+            .and_then(|bytes| bytes.checked_add(MetalPartialRopeParams::BYTE_LEN))
+            .ok_or_else(|| {
+                EngineError::Shape("Metal graph RoPE transient bytes overflow".into())
+            })?;
+        Ok(PreparedMetalPartialRope {
+            heads,
+            head_dim,
+            rotary_dim,
+            theta,
+            values_buffer: None,
+            cosine_buffer: buffer_with_data(&self.device, as_bytes(&cosine)),
+            sine_buffer: buffer_with_data(&self.device, as_bytes(&sine)),
+            params_buffer: buffer_with_data(&self.device, &params.encode()),
             transient_bytes,
         })
     }
@@ -5019,44 +5114,13 @@ impl MetalCandidateRuntime {
         let command_buffer = self.queue.new_command_buffer();
         command_buffer.set_label("ctox-qwen38-partial-rope-verifier");
         let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&self.partial_rope_pipeline);
         for operation in prepared {
-            encoder.set_buffer(
-                MetalPartialRopeBufferAbi::VALUES as u64,
-                Some(&operation.values_buffer),
-                0,
-            );
-            encoder.set_buffer(
-                MetalPartialRopeBufferAbi::COSINE as u64,
-                Some(&operation.cosine_buffer),
-                0,
-            );
-            encoder.set_buffer(
-                MetalPartialRopeBufferAbi::SINE as u64,
-                Some(&operation.sine_buffer),
-                0,
-            );
-            encoder.set_buffer(
-                MetalPartialRopeBufferAbi::PARAMS as u64,
-                Some(&operation.params_buffer),
-                0,
-            );
-            let pair_count = operation
-                .heads
-                .checked_mul(operation.rotary_dim / 2)
-                .ok_or_else(|| EngineError::Shape("Metal RoPE pair count overflows".into()))?;
-            encoder.dispatch_thread_groups(
-                MTLSize {
-                    width: pair_count.div_ceil(thread_width) as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: thread_width as u64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            let values_buffer = operation.values_buffer.as_ref().ok_or_else(|| {
+                EngineError::InvalidState(
+                    "Metal graph RoPE requires an explicit shared-arena dispatch".into(),
+                )
+            })?;
+            self.encode_partial_rope_between(encoder, operation, values_buffer, 0, thread_width)?;
         }
         encoder.end_encoding();
         command_buffer.commit();
@@ -5079,7 +5143,12 @@ impl MetalCandidateRuntime {
                         })?;
                 let output = unsafe {
                     slice::from_raw_parts(
-                        operation.values_buffer.contents().cast::<f32>(),
+                        operation
+                            .values_buffer
+                            .as_ref()
+                            .expect("owned RoPE buffer checked before dispatch")
+                            .contents()
+                            .cast::<f32>(),
                         value_count,
                     )
                     .to_vec()
@@ -5092,6 +5161,102 @@ impl MetalCandidateRuntime {
                 Ok(output)
             })
             .collect()
+    }
+
+    /// Apply in-place partial RoPE directly to one exact shared-arena view.
+    /// The view is never copied to an operation-local activation buffer.
+    pub fn dispatch_partial_rope_view(
+        &self,
+        prepared: &PreparedMetalPartialRope,
+        view: &PreparedMetalDecodeBufferView<'_>,
+    ) -> Result<()> {
+        if prepared.has_owned_values() {
+            return Err(EngineError::InvalidState(
+                "Metal graph RoPE unexpectedly owns an activation buffer".into(),
+            ));
+        }
+        let expected = prepared
+            .heads
+            .checked_mul(prepared.head_dim)
+            .ok_or_else(|| EngineError::Shape("Metal graph RoPE shape overflows".into()))?;
+        if view.values() < expected
+            || !matches!(view.slot(), MetalBufferSlot::Query | MetalBufferSlot::Key)
+        {
+            return Err(EngineError::Shape(format!(
+                "Metal graph RoPE view {:?} has {} values, expected {expected}",
+                view.slot(),
+                view.values()
+            )));
+        }
+        let thread_width = dispatch_width(&self.partial_rope_pipeline, DEFAULT_SIMDGROUPS)?;
+        let command_buffer = self.queue.new_command_buffer();
+        command_buffer.set_label("ctox-qwen38-partial-rope-graph-view");
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_partial_rope_between(
+            encoder,
+            prepared,
+            view.buffer(),
+            view.offset(),
+            thread_width,
+        )?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::InvalidState(format!(
+                "Metal graph partial-RoPE command ended with {:?}",
+                command_buffer.status()
+            )));
+        }
+        Ok(())
+    }
+
+    fn encode_partial_rope_between(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        prepared: &PreparedMetalPartialRope,
+        values_buffer: &Buffer,
+        values_offset: u64,
+        thread_width: usize,
+    ) -> Result<()> {
+        encoder.set_compute_pipeline_state(&self.partial_rope_pipeline);
+        encoder.set_buffer(
+            MetalPartialRopeBufferAbi::VALUES as u64,
+            Some(values_buffer),
+            values_offset,
+        );
+        encoder.set_buffer(
+            MetalPartialRopeBufferAbi::COSINE as u64,
+            Some(&prepared.cosine_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalPartialRopeBufferAbi::SINE as u64,
+            Some(&prepared.sine_buffer),
+            0,
+        );
+        encoder.set_buffer(
+            MetalPartialRopeBufferAbi::PARAMS as u64,
+            Some(&prepared.params_buffer),
+            0,
+        );
+        let pair_count = prepared
+            .heads
+            .checked_mul(prepared.rotary_dim / 2)
+            .ok_or_else(|| EngineError::Shape("Metal RoPE pair count overflows".into()))?;
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: pair_count.div_ceil(thread_width) as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: thread_width as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
     }
 
     /// Append one K/V token to the persistent packed cache and execute one
@@ -8158,6 +8323,16 @@ mod tests {
         }
         assert!(program.linear_attention_layer_steps(3).is_err());
         assert!(program.linear_attention_layer_steps(64).is_err());
+        for layer in [3, 7, 11, 15, 63] {
+            let layer_steps = program
+                .full_attention_layer_steps(layer)
+                .expect("bind reusable full-attention layer slice");
+            assert_eq!(layer_steps.len(), 10);
+            assert_eq!(layer_steps[0].step().schedule_index, 2 + layer * 10);
+            assert_eq!(layer_steps[9].step().schedule_index, 11 + layer * 10);
+        }
+        assert!(program.full_attention_layer_steps(0).is_err());
+        assert!(program.full_attention_layer_steps(64).is_err());
         let expected_views = schedule
             .steps
             .iter()
@@ -10963,6 +11138,85 @@ mod tests {
             .dispatch_partial_rope(&prepared_query)
             .expect("dispatch position-zero RoPE");
         assert_eq!(identity, query);
+    }
+
+    #[test]
+    fn partial_rope_updates_full_attention_key_in_shared_decode_arena() {
+        let config = Qwen38Config::default();
+        let schedule = MetalDecodeSchedule::qwen38(&config).expect("frozen Metal schedule");
+        let projections = MetalProjectionPlan::qwen38(&config).expect("Metal projection plan");
+        let bindings = MetalDecodeBindingPlan::qwen38(&schedule, &projections, &config)
+            .expect("complete Metal binding plan");
+        let workspace_plan = MetalDecodeWorkspacePlan::qwen38(&schedule, &config, 40_000)
+            .expect("decode workspace plan");
+        let runtime = MetalCandidateRuntime::new().expect("Metal device runtime");
+        let mut workspace = runtime
+            .prepare_decode_workspace(&workspace_plan)
+            .expect("allocate one decode arena");
+        let key_heads = 4;
+        let query_heads = 24;
+        let head_dim = 256;
+        let rotary_dim = 64;
+        let position = 12_345;
+        let theta = 10_000_000.0;
+        let key: Vec<f32> = (0..key_heads * head_dim)
+            .map(|index| (index as f32 * 0.019).cos() * 0.7)
+            .collect();
+        let mut expected_key = key.clone();
+        let mut unused_query = vec![0.0; query_heads * head_dim];
+        crate::reference::apply_partial_rope(
+            &mut unused_query,
+            &mut expected_key,
+            query_heads,
+            key_heads,
+            head_dim,
+            rotary_dim,
+            position,
+            theta,
+        )
+        .expect("partial-RoPE scalar oracle");
+        let key_slot_values = workspace
+            .binding(MetalBufferSlot::Key)
+            .expect("key arena binding")
+            .values;
+        let mut key_slot = vec![-17.0; key_slot_values];
+        key_slot[..key.len()].copy_from_slice(&key);
+        workspace
+            .write_f32(MetalBufferSlot::Key, &key_slot)
+            .expect("seed shared-arena key");
+        let prepared = runtime
+            .prepare_partial_rope_graph(key_heads, head_dim, rotary_dim, position, theta)
+            .expect("prepare graph-only key RoPE");
+        assert!(!prepared.has_owned_values());
+        assert_eq!(
+            prepared.transient_bytes(),
+            rotary_dim * std::mem::size_of::<f32>() + MetalPartialRopeParams::BYTE_LEN
+        );
+        assert!(prepared.write_values(&key).is_err());
+        let program = workspace
+            .bind_decode_program(&bindings)
+            .expect("bind shared-arena decode program");
+        let full_attention = program
+            .full_attention_layer_steps(3)
+            .expect("bind layer-3 full-attention schedule");
+        let key_rope = &full_attention[2];
+        assert_eq!(key_rope.step().operation, MetalDecodeOperation::KeyRope);
+        assert_eq!(key_rope.reads()[0].offset(), key_rope.writes()[0].offset());
+        runtime
+            .dispatch_partial_rope_view(&prepared, &key_rope.writes()[0])
+            .expect("dispatch key RoPE directly in shared arena");
+        drop(program);
+        let actual = workspace
+            .read_f32(MetalBufferSlot::Key)
+            .expect("read shared-arena key");
+        for (index, (expected, actual)) in expected_key.iter().zip(&actual).enumerate() {
+            let tolerance = 3.0e-5_f32.max(expected.abs() * 4.0e-5);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "graph key RoPE value {index}: expected {expected}, got {actual}"
+            );
+        }
+        assert!(actual[key.len()..].iter().all(|value| *value == -17.0));
     }
 
     #[test]

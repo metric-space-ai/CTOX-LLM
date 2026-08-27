@@ -298,6 +298,12 @@ MSL and differed from the f32 reference by roughly `1.65e-4` at position
 pairs with the pinned reference equation, retains those 256 bytes in reusable
 Metal buffers, and performs all head rotations on the GPU. Updating position
 rewrites only these tables and the 32-byte parameter block.
+`prepare_partial_rope_graph` omits the operation-local activation buffer and
+binds the same kernel directly to an offset in the shared decode arena. The
+Layer-3 Full-Attention Golden test validates the real `KeyRope` schedule view,
+including preservation of the unused tail in the aliased `Key` slot. The
+decode program also exposes a fail-closed ten-step full-attention slice for all
+17 target/MTP owners, parallel to the reusable linear-layer slice.
 
 The decode-only grouped-query-attention candidate keeps persistent K/V pages
 packed on the Metal device. Logical pages have deterministic Q2 arena slots;
@@ -506,9 +512,11 @@ dequantization array before this source was accepted.
   projection, then fused residual-add/Qwen RMSNorm into `HiddenB` and the next
   `Normalized` view, then mixed-Q2/Q4 FFN gate/up fan-out and fused SwiGLU-down
   projection, then fused post-FFN residual-add/next-layer Qwen RMSNorm). The
-  complete first linear-attention layer is therefore wired. The remaining 633
-  schedule steps,
-  the prefill arena, removal of the verifier CPU KV mirror, and complete
+  complete first linear-attention layer is therefore wired. Full-attention
+  schedule slices and the Layer-3 key-RoPE arena edge are also executable. The
+  remaining Full-Attention fan-out, query/gate normalization, device-only KV
+  append, paged-GQA arena edge, gated output projection, and later schedule
+  steps, the prefill arena, removal of the verifier CPU KV mirror, and complete
   model-graph execution remain unfinished.
 - Per `docs/PROMOTION_GATES.md`, all promotion evidence is required before any state change;
   the backend therefore remains fail-closed.
