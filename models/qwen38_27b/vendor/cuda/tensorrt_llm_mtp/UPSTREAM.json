@@ -1,0 +1,41 @@
+{
+  "upstream": {
+    "repository": "https://github.com/NVIDIA/TensorRT-LLM",
+    "revision": "390f92d76377afe0159e8d7ffd2312483cf2a358",
+    "license": "Apache-2.0",
+    "license_file": "LICENSE",
+    "fetched": "2026-08-28"
+  },
+  "scope": "The unchanged greedy MTP prefix-acceptance body is extracted into one standalone SM86 verifier kernel. TensorRT-LLM is not linked and none of its runtime or allocator code is used.",
+  "files": [
+    {
+      "path": "LICENSE",
+      "upstream_path": "LICENSE",
+      "sha256": "4fab2db8e634ec435a39aa264d0a1171be52d8dd128cda57fb3c50747a969627",
+      "purpose": "Byte-identical upstream Apache-2.0 license."
+    },
+    {
+      "path": "upstream/mtpKernels.cu",
+      "upstream_path": "cpp/tensorrt_llm/kernels/speculativeDecoding/mtpKernels.cu",
+      "sha256": "6e365783bec3a26cd9adcaa1dd25e5cdfe2095864eba74c9ead380fbab603255",
+      "purpose": "Byte-identical audit source; mtpAcceptDraftToken is lines 250-312."
+    },
+    {
+      "path": "upstream/mtpKernels.h",
+      "upstream_path": "cpp/tensorrt_llm/kernels/speculativeDecoding/mtpKernels.h",
+      "sha256": "7d21be5bb3494b2d58625dcdc801c50a4baf29a1505c6f85fc34e6b836bff1d7",
+      "purpose": "Byte-identical upstream MTP public contract for audit."
+    },
+    {
+      "path": "mtp_accept_draft_token_sm86.cu",
+      "derived_from": "upstream/mtpKernels.cu:250-312",
+      "sha256": "8a8d462958449a4ce9d27659047308e37b295bfe9c0a06a9d3f54daff4785667",
+      "purpose": "Standalone verifier extraction with unchanged kernel body and only C linkage plus a CTOX symbol name."
+    }
+  ],
+  "notes": [
+    "The extraction must compile standalone for sm_86 and export exactly ctox_trtllm_mtp_accept_draft_token_sm86 before any Rust dispatcher wiring is accepted.",
+    "The physical count includes the golden target token; the Rust boundary subtracts one to produce accepted draft count.",
+    "This candidate remains excluded from default, server, and production promotion paths until same-device parity, lifecycle, and performance gates pass."
+  ]
+}

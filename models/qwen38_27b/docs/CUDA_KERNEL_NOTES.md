@@ -5,6 +5,22 @@ explicit SM86 cubin and executes isolated Q2_B64/Q4_B64 fused matvecs. The
 public `CudaBackend` remains `Contract` and fail-closed: the candidate is not a
 production kernel and no full graph or promotion is claimed.
 
+## Qwen3.5 target-path inheritance
+
+The production target path is not a new Qwen3.8 graph. Qwen3.8-27B freezes the
+same target geometry as the established CTOX Qwen3.5-27B path: 64 layers,
+5,120 hidden values, 17,408 FFN values, the `linear, linear, linear,
+full-attention` cadence, 24/4 heads of width 256, partial RoPE width 64 and the
+248,320-row vocabulary. `cuda_schedule.rs` expands that topology into 645
+records only as an ownership/order oracle. The executor must submit the direct
+layer-major path and may not walk those records at runtime.
+
+The only target substitutions are the immutable CTQ38 Q2/Q4 row packs,
+folded recovery scales, packed long-context KV pages and the corresponding
+Q2/Q4 projection kernels. MTP is attached after the inherited target path and
+uses the pinned TensorRT-LLM acceptance primitive. Host-side per-draft target
+replay is not an acceptable promoted MTP implementation.
+
 The serving evidence and non-transferable benchmark distinctions from the
 user-supplied RTX 3090 project are pinned separately in
 [`RTX3090_UPSTREAM_NOTES.md`](RTX3090_UPSTREAM_NOTES.md). In particular, its
@@ -682,6 +698,38 @@ by at most `7.45e-9`. All 398,458,880 verifier-observed allocation bytes were
 reclaimed. Evidence is recorded in
 `benchmarks/cuda/sm86-embedding-batch-20260826.json`. Executor binding remains
 required before this candidate is promoted.
+
+## Chained MTP4 target verification
+
+The SM86 graph path now mirrors the established Qwen3.5 execution boundary:
+four one-layer MTP drafts are chained through resident hidden/token state, then
+one five-row target pass verifies `[target, draft1, draft2, draft3, draft4]`.
+The target pass constructs its token vector D2D, gathers all five embedding
+rows on device, builds one shared RoPE table for all sixteen full-attention
+layers, uses the batched Q2/Q4 MMQ path for every projection, and performs all
+five full-vocabulary LM-head rows without a CPU intermediate or dequantized
+weight tensor.
+
+The paged-Q4 ring has a new fail-closed speculative-alias proof. With 128-token
+pages and a five-token block, verification can touch only the current partial
+page and one new page. The existing extra Q4 ring page is admitted only after
+the boundary page has been copied to Q2; otherwise capture is rejected. Full
+acceptance commits the device state directly. Partial acceptance restores the
+target hidden state, all linear states, KV metadata, position, and original
+target token, then replays exactly `accepted_drafts + 1` already-captured
+MTP-to-target pairs. The host reads one compact 64-byte physical acceptance
+record and never feeds a token back into embedding.
+
+The four MTP draft heads use the signed 40,000-row restricted vocabulary;
+their local device argmax is mapped D2D back to the canonical tokenizer ID by
+a 10-register, zero-spill SM86 kernel before the next embedding. The combined
+cubin built on GPU3 has SHA-256
+`b7e06848303b24007e7517bbcb210f2d2119209aee4c5249975c6e71c3bae0d1`.
+The CUDA-focused local suite passes 72/72 tests, including the speculative
+ring-alias guard. `cuda_target_mtp4_graph_bench` is the first benchmark entry
+that measures this committed-generation transaction; no throughput claim is
+valid until its full-artifact SM86 capture, replay, acceptance, and unload run
+has completed on a free GPU1 or GPU2.
 
 ## Runtime ownership and unload
 

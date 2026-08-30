@@ -166,6 +166,7 @@ pub const Q4_B64_A8_BATCHED_MMQ_SYMBOL: &str = "ctox_q4_b64_a8_batched_mmq_sm86"
 pub const Q2_B64_A8_GATHERED_MATVEC_SYMBOL: &str = "ctox_q2_b64_a8_gathered_matvec_sm86";
 pub const Q4_B64_A8_GATHERED_MATVEC_SYMBOL: &str = "ctox_q4_b64_a8_gathered_matvec_sm86";
 pub const ARGMAX_F32_SYMBOL: &str = "ctox_argmax_f32_sm86";
+pub const MAP_ARGMAX_ROW_U32_SYMBOL: &str = "ctox_map_argmax_row_u32_sm86";
 pub const TOPK_TOPP_SAMPLE_F32_SYMBOL: &str = "ctox_topk_topp_sample_f32_sm86";
 pub const CUDA_SAMPLER_MAX_TOP_K: usize = 256;
 pub const Q2_B64_RECOVERED_ROW_SYMBOL: &str = "ctox_q2_b64_recovered_row_sm86";
@@ -536,6 +537,9 @@ pub const QWEN_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_rms_norm_f16_sm86";
 pub const RESIDUAL_RMS_NORM_F16_SYMBOL: &str = "ctox_qwen_residual_rms_norm_f16_sm86";
 pub const PARTIAL_ROPE_F32_SYMBOL: &str = "ctox_partial_rope_f32_sm86";
 pub const ROPE_TABLE_BATCH_F32_SYMBOL: &str = "ctox_rope_table_batch_f32_sm86";
+pub const ROPE_TABLE_POSITION_F32_SYMBOL: &str = "ctox_rope_table_position_f32_sm86";
+pub const ROPE_TABLE_POSITIONS_F32_SYMBOL: &str = "ctox_rope_table_positions_f32_sm86";
+pub const INCREMENT_U64_SYMBOL: &str = "ctox_increment_u64_sm86";
 pub const PARTIAL_ROPE_BATCH_F32_SYMBOL: &str = "ctox_partial_rope_batch_f32_sm86";
 pub const QUERY_GATE_NORM_ROPE_F32_SYMBOL: &str = "ctox_qwen_query_gate_norm_rope_f32_sm86";
 pub const QUERY_GATE_NORM_ROPE_BATCH_F32_SYMBOL: &str =
@@ -543,12 +547,22 @@ pub const QUERY_GATE_NORM_ROPE_BATCH_F32_SYMBOL: &str =
 pub const PACK_PAGED_KV_Q4_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_f32_sm86";
 pub const PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL: &str = "ctox_pack_paged_kv_q4_batch_f32_sm86";
 pub const DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL: &str = "ctox_demote_paged_kv_q4_to_q2_sm86";
+pub const PACK_GRAPH_KV_Q4_F32_SYMBOL: &str = "ctox_pack_graph_kv_q4_f32_sm86";
+pub const DEMOTE_GRAPH_KV_Q4_TO_Q2_SYMBOL: &str = "ctox_demote_graph_kv_q4_to_q2_sm86";
+pub const GRAPH_PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL: &str =
+    "ctox_graph_paged_q2q4_gqa_split_partial_f32_sm86";
 pub const PAGED_Q2Q4_GQA_F32_SYMBOL: &str = "ctox_paged_q2q4_gqa_decode_f32_sm86";
 pub const PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL: &str = "ctox_paged_q2q4_gqa_prefill_f32_sm86";
+pub const GRAPH_PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL: &str =
+    "ctox_graph_paged_q2q4_gqa_prefill_f32_sm86";
 pub const PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL: &str =
     "ctox_paged_q2q4_gqa_split_partial_f32_sm86";
 pub const PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL: &str =
     "ctox_paged_q2q4_gqa_split_combine_f32_sm86";
+/// Exact TensorRT-LLM MTP acceptance primitive, vendored at a pinned
+/// Apache-2.0 revision. The Qwen executor supplies one generation request and
+/// keeps both draft and target token IDs resident until this kernel completes.
+pub const MTP_ACCEPT_DRAFT_TOKEN_SM86_SYMBOL: &str = "ctox_trtllm_mtp_accept_draft_token_sm86";
 pub const PAGED_GQA_SPLIT_SEGMENTS: usize = 16;
 pub const PAGED_GQA_SPLIT_MAX_QUERY_TOKENS: usize = 5;
 pub const LINEAR_CONV_CHANNELS: usize = 10_240;

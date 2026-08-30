@@ -17,6 +17,7 @@ from build_recovery_run_plan import (  # noqa: E402
     REQUIRED_LOSSES,
     safetensors_metadata,
     validate_activation_assignment,
+    validate_million_corpus_audit,
     validate_smoke,
 )
 
@@ -107,7 +108,7 @@ class RecoveryRunPlanTests(unittest.TestCase):
                 safetensors_metadata(path), {"format": "example", "samples": "2"}
             )
 
-    def test_activation_assignment_requires_complete_training_cohort(self) -> None:
+    def test_activation_assignment_requires_complete_calibration_cohort(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             ids = ["a", "b"]
@@ -127,7 +128,7 @@ class RecoveryRunPlanTests(unittest.TestCase):
             self.assertEqual(evidence["activation_samples"], 2)
             self.assertEqual(evidence["sensitivity_candidates"], 1)
 
-            with self.assertRaisesRegex(ValueError, "complete training cohort"):
+            with self.assertRaisesRegex(ValueError, "admitted calibration cohort"):
                 validate_activation_assignment(
                     stats,
                     sensitivity,
@@ -137,6 +138,51 @@ class RecoveryRunPlanTests(unittest.TestCase):
                     provenance.name,
                     {"a", "b", "c"},
                 )
+
+    def test_million_corpus_audit_binds_evidence_and_partition_minima(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / "evidence.json"
+            write_json(
+                evidence,
+                {
+                    "format": "ctox.recovery-million-corpus-evidence.v1",
+                    "hard_gates": {
+                        "exact_duplicate_records": 0,
+                        "semantic_duplicate_records": 0,
+                    },
+                    "partitions": {},
+                },
+            )
+            audit = root / "audit.json"
+            write_json(
+                audit,
+                {
+                    "format": "ctox.recovery-million-corpus-audit.v1",
+                    "status": "passed",
+                    "hard_gate_gaps": {},
+                    "evidence": str(evidence),
+                    "evidence_sha256": sha256(evidence),
+                    "partitions": {
+                        "train": {"status": "passed", "records": 1_000_000},
+                        "calibration": {"status": "passed", "records": 50_000},
+                        "held_out": {"status": "passed", "records": 50_000},
+                    },
+                },
+            )
+            loaded_audit, loaded_evidence = validate_million_corpus_audit(
+                audit, sha256(audit)
+            )
+            self.assertEqual(loaded_audit["partitions"]["train"]["records"], 1_000_000)
+            self.assertEqual(
+                loaded_evidence["format"], "ctox.recovery-million-corpus-evidence.v1"
+            )
+
+            changed = json.loads(evidence.read_text())
+            changed["hard_gates"]["semantic_duplicate_records"] = 1
+            write_json(evidence, changed)
+            with self.assertRaisesRegex(ValueError, "evidence changed"):
+                validate_million_corpus_audit(audit, sha256(audit))
 
     def test_activation_assignment_rejects_unobserved_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

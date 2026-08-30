@@ -122,6 +122,8 @@ fn main() -> anyhow::Result<()> {
     let model_bytes_per_layer = batched.model_bytes();
     let graph_bytes_per_layer = batched.graph_bytes();
     let session_bytes_per_layer = batched.session_bytes();
+    let sequential_split = runtime.prepare_graph_paged_q2q4_gqa_split(sequential.kv_mut())?;
+    let sequential_state = runtime.prepare_decode_state(0, 0)?;
 
     let query_values = config
         .num_attention_heads
@@ -155,8 +157,11 @@ fn main() -> anyhow::Result<()> {
     let mut expected_attention = Vec::with_capacity(args.tokens * query_values);
     let mut expected_gate = Vec::with_capacity(args.tokens * query_values);
     for token in 0..args.tokens {
+        runtime.write_decode_position(&sequential_state, token as u64)?;
         let (attention, gate) = sequential.dispatch_device(
             &runtime,
+            &sequential_split,
+            &sequential_state,
             query_gate_owner
                 .device_view()?
                 .slice(token * query_values * 2, query_values * 2)?,
@@ -253,6 +258,8 @@ fn main() -> anyhow::Result<()> {
     let (free_after_prepare, _) = runtime.memory_info()?;
 
     drop(sequential);
+    drop(sequential_split);
+    drop(sequential_state);
     drop(batched);
     drop(query_gate_owner);
     drop(key_owner);

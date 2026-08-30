@@ -20,14 +20,17 @@ use sha2::{Digest, Sha256};
 use super::cuda::{
     validate_mixed_operation, validate_operation, validate_recovered_row, CudaMixedRowSegment,
     A8_BATCHED_QUANTIZE_SYMBOL, A8_QUANTIZE_SYMBOL, ARGMAX_F32_SYMBOL, CAUSAL_CONV_F16_SYMBOL,
-    CAUSAL_CONV_SCAN_F16_SYMBOL, CUDA_SAMPLER_MAX_TOP_K, DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL,
-    GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS, GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS,
-    GATED_DELTA_PREP_F32_SYMBOL, GATED_DELTA_PREP_SCAN_F32_SYMBOL, GATED_DELTA_SCAN_F16_SYMBOL,
-    GATED_DELTA_STATE_BYTES, GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS,
-    GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH,
-    LINEAR_CONV_STATE_BYTES, PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL, PACK_PAGED_KV_Q4_F32_SYMBOL,
-    PAGED_GQA_DESCRIPTOR_BYTES, PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS,
-    PAGED_GQA_SPLIT_SEGMENTS, PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL,
+    CAUSAL_CONV_SCAN_F16_SYMBOL, CUDA_SAMPLER_MAX_TOP_K, DEMOTE_GRAPH_KV_Q4_TO_Q2_SYMBOL,
+    DEMOTE_PAGED_KV_Q4_TO_Q2_SYMBOL, GATED_DELTA_F16_SYMBOL, GATED_DELTA_HEADS,
+    GATED_DELTA_KEY_DIM, GATED_DELTA_KEY_HEADS, GATED_DELTA_PREP_F32_SYMBOL,
+    GATED_DELTA_PREP_SCAN_F32_SYMBOL, GATED_DELTA_SCAN_F16_SYMBOL, GATED_DELTA_STATE_BYTES,
+    GATED_DELTA_VALUE_DIM, GATED_RMS_NORM_COLUMNS, GATED_RMS_NORM_F16_SYMBOL, GATED_RMS_NORM_ROWS,
+    GRAPH_PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL, GRAPH_PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL,
+    INCREMENT_U64_SYMBOL, LINEAR_CONV_CHANNELS, LINEAR_CONV_KERNEL_WIDTH, LINEAR_CONV_STATE_BYTES,
+    MAP_ARGMAX_ROW_U32_SYMBOL, MTP_ACCEPT_DRAFT_TOKEN_SM86_SYMBOL, PACK_GRAPH_KV_Q4_F32_SYMBOL,
+    PACK_PAGED_KV_Q4_BATCH_F32_SYMBOL, PACK_PAGED_KV_Q4_F32_SYMBOL, PAGED_GQA_DESCRIPTOR_BYTES,
+    PAGED_GQA_PARAMS_BYTES, PAGED_GQA_SPLIT_MAX_QUERY_TOKENS, PAGED_GQA_SPLIT_SEGMENTS,
+    PAGED_Q2Q4_GQA_F32_SYMBOL, PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL,
     PAGED_Q2Q4_GQA_SPLIT_COMBINE_F32_SYMBOL, PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL,
     PARTIAL_ROPE_BATCH_F32_SYMBOL, PARTIAL_ROPE_F32_SYMBOL, Q2_B64_A8_BATCHED_MATMUL_SYMBOL,
     Q2_B64_A8_BATCHED_MMQ_SYMBOL, Q2_B64_A8_GATHERED_MATVEC_SYMBOL, Q2_B64_A8_MATVEC_SYMBOL,
@@ -37,6 +40,7 @@ use super::cuda::{
     Q4_B64_RECOVERED_ROWS_SYMBOL, Q4_B64_RECOVERED_ROW_SYMBOL,
     QUERY_GATE_NORM_ROPE_BATCH_F32_SYMBOL, QUERY_GATE_NORM_ROPE_F32_SYMBOL,
     QWEN_RMS_NORM_F16_SYMBOL, RESIDUAL_RMS_NORM_F16_SYMBOL, ROPE_TABLE_BATCH_F32_SYMBOL,
+    ROPE_TABLE_POSITIONS_F32_SYMBOL, ROPE_TABLE_POSITION_F32_SYMBOL,
     SIGMOID_GATE_A8_QUANTIZE_SYMBOL, SWIGLU_A8_QUANTIZE_SYMBOL, TOPK_TOPP_SAMPLE_F32_SYMBOL,
 };
 use super::{Activation, FusedMatVec, RecoveredRow, ScaleSlice};
@@ -45,6 +49,7 @@ use crate::kv_cache::KvPrecision;
 use crate::loader::RecoveredMatrixView;
 use crate::quant::{BLOCK_LEN, Q2_BLOCK_BYTES, Q4_BLOCK_BYTES};
 use crate::sampler::SamplerConfig;
+use crate::tokenizer::TOKENIZER_VOCAB_SIZE;
 use crate::{EngineError, Result};
 
 type CuResult = i32;
@@ -53,9 +58,13 @@ type CuContext = *mut c_void;
 type CuModule = *mut c_void;
 type CuFunction = *mut c_void;
 type CuStream = *mut c_void;
+type CuGraph = *mut c_void;
+type CuGraphExec = *mut c_void;
 type CuDevicePtr = u64;
 
 const CUDA_SUCCESS: CuResult = 0;
+const CU_STREAM_DEFAULT: u32 = 0;
+const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: u32 = 1;
 const THREADS_PER_BLOCK: u32 = 128;
 const LINEAR_THREADS_PER_BLOCK: u32 = 256;
 const WARP_SIZE: u32 = 32;
@@ -64,6 +73,7 @@ const MMQ_THREADS_PER_BLOCK: u32 = 256;
 const MMQ_ROWS_PER_BLOCK: u32 = 128;
 const MMQ_BATCH_ROWS_PER_BLOCK: u32 = 64;
 const CUDA_GRID_Y_MAX: u32 = 65_535;
+const GRAPH_PAGED_GQA_PARAMS_BYTES: usize = 15 * std::mem::size_of::<u32>();
 
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
 type CuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
@@ -73,6 +83,15 @@ type CuCtxCreate = unsafe extern "C" fn(*mut CuContext, u32, CuDevice) -> CuResu
 type CuCtxSetCurrent = unsafe extern "C" fn(CuContext) -> CuResult;
 type CuCtxSynchronize = unsafe extern "C" fn() -> CuResult;
 type CuCtxDestroy = unsafe extern "C" fn(CuContext) -> CuResult;
+type CuStreamCreate = unsafe extern "C" fn(*mut CuStream, u32) -> CuResult;
+type CuStreamDestroy = unsafe extern "C" fn(CuStream) -> CuResult;
+type CuStreamSynchronize = unsafe extern "C" fn(CuStream) -> CuResult;
+type CuStreamBeginCapture = unsafe extern "C" fn(CuStream, u32) -> CuResult;
+type CuStreamEndCapture = unsafe extern "C" fn(CuStream, *mut CuGraph) -> CuResult;
+type CuGraphInstantiateWithFlags = unsafe extern "C" fn(*mut CuGraphExec, CuGraph, u64) -> CuResult;
+type CuGraphLaunch = unsafe extern "C" fn(CuGraphExec, CuStream) -> CuResult;
+type CuGraphDestroy = unsafe extern "C" fn(CuGraph) -> CuResult;
+type CuGraphExecDestroy = unsafe extern "C" fn(CuGraphExec) -> CuResult;
 type CuModuleLoadData = unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult;
 type CuModuleGetFunction =
     unsafe extern "C" fn(*mut CuFunction, CuModule, *const c_char) -> CuResult;
@@ -80,11 +99,14 @@ type CuModuleUnload = unsafe extern "C" fn(CuModule) -> CuResult;
 type CuMemAlloc = unsafe extern "C" fn(*mut CuDevicePtr, usize) -> CuResult;
 type CuMemFree = unsafe extern "C" fn(CuDevicePtr) -> CuResult;
 type CuMemsetD8 = unsafe extern "C" fn(CuDevicePtr, u8, usize) -> CuResult;
+type CuMemsetD8Async = unsafe extern "C" fn(CuDevicePtr, u8, usize, CuStream) -> CuResult;
 type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CuResult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> CuResult;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> CuResult;
 type CuMemcpyDtoD = unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize) -> CuResult;
-type CuMemcpy2D = unsafe extern "C" fn(*const CudaMemcpy2DDescriptor) -> CuResult;
+type CuMemcpyDtoDAsync =
+    unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize, CuStream) -> CuResult;
+type CuMemcpy2DAsync = unsafe extern "C" fn(*const CudaMemcpy2DDescriptor, CuStream) -> CuResult;
 type CuLaunchKernel = unsafe extern "C" fn(
     CuFunction,
     u32,
@@ -180,17 +202,28 @@ struct CudaDriver {
     ctx_set_current: CuCtxSetCurrent,
     ctx_synchronize: CuCtxSynchronize,
     ctx_destroy: CuCtxDestroy,
+    stream_create: CuStreamCreate,
+    stream_destroy: CuStreamDestroy,
+    stream_synchronize: CuStreamSynchronize,
+    stream_begin_capture: CuStreamBeginCapture,
+    stream_end_capture: CuStreamEndCapture,
+    graph_instantiate_with_flags: CuGraphInstantiateWithFlags,
+    graph_launch: CuGraphLaunch,
+    graph_destroy: CuGraphDestroy,
+    graph_exec_destroy: CuGraphExecDestroy,
     module_load_data: CuModuleLoadData,
     module_get_function: CuModuleGetFunction,
     module_unload: CuModuleUnload,
     mem_alloc: CuMemAlloc,
     mem_free: CuMemFree,
     memset_d8: CuMemsetD8,
+    memset_d8_async: CuMemsetD8Async,
     mem_get_info: CuMemGetInfo,
     memcpy_htod: CuMemcpyHtoD,
     memcpy_dtoh: CuMemcpyDtoH,
     memcpy_dtod: CuMemcpyDtoD,
-    memcpy_2d: CuMemcpy2D,
+    memcpy_dtod_async: CuMemcpyDtoDAsync,
+    memcpy_2d_async: CuMemcpy2DAsync,
     launch_kernel: CuLaunchKernel,
     get_error_name: CuGetErrorName,
     get_error_string: CuGetErrorString,
@@ -211,17 +244,28 @@ impl CudaDriver {
                 ctx_set_current: symbol(&library, b"cuCtxSetCurrent\0")?,
                 ctx_synchronize: symbol(&library, b"cuCtxSynchronize\0")?,
                 ctx_destroy: symbol(&library, b"cuCtxDestroy_v2\0")?,
+                stream_create: symbol(&library, b"cuStreamCreate\0")?,
+                stream_destroy: symbol(&library, b"cuStreamDestroy_v2\0")?,
+                stream_synchronize: symbol(&library, b"cuStreamSynchronize\0")?,
+                stream_begin_capture: symbol(&library, b"cuStreamBeginCapture\0")?,
+                stream_end_capture: symbol(&library, b"cuStreamEndCapture\0")?,
+                graph_instantiate_with_flags: symbol(&library, b"cuGraphInstantiateWithFlags\0")?,
+                graph_launch: symbol(&library, b"cuGraphLaunch\0")?,
+                graph_destroy: symbol(&library, b"cuGraphDestroy\0")?,
+                graph_exec_destroy: symbol(&library, b"cuGraphExecDestroy\0")?,
                 module_load_data: symbol(&library, b"cuModuleLoadData\0")?,
                 module_get_function: symbol(&library, b"cuModuleGetFunction\0")?,
                 module_unload: symbol(&library, b"cuModuleUnload\0")?,
                 mem_alloc: symbol(&library, b"cuMemAlloc_v2\0")?,
                 mem_free: symbol(&library, b"cuMemFree_v2\0")?,
                 memset_d8: symbol(&library, b"cuMemsetD8_v2\0")?,
+                memset_d8_async: symbol(&library, b"cuMemsetD8Async\0")?,
                 mem_get_info: symbol(&library, b"cuMemGetInfo_v2\0")?,
                 memcpy_htod: symbol(&library, b"cuMemcpyHtoD_v2\0")?,
                 memcpy_dtoh: symbol(&library, b"cuMemcpyDtoH_v2\0")?,
                 memcpy_dtod: symbol(&library, b"cuMemcpyDtoD_v2\0")?,
-                memcpy_2d: symbol(&library, b"cuMemcpy2D_v2\0")?,
+                memcpy_dtod_async: symbol(&library, b"cuMemcpyDtoDAsync_v2\0")?,
+                memcpy_2d_async: symbol(&library, b"cuMemcpy2DAsync_v2\0")?,
                 launch_kernel: symbol(&library, b"cuLaunchKernel\0")?,
                 get_error_name: symbol(&library, b"cuGetErrorName\0")?,
                 get_error_string: symbol(&library, b"cuGetErrorString\0")?,
@@ -255,6 +299,15 @@ pub struct CudaCandidateRuntime {
     inner: Rc<CudaContextInner>,
 }
 
+/// Executable CUDA graph captured on the runtime's dedicated non-legacy
+/// stream. Keeping the context alive in the handle makes graph teardown and
+/// complete engine unload deterministic.
+pub(crate) struct CudaCapturedGraph {
+    context: Rc<CudaContextInner>,
+    graph: CuGraph,
+    executable: CuGraphExec,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CudaSubmissionStats {
     pub token_submission_attempts: u64,
@@ -280,9 +333,26 @@ pub struct CudaSplitGqaBenchmark {
     pub speedup: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CudaGraphReplayVerification {
+    pub iterations: usize,
+    pub microseconds_per_replay: f64,
+    pub maximum_absolute_delta: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CudaGraphPagedGqaReplayVerification {
+    pub iterations: usize,
+    pub microseconds_per_replay: f64,
+    pub packed_device_bytes: usize,
+    pub final_position: u64,
+    pub final_output: Vec<f32>,
+}
+
 struct CudaContextInner {
     driver: CudaDriver,
     context: CuContext,
+    stream: CuStream,
     module: CuModule,
     q2_function: CuFunction,
     q4_function: CuFunction,
@@ -313,21 +383,31 @@ struct CudaContextInner {
     residual_rms_norm_f16_function: CuFunction,
     partial_rope_f32_function: CuFunction,
     rope_table_batch_f32_function: CuFunction,
+    rope_table_position_f32_function: CuFunction,
+    rope_table_positions_f32_function: CuFunction,
+    increment_u64_function: CuFunction,
     partial_rope_batch_f32_function: CuFunction,
     query_gate_norm_rope_f32_function: CuFunction,
     query_gate_norm_rope_batch_f32_function: CuFunction,
     pack_paged_kv_q4_f32_function: CuFunction,
     pack_paged_kv_q4_batch_f32_function: CuFunction,
     demote_paged_kv_q4_to_q2_function: CuFunction,
+    pack_graph_kv_q4_f32_function: CuFunction,
+    demote_graph_kv_q4_to_q2_function: CuFunction,
+    graph_paged_q2q4_gqa_prefill_f32_function: CuFunction,
+    graph_paged_q2q4_gqa_split_partial_f32_function: CuFunction,
     paged_q2q4_gqa_f32_function: CuFunction,
     paged_q2q4_gqa_prefill_f32_function: CuFunction,
     paged_q2q4_gqa_split_partial_f32_function: CuFunction,
     paged_q2q4_gqa_split_combine_f32_function: CuFunction,
     argmax_f32_function: CuFunction,
+    map_argmax_row_u32_function: CuFunction,
+    mtp_accept_draft_token_function: CuFunction,
     topk_topp_sample_f32_function: CuFunction,
     device_name: String,
     compute_capability: (u32, u32),
     token_submission_active: Cell<bool>,
+    graph_capture_active: Cell<bool>,
     token_submission_attempts: Cell<u64>,
     token_submission_commits: Cell<u64>,
     deferred_operator_synchronizations: Cell<u64>,
@@ -409,6 +489,16 @@ pub struct PreparedCudaF32Checkpoint {
     values: usize,
     snapshot: DeviceBuffer,
     valid: bool,
+}
+
+/// Reusable device-only hidden-state scratch for chained MTP drafts. Unlike a
+/// speculative checkpoint this buffer has no host-visible validity state: a
+/// captured graph overwrites it after every draft and the next draft consumes
+/// it directly.
+pub struct PreparedCudaF32Scratch {
+    context: Rc<CudaContextInner>,
+    values: usize,
+    buffer: DeviceBuffer,
 }
 
 /// Device-resident buffers for one pure Q2 or Q4 projection. Immutable model
@@ -663,6 +753,7 @@ pub struct PreparedCudaGatheredA8Projection {
     columns: u32,
     groups: Vec<CudaGatheredRowGroup>,
     row_ids: DeviceBuffer,
+    canonical_row_ids: DeviceBuffer,
     output: DeviceBuffer,
     resident_bytes: usize,
 }
@@ -671,6 +762,93 @@ pub struct PreparedCudaGatheredA8Projection {
 pub struct PreparedCudaArgmax {
     context: Rc<CudaContextInner>,
     result: DeviceBuffer,
+}
+
+pub const CUDA_MTP_MAXIMUM_DRAFT_TOKENS: usize = 4;
+const CUDA_MTP_PHYSICAL_RESULT_WORDS: usize = 16;
+
+/// Stable public result returned by the verifier-only CUDA MTP boundary.
+/// The physical TensorRT-compatible device record is validated and compacted
+/// before this value is exposed to the executor.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CudaMtpCompactResultRecord {
+    pub accepted_count: u32,
+    pub emitted_tokens: [u32; CUDA_MTP_MAXIMUM_DRAFT_TOKENS],
+    pub bonus_token: u32,
+}
+
+/// Private fixed-width device record. Words 0..5 preserve TensorRT-LLM's
+/// accepted-token/count ABI; the remaining words bind finite-selection
+/// statuses and zero padding so stale or invalid results fail closed.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CudaMtpPhysicalResultRecord {
+    words: [u32; CUDA_MTP_PHYSICAL_RESULT_WORDS],
+}
+
+impl CudaMtpPhysicalResultRecord {
+    fn checked_compact(self, draft_count: usize) -> Result<CudaMtpCompactResultRecord> {
+        if !(1..=CUDA_MTP_MAXIMUM_DRAFT_TOKENS).contains(&draft_count) {
+            return Err(EngineError::Shape(format!(
+                "CUDA MTP draft count {draft_count} is outside 1..={CUDA_MTP_MAXIMUM_DRAFT_TOKENS}"
+            )));
+        }
+        if self.words[15] != 0 {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP physical result has nonzero padding".into(),
+            ));
+        }
+        if self.words[6..15].iter().any(|status| *status != 0) {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP argmax observed non-finite logits".into(),
+            ));
+        }
+        let physical_count = self.words[5] as usize;
+        if !(1..=draft_count + 1).contains(&physical_count) {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA MTP physical accepted-token count {physical_count} is invalid for {draft_count} drafts"
+            )));
+        }
+        if self.words[physical_count..5]
+            .iter()
+            .any(|token| *token != 0)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP physical result contains stale unused tokens".into(),
+            ));
+        }
+        let accepted_tokens = &self.words[..physical_count];
+        if accepted_tokens
+            .iter()
+            .any(|token| (*token as usize) >= TOKENIZER_VOCAB_SIZE)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP result contains a padded-vocabulary token".into(),
+            ));
+        }
+        let accepted_count = physical_count - 1;
+        let mut emitted_tokens = [0_u32; CUDA_MTP_MAXIMUM_DRAFT_TOKENS];
+        emitted_tokens[..accepted_count].copy_from_slice(&accepted_tokens[..accepted_count]);
+        Ok(CudaMtpCompactResultRecord {
+            accepted_count: accepted_count as u32,
+            emitted_tokens,
+            bonus_token: accepted_tokens[accepted_count],
+        })
+    }
+}
+
+/// Persistent verifier-only MTP result ownership. Draft IDs, target IDs and
+/// the TensorRT-compatible physical record stay resident for the complete
+/// speculative submission and are released by normal RAII/unload.
+pub struct PreparedCudaMtpCompactResult {
+    context: Rc<CudaContextInner>,
+    draft_ids: DeviceBuffer,
+    draft_statuses: DeviceBuffer,
+    verify_input_ids: DeviceBuffer,
+    target_ids: DeviceBuffer,
+    argmax_results: DeviceBuffer,
+    physical_record: DeviceBuffer,
 }
 
 /// Bounded top-k/top-p workspace and result. It never owns logits or RNG
@@ -961,6 +1139,16 @@ pub struct PreparedCudaBatchedRopeWorkspace {
     transient_bytes: usize,
 }
 
+/// Persistent graph inputs/outputs for one decode session. The host seeds
+/// these two scalars once; embedding, argmax and position advance remain on
+/// the dedicated CUDA stream for every graph replay.
+pub struct PreparedCudaDecodeState {
+    context: Rc<CudaContextInner>,
+    token_id: DeviceBuffer,
+    position: DeviceBuffer,
+    argmax: DeviceBuffer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CudaQueryGateConfig {
     pub heads: usize,
@@ -1041,6 +1229,29 @@ pub struct PreparedCudaPagedGqa {
     transient_bytes: usize,
     poisoned: bool,
     speculative_checkpoint: Option<CudaPagedGqaCheckpoint>,
+}
+
+/// CUDA-Graph-compatible packed KV owner. Q2 uses logical page indices while
+/// sink/recent Q4 pages use a deterministic fixed-size ring. Both mappings are
+/// pure functions of the device position, so decode replay needs no host page
+/// allocator, descriptor upload, or changing device address.
+pub struct PreparedCudaGraphPagedGqa {
+    context: Rc<CudaContextInner>,
+    config: CudaPagedGqaConfig,
+    q4_token_bytes: usize,
+    q2_page_bytes: usize,
+    q4_page_bytes: usize,
+    sink_pages: usize,
+    q4_ring_pages: usize,
+    component_values: usize,
+    blocks_per_token: usize,
+    q2_pages: DeviceBuffer,
+    q4_pages: DeviceBuffer,
+    params: DeviceBuffer,
+    packed_device_bytes: usize,
+    tokens: usize,
+    poisoned: bool,
+    speculative_checkpoint_tokens: Option<usize>,
 }
 
 /// Fixed-address scratch shared by ordinary one-query decode and MTP tail
@@ -1477,6 +1688,38 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let rope_table_position_f32_function =
+            match resolve_function(&driver, module, ROPE_TABLE_POSITION_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let rope_table_positions_f32_function =
+            match resolve_function(&driver, module, ROPE_TABLE_POSITIONS_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let increment_u64_function = match resolve_function(&driver, module, INCREMENT_U64_SYMBOL) {
+            Ok(function) => function,
+            Err(error) => {
+                unsafe {
+                    let _ = (driver.module_unload)(module);
+                    let _ = (driver.ctx_destroy)(context);
+                }
+                return Err(error);
+            }
+        };
         let partial_rope_batch_f32_function =
             match resolve_function(&driver, module, PARTIAL_ROPE_BATCH_F32_SYMBOL) {
                 Ok(function) => function,
@@ -1543,6 +1786,53 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let pack_graph_kv_q4_f32_function =
+            match resolve_function(&driver, module, PACK_GRAPH_KV_Q4_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let demote_graph_kv_q4_to_q2_function =
+            match resolve_function(&driver, module, DEMOTE_GRAPH_KV_Q4_TO_Q2_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let graph_paged_q2q4_gqa_prefill_f32_function =
+            match resolve_function(&driver, module, GRAPH_PAGED_Q2Q4_GQA_PREFILL_F32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let graph_paged_q2q4_gqa_split_partial_f32_function = match resolve_function(
+            &driver,
+            module,
+            GRAPH_PAGED_Q2Q4_GQA_SPLIT_PARTIAL_F32_SYMBOL,
+        ) {
+            Ok(function) => function,
+            Err(error) => {
+                unsafe {
+                    let _ = (driver.module_unload)(module);
+                    let _ = (driver.ctx_destroy)(context);
+                }
+                return Err(error);
+            }
+        };
         let paged_q2q4_gqa_f32_function =
             match resolve_function(&driver, module, PAGED_Q2Q4_GQA_F32_SYMBOL) {
                 Ok(function) => function,
@@ -1597,6 +1887,28 @@ impl CudaCandidateRuntime {
                 return Err(error);
             }
         };
+        let map_argmax_row_u32_function =
+            match resolve_function(&driver, module, MAP_ARGMAX_ROW_U32_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
+        let mtp_accept_draft_token_function =
+            match resolve_function(&driver, module, MTP_ACCEPT_DRAFT_TOKEN_SM86_SYMBOL) {
+                Ok(function) => function,
+                Err(error) => {
+                    unsafe {
+                        let _ = (driver.module_unload)(module);
+                        let _ = (driver.ctx_destroy)(context);
+                    }
+                    return Err(error);
+                }
+            };
         let topk_topp_sample_f32_function =
             match resolve_function(&driver, module, TOPK_TOPP_SAMPLE_F32_SYMBOL) {
                 Ok(function) => function,
@@ -1608,10 +1920,23 @@ impl CudaCandidateRuntime {
                     return Err(error);
                 }
             };
+        let mut stream = ptr::null_mut();
+        let stream_result = unsafe { (driver.stream_create)(&mut stream, CU_STREAM_DEFAULT) };
+        if stream_result != CUDA_SUCCESS {
+            let error = driver
+                .check(stream_result, "stream creation")
+                .expect_err("non-success CUDA result must be an error");
+            unsafe {
+                let _ = (driver.module_unload)(module);
+                let _ = (driver.ctx_destroy)(context);
+            }
+            return Err(error);
+        }
         Ok(Self {
             inner: Rc::new(CudaContextInner {
                 driver,
                 context,
+                stream,
                 module,
                 q2_function,
                 q4_function,
@@ -1642,21 +1967,31 @@ impl CudaCandidateRuntime {
                 residual_rms_norm_f16_function,
                 partial_rope_f32_function,
                 rope_table_batch_f32_function,
+                rope_table_position_f32_function,
+                rope_table_positions_f32_function,
+                increment_u64_function,
                 partial_rope_batch_f32_function,
                 query_gate_norm_rope_f32_function,
                 query_gate_norm_rope_batch_f32_function,
                 pack_paged_kv_q4_f32_function,
                 pack_paged_kv_q4_batch_f32_function,
                 demote_paged_kv_q4_to_q2_function,
+                pack_graph_kv_q4_f32_function,
+                demote_graph_kv_q4_to_q2_function,
+                graph_paged_q2q4_gqa_prefill_f32_function,
+                graph_paged_q2q4_gqa_split_partial_f32_function,
                 paged_q2q4_gqa_f32_function,
                 paged_q2q4_gqa_prefill_f32_function,
                 paged_q2q4_gqa_split_partial_f32_function,
                 paged_q2q4_gqa_split_combine_f32_function,
                 argmax_f32_function,
+                map_argmax_row_u32_function,
+                mtp_accept_draft_token_function,
                 topk_topp_sample_f32_function,
                 device_name,
                 compute_capability,
                 token_submission_active: Cell::new(false),
+                graph_capture_active: Cell::new(false),
                 token_submission_attempts: Cell::new(0),
                 token_submission_commits: Cell::new(0),
                 deferred_operator_synchronizations: Cell::new(0),
@@ -1678,7 +2013,256 @@ impl CudaCandidateRuntime {
         }
     }
 
-    /// Submit one complete target or MTP token as an ordered default-stream
+    pub(crate) fn begin_graph_capture(&self) -> Result<()> {
+        self.make_current()?;
+        if self.inner.token_submission_active.get() || self.inner.graph_capture_active.replace(true)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA graph capture requires an idle token stream".into(),
+            ));
+        }
+        let result = unsafe {
+            (self.inner.driver.stream_begin_capture)(
+                self.inner.stream,
+                CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+        };
+        if let Err(error) = self.inner.driver.check(result, "graph begin capture") {
+            self.inner.graph_capture_active.set(false);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn end_graph_capture(&self) -> Result<CudaCapturedGraph> {
+        self.make_current()?;
+        if !self.inner.graph_capture_active.replace(false) {
+            return Err(EngineError::InvalidState(
+                "CUDA graph end requested without active capture".into(),
+            ));
+        }
+        let mut graph = ptr::null_mut();
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.stream_end_capture)(self.inner.stream, &mut graph),
+                "graph end capture",
+            )?;
+        }
+        if graph.is_null() {
+            return Err(EngineError::InvalidState(
+                "CUDA graph capture returned a null graph".into(),
+            ));
+        }
+        let mut executable = ptr::null_mut();
+        let instantiate =
+            unsafe { (self.inner.driver.graph_instantiate_with_flags)(&mut executable, graph, 0) };
+        if let Err(error) = self.inner.driver.check(instantiate, "graph instantiation") {
+            unsafe {
+                let _ = (self.inner.driver.graph_destroy)(graph);
+            }
+            return Err(error);
+        }
+        if executable.is_null() {
+            unsafe {
+                let _ = (self.inner.driver.graph_destroy)(graph);
+            }
+            return Err(EngineError::InvalidState(
+                "CUDA graph instantiation returned a null executable".into(),
+            ));
+        }
+        Ok(CudaCapturedGraph {
+            context: Rc::clone(&self.inner),
+            graph,
+            executable,
+        })
+    }
+
+    pub(crate) fn abort_graph_capture(&self) {
+        if !self.inner.graph_capture_active.replace(false) {
+            return;
+        }
+        if self.make_current().is_err() {
+            return;
+        }
+        let mut graph = ptr::null_mut();
+        unsafe {
+            let _ = (self.inner.driver.stream_end_capture)(self.inner.stream, &mut graph);
+            if !graph.is_null() {
+                let _ = (self.inner.driver.graph_destroy)(graph);
+            }
+        }
+    }
+
+    /// Hardware verifier for the dedicated-stream graph lifecycle. It proves
+    /// device-resident token selection/chaining and position advance, but is
+    /// not a model throughput benchmark.
+    pub fn verifier_capture_rope_graph(
+        &self,
+        position: u64,
+        iterations: usize,
+    ) -> Result<CudaGraphReplayVerification> {
+        if iterations == 0 {
+            return Err(EngineError::Shape(
+                "CUDA graph replay count must be positive".into(),
+            ));
+        }
+        let config = CudaPartialRopeConfig {
+            heads: 24,
+            head_dim: 256,
+            rotary_dim: 64,
+            theta: 10_000_000.0,
+        };
+        let workspace = self.prepare_batched_rope_workspace(config, 1)?;
+        let selected_token = 197_531_u32;
+        let mut logits = vec![-100.0_f32; TOKENIZER_VOCAB_SIZE];
+        logits[selected_token as usize] = 42.0;
+        let logits = self.prepare_verifier_f32_tensor(&logits)?;
+        let state = self.prepare_decode_state(7, position)?;
+        self.synchronize_context("graph verifier preparation synchronization")?;
+        self.begin_graph_capture()?;
+        let capture = (|| {
+            self.write_decode_rope_position_device(&workspace, &state)?;
+            self.enqueue_decode_argmax_and_advance(&state, logits.device_view()?)
+        })();
+        if let Err(error) = capture {
+            self.abort_graph_capture();
+            return Err(error);
+        }
+        let graph = self.end_graph_capture()?;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            graph.launch()?;
+        }
+        self.synchronize_context("graph verifier replay synchronization")?;
+        let microseconds_per_replay =
+            started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+
+        let (actual_token, actual_position) = self.verifier_read_decode_state(&state)?;
+        let expected_position = position
+            .checked_add(iterations as u64)
+            .ok_or_else(|| EngineError::Shape("CUDA graph verifier position overflows".into()))?;
+        if actual_token != selected_token || actual_position != expected_position {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA graph replay ended at token/position {actual_token}/{actual_position}, expected {selected_token}/{expected_position}"
+            )));
+        }
+        let last_replay_position = expected_position - 1;
+        let values = config.rotary_dim / 2;
+        let mut cosine = vec![0.0_f32; values];
+        let mut sine = vec![0.0_f32; values];
+        workspace.cosine.copy_to(as_bytes_mut(&mut cosine))?;
+        workspace.sine.copy_to(as_bytes_mut(&mut sine))?;
+        let mut maximum_absolute_delta = 0.0_f32;
+        for pair in 0..values {
+            let exponent = -2.0 * pair as f32 / config.rotary_dim as f32;
+            let inverse_frequency = config.theta.powf(exponent);
+            let angle = last_replay_position as f32 * inverse_frequency;
+            maximum_absolute_delta = maximum_absolute_delta
+                .max((cosine[pair] - angle.cos()).abs())
+                .max((sine[pair] - angle.sin()).abs());
+        }
+        if cosine.iter().chain(&sine).any(|value| !value.is_finite())
+            || maximum_absolute_delta > 5.0e-5
+        {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA graph replay RoPE verification failed with maximum absolute delta {maximum_absolute_delta}"
+            )));
+        }
+        Ok(CudaGraphReplayVerification {
+            iterations,
+            microseconds_per_replay,
+            maximum_absolute_delta,
+        })
+    }
+
+    /// Capture and replay the graph-stable Q2/Q4 KV append, page demotion and
+    /// one-query split GQA sequence. Constant verifier Q/K/V inputs isolate
+    /// address/state stability; the binary compares the final output against
+    /// the independent CPU packed-cache oracle.
+    pub fn verifier_capture_graph_paged_gqa(
+        &self,
+        maximum_tokens: usize,
+        iterations: usize,
+    ) -> Result<CudaGraphPagedGqaReplayVerification> {
+        if !(24..=10_000).contains(&iterations) {
+            return Err(EngineError::Shape(
+                "CUDA graph paged-GQA replay count must be within 24..=10000".into(),
+            ));
+        }
+        if maximum_tokens < iterations || maximum_tokens > 131_072 {
+            return Err(EngineError::Shape(
+                "CUDA graph paged-GQA maximum tokens must cover replay count and not exceed 131072"
+                    .into(),
+            ));
+        }
+        let config = CudaPagedGqaConfig {
+            query_heads: 24,
+            key_value_heads: 4,
+            head_dim: 256,
+            maximum_tokens,
+            page_tokens: 128,
+            sink_tokens: 128,
+            recent_tokens: 256,
+        };
+        let paged = self.prepare_graph_paged_q2q4_gqa(config)?;
+        let split = self.prepare_graph_paged_q2q4_gqa_split(&paged)?;
+        let state = self.prepare_decode_state(0, 0)?;
+        let query_values = config.query_heads * config.head_dim;
+        let component_values = config.key_value_heads * config.head_dim;
+        let query: Vec<f32> = (0..query_values)
+            .map(|index| (index as f32 * 0.017).sin() * 0.35)
+            .collect();
+        let key: Vec<f32> = (0..component_values)
+            .map(|index| (index as f32 * 0.021).cos() * 0.45)
+            .collect();
+        let value: Vec<f32> = (0..component_values)
+            .map(|index| (index as f32 * 0.015).sin() * 0.55)
+            .collect();
+        let query = self.prepare_verifier_f32_tensor(&query)?;
+        let key = self.prepare_verifier_f32_tensor(&key)?;
+        let value = self.prepare_verifier_f32_tensor(&value)?;
+        self.synchronize_context("graph paged-GQA verifier preparation")?;
+        self.begin_graph_capture()?;
+        let capture = (|| {
+            self.append_and_dispatch_graph_paged_q2q4_gqa_split_device(
+                &paged,
+                &split,
+                &state,
+                query.device_view()?,
+                key.device_view()?,
+                value.device_view()?,
+            )?;
+            self.advance_decode_position_device(&state)
+        })();
+        if let Err(error) = capture {
+            self.abort_graph_capture();
+            return Err(error);
+        }
+        let graph = self.end_graph_capture()?;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            graph.launch()?;
+        }
+        self.synchronize_context("graph paged-GQA verifier replay")?;
+        let microseconds_per_replay =
+            started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        let (token, final_position) = self.verifier_read_decode_state(&state)?;
+        if token != 0 || final_position != iterations as u64 {
+            return Err(EngineError::InvalidState(format!(
+                "CUDA graph paged-GQA replay ended at token/position {token}/{final_position}, expected 0/{iterations}"
+            )));
+        }
+        let final_output = self.verifier_read_f32(split.output.f32_view(0, query_values)?)?;
+        Ok(CudaGraphPagedGqaReplayVerification {
+            iterations,
+            microseconds_per_replay,
+            packed_device_bytes: paged.packed_device_bytes(),
+            final_position,
+            final_output,
+        })
+    }
+
+    /// Submit one complete target or MTP token as an ordered dedicated-stream
     /// transaction. Per-operator helpers keep their standalone synchronous
     /// behavior, but suppress intermediate context barriers while this scope
     /// is active. The final synchronization is the commit point at which
@@ -1720,14 +2304,15 @@ impl CudaCandidateRuntime {
             .context_synchronizations
             .set(self.inner.context_synchronizations.get().saturating_add(1));
         unsafe {
-            self.inner
-                .driver
-                .check((self.inner.driver.ctx_synchronize)(), operation)
+            self.inner.driver.check(
+                (self.inner.driver.stream_synchronize)(self.inner.stream),
+                operation,
+            )
         }
     }
 
     fn synchronize_after_launch(&self, operation: &'static str) -> Result<()> {
-        if self.inner.token_submission_active.get() {
+        if self.inner.token_submission_active.get() || self.inner.graph_capture_active.get() {
             self.inner.deferred_operator_synchronizations.set(
                 self.inner
                     .deferred_operator_synchronizations
@@ -1795,6 +2380,351 @@ impl CudaCandidateRuntime {
         })
     }
 
+    pub fn prepare_mtp_compact_result(&self) -> Result<PreparedCudaMtpCompactResult> {
+        let draft_ids = DeviceBuffer::allocate(
+            self,
+            CUDA_MTP_MAXIMUM_DRAFT_TOKENS * std::mem::size_of::<u32>(),
+        )?;
+        let draft_statuses = DeviceBuffer::allocate(
+            self,
+            CUDA_MTP_MAXIMUM_DRAFT_TOKENS * std::mem::size_of::<u32>(),
+        )?;
+        let target_ids = DeviceBuffer::allocate(
+            self,
+            (CUDA_MTP_MAXIMUM_DRAFT_TOKENS + 1) * std::mem::size_of::<u32>(),
+        )?;
+        let verify_input_ids = DeviceBuffer::allocate(
+            self,
+            (CUDA_MTP_MAXIMUM_DRAFT_TOKENS + 1) * std::mem::size_of::<u32>(),
+        )?;
+        let argmax_results = DeviceBuffer::allocate(
+            self,
+            (CUDA_MTP_MAXIMUM_DRAFT_TOKENS + 1) * 2 * std::mem::size_of::<u32>(),
+        )?;
+        let physical_record =
+            DeviceBuffer::allocate(self, std::mem::size_of::<CudaMtpPhysicalResultRecord>())?;
+        draft_ids.zero_async()?;
+        draft_statuses.zero_async()?;
+        verify_input_ids.zero_async()?;
+        target_ids.zero_async()?;
+        argmax_results.zero_async()?;
+        physical_record.zero_async()?;
+        Ok(PreparedCudaMtpCompactResult {
+            context: Rc::clone(&self.inner),
+            draft_ids,
+            draft_statuses,
+            verify_input_ids,
+            target_ids,
+            argmax_results,
+            physical_record,
+        })
+    }
+
+    pub fn reset_mtp_compact_result(&self, prepared: &PreparedCudaMtpCompactResult) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP result owner belongs to another context".into(),
+            ));
+        }
+        prepared.draft_ids.zero_async()?;
+        prepared.draft_statuses.zero_async()?;
+        prepared.verify_input_ids.zero_async()?;
+        prepared.target_ids.zero_async()?;
+        prepared.argmax_results.zero_async()?;
+        prepared.physical_record.zero_async()
+    }
+
+    /// Enqueue the complete Qwen3.5-style batched target-verification
+    /// boundary without reading any per-row selection through the host.
+    ///
+    /// `target_logits` is row-major `[draft_count + 1, vocabulary]`: the
+    /// first row predicts the first draft and the final row is the bonus
+    /// token. The existing deterministic argmax primitive writes private
+    /// `{token,status}` pairs, compact D2D copies build the TensorRT input,
+    /// and the pinned TensorRT-LLM kernel emits the accepted prefix. The sole
+    /// supported readback is [`Self::verifier_read_mtp_compact_result`].
+    pub fn enqueue_mtp_accept_from_logits(
+        &self,
+        prepared: &PreparedCudaMtpCompactResult,
+        draft_tokens: &[u32],
+        target_logits: CudaDeviceF32View<'_>,
+    ) -> Result<()> {
+        let draft_count = draft_tokens.len();
+        self.reset_mtp_compact_result(prepared)?;
+        prepared.draft_ids.write_range(0, as_bytes(draft_tokens))?;
+        self.enqueue_mtp_accept_from_device_drafts(prepared, draft_count, target_logits)
+    }
+
+    /// Device-only MTP4 acceptance. Draft IDs must already occupy the compact
+    /// result owner; only target/argmax/result buffers are cleared, preserving
+    /// both the draft vector and the five verify input IDs captured earlier.
+    pub fn enqueue_mtp_accept_from_device_drafts(
+        &self,
+        prepared: &PreparedCudaMtpCompactResult,
+        draft_count: usize,
+        target_logits: CudaDeviceF32View<'_>,
+    ) -> Result<()> {
+        if !(1..=CUDA_MTP_MAXIMUM_DRAFT_TOKENS).contains(&draft_count) {
+            return Err(EngineError::Shape(format!(
+                "CUDA MTP draft count {draft_count} is outside 1..={CUDA_MTP_MAXIMUM_DRAFT_TOKENS}"
+            )));
+        }
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, target_logits.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP acceptance crosses driver contexts".into(),
+            ));
+        }
+        let target_rows = draft_count + 1;
+        let expected_values = target_rows
+            .checked_mul(TOKENIZER_VOCAB_SIZE)
+            .ok_or_else(|| EngineError::Shape("CUDA MTP target-logit shape overflows".into()))?;
+        if target_logits.values() != expected_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA MTP target logits have {} values, expected {target_rows}x{TOKENIZER_VOCAB_SIZE}",
+                target_logits.values()
+            )));
+        }
+
+        prepared.target_ids.zero_async()?;
+        prepared.argmax_results.zero_async()?;
+        prepared.physical_record.zero_async()?;
+        self.make_current()?;
+        for draft in 0..draft_count {
+            unsafe {
+                self.inner.driver.check(
+                    (self.inner.driver.memcpy_dtod_async)(
+                        device_ptr_offset(
+                            prepared.physical_record.ptr(),
+                            (11 + draft) * std::mem::size_of::<u32>(),
+                        )?,
+                        device_ptr_offset(
+                            prepared.draft_statuses.ptr(),
+                            draft * std::mem::size_of::<u32>(),
+                        )?,
+                        std::mem::size_of::<u32>(),
+                        self.inner.stream,
+                    ),
+                    "CUDA MTP draft-status D2D copy",
+                )?;
+            }
+        }
+        for row in 0..target_rows {
+            let row_offset = row
+                .checked_mul(TOKENIZER_VOCAB_SIZE)
+                .ok_or_else(|| EngineError::Shape("CUDA MTP logit row offset overflows".into()))?;
+            let mut input = target_logits
+                .slice(row_offset, TOKENIZER_VOCAB_SIZE)?
+                .ptr()?;
+            let pair_offset = row
+                .checked_mul(2 * std::mem::size_of::<u32>())
+                .ok_or_else(|| EngineError::Shape("CUDA MTP argmax offset overflows".into()))?;
+            let mut result = device_ptr_offset(prepared.argmax_results.ptr(), pair_offset)?;
+            let mut count = cuda_u32(TOKENIZER_VOCAB_SIZE, "CUDA MTP argmax width")?;
+            let mut params = [
+                (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut result as *mut CuDevicePtr).cast::<c_void>(),
+                (&mut count as *mut u32).cast::<c_void>(),
+            ];
+            unsafe {
+                self.inner.driver.check(
+                    (self.inner.driver.launch_kernel)(
+                        self.inner.argmax_f32_function,
+                        1,
+                        1,
+                        1,
+                        THREADS_PER_BLOCK,
+                        1,
+                        1,
+                        0,
+                        self.inner.stream,
+                        params.as_mut_ptr(),
+                        ptr::null_mut(),
+                    ),
+                    "CUDA MTP row argmax launch",
+                )?;
+                self.inner.driver.check(
+                    (self.inner.driver.memcpy_dtod_async)(
+                        device_ptr_offset(
+                            prepared.target_ids.ptr(),
+                            row * std::mem::size_of::<u32>(),
+                        )?,
+                        result,
+                        std::mem::size_of::<u32>(),
+                        self.inner.stream,
+                    ),
+                    "CUDA MTP target-token D2D copy",
+                )?;
+                self.inner.driver.check(
+                    (self.inner.driver.memcpy_dtod_async)(
+                        device_ptr_offset(
+                            prepared.physical_record.ptr(),
+                            (6 + row) * std::mem::size_of::<u32>(),
+                        )?,
+                        device_ptr_offset(result, std::mem::size_of::<u32>())?,
+                        std::mem::size_of::<u32>(),
+                        self.inner.stream,
+                    ),
+                    "CUDA MTP argmax-status D2D copy",
+                )?;
+            }
+        }
+
+        let mut num_mtp_modules = i32::try_from(draft_count)
+            .map_err(|_| EngineError::Shape("CUDA MTP draft count exceeds i32".into()))?;
+        let mut batch_size = 1_i32;
+        let mut context_requests = 0_i32;
+        let mut draft_ids = prepared.draft_ids.ptr();
+        let mut target_ids = prepared.target_ids.ptr();
+        let mut accepted_tokens = prepared.physical_record.ptr();
+        let mut accepted_count = device_ptr_offset(
+            prepared.physical_record.ptr(),
+            5 * std::mem::size_of::<u32>(),
+        )?;
+        let mut params = [
+            (&mut num_mtp_modules as *mut i32).cast::<c_void>(),
+            (&mut batch_size as *mut i32).cast::<c_void>(),
+            (&mut context_requests as *mut i32).cast::<c_void>(),
+            (&mut draft_ids as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut target_ids as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut accepted_tokens as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut accepted_count as *mut CuDevicePtr).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.mtp_accept_draft_token_function,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "TensorRT-LLM MTP acceptance launch",
+            )?;
+        }
+        self.inner.device_argmax_launches.set(
+            self.inner
+                .device_argmax_launches
+                .get()
+                .saturating_add(target_rows as u64),
+        );
+        Ok(())
+    }
+
+    /// Compare one device-resident MTP draft with the following target
+    /// verification token through the pinned TensorRT-LLM acceptance kernel.
+    /// Both selections have already passed the finite-logit argmax kernel;
+    /// no token ID crosses the host at this boundary. The duplicated second
+    /// target slot is a verifier-only bonus token and is not exposed as a
+    /// production multi-draft result.
+    pub fn enqueue_mtp_accept_decode_states(
+        &self,
+        prepared: &PreparedCudaMtpCompactResult,
+        draft: &PreparedCudaDecodeState,
+        target: &PreparedCudaDecodeState,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &draft.context)
+            || !Rc::ptr_eq(&self.inner, &target.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP state acceptance crosses driver contexts".into(),
+            ));
+        }
+        self.reset_mtp_compact_result(prepared)?;
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod_async)(
+                    prepared.draft_ids.ptr(),
+                    draft.token_id.ptr(),
+                    std::mem::size_of::<u32>(),
+                    self.inner.stream,
+                ),
+                "CUDA MTP state draft copy",
+            )?;
+            for row in 0..2 {
+                self.inner.driver.check(
+                    (self.inner.driver.memcpy_dtod_async)(
+                        device_ptr_offset(
+                            prepared.target_ids.ptr(),
+                            row * std::mem::size_of::<u32>(),
+                        )?,
+                        target.token_id.ptr(),
+                        std::mem::size_of::<u32>(),
+                        self.inner.stream,
+                    ),
+                    "CUDA MTP state target copy",
+                )?;
+            }
+        }
+        let mut num_mtp_modules = 1_i32;
+        let mut batch_size = 1_i32;
+        let mut context_requests = 0_i32;
+        let mut draft_ids = prepared.draft_ids.ptr();
+        let mut target_ids = prepared.target_ids.ptr();
+        let mut accepted_tokens = prepared.physical_record.ptr();
+        let mut accepted_count = device_ptr_offset(
+            prepared.physical_record.ptr(),
+            5 * std::mem::size_of::<u32>(),
+        )?;
+        let mut params = [
+            (&mut num_mtp_modules as *mut i32).cast::<c_void>(),
+            (&mut batch_size as *mut i32).cast::<c_void>(),
+            (&mut context_requests as *mut i32).cast::<c_void>(),
+            (&mut draft_ids as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut target_ids as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut accepted_tokens as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut accepted_count as *mut CuDevicePtr).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.mtp_accept_draft_token_function,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "TensorRT-LLM MTP state acceptance launch",
+            )
+        }
+    }
+
+    /// Sole verifier boundary for one completed speculative submission: one
+    /// synchronization, one 64-byte D2H copy, then fail-closed conversion to
+    /// the stable 24-byte logical result.
+    pub fn verifier_read_mtp_compact_result(
+        &self,
+        prepared: &PreparedCudaMtpCompactResult,
+        draft_count: usize,
+    ) -> Result<CudaMtpCompactResultRecord> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP result owner belongs to another context".into(),
+            ));
+        }
+        self.synchronize_context("verifier MTP result synchronization")?;
+        let mut physical = CudaMtpPhysicalResultRecord::default();
+        prepared
+            .physical_record
+            .copy_to(as_bytes_mut(slice::from_mut(&mut physical)))?;
+        physical.checked_compact(draft_count)
+    }
+
     pub fn prepare_topk_topp_sampler(
         &self,
         max_values: usize,
@@ -1847,7 +2777,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -1952,7 +2882,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -2003,6 +2933,46 @@ impl CudaCandidateRuntime {
             snapshot,
             valid: false,
         })
+    }
+
+    pub fn prepare_f32_scratch(&self, values: usize) -> Result<PreparedCudaF32Scratch> {
+        let bytes = values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("CUDA scratch bytes overflow".into()))?;
+        if values == 0 {
+            return Err(EngineError::Shape(
+                "CUDA f32 scratch must contain at least one value".into(),
+            ));
+        }
+        let buffer = DeviceBuffer::allocate(self, bytes)?;
+        buffer.zero()?;
+        Ok(PreparedCudaF32Scratch {
+            context: Rc::clone(&self.inner),
+            values,
+            buffer,
+        })
+    }
+
+    pub fn overwrite_f32_scratch_device(
+        &self,
+        prepared: &PreparedCudaF32Scratch,
+        source: CudaDeviceF32View<'_>,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context) || !Rc::ptr_eq(&self.inner, source.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA f32 scratch copy crosses driver contexts".into(),
+            ));
+        }
+        if source.values() != prepared.values {
+            return Err(EngineError::Shape(format!(
+                "CUDA f32 scratch has {} values for a {}-value source",
+                prepared.values,
+                source.values()
+            )));
+        }
+        prepared
+            .buffer
+            .copy_from_view(source, "MTP chained-hidden device copy")
     }
 
     pub fn snapshot_f32_device(
@@ -2114,7 +3084,7 @@ impl CudaCandidateRuntime {
         self.make_current()?;
         unsafe {
             self.inner.driver.check(
-                (self.inner.driver.memcpy_2d)(&descriptor),
+                (self.inner.driver.memcpy_2d_async)(&descriptor, self.inner.stream),
                 "f32 device row copy",
             )?;
         }
@@ -2156,11 +3126,21 @@ impl CudaCandidateRuntime {
         let right_target = device_ptr_offset(prepared.output.ptr(), left_bytes)?;
         unsafe {
             self.inner.driver.check(
-                (self.inner.driver.memcpy_dtod)(prepared.output.ptr(), left.ptr()?, left_bytes),
+                (self.inner.driver.memcpy_dtod_async)(
+                    prepared.output.ptr(),
+                    left.ptr()?,
+                    left_bytes,
+                    self.inner.stream,
+                ),
                 "MTP left device concatenation",
             )?;
             self.inner.driver.check(
-                (self.inner.driver.memcpy_dtod)(right_target, right.ptr()?, right_bytes),
+                (self.inner.driver.memcpy_dtod_async)(
+                    right_target,
+                    right.ptr()?,
+                    right_bytes,
+                    self.inner.stream,
+                ),
                 "MTP right device concatenation",
             )?;
         }
@@ -2344,7 +3324,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -2509,7 +3489,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -2736,7 +3716,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -2911,7 +3891,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -3046,7 +4026,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -3161,7 +4141,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -3394,7 +4374,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -3518,7 +4498,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -3625,7 +4605,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -3718,7 +4698,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -3777,7 +4757,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -3956,7 +4936,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     table_params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -4037,7 +5017,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     apply_params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -4144,7 +5124,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -4266,7 +5246,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -4362,7 +5342,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -4498,6 +5478,108 @@ impl CudaCandidateRuntime {
             transient_bytes,
             poisoned: false,
             speculative_checkpoint: None,
+        })
+    }
+
+    pub fn prepare_graph_paged_q2q4_gqa(
+        &self,
+        config: CudaPagedGqaConfig,
+    ) -> Result<PreparedCudaGraphPagedGqa> {
+        if config.query_heads != 24
+            || config.key_value_heads != 4
+            || config.head_dim != 256
+            || config.maximum_tokens == 0
+            || config.maximum_tokens > u32::MAX as usize
+            || config.page_tokens == 0
+            || !config.sink_tokens.is_multiple_of(config.page_tokens)
+            || !config.recent_tokens.is_multiple_of(config.page_tokens)
+            || config.sink_tokens > config.maximum_tokens
+            || config.recent_tokens > config.maximum_tokens
+        {
+            return Err(EngineError::Shape(
+                "graph CUDA paged GQA requires Qwen's 24/4/256 profile and page-aligned sink/recent windows".into(),
+            ));
+        }
+        let component_values = config
+            .key_value_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA KV width overflows".into()))?;
+        let combined_values = component_values
+            .checked_mul(2)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA combined KV overflows".into()))?;
+        let blocks_per_token = combined_values / BLOCK_LEN;
+        let q2_token_bytes = blocks_per_token
+            .checked_mul(Q2_BLOCK_BYTES)
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("graph CUDA Q2 token bytes overflow".into())
+            })?;
+        let q4_token_bytes = blocks_per_token
+            .checked_mul(Q4_BLOCK_BYTES)
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("graph CUDA Q4 token bytes overflow".into())
+            })?;
+        let q2_page_bytes = config
+            .page_tokens
+            .checked_mul(q2_token_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA Q2 page bytes overflow".into()))?;
+        let q4_page_bytes = config
+            .page_tokens
+            .checked_mul(q4_token_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA Q4 page bytes overflow".into()))?;
+        let maximum_pages = config.maximum_tokens.div_ceil(config.page_tokens);
+        let q2_arena_bytes = maximum_pages
+            .checked_mul(q2_page_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA Q2 arena overflows".into()))?;
+        let sink_pages = config.sink_tokens / config.page_tokens;
+        let non_sink_pages = maximum_pages.saturating_sub(sink_pages);
+        let q4_ring_pages = non_sink_pages.min(config.recent_tokens / config.page_tokens + 1);
+        let q4_slots = sink_pages
+            .checked_add(q4_ring_pages)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA Q4 slots overflow".into()))?;
+        let q4_arena_bytes = q4_slots
+            .checked_mul(q4_page_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA Q4 arena overflows".into()))?;
+        let q2_pages = DeviceBuffer::allocate(self, q2_arena_bytes)?;
+        let q4_pages = DeviceBuffer::allocate(self, q4_arena_bytes)?;
+        let params = DeviceBuffer::allocate(self, GRAPH_PAGED_GQA_PARAMS_BYTES)?;
+        q2_pages.zero()?;
+        q4_pages.zero()?;
+        let scale = 1.0_f32 / (config.head_dim as f32).sqrt();
+        let words = [
+            cuda_u32(config.query_heads, "graph CUDA query heads")?,
+            cuda_u32(config.key_value_heads, "graph CUDA KV heads")?,
+            cuda_u32(config.head_dim, "graph CUDA head dim")?,
+            cuda_u32(config.maximum_tokens, "graph CUDA maximum tokens")?,
+            cuda_u32(config.page_tokens, "graph CUDA page tokens")?,
+            cuda_u32(config.sink_tokens, "graph CUDA sink tokens")?,
+            cuda_u32(config.recent_tokens, "graph CUDA recent tokens")?,
+            cuda_u32(sink_pages, "graph CUDA sink pages")?,
+            cuda_u32(q4_ring_pages, "graph CUDA Q4 ring pages")?,
+            cuda_u32(combined_values, "graph CUDA combined values")?,
+            cuda_u32(q2_token_bytes, "graph CUDA Q2 token bytes")?,
+            cuda_u32(q4_token_bytes, "graph CUDA Q4 token bytes")?,
+            cuda_u32(q2_page_bytes, "graph CUDA Q2 page bytes")?,
+            cuda_u32(q4_page_bytes, "graph CUDA Q4 page bytes")?,
+            scale.to_bits(),
+        ];
+        params.write(as_bytes(&words))?;
+        Ok(PreparedCudaGraphPagedGqa {
+            context: Rc::clone(&self.inner),
+            config,
+            q4_token_bytes,
+            q2_page_bytes,
+            q4_page_bytes,
+            sink_pages,
+            q4_ring_pages,
+            component_values,
+            blocks_per_token,
+            q2_pages,
+            q4_pages,
+            params,
+            packed_device_bytes: q2_arena_bytes + q4_arena_bytes,
+            tokens: 0,
+            poisoned: false,
+            speculative_checkpoint_tokens: None,
         })
     }
 
@@ -4745,7 +5827,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     pack_params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -4879,7 +5961,7 @@ impl CudaCandidateRuntime {
                             1,
                             1,
                             0,
-                            ptr::null_mut(),
+                            self.inner.stream,
                             pack_params.as_mut_ptr(),
                             ptr::null_mut(),
                         ),
@@ -4967,7 +6049,7 @@ impl CudaCandidateRuntime {
                         1,
                         1,
                         0,
-                        ptr::null_mut(),
+                        self.inner.stream,
                         demote_params.as_mut_ptr(),
                         ptr::null_mut(),
                     ),
@@ -5047,7 +6129,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     kernel_params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -5202,7 +6284,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -5498,6 +6580,537 @@ impl CudaCandidateRuntime {
         })
     }
 
+    pub fn prepare_graph_paged_q2q4_gqa_split(
+        &self,
+        paged: &PreparedCudaGraphPagedGqa,
+    ) -> Result<PreparedCudaSplitPagedGqa> {
+        if !Rc::ptr_eq(&self.inner, &paged.context) {
+            return Err(EngineError::InvalidState(
+                "graph CUDA split GQA cache belongs to another context".into(),
+            ));
+        }
+        let row_values = paged.config.query_heads * paged.config.head_dim;
+        let query_values = row_values
+            .checked_mul(PAGED_GQA_SPLIT_MAX_QUERY_TOKENS)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA split queries overflow".into()))?;
+        let partial_rows = paged
+            .config
+            .query_heads
+            .checked_mul(PAGED_GQA_SPLIT_MAX_QUERY_TOKENS)
+            .and_then(|rows| rows.checked_mul(PAGED_GQA_SPLIT_SEGMENTS))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("graph CUDA split partials overflow".into())
+            })?;
+        let query_bytes = query_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("graph CUDA split query bytes overflow".into())
+            })?;
+        let partial_output_bytes = partial_rows
+            .checked_mul(paged.config.head_dim)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA split output overflows".into()))?;
+        let partial_scalar_bytes = partial_rows
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA split scalars overflow".into()))?;
+        let transient_bytes = query_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(partial_output_bytes))
+            .and_then(|bytes| bytes.checked_add(partial_scalar_bytes.checked_mul(2)?))
+            .ok_or_else(|| {
+                EngineError::MemoryBudget("graph CUDA split scratch overflows".into())
+            })?;
+        let prepared = PreparedCudaSplitPagedGqa {
+            context: Rc::clone(&self.inner),
+            query: DeviceBuffer::allocate(self, query_bytes)?,
+            output: DeviceBuffer::allocate(self, query_bytes)?,
+            partial_output: DeviceBuffer::allocate(self, partial_output_bytes)?,
+            partial_maximum: DeviceBuffer::allocate(self, partial_scalar_bytes)?,
+            partial_denominator: DeviceBuffer::allocate(self, partial_scalar_bytes)?,
+            transient_bytes,
+        };
+        prepared.query.zero()?;
+        prepared.output.zero()?;
+        prepared.partial_output.zero()?;
+        prepared.partial_maximum.zero()?;
+        prepared.partial_denominator.zero()?;
+        Ok(prepared)
+    }
+
+    /// Appends a token-major prompt chunk directly into the graph-stable
+    /// logical-Q2/Q4-ring cache and executes causal attention from that same
+    /// storage. Page-boundary segmentation preserves decode's exact Q4-to-Q2
+    /// transition without constructing descriptors or a second KV cache.
+    pub fn append_and_dispatch_graph_paged_q2q4_gqa_prefill_device<'a>(
+        &self,
+        paged: &mut PreparedCudaGraphPagedGqa,
+        output: &'a PreparedCudaPagedGqaPrefillOutput,
+        query: CudaDeviceF32View<'_>,
+        keys: CudaDeviceF32View<'_>,
+        values: CudaDeviceF32View<'_>,
+        token_count: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let token_count = validate_a8_batch_capacity(token_count)? as usize;
+        if !Rc::ptr_eq(&self.inner, &paged.context)
+            || !Rc::ptr_eq(&self.inner, &output.context)
+            || !Rc::ptr_eq(&self.inner, query.context)
+            || !Rc::ptr_eq(&self.inner, keys.context)
+            || !Rc::ptr_eq(&self.inner, values.context)
+        {
+            return Err(EngineError::InvalidState(
+                "graph CUDA paged-GQA prefill crosses driver contexts".into(),
+            ));
+        }
+        if paged.poisoned {
+            return Err(EngineError::InvalidState(
+                "graph CUDA paged-GQA prefill requires healthy state".into(),
+            ));
+        }
+        if let Some(checkpoint_tokens) = paged.speculative_checkpoint_tokens {
+            validate_graph_speculative_prefill_append(
+                checkpoint_tokens,
+                paged.tokens,
+                token_count,
+                paged.config.page_tokens,
+                paged.sink_pages,
+                paged.config.recent_tokens,
+                paged.q4_ring_pages,
+            )?;
+        }
+        if token_count > output.token_capacity as usize
+            || output.query_heads != paged.config.query_heads as u32
+            || output.head_dim != paged.config.head_dim as u32
+        {
+            return Err(EngineError::MemoryBudget(format!(
+                "graph CUDA paged-GQA prefill requests {token_count} tokens with output capacity {}",
+                output.token_capacity
+            )));
+        }
+        let query_width = paged
+            .config
+            .query_heads
+            .checked_mul(paged.config.head_dim)
+            .ok_or_else(|| EngineError::Shape("graph CUDA prefill query width overflows".into()))?;
+        let query_values = token_count
+            .checked_mul(query_width)
+            .ok_or_else(|| EngineError::Shape("graph CUDA prefill query shape overflows".into()))?;
+        let component_values = token_count
+            .checked_mul(paged.component_values)
+            .ok_or_else(|| EngineError::Shape("graph CUDA prefill K/V shape overflows".into()))?;
+        if query.values() != query_values
+            || keys.values() != component_values
+            || values.values() != component_values
+        {
+            return Err(EngineError::Shape(format!(
+                "graph CUDA paged-GQA prefill has Q/K/V {}/{}/{}, expected {query_values}/{component_values}/{component_values}",
+                query.values(),
+                keys.values(),
+                values.values()
+            )));
+        }
+        let final_tokens = paged.tokens.checked_add(token_count).ok_or_else(|| {
+            EngineError::MemoryBudget("graph CUDA prefill token count overflows".into())
+        })?;
+        if final_tokens > paged.config.maximum_tokens {
+            return Err(EngineError::MemoryBudget(format!(
+                "graph CUDA prefill reaches {final_tokens} tokens, capacity is {}",
+                paged.config.maximum_tokens
+            )));
+        }
+
+        self.make_current()?;
+        paged.poisoned = true;
+        let result = (|| {
+            let mut processed = 0_usize;
+            while processed < token_count {
+                let (segment_tokens, demote_before_attention) = graph_paged_prefill_segment(
+                    paged.tokens,
+                    token_count - processed,
+                    paged.config.page_tokens,
+                    paged.config.sink_tokens,
+                    paged.config.recent_tokens,
+                )?;
+                let logical_page = paged.tokens / paged.config.page_tokens;
+                let first_token_in_page = paged.tokens % paged.config.page_tokens;
+                let physical_slot =
+                    graph_q4_slot(logical_page, paged.sink_pages, paged.q4_ring_pages)?;
+                let mut q4_pages_ptr = paged.q4_pages.ptr();
+                let mut keys_ptr = keys.ptr()?;
+                let mut values_ptr = values.ptr()?;
+                let mut physical_slot_u32 = cuda_u32(physical_slot, "graph CUDA Q4 physical slot")?;
+                let mut first_token_in_page_u32 =
+                    cuda_u32(first_token_in_page, "graph CUDA first token in page")?;
+                let mut first_input_token = cuda_u32(processed, "graph CUDA first input token")?;
+                let mut segment_token_count =
+                    cuda_u32(segment_tokens, "graph CUDA segment tokens")?;
+                let mut component_values_u32 =
+                    cuda_u32(paged.component_values, "graph CUDA KV width")?;
+                let mut q4_token_bytes =
+                    cuda_u32(paged.q4_token_bytes, "graph CUDA Q4 token bytes")?;
+                let mut q4_page_bytes = cuda_u32(paged.q4_page_bytes, "graph CUDA Q4 page bytes")?;
+                let mut pack_params = [
+                    (&mut q4_pages_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut keys_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut values_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut physical_slot_u32 as *mut u32).cast::<c_void>(),
+                    (&mut first_token_in_page_u32 as *mut u32).cast::<c_void>(),
+                    (&mut first_input_token as *mut u32).cast::<c_void>(),
+                    (&mut segment_token_count as *mut u32).cast::<c_void>(),
+                    (&mut component_values_u32 as *mut u32).cast::<c_void>(),
+                    (&mut q4_token_bytes as *mut u32).cast::<c_void>(),
+                    (&mut q4_page_bytes as *mut u32).cast::<c_void>(),
+                ];
+                unsafe {
+                    self.inner.driver.check(
+                        (self.inner.driver.launch_kernel)(
+                            self.inner.pack_paged_kv_q4_batch_f32_function,
+                            cuda_u32(paged.blocks_per_token, "graph CUDA KV quant blocks")?,
+                            segment_token_count,
+                            1,
+                            64,
+                            1,
+                            1,
+                            0,
+                            self.inner.stream,
+                            pack_params.as_mut_ptr(),
+                            ptr::null_mut(),
+                        ),
+                        "graph batched Q4 KV pack kernel launch",
+                    )?;
+                }
+                paged.tokens += segment_tokens;
+                if demote_before_attention {
+                    self.demote_graph_prefill_boundary(paged)?;
+                }
+
+                let query_offset = processed.checked_mul(query_width).ok_or_else(|| {
+                    EngineError::Shape("graph CUDA prefill query offset overflows".into())
+                })?;
+                let mut query_ptr = query
+                    .slice(
+                        query_offset,
+                        segment_tokens.checked_mul(query_width).ok_or_else(|| {
+                            EngineError::Shape("graph CUDA prefill query segment overflows".into())
+                        })?,
+                    )?
+                    .ptr()?;
+                let mut q2_pages_ptr = paged.q2_pages.ptr();
+                let mut q4_pages_ptr = paged.q4_pages.ptr();
+                let output_offset = processed.checked_mul(query_width).ok_or_else(|| {
+                    EngineError::Shape("graph CUDA prefill output offset overflows".into())
+                })?;
+                let mut output_ptr = device_ptr_offset(
+                    output.output.ptr(),
+                    output_offset
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .ok_or_else(|| {
+                            EngineError::Shape("graph CUDA prefill output bytes overflow".into())
+                        })?,
+                )?;
+                let mut params_ptr = paged.params.ptr();
+                let mut committed_tokens = cuda_u32(paged.tokens, "graph CUDA committed tokens")?;
+                let mut query_tokens = segment_token_count;
+                let mut attention_params = [
+                    (&mut query_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut q2_pages_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut q4_pages_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut output_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut params_ptr as *mut CuDevicePtr).cast::<c_void>(),
+                    (&mut committed_tokens as *mut u32).cast::<c_void>(),
+                    (&mut query_tokens as *mut u32).cast::<c_void>(),
+                ];
+                let blocks = query_tokens
+                    .checked_mul(paged.config.query_heads as u32)
+                    .ok_or_else(|| {
+                        EngineError::Shape("graph CUDA prefill grid overflows".into())
+                    })?;
+                unsafe {
+                    self.inner.driver.check(
+                        (self.inner.driver.launch_kernel)(
+                            self.inner.graph_paged_q2q4_gqa_prefill_f32_function,
+                            blocks,
+                            1,
+                            1,
+                            WARP_SIZE,
+                            1,
+                            1,
+                            0,
+                            self.inner.stream,
+                            attention_params.as_mut_ptr(),
+                            ptr::null_mut(),
+                        ),
+                        "graph Q2/Q4 GQA prefill kernel launch",
+                    )?;
+                }
+                if !demote_before_attention {
+                    self.demote_graph_prefill_boundary(paged)?;
+                }
+                processed += segment_tokens;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(error);
+        }
+        paged.poisoned = false;
+        debug_assert_eq!(paged.tokens, final_tokens);
+        output.device_output(token_count)
+    }
+
+    fn demote_graph_prefill_boundary(&self, paged: &PreparedCudaGraphPagedGqa) -> Result<()> {
+        let recent_start = paged.tokens.saturating_sub(paged.config.recent_tokens);
+        if recent_start == 0 || !recent_start.is_multiple_of(paged.config.page_tokens) {
+            return Ok(());
+        }
+        let logical_page = recent_start / paged.config.page_tokens - 1;
+        if logical_page * paged.config.page_tokens < paged.config.sink_tokens {
+            return Ok(());
+        }
+        let physical_slot = graph_q4_slot(logical_page, paged.sink_pages, paged.q4_ring_pages)?;
+        let q4_offset = physical_slot
+            .checked_mul(paged.q4_page_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA Q4 offset overflows".into()))?;
+        let q2_offset = logical_page
+            .checked_mul(paged.q2_page_bytes)
+            .ok_or_else(|| EngineError::MemoryBudget("graph CUDA Q2 offset overflows".into()))?;
+        let mut q4_page_ptr = device_ptr_offset(paged.q4_pages.ptr(), q4_offset)?;
+        let mut q2_page_ptr = device_ptr_offset(paged.q2_pages.ptr(), q2_offset)?;
+        let mut page_tokens = cuda_u32(paged.config.page_tokens, "graph CUDA page tokens")?;
+        let mut blocks_per_token =
+            cuda_u32(paged.blocks_per_token, "graph CUDA KV blocks per token")?;
+        let mut params = [
+            (&mut q4_page_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q2_page_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut page_tokens as *mut u32).cast::<c_void>(),
+            (&mut blocks_per_token as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.demote_paged_kv_q4_to_q2_function,
+                    cuda_u32(
+                        paged
+                            .config
+                            .page_tokens
+                            .checked_mul(paged.blocks_per_token)
+                            .ok_or_else(|| {
+                                EngineError::MemoryBudget(
+                                    "graph CUDA demotion grid overflows".into(),
+                                )
+                            })?,
+                        "graph CUDA demotion grid",
+                    )?,
+                    1,
+                    1,
+                    16,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "graph prefill Q4-to-Q2 demotion kernel launch",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn append_and_dispatch_graph_paged_q2q4_gqa_split_device<'a>(
+        &self,
+        paged: &PreparedCudaGraphPagedGqa,
+        split: &'a PreparedCudaSplitPagedGqa,
+        state: &PreparedCudaDecodeState,
+        query: CudaDeviceF32View<'_>,
+        key: CudaDeviceF32View<'_>,
+        value: CudaDeviceF32View<'_>,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &paged.context)
+            || !Rc::ptr_eq(&self.inner, &split.context)
+            || !Rc::ptr_eq(&self.inner, &state.context)
+            || !Rc::ptr_eq(&self.inner, query.context)
+            || !Rc::ptr_eq(&self.inner, key.context)
+            || !Rc::ptr_eq(&self.inner, value.context)
+        {
+            return Err(EngineError::InvalidState(
+                "graph CUDA paged GQA crosses driver contexts".into(),
+            ));
+        }
+        let query_values = paged.config.query_heads * paged.config.head_dim;
+        if query.values() != query_values
+            || key.values() != paged.component_values
+            || value.values() != paged.component_values
+        {
+            return Err(EngineError::Shape(
+                "graph CUDA paged GQA Q/K/V shape is invalid".into(),
+            ));
+        }
+        self.make_current()?;
+        let mut q4_pages = paged.q4_pages.ptr();
+        let mut key_ptr = key.ptr()?;
+        let mut value_ptr = value.ptr()?;
+        let mut position = state.position.ptr();
+        let mut maximum_tokens =
+            cuda_u32(paged.config.maximum_tokens, "graph CUDA maximum tokens")?;
+        let mut page_tokens = cuda_u32(paged.config.page_tokens, "graph CUDA page tokens")?;
+        let mut sink_pages = cuda_u32(paged.sink_pages, "graph CUDA sink pages")?;
+        let mut q4_ring_pages = cuda_u32(paged.q4_ring_pages, "graph CUDA Q4 ring pages")?;
+        let mut component_values = cuda_u32(paged.component_values, "graph CUDA KV width")?;
+        let mut q4_token_bytes = cuda_u32(paged.q4_token_bytes, "graph CUDA Q4 token bytes")?;
+        let mut q4_page_bytes = cuda_u32(paged.q4_page_bytes, "graph CUDA Q4 page bytes")?;
+        let mut pack_params = [
+            (&mut q4_pages as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut key_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut value_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut position as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut maximum_tokens as *mut u32).cast::<c_void>(),
+            (&mut page_tokens as *mut u32).cast::<c_void>(),
+            (&mut sink_pages as *mut u32).cast::<c_void>(),
+            (&mut q4_ring_pages as *mut u32).cast::<c_void>(),
+            (&mut component_values as *mut u32).cast::<c_void>(),
+            (&mut q4_token_bytes as *mut u32).cast::<c_void>(),
+            (&mut q4_page_bytes as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.pack_graph_kv_q4_f32_function,
+                    cuda_u32(paged.blocks_per_token, "graph CUDA KV blocks")?,
+                    1,
+                    1,
+                    64,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    pack_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "graph CUDA Q4 KV pack kernel launch",
+            )?;
+        }
+
+        let mut q4_pages = paged.q4_pages.ptr();
+        let mut q2_pages = paged.q2_pages.ptr();
+        let mut position = state.position.ptr();
+        let mut sink_tokens = cuda_u32(paged.config.sink_tokens, "graph CUDA sink tokens")?;
+        let mut recent_tokens = cuda_u32(paged.config.recent_tokens, "graph CUDA recent tokens")?;
+        let mut blocks_per_token = cuda_u32(paged.blocks_per_token, "graph CUDA blocks per token")?;
+        let mut q2_page_bytes = cuda_u32(paged.q2_page_bytes, "graph CUDA Q2 page bytes")?;
+        let mut demote_params = [
+            (&mut q4_pages as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q2_pages as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut position as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut maximum_tokens as *mut u32).cast::<c_void>(),
+            (&mut page_tokens as *mut u32).cast::<c_void>(),
+            (&mut sink_tokens as *mut u32).cast::<c_void>(),
+            (&mut recent_tokens as *mut u32).cast::<c_void>(),
+            (&mut sink_pages as *mut u32).cast::<c_void>(),
+            (&mut q4_ring_pages as *mut u32).cast::<c_void>(),
+            (&mut blocks_per_token as *mut u32).cast::<c_void>(),
+            (&mut q2_page_bytes as *mut u32).cast::<c_void>(),
+            (&mut q4_page_bytes as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.demote_graph_kv_q4_to_q2_function,
+                    cuda_u32(
+                        paged.config.page_tokens * paged.blocks_per_token,
+                        "graph CUDA demotion grid",
+                    )?,
+                    1,
+                    1,
+                    16,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    demote_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "graph CUDA Q4-to-Q2 demotion kernel launch",
+            )?;
+        }
+
+        let mut query_ptr = query.ptr()?;
+        let mut q2_pages = paged.q2_pages.ptr();
+        let mut q4_pages = paged.q4_pages.ptr();
+        let mut position = state.position.ptr();
+        let mut partial_output = split.partial_output.ptr();
+        let mut partial_maximum = split.partial_maximum.ptr();
+        let mut partial_denominator = split.partial_denominator.ptr();
+        let mut graph_params = paged.params.ptr();
+        let mut segments = cuda_u32(PAGED_GQA_SPLIT_SEGMENTS, "graph CUDA GQA segments")?;
+        let mut partial_params = [
+            (&mut query_ptr as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q2_pages as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut q4_pages as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut position as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_maximum as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_denominator as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut graph_params as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut segments as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.graph_paged_q2q4_gqa_split_partial_f32_function,
+                    cuda_u32(
+                        paged.config.query_heads * PAGED_GQA_SPLIT_SEGMENTS,
+                        "graph CUDA split GQA grid",
+                    )?,
+                    1,
+                    1,
+                    WARP_SIZE,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    partial_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "graph CUDA split GQA partial kernel launch",
+            )?;
+        }
+
+        let mut output = split.output.ptr();
+        let mut query_tokens = 1_u32;
+        let mut combine_params = [
+            (&mut partial_output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_maximum as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut partial_denominator as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut output as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut graph_params as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut query_tokens as *mut u32).cast::<c_void>(),
+            (&mut segments as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.paged_q2q4_gqa_split_combine_f32_function,
+                    cuda_u32(paged.config.query_heads, "graph CUDA combine grid")?,
+                    1,
+                    1,
+                    WARP_SIZE,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    combine_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "graph CUDA split GQA combine kernel launch",
+            )?;
+        }
+        // Intentionally no host/context synchronization here: this exact
+        // append + demote + attention sequence is captured by the decode
+        // graph. Explicit verifier readback and graph-launch boundaries own
+        // synchronization outside production replay.
+        split.output.f32_view(0, query_values)
+    }
+
     pub fn dispatch_paged_q2q4_gqa_split(
         &self,
         paged: &PreparedCudaPagedGqa,
@@ -5629,7 +7242,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     partial_params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -5661,7 +7274,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     combine_params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -5875,6 +7488,579 @@ impl CudaCandidateRuntime {
         })
     }
 
+    pub fn prepare_decode_state(
+        &self,
+        token_id: u32,
+        position: u64,
+    ) -> Result<PreparedCudaDecodeState> {
+        if token_id as usize >= TOKENIZER_VOCAB_SIZE {
+            return Err(EngineError::Shape(format!(
+                "CUDA decode token {token_id} exceeds vocabulary {TOKENIZER_VOCAB_SIZE}"
+            )));
+        }
+        Ok(PreparedCudaDecodeState {
+            context: Rc::clone(&self.inner),
+            token_id: DeviceBuffer::from_bytes(self, &token_id.to_le_bytes())?,
+            position: DeviceBuffer::from_bytes(self, &position.to_le_bytes())?,
+            argmax: DeviceBuffer::allocate(self, 2 * std::mem::size_of::<u32>())?,
+        })
+    }
+
+    pub fn write_decode_position(
+        &self,
+        state: &PreparedCudaDecodeState,
+        position: u64,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &state.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA decode state belongs to another context".into(),
+            ));
+        }
+        state.position.write(&position.to_le_bytes())
+    }
+
+    pub fn write_decode_token(&self, state: &PreparedCudaDecodeState, token_id: u32) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &state.context) || token_id as usize >= TOKENIZER_VOCAB_SIZE {
+            return Err(EngineError::InvalidState(
+                "CUDA decode token state belongs to another context or is out of vocabulary".into(),
+            ));
+        }
+        state.token_id.write(&token_id.to_le_bytes())
+    }
+
+    pub fn copy_decode_token_device(
+        &self,
+        destination: &PreparedCudaDecodeState,
+        source: &PreparedCudaDecodeState,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &destination.context)
+            || !Rc::ptr_eq(&self.inner, &source.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA decode token copy crosses driver contexts".into(),
+            ));
+        }
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod_async)(
+                    destination.token_id.ptr(),
+                    source.token_id.ptr(),
+                    std::mem::size_of::<u32>(),
+                    self.inner.stream,
+                ),
+                "decode token device-to-device copy",
+            )
+        }
+    }
+
+    pub fn copy_decode_token_to_mtp_draft_slot(
+        &self,
+        prepared: &PreparedCudaMtpCompactResult,
+        slot: usize,
+        source: &PreparedCudaDecodeState,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &source.context)
+            || slot >= CUDA_MTP_MAXIMUM_DRAFT_TOKENS
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP draft-slot copy has invalid context or slot".into(),
+            ));
+        }
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod_async)(
+                    device_ptr_offset(prepared.draft_ids.ptr(), slot * std::mem::size_of::<u32>())?,
+                    source.token_id.ptr(),
+                    std::mem::size_of::<u32>(),
+                    self.inner.stream,
+                ),
+                "CUDA MTP draft token D2D slot copy",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod_async)(
+                    device_ptr_offset(
+                        prepared.draft_statuses.ptr(),
+                        slot * std::mem::size_of::<u32>(),
+                    )?,
+                    device_ptr_offset(source.argmax.ptr(), std::mem::size_of::<u32>())?,
+                    std::mem::size_of::<u32>(),
+                    self.inner.stream,
+                ),
+                "CUDA MTP draft argmax-status D2D slot copy",
+            )
+        }
+    }
+
+    pub fn assemble_mtp_verify_input_ids_device(
+        &self,
+        prepared: &PreparedCudaMtpCompactResult,
+        target: &PreparedCudaDecodeState,
+        draft_count: usize,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !Rc::ptr_eq(&self.inner, &target.context)
+            || !(1..=CUDA_MTP_MAXIMUM_DRAFT_TOKENS).contains(&draft_count)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP verify-input assembly has invalid context or draft count".into(),
+            ));
+        }
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod_async)(
+                    prepared.verify_input_ids.ptr(),
+                    target.token_id.ptr(),
+                    std::mem::size_of::<u32>(),
+                    self.inner.stream,
+                ),
+                "CUDA MTP target input D2D copy",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod_async)(
+                    device_ptr_offset(prepared.verify_input_ids.ptr(), std::mem::size_of::<u32>())?,
+                    prepared.draft_ids.ptr(),
+                    draft_count * std::mem::size_of::<u32>(),
+                    self.inner.stream,
+                ),
+                "CUDA MTP draft-vector D2D copy",
+            )
+        }
+    }
+
+    pub fn dispatch_embedding_mtp_verify_inputs_device<'a>(
+        &self,
+        embedding: &PreparedCudaEmbedding,
+        workspace: &'a PreparedCudaBatchedEmbeddingWorkspace,
+        prepared: &PreparedCudaMtpCompactResult,
+        draft_count: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !(1..=CUDA_MTP_MAXIMUM_DRAFT_TOKENS).contains(&draft_count)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP verify embedding has invalid context or draft count".into(),
+            ));
+        }
+        self.dispatch_embedding_rows_from_device_ids(
+            embedding,
+            workspace,
+            prepared.verify_input_ids.ptr(),
+            draft_count + 1,
+        )
+    }
+
+    pub fn restore_decode_token_from_mtp_verify_input_device(
+        &self,
+        state: &PreparedCudaDecodeState,
+        prepared: &PreparedCudaMtpCompactResult,
+        input_index: usize,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &state.context)
+            || !Rc::ptr_eq(&self.inner, &prepared.context)
+            || input_index > CUDA_MTP_MAXIMUM_DRAFT_TOKENS
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP verify-input restore has invalid context or index".into(),
+            ));
+        }
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod_async)(
+                    state.token_id.ptr(),
+                    device_ptr_offset(
+                        prepared.verify_input_ids.ptr(),
+                        input_index * std::mem::size_of::<u32>(),
+                    )?,
+                    std::mem::size_of::<u32>(),
+                    self.inner.stream,
+                ),
+                "CUDA MTP verify-input token restore",
+            )
+        }
+    }
+
+    pub fn commit_decode_state_from_mtp_bonus_device(
+        &self,
+        state: &PreparedCudaDecodeState,
+        prepared: &PreparedCudaMtpCompactResult,
+        draft_count: usize,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &state.context)
+            || !Rc::ptr_eq(&self.inner, &prepared.context)
+            || !(1..=CUDA_MTP_MAXIMUM_DRAFT_TOKENS).contains(&draft_count)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA MTP bonus commit has invalid context or draft count".into(),
+            ));
+        }
+        self.make_current()?;
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod_async)(
+                    state.token_id.ptr(),
+                    device_ptr_offset(
+                        prepared.target_ids.ptr(),
+                        draft_count * std::mem::size_of::<u32>(),
+                    )?,
+                    std::mem::size_of::<u32>(),
+                    self.inner.stream,
+                ),
+                "CUDA MTP bonus-token D2D commit",
+            )?;
+            for _ in 0..=draft_count {
+                let mut position = state.position.ptr();
+                let mut params = [(&mut position as *mut CuDevicePtr).cast::<c_void>()];
+                self.inner.driver.check(
+                    (self.inner.driver.launch_kernel)(
+                        self.inner.increment_u64_function,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        0,
+                        self.inner.stream,
+                        params.as_mut_ptr(),
+                        ptr::null_mut(),
+                    ),
+                    "CUDA MTP target-position increment",
+                )?;
+            }
+        }
+        self.synchronize_after_launch("CUDA MTP bonus-state commit synchronization")
+    }
+
+    pub fn dispatch_embedding_decode_state_device<'a>(
+        &self,
+        prepared: &PreparedCudaEmbedding,
+        workspace: &'a PreparedCudaBatchedEmbeddingWorkspace,
+        state: &PreparedCudaDecodeState,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        if !Rc::ptr_eq(&self.inner, &state.context)
+            || !Rc::ptr_eq(&self.inner, &workspace.context)
+            || workspace.token_capacity == 0
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA decode embedding state/workspace belongs to another context".into(),
+            ));
+        }
+        self.dispatch_embedding_rows_from_device_ids(prepared, workspace, state.token_id.ptr(), 1)
+    }
+
+    pub fn write_decode_rope_position_device(
+        &self,
+        workspace: &PreparedCudaBatchedRopeWorkspace,
+        state: &PreparedCudaDecodeState,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &workspace.context)
+            || !Rc::ptr_eq(&self.inner, &state.context)
+            || workspace.token_capacity == 0
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA decode RoPE state/workspace belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        let mut cosine = workspace.cosine.ptr();
+        let mut sine = workspace.sine.ptr();
+        let mut position = state.position.ptr();
+        let mut rotary_dim = workspace.rotary_dim;
+        let mut theta = workspace.theta;
+        let mut params = [
+            (&mut cosine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut sine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut position as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut rotary_dim as *mut u32).cast::<c_void>(),
+            (&mut theta as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.rope_table_position_f32_function,
+                    (workspace.rotary_dim / 2).div_ceil(LINEAR_THREADS_PER_BLOCK),
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "device-position RoPE table kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("device-position RoPE table synchronization")
+    }
+
+    pub fn write_batched_rope_positions_decode_state_device(
+        &self,
+        workspace: &PreparedCudaBatchedRopeWorkspace,
+        state: &PreparedCudaDecodeState,
+        token_count: usize,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &workspace.context)
+            || !Rc::ptr_eq(&self.inner, &state.context)
+            || token_count == 0
+            || token_count > workspace.token_capacity as usize
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA batched device-position RoPE state/workspace is invalid".into(),
+            ));
+        }
+        self.make_current()?;
+        let table_values = token_count
+            .checked_mul((workspace.rotary_dim / 2) as usize)
+            .ok_or_else(|| EngineError::Shape("CUDA device RoPE table size overflows".into()))?;
+        let mut cosine = workspace.cosine.ptr();
+        let mut sine = workspace.sine.ptr();
+        let mut position = state.position.ptr();
+        let mut token_count = cuda_u32(token_count, "CUDA device RoPE token count")?;
+        let mut rotary_dim = workspace.rotary_dim;
+        let mut theta = workspace.theta;
+        let mut params = [
+            (&mut cosine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut sine as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut position as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut token_count as *mut u32).cast::<c_void>(),
+            (&mut rotary_dim as *mut u32).cast::<c_void>(),
+            (&mut theta as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.rope_table_positions_f32_function,
+                    cuda_u32(
+                        table_values.div_ceil(LINEAR_THREADS_PER_BLOCK as usize),
+                        "CUDA device RoPE grid",
+                    )?,
+                    1,
+                    1,
+                    LINEAR_THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "batched device-position RoPE table kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("batched device-position RoPE table synchronization")
+    }
+
+    pub fn enqueue_decode_argmax_and_advance(
+        &self,
+        state: &PreparedCudaDecodeState,
+        logits: CudaDeviceF32View<'_>,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &state.context)
+            || !Rc::ptr_eq(&self.inner, logits.context)
+            || logits.values() != TOKENIZER_VOCAB_SIZE
+        {
+            return Err(EngineError::Shape(
+                "CUDA decode argmax requires one resident full-vocabulary row".into(),
+            ));
+        }
+        self.make_current()?;
+        let mut input = logits.ptr()?;
+        let mut result = state.argmax.ptr();
+        let mut count = cuda_u32(logits.values(), "CUDA decode argmax width")?;
+        let mut params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut result as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut count as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.argmax_f32_function,
+                    1,
+                    1,
+                    1,
+                    THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "decode argmax kernel launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.memcpy_dtod_async)(
+                    state.token_id.ptr(),
+                    state.argmax.ptr(),
+                    std::mem::size_of::<u32>(),
+                    self.inner.stream,
+                ),
+                "decode argmax token chaining",
+            )?;
+            let mut position = state.position.ptr();
+            let mut increment_params = [(&mut position as *mut CuDevicePtr).cast::<c_void>()];
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.increment_u64_function,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    increment_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "decode position increment kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("decode argmax/position synchronization")
+    }
+
+    pub fn enqueue_restricted_argmax_and_advance(
+        &self,
+        state: &PreparedCudaDecodeState,
+        logits: CudaDeviceF32View<'_>,
+        gathered: &PreparedCudaGatheredA8Projection,
+    ) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &state.context)
+            || !Rc::ptr_eq(&self.inner, logits.context)
+            || !Rc::ptr_eq(&self.inner, &gathered.context)
+            || logits.values() != gathered.rows as usize
+        {
+            return Err(EngineError::Shape(
+                "CUDA restricted argmax has invalid state, logits, or row map".into(),
+            ));
+        }
+        self.make_current()?;
+        let mut input = logits.ptr()?;
+        let mut result = state.argmax.ptr();
+        let mut count = gathered.rows;
+        let mut argmax_params = [
+            (&mut input as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut result as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut count as *mut u32).cast::<c_void>(),
+        ];
+        let mut canonical = gathered.canonical_row_ids.ptr();
+        let mut token = state.token_id.ptr();
+        let mut map_params = [
+            (&mut result as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut canonical as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut token as *mut CuDevicePtr).cast::<c_void>(),
+            (&mut count as *mut u32).cast::<c_void>(),
+        ];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.argmax_f32_function,
+                    1,
+                    1,
+                    1,
+                    THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    argmax_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "restricted decode argmax launch",
+            )?;
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.map_argmax_row_u32_function,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    map_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "restricted decode canonical-row map launch",
+            )?;
+            let mut position = state.position.ptr();
+            let mut increment_params = [(&mut position as *mut CuDevicePtr).cast::<c_void>()];
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.increment_u64_function,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    increment_params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "restricted decode position increment",
+            )?;
+        }
+        self.synchronize_after_launch("restricted decode argmax/position synchronization")
+    }
+
+    pub fn verifier_read_decode_state(
+        &self,
+        state: &PreparedCudaDecodeState,
+    ) -> Result<(u32, u64)> {
+        if !Rc::ptr_eq(&self.inner, &state.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA decode state belongs to another context".into(),
+            ));
+        }
+        self.synchronize_context("decode state verifier synchronization")?;
+        let mut token = [0_u32; 1];
+        let mut position = [0_u64; 1];
+        state.token_id.copy_to(as_bytes_mut(&mut token))?;
+        state.position.copy_to(as_bytes_mut(&mut position))?;
+        Ok((token[0], position[0]))
+    }
+
+    pub fn advance_decode_position_device(&self, state: &PreparedCudaDecodeState) -> Result<()> {
+        if !Rc::ptr_eq(&self.inner, &state.context) {
+            return Err(EngineError::InvalidState(
+                "CUDA decode state belongs to another context".into(),
+            ));
+        }
+        self.make_current()?;
+        let mut position = state.position.ptr();
+        let mut params = [(&mut position as *mut CuDevicePtr).cast::<c_void>()];
+        unsafe {
+            self.inner.driver.check(
+                (self.inner.driver.launch_kernel)(
+                    self.inner.increment_u64_function,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    self.inner.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "decode verifier position increment kernel launch",
+            )?;
+        }
+        self.synchronize_after_launch("decode verifier position synchronization")
+    }
+
     pub fn dispatch_embedding_rows_device<'a>(
         &self,
         prepared: &PreparedCudaEmbedding,
@@ -5897,6 +8083,21 @@ impl CudaCandidateRuntime {
             row_bytes.extend_from_slice(&row.to_le_bytes());
         }
         workspace.row_ids.write_range(0, &row_bytes)?;
+        self.dispatch_embedding_rows_from_device_ids(
+            prepared,
+            workspace,
+            workspace.row_ids.ptr(),
+            row_ids.len(),
+        )
+    }
+
+    fn dispatch_embedding_rows_from_device_ids<'a>(
+        &self,
+        prepared: &PreparedCudaEmbedding,
+        workspace: &'a PreparedCudaBatchedEmbeddingWorkspace,
+        row_ids: CuDevicePtr,
+        requested_rows: usize,
+    ) -> Result<CudaDeviceF32View<'a>> {
         self.make_current()?;
         let launches: Vec<(TensorDType, u32, u32, usize)> = match &prepared.layout {
             CudaA8ProjectionLayout::Pure(dtype) => vec![(*dtype, 0, prepared.rows, 0)],
@@ -5921,9 +8122,9 @@ impl CudaCandidateRuntime {
             let mut weights = device_ptr_offset(prepared.weights.ptr(), weight_offset)?;
             let mut s_in = prepared.s_in.ptr();
             let mut s_out = prepared.s_out.ptr();
-            let mut ids = workspace.row_ids.ptr();
+            let mut ids = row_ids;
             let mut output = workspace.output.ptr();
-            let mut requested_rows = u32::try_from(row_ids.len())
+            let mut requested_rows = u32::try_from(requested_rows)
                 .map_err(|_| EngineError::Shape("CUDA embedding row count exceeds u32".into()))?;
             let mut columns = prepared.columns;
             let mut params = [
@@ -5948,7 +8149,7 @@ impl CudaCandidateRuntime {
                         1,
                         1,
                         0,
-                        ptr::null_mut(),
+                        self.inner.stream,
                         params.as_mut_ptr(),
                         ptr::null_mut(),
                     ),
@@ -5958,8 +8159,7 @@ impl CudaCandidateRuntime {
         }
         workspace.output.f32_view(
             0,
-            row_ids
-                .len()
+            (requested_rows as usize)
                 .checked_mul(prepared.columns as usize)
                 .ok_or_else(|| {
                     EngineError::Shape("CUDA batched embedding output view overflows".into())
@@ -6017,7 +8217,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -6109,7 +8309,7 @@ impl CudaCandidateRuntime {
                         1,
                         1,
                         0,
-                        ptr::null_mut(),
+                        self.inner.stream,
                         params.as_mut_ptr(),
                         ptr::null_mut(),
                     ),
@@ -6693,15 +8893,17 @@ impl CudaCandidateRuntime {
         let (local_ids, groups) =
             build_gathered_row_plan(&projection.layout, projection.rows, row_ids)?;
         self.make_current()?;
-        let row_ids = DeviceBuffer::from_bytes(self, as_bytes(&local_ids))?;
+        let local_row_ids = DeviceBuffer::from_bytes(self, as_bytes(&local_ids))?;
+        let canonical_row_ids = DeviceBuffer::from_bytes(self, as_bytes(row_ids))?;
         let output_bytes = local_ids
             .len()
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| EngineError::Shape("gathered CUDA output size overflows".into()))?;
         let output = DeviceBuffer::allocate(self, output_bytes)?;
-        let resident_bytes = row_ids
+        let resident_bytes = local_row_ids
             .len()
-            .checked_add(output.len())
+            .checked_add(canonical_row_ids.len())
+            .and_then(|bytes| bytes.checked_add(output.len()))
             .ok_or_else(|| EngineError::Shape("gathered CUDA residency overflows".into()))?;
         Ok(PreparedCudaGatheredA8Projection {
             context: Rc::clone(&self.inner),
@@ -6709,7 +8911,8 @@ impl CudaCandidateRuntime {
                 .map_err(|_| EngineError::Shape("gathered CUDA rows exceed u32".into()))?,
             columns: projection.columns,
             groups,
-            row_ids,
+            row_ids: local_row_ids,
+            canonical_row_ids,
             output,
             resident_bytes,
         })
@@ -7125,6 +9328,75 @@ impl CudaCandidateRuntime {
                 outputs.device_output(*slot, projection.rows(), batch_rows as usize)
             })
             .collect()
+    }
+
+    /// Execute one arbitrary-width batched projection with the graph's shared
+    /// activation workspace. This is used by the five-row target LM head,
+    /// whose vocabulary output intentionally does not fit the four ordinary
+    /// intermediate-output arena slots.
+    pub fn dispatch_batched_a8_output_device<'a>(
+        &self,
+        activation: &PreparedCudaA8Activation,
+        workspace: &PreparedCudaBatchedA8Workspace,
+        output: &'a PreparedCudaBatchedA8Output,
+        input: CudaDeviceF32View<'_>,
+        batch_rows: usize,
+        projection: &PreparedCudaA8Projection,
+    ) -> Result<CudaDeviceF32View<'a>> {
+        let batch_rows = validate_a8_batch_capacity(batch_rows)?;
+        if !Rc::ptr_eq(&self.inner, &activation.context)
+            || !Rc::ptr_eq(&self.inner, &workspace.context)
+            || !Rc::ptr_eq(&self.inner, &output.context)
+            || !Rc::ptr_eq(&self.inner, &projection.context)
+            || !Rc::ptr_eq(&self.inner, input.context)
+        {
+            return Err(EngineError::InvalidState(
+                "CUDA dedicated batched projection crosses driver contexts".into(),
+            ));
+        }
+        if activation.columns != projection.columns
+            || activation.correction_identity != projection.correction_identity
+        {
+            return Err(EngineError::InvalidArtifact(
+                "CUDA dedicated batched projection s_in identity differs".into(),
+            ));
+        }
+        if activation.columns > workspace.column_capacity
+            || batch_rows > workspace.batch_capacity
+            || batch_rows > output.batch_capacity
+            || output.rows != projection.rows
+        {
+            return Err(EngineError::MemoryBudget(format!(
+                "CUDA dedicated batched output does not admit {batch_rows}x{} projection",
+                projection.rows
+            )));
+        }
+        let input_values = (batch_rows as usize)
+            .checked_mul(activation.columns as usize)
+            .ok_or_else(|| EngineError::Shape("CUDA dedicated batched input overflows".into()))?;
+        if input.values() != input_values {
+            return Err(EngineError::Shape(format!(
+                "CUDA dedicated batched input has {} values, expected {input_values}",
+                input.values()
+            )));
+        }
+        self.launch_batched_a8_quantization(
+            input.ptr()?,
+            activation.s_in.as_ref().map_or(0, DeviceBuffer::ptr),
+            workspace.q8_codes.ptr(),
+            workspace.q8_scales.ptr(),
+            activation.columns,
+            batch_rows,
+        )?;
+        self.launch_batched_a8_projection_buffers(
+            workspace.q8_codes.ptr(),
+            workspace.q8_scales.ptr(),
+            projection,
+            output.output.ptr(),
+            batch_rows,
+        )?;
+        self.synchronize_after_launch("CUDA dedicated batched projection synchronization")?;
+        output.device_output(batch_rows as usize)
     }
 
     /// Batches the complete Qwen FFN middle edge over one prompt chunk. The
@@ -7577,7 +9849,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -7623,7 +9895,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -7669,7 +9941,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -8017,7 +10289,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -8083,7 +10355,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -8149,7 +10421,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -8208,7 +10480,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -8273,7 +10545,7 @@ impl CudaCandidateRuntime {
                     1,
                     1,
                     0,
-                    ptr::null_mut(),
+                    self.inner.stream,
                     params.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
@@ -8340,7 +10612,7 @@ impl CudaCandidateRuntime {
                         1,
                         1,
                         0,
-                        ptr::null_mut(),
+                        self.inner.stream,
                         params.as_mut_ptr(),
                         ptr::null_mut(),
                     ),
@@ -8740,6 +11012,27 @@ impl PreparedCudaArgmax {
     }
 }
 
+impl PreparedCudaF32Scratch {
+    pub fn resident_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn device_view(&self) -> Result<CudaDeviceF32View<'_>> {
+        self.buffer.f32_view(0, self.values)
+    }
+}
+
+impl PreparedCudaMtpCompactResult {
+    pub fn resident_bytes(&self) -> usize {
+        self.draft_ids.len()
+            + self.draft_statuses.len()
+            + self.verify_input_ids.len()
+            + self.target_ids.len()
+            + self.argmax_results.len()
+            + self.physical_record.len()
+    }
+}
+
 impl PreparedCudaTopKTopPSampler {
     pub fn max_values(&self) -> usize {
         self.max_values
@@ -8810,6 +11103,95 @@ impl PreparedCudaBatchedEmbeddingWorkspace {
             ));
         }
         self.output.f32_view(0, tokens * self.columns())
+    }
+}
+
+impl PreparedCudaDecodeState {
+    pub fn resident_bytes(&self) -> usize {
+        self.token_id.len() + self.position.len() + self.argmax.len()
+    }
+
+    pub fn write_position(&self, position: u64) -> Result<()> {
+        self.position.write(&position.to_le_bytes())
+    }
+}
+
+impl PreparedCudaGraphPagedGqa {
+    pub fn packed_device_bytes(&self) -> usize {
+        self.packed_device_bytes
+    }
+
+    pub fn config(&self) -> CudaPagedGqaConfig {
+        self.config
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    pub fn q4_tokens(&self) -> usize {
+        let sink = self.tokens.min(self.config.sink_tokens);
+        let recent_start = self.tokens.saturating_sub(self.config.recent_tokens);
+        let first_recent_token = (recent_start / self.config.page_tokens) * self.config.page_tokens;
+        sink + self
+            .tokens
+            .saturating_sub(self.config.sink_tokens.max(first_recent_token))
+    }
+
+    pub fn q2_tokens(&self) -> usize {
+        self.tokens.saturating_sub(self.q4_tokens())
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        self.q2_pages.zero()?;
+        self.q4_pages.zero()?;
+        self.tokens = 0;
+        self.poisoned = false;
+        self.speculative_checkpoint_tokens = None;
+        Ok(())
+    }
+
+    pub fn record_decode_token(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(EngineError::InvalidState(
+                "graph CUDA KV cache is poisoned".into(),
+            ));
+        }
+        self.tokens = self.tokens.checked_add(1).ok_or_else(|| {
+            EngineError::MemoryBudget("graph CUDA KV token count overflows".into())
+        })?;
+        if self.tokens > self.config.maximum_tokens {
+            self.poisoned = true;
+            return Err(EngineError::MemoryBudget(
+                "graph CUDA KV token count exceeds capacity".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn begin_speculative(&mut self) -> Result<()> {
+        if self.poisoned || self.speculative_checkpoint_tokens.is_some() {
+            return Err(EngineError::InvalidState(
+                "graph CUDA KV checkpoint requires healthy unbranched state".into(),
+            ));
+        }
+        self.speculative_checkpoint_tokens = Some(self.tokens);
+        Ok(())
+    }
+
+    pub fn restore_speculative(&mut self) -> Result<()> {
+        self.tokens = self.speculative_checkpoint_tokens.take().ok_or_else(|| {
+            EngineError::InvalidState("graph CUDA KV cache has no checkpoint".into())
+        })?;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn commit_speculative(&mut self) -> Result<()> {
+        self.speculative_checkpoint_tokens.take().ok_or_else(|| {
+            EngineError::InvalidState("graph CUDA KV cache has no checkpoint".into())
+        })?;
+        Ok(())
     }
 }
 
@@ -9501,10 +11883,44 @@ impl PreparedCudaF32Checkpoint {
     }
 }
 
+impl CudaCapturedGraph {
+    pub(crate) fn launch(&self) -> Result<()> {
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.ctx_set_current)(self.context.context),
+                "graph context selection",
+            )?;
+            self.context.driver.check(
+                (self.context.driver.graph_launch)(self.executable, self.context.stream),
+                "graph launch",
+            )
+        }
+    }
+}
+
+impl Drop for CudaCapturedGraph {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (self.context.driver.ctx_set_current)(self.context.context);
+            let _ = (self.context.driver.graph_exec_destroy)(self.executable);
+            let _ = (self.context.driver.graph_destroy)(self.graph);
+        }
+    }
+}
+
 impl Drop for CudaContextInner {
     fn drop(&mut self) {
         unsafe {
             let _ = (self.driver.ctx_set_current)(self.context);
+            if self.graph_capture_active.get() {
+                let mut graph = ptr::null_mut();
+                let _ = (self.driver.stream_end_capture)(self.stream, &mut graph);
+                if !graph.is_null() {
+                    let _ = (self.driver.graph_destroy)(graph);
+                }
+            }
+            let _ = (self.driver.stream_synchronize)(self.stream);
+            let _ = (self.driver.stream_destroy)(self.stream);
             let _ = (self.driver.module_unload)(self.module);
             let _ = (self.driver.ctx_destroy)(self.context);
         }
@@ -9662,6 +12078,16 @@ impl DeviceBuffer {
             self.context.driver.check(
                 (self.context.driver.memset_d8)(self.ptr, 0, self.len),
                 "device-buffer zero",
+            )
+        }
+    }
+
+    fn zero_async(&self) -> Result<()> {
+        self.context.make_current()?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.memset_d8_async)(self.ptr, 0, self.len, self.context.stream),
+                "asynchronous device-buffer zero",
             )
         }
     }
@@ -9920,6 +12346,107 @@ fn paged_prefill_segment(
     } else {
         Ok((page_segment_tokens, demotion_at_page_segment_end))
     }
+}
+
+fn graph_paged_prefill_segment(
+    committed_tokens: usize,
+    remaining_tokens: usize,
+    page_tokens: usize,
+    sink_tokens: usize,
+    recent_tokens: usize,
+) -> Result<(usize, bool)> {
+    if remaining_tokens == 0 || page_tokens == 0 {
+        return Err(EngineError::Shape(
+            "graph CUDA prefill segment requires remaining tokens and page capacity".into(),
+        ));
+    }
+    let token_in_page = committed_tokens % page_tokens;
+    let page_segment_tokens = remaining_tokens.min(page_tokens - token_in_page);
+    let page_segment_end = committed_tokens
+        .checked_add(page_segment_tokens)
+        .ok_or_else(|| EngineError::Shape("graph CUDA page segment end overflows".into()))?;
+    let recent_start = page_segment_end.saturating_sub(recent_tokens);
+    let demotion_at_end = recent_start >= sink_tokens.saturating_add(page_tokens)
+        && recent_start.is_multiple_of(page_tokens);
+    if demotion_at_end && page_segment_tokens > 1 {
+        Ok((page_segment_tokens - 1, false))
+    } else {
+        Ok((page_segment_tokens, demotion_at_end))
+    }
+}
+
+fn graph_q4_slot(logical_page: usize, sink_pages: usize, q4_ring_pages: usize) -> Result<usize> {
+    if logical_page < sink_pages {
+        return Ok(logical_page);
+    }
+    if q4_ring_pages == 0 {
+        return Err(EngineError::MemoryBudget(
+            "graph CUDA Q4 ring has no non-sink slots".into(),
+        ));
+    }
+    sink_pages
+        .checked_add(logical_page % q4_ring_pages)
+        .ok_or_else(|| EngineError::MemoryBudget("graph CUDA Q4 slot overflows".into()))
+}
+
+/// Proves that a bounded speculative prefill cannot overwrite a Q4 page that
+/// belongs to the committed branch. The graph cache deliberately owns one
+/// more non-sink Q4 page than the recent window. A block no wider than one KV
+/// page may therefore finish the current partial page and use at most that one
+/// spare ring page. Metadata rollback is sufficient because neither write can
+/// alias a different live logical page; Q4-to-Q2 demotion is copy-only.
+fn validate_graph_speculative_prefill_append(
+    checkpoint_tokens: usize,
+    current_tokens: usize,
+    append_tokens: usize,
+    page_tokens: usize,
+    sink_pages: usize,
+    recent_tokens: usize,
+    q4_ring_pages: usize,
+) -> Result<()> {
+    if append_tokens == 0
+        || page_tokens == 0
+        || append_tokens > page_tokens
+        || current_tokens != checkpoint_tokens
+    {
+        return Err(EngineError::InvalidState(
+            "graph CUDA speculative prefill must be one bounded append from its checkpoint".into(),
+        ));
+    }
+    let final_tokens = current_tokens.checked_add(append_tokens).ok_or_else(|| {
+        EngineError::MemoryBudget("graph CUDA speculative prefill token count overflows".into())
+    })?;
+    if checkpoint_tokens == 0 {
+        return Ok(());
+    }
+
+    let committed_last_page = (checkpoint_tokens - 1) / page_tokens;
+    let touched_last_page = (final_tokens - 1) / page_tokens;
+    if touched_last_page > committed_last_page + 1 {
+        return Err(EngineError::InvalidState(
+            "graph CUDA speculative prefill spans more than one new KV page".into(),
+        ));
+    }
+    if touched_last_page == committed_last_page {
+        return Ok(());
+    }
+
+    let new_slot = graph_q4_slot(touched_last_page, sink_pages, q4_ring_pages)?;
+    // The segmented prefill demotes the expiring boundary page before it
+    // starts writing the next logical page. Test aliasing against the pages
+    // that are still live at that exact boundary, not against the wider
+    // checkpoint-time Q4 set.
+    let new_page_start = touched_last_page * page_tokens;
+    let first_recent_page =
+        (new_page_start.saturating_sub(recent_tokens) / page_tokens).max(sink_pages);
+    for logical_page in first_recent_page..=committed_last_page {
+        if graph_q4_slot(logical_page, sink_pages, q4_ring_pages)? == new_slot {
+            return Err(EngineError::InvalidState(format!(
+                "graph CUDA speculative KV page {touched_last_page} aliases committed page {logical_page}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_batched_norm_inputs(
@@ -10209,6 +12736,109 @@ mod tests {
     use super::*;
     use crate::format::QuantSegment;
     use crate::loader::{FloatTensorView, QuantizedMatrixView};
+
+    fn mtp_physical(tokens: &[u32], physical_count: u32) -> CudaMtpPhysicalResultRecord {
+        let mut record = CudaMtpPhysicalResultRecord::default();
+        record.words[..tokens.len()].copy_from_slice(tokens);
+        record.words[5] = physical_count;
+        record
+    }
+
+    #[test]
+    fn cuda_mtp_result_layouts_are_stable_and_exact() {
+        assert_eq!(std::mem::size_of::<CudaMtpCompactResultRecord>(), 24);
+        assert_eq!(std::mem::align_of::<CudaMtpCompactResultRecord>(), 4);
+        assert_eq!(
+            std::mem::offset_of!(CudaMtpCompactResultRecord, accepted_count),
+            0
+        );
+        assert_eq!(
+            std::mem::offset_of!(CudaMtpCompactResultRecord, emitted_tokens),
+            4
+        );
+        assert_eq!(
+            std::mem::offset_of!(CudaMtpCompactResultRecord, bonus_token),
+            20
+        );
+        assert_eq!(std::mem::size_of::<CudaMtpPhysicalResultRecord>(), 64);
+        assert_eq!(std::mem::align_of::<CudaMtpPhysicalResultRecord>(), 16);
+        assert_eq!(4 * 4 + 5 * 4 + 64, 100);
+    }
+
+    #[test]
+    fn cuda_mtp_reject_zero_exposes_only_the_target_bonus() {
+        let result = mtp_physical(&[41], 1).checked_compact(4).unwrap();
+        assert_eq!(result.accepted_count, 0);
+        assert_eq!(result.emitted_tokens, [0; 4]);
+        assert_eq!(result.bonus_token, 41);
+    }
+
+    #[test]
+    fn cuda_mtp_partial_rejections_preserve_prefix_and_bonus() {
+        for accepted in 1..=3 {
+            let tokens = [11_u32, 12, 13, 14, 15];
+            let physical_count = accepted + 1;
+            let result = mtp_physical(&tokens[..physical_count], physical_count as u32)
+                .checked_compact(4)
+                .unwrap();
+            assert_eq!(result.accepted_count, accepted as u32);
+            assert_eq!(&result.emitted_tokens[..accepted], &tokens[..accepted]);
+            assert!(result.emitted_tokens[accepted..]
+                .iter()
+                .all(|token| *token == 0));
+            assert_eq!(result.bonus_token, tokens[accepted]);
+        }
+    }
+
+    #[test]
+    fn cuda_mtp_full_accept_returns_four_drafts_and_golden_token() {
+        let result = mtp_physical(&[21, 22, 23, 24, 25], 5)
+            .checked_compact(4)
+            .unwrap();
+        assert_eq!(result.accepted_count, 4);
+        assert_eq!(result.emitted_tokens, [21, 22, 23, 24]);
+        assert_eq!(result.bonus_token, 25);
+    }
+
+    #[test]
+    fn cuda_mtp_count_status_padding_and_stale_words_fail_closed() {
+        assert!(mtp_physical(&[], 0).checked_compact(4).is_err());
+        assert!(mtp_physical(&[1, 2, 3, 4, 5], 5)
+            .checked_compact(3)
+            .is_err());
+        assert!(mtp_physical(&[1], 1).checked_compact(0).is_err());
+        assert!(mtp_physical(&[1], 1).checked_compact(5).is_err());
+
+        for status_word in 6..15 {
+            let mut status = mtp_physical(&[1], 1);
+            status.words[status_word] = 1;
+            assert!(status.checked_compact(4).is_err());
+        }
+        let mut padding = mtp_physical(&[1], 1);
+        padding.words[15] = 1;
+        assert!(padding.checked_compact(4).is_err());
+        let mut stale = mtp_physical(&[1], 1);
+        stale.words[4] = 9;
+        assert!(stale.checked_compact(4).is_err());
+    }
+
+    #[test]
+    fn cuda_mtp_rejects_padded_vocab_and_accepts_last_canonical_token() {
+        let last = (TOKENIZER_VOCAB_SIZE - 1) as u32;
+        assert_eq!(
+            mtp_physical(&[last], 1)
+                .checked_compact(4)
+                .unwrap()
+                .bonus_token,
+            last
+        );
+        assert!(mtp_physical(&[TOKENIZER_VOCAB_SIZE as u32], 1)
+            .checked_compact(4)
+            .is_err());
+        assert!(mtp_physical(&[TOKENIZER_VOCAB_SIZE as u32, 1], 2)
+            .checked_compact(4)
+            .is_err());
+    }
 
     #[test]
     fn driver_2d_descriptor_and_mtp_row_geometry_are_exact() {
@@ -10566,6 +13196,40 @@ mod tests {
     }
 
     #[test]
+    fn graph_paged_prefill_matches_descriptor_demotion_boundaries() {
+        assert_eq!(
+            graph_paged_prefill_segment(384, 128, 128, 128, 256).unwrap(),
+            (127, false)
+        );
+        assert_eq!(
+            graph_paged_prefill_segment(511, 1, 128, 128, 256).unwrap(),
+            (1, true)
+        );
+        assert_eq!(
+            graph_paged_prefill_segment(0, 512, 128, 128, 256).unwrap(),
+            (128, false)
+        );
+        assert_eq!(graph_q4_slot(0, 1, 3).unwrap(), 0);
+        assert_eq!(graph_q4_slot(1, 1, 3).unwrap(), 2);
+        assert_eq!(graph_q4_slot(4, 1, 3).unwrap(), 2);
+        assert!(graph_q4_slot(1, 1, 0).is_err());
+    }
+
+    #[test]
+    fn graph_speculative_prefill_uses_only_the_spare_q4_ring_page() {
+        // At the page-4 boundary, page 1 has just been copied to Q2. Base
+        // pages 2 and 3 remain in the recent window and page 4 maps to the
+        // deliberately spare third ring slot.
+        validate_graph_speculative_prefill_append(510, 510, 5, 128, 1, 256, 3).unwrap();
+        // A block wholly inside the current logical page needs no spare slot.
+        validate_graph_speculative_prefill_append(500, 500, 5, 128, 1, 256, 3).unwrap();
+        assert!(validate_graph_speculative_prefill_append(510, 511, 5, 128, 1, 256, 3).is_err());
+        assert!(validate_graph_speculative_prefill_append(510, 510, 129, 128, 1, 256, 3).is_err());
+        // Without the spare page, logical page 4 aliases committed page 2.
+        assert!(validate_graph_speculative_prefill_append(510, 510, 5, 128, 1, 256, 2).is_err());
+    }
+
+    #[test]
     fn prepared_graph_objects_own_their_context_without_borrowed_lifetimes() {
         fn assert_owned<T: 'static>() {}
         assert_owned::<PreparedCudaMatVec>();
@@ -10577,6 +13241,7 @@ mod tests {
         assert_owned::<PreparedCudaA8Projection>();
         assert_owned::<PreparedCudaBatchedA8Output>();
         assert_owned::<PreparedCudaBatchedA8OutputArena>();
+        assert_owned::<PreparedCudaF32Scratch>();
         assert_owned::<PreparedCudaBatchedRmsNormWorkspace>();
         assert_owned::<PreparedCudaBatchedGatedRmsNormOutput>();
         assert_owned::<PreparedCudaCausalConvScanOutput>();
@@ -10584,6 +13249,7 @@ mod tests {
         assert_owned::<PreparedCudaGatedDeltaScanOutput>();
         assert_owned::<PreparedCudaGatheredA8Projection>();
         assert_owned::<PreparedCudaArgmax>();
+        assert_owned::<PreparedCudaMtpCompactResult>();
         assert_owned::<PreparedCudaRecoveredRow>();
         assert_owned::<PreparedCudaEmbedding>();
         assert_owned::<PreparedCudaBatchedEmbeddingWorkspace>();

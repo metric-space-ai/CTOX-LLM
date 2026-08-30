@@ -32,7 +32,7 @@ material roofline gap is unmeasured or unexplained.
 
 - weighted quality >= 95% of BF16;
 - no primary category below 90% of BF16;
-- recovery closes >= 30% of the direct-quantization gap;
+- recovery closes >= 50% of the direct-quantization gap;
 - agentic tool-error recovery immediately converts an actionable diagnostic
   into the exact corrected call (for example a qualified symbol or the
   repository's actual filename) without an unrelated search branch;

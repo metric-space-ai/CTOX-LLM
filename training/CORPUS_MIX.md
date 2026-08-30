@@ -6,7 +6,12 @@ capability families, application domains, languages, prompt lengths, and output
 shapes. Training and evaluation identities are disjoint before prompt text is
 materialized.
 
-## Final quality-filtered cohort
+## Pilot quality-filtered cohort
+
+The table below describes the completed regression cohort. It is no longer the
+final release corpus. The single final release requires the independently
+audited 1,000,000 training, 50,000 calibration, and 50,000 held-out partitions
+defined by `MILLION_RECOVERY_POLICY.json`.
 
 | Capability stratum | Train | Held-out | Purpose |
 |---|---:|---:|---|

@@ -25,6 +25,10 @@ struct Args {
     relative_tolerance: f32,
     #[arg(long, default_value_t = 20)]
     benchmark_iterations: usize,
+    #[arg(long, default_value_t = 1_000)]
+    graph_replays: usize,
+    #[arg(long, default_value_t = 131_072)]
+    graph_maximum_tokens: usize,
     /// Number of newest causal queries measured by the split-KV path. One is
     /// the ordinary long-context decode shape; five is the MTP4 verification
     /// block shape.
@@ -63,6 +67,16 @@ struct Report<'a> {
     verifier_device_staging_bytes: usize,
     verifier_cpu_packed_bytes: usize,
     q4_tokens: usize,
+    graph_tokenwise_packed_device_bytes: usize,
+    graph_packed_device_bytes: usize,
+    graph_target_16_layer_packed_device_bytes: usize,
+    graph_target_mtp_17_layer_packed_device_bytes: usize,
+    graph_maximum_absolute_delta: f32,
+    graph_device_position_verified: bool,
+    graph_maximum_tokens: usize,
+    graph_replays: usize,
+    graph_microseconds_per_replay: f64,
+    graph_replay_maximum_absolute_error: f32,
     maximum_absolute_error: f32,
     maximum_relative_error: f32,
     split_query_tokens: usize,
@@ -125,19 +139,70 @@ fn main() -> anyhow::Result<()> {
     let mut maximum_relative_error = 0.0_f32;
     let mut split_maximum_absolute_error = 0.0_f32;
     let mut split_maximum_relative_error = 0.0_f32;
+    let mut graph_maximum_absolute_delta = 0.0_f32;
     let packed_device_bytes;
     let transient_bytes;
     let verifier_device_staging_bytes;
     let verifier_cpu_packed_bytes;
     let q4_tokens;
+    let graph_tokenwise_packed_device_bytes;
+    let graph_device_position_verified;
     let split_transient_bytes;
     let free_after_prepare;
     let reset_verified;
     let benchmark;
     let mut latency_sweep = Vec::with_capacity(args.latency_contexts.len());
+    let graph_replay =
+        runtime.verifier_capture_graph_paged_gqa(args.graph_maximum_tokens, args.graph_replays)?;
+    let graph_query: Vec<f32> = (0..config.query_heads * config.head_dim)
+        .map(|index| (index as f32 * 0.017).sin() * 0.35)
+        .collect();
+    let graph_key: Vec<f32> = (0..config.key_value_heads * config.head_dim)
+        .map(|index| (index as f32 * 0.021).cos() * 0.45)
+        .collect();
+    let graph_value: Vec<f32> = (0..config.key_value_heads * config.head_dim)
+        .map(|index| (index as f32 * 0.015).sin() * 0.55)
+        .collect();
+    let mut graph_oracle = PagedKvCache::new(
+        args.graph_replays,
+        config.key_value_heads * config.head_dim,
+        128,
+        128,
+        256,
+    )?;
+    for _ in 0..args.graph_replays {
+        graph_oracle.push(&graph_key, &graph_value)?;
+    }
+    let graph_expected = grouped_query_attention(
+        &graph_query,
+        &graph_oracle.flattened_key(config.key_value_heads, config.head_dim)?,
+        &graph_oracle.flattened_value(config.key_value_heads, config.head_dim)?,
+        config.query_heads,
+        config.key_value_heads,
+        1,
+        args.graph_replays,
+        config.head_dim,
+        args.graph_replays - 1,
+    )?;
+    let mut graph_replay_maximum_absolute_error = 0.0_f32;
+    for (index, (expected, actual)) in graph_expected
+        .iter()
+        .zip(&graph_replay.final_output)
+        .enumerate()
+    {
+        let absolute = (expected - actual).abs();
+        graph_replay_maximum_absolute_error = graph_replay_maximum_absolute_error.max(absolute);
+        anyhow::ensure!(
+            absolute <= args.absolute_tolerance + args.relative_tolerance * expected.abs(),
+            "graph replay output {index}: expected {expected}, got {actual}"
+        );
+    }
     {
         let mut prepared = runtime.prepare_paged_q2q4_gqa(config)?;
         let mut split = runtime.prepare_paged_q2q4_gqa_split(&prepared)?;
+        let graph = runtime.prepare_graph_paged_q2q4_gqa(config)?;
+        let graph_split = runtime.prepare_graph_paged_q2q4_gqa_split(&graph)?;
+        let graph_state = runtime.prepare_decode_state(0, 0)?;
         let query_staging =
             runtime
                 .prepare_verifier_f32_tensor(&vec![0.0; config.query_heads * config.head_dim])?;
@@ -170,6 +235,7 @@ fn main() -> anyhow::Result<()> {
         )?;
         (free_after_prepare, _) = runtime.memory_info()?;
         packed_device_bytes = prepared.packed_device_bytes();
+        graph_tokenwise_packed_device_bytes = graph.packed_device_bytes();
         transient_bytes = prepared.transient_bytes();
         split_transient_bytes = split.transient_bytes();
         let mut query_history =
@@ -195,6 +261,26 @@ fn main() -> anyhow::Result<()> {
                 value_staging.device_view()?,
             )?;
             let actual = runtime.verifier_read_f32(output)?;
+            let graph_output = runtime.append_and_dispatch_graph_paged_q2q4_gqa_split_device(
+                &graph,
+                &graph_split,
+                &graph_state,
+                query_staging.device_view()?,
+                key_staging.device_view()?,
+                value_staging.device_view()?,
+            )?;
+            let graph_actual = runtime.verifier_read_f32(graph_output)?;
+            for (index, (descriptor, graph_value)) in actual.iter().zip(&graph_actual).enumerate() {
+                let absolute = (descriptor - graph_value).abs();
+                graph_maximum_absolute_delta = graph_maximum_absolute_delta.max(absolute);
+                anyhow::ensure!(
+                    absolute
+                        <= args.absolute_tolerance
+                            + args.relative_tolerance * descriptor.abs(),
+                    "token {token} graph output {index}: descriptor {descriptor}, graph {graph_value}"
+                );
+            }
+            runtime.advance_decode_position_device(&graph_state)?;
             oracle.push(&key, &value)?;
             let cached_key = oracle.flattened_key(config.key_value_heads, config.head_dim)?;
             let cached_value = oracle.flattened_value(config.key_value_heads, config.head_dim)?;
@@ -343,6 +429,13 @@ fn main() -> anyhow::Result<()> {
         }
         verifier_cpu_packed_bytes = oracle.packed_bytes();
         q4_tokens = prepared.q4_tokens();
+        let (graph_token, graph_position) = runtime.verifier_read_decode_state(&graph_state)?;
+        graph_device_position_verified = graph_token == 0 && graph_position == args.tokens as u64;
+        anyhow::ensure!(
+            graph_device_position_verified,
+            "graph CUDA decode state ended at token {graph_token}, position {graph_position}, expected token 0 and position {}",
+            args.tokens
+        );
         anyhow::ensure!(
             prepared.q2_tokens() > 0 && q4_tokens == oracle.q4_tokens(),
             "device page demotion differs from the canonical CPU policy"
@@ -382,6 +475,22 @@ fn main() -> anyhow::Result<()> {
             verifier_device_staging_bytes,
             verifier_cpu_packed_bytes,
             q4_tokens,
+            graph_tokenwise_packed_device_bytes,
+            graph_packed_device_bytes: graph_replay.packed_device_bytes,
+            graph_target_16_layer_packed_device_bytes: graph_replay
+                .packed_device_bytes
+                .checked_mul(16)
+                .context("16-layer graph KV bytes overflow")?,
+            graph_target_mtp_17_layer_packed_device_bytes: graph_replay
+                .packed_device_bytes
+                .checked_mul(17)
+                .context("17-layer graph KV bytes overflow")?,
+            graph_maximum_absolute_delta,
+            graph_device_position_verified,
+            graph_maximum_tokens: args.graph_maximum_tokens,
+            graph_replays: graph_replay.iterations,
+            graph_microseconds_per_replay: graph_replay.microseconds_per_replay,
+            graph_replay_maximum_absolute_error,
             maximum_absolute_error,
             maximum_relative_error,
             split_query_tokens: args.split_query_tokens,
@@ -404,7 +513,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes: free_after_drop.saturating_sub(free_after_prepare),
-            note: "Q/K/V enter the GQA dispatcher as context-bound device views and its output is read back only by the explicit verifier API. The CPU cache exists solely as the external numerical oracle; CUDA packs Q4 and demotes Q4-to-Q2 entirely on device with no host packed-cache mirror. The isolated one-to-five-query path splits canonical mixed Q2/Q4 KV across 16 partial blocks per head, combines online-softmax state on device, and verifies tail causality against the scalar oracle before scheduler integration. The latency comparison gives both paths one final context barrier; its sequential baseline conservatively exposes the full cache to every query, while the split path applies exact per-tail-query causality.",
+            note: "Q/K/V enter the GQA dispatcher as context-bound device views and its output is read back only by the explicit verifier API. The CPU cache exists solely as the external numerical oracle; CUDA packs Q4 and demotes Q4-to-Q2 entirely on device with no host packed-cache mirror. The graph candidate stores logical Q2 pages plus a fixed sink/recent Q4 ring, derives both precision and physical Q4 slot from a device-resident position, performs append/demotion/attention without host metadata mutation or synchronization, and is compared token-by-token with the canonical descriptor path. The isolated one-to-five-query path splits canonical mixed Q2/Q4 KV across 16 partial blocks per head, combines online-softmax state on device, and verifies tail causality against the scalar oracle before scheduler integration. The latency comparison gives both paths one final context barrier; its sequential baseline conservatively exposes the full cache to every query, while the split path applies exact per-tail-query causality.",
         })?
     );
     Ok(())

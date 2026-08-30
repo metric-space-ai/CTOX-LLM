@@ -256,6 +256,7 @@ impl MetalModelExecutor {
                 target_tokens: records.iter().map(|record| record.target_token).collect(),
                 bonus_token,
             }),
+            resolved_greedy_mtp: None,
         }
     }
 
@@ -266,6 +267,7 @@ impl MetalModelExecutor {
             target_verification_logits: Vec::new(),
             bonus_logits: None,
             compact_greedy_mtp: None,
+            resolved_greedy_mtp: None,
         }
     }
 

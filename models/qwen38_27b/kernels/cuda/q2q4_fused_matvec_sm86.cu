@@ -1384,6 +1384,71 @@ void ctox_rope_table_batch_f32_sm86(
     cosine[table_index] = static_cast<float>(cos(static_cast<double>(angle)));
 }
 
+// Decode-graph variant of the shared RoPE table builder. The position lives
+// on device and is incremented by the captured graph after token selection,
+// exactly like the established Qwen3.5 CUDA path.
+// ref: embed_native_cuda.cu:1640-1668 (gp_qwen_rope_decode_position)
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_rope_table_position_f32_sm86(
+    float* __restrict__ cosine,
+    float* __restrict__ sine,
+    const unsigned long long* __restrict__ position,
+    unsigned rotary_dim,
+    float theta) {
+    const unsigned half_dim = rotary_dim / 2u;
+    const unsigned pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= half_dim || rotary_dim == 0u || (rotary_dim & 1u) != 0u
+        || theta <= 0.0f) {
+        return;
+    }
+    const float exponent = __fdiv_rn(
+        -2.0f * static_cast<float>(pair), static_cast<float>(rotary_dim));
+    const float inverse_frequency = static_cast<float>(
+        pow(static_cast<double>(theta), static_cast<double>(exponent)));
+    const float angle = __fmul_rn(static_cast<float>(*position), inverse_frequency);
+    sine[pair] = static_cast<float>(sin(static_cast<double>(angle)));
+    cosine[pair] = static_cast<float>(cos(static_cast<double>(angle)));
+}
+
+// Batched speculative-verify variant. One device-resident base position owns
+// all query rows, so the captured graph can be replayed at arbitrary context
+// positions without a host scalar upload or one RoPE-table launch per layer.
+// ref: embed_native_cuda.cu:1640-1668 (gp_qwen_rope_decode_position)
+extern "C" __global__ __launch_bounds__(256, 2)
+void ctox_rope_table_positions_f32_sm86(
+    float* __restrict__ cosine,
+    float* __restrict__ sine,
+    const unsigned long long* __restrict__ base_position,
+    unsigned token_count,
+    unsigned rotary_dim,
+    float theta) {
+    const unsigned half_dim = rotary_dim / 2u;
+    const unsigned table_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned table_values = token_count * half_dim;
+    if (table_index >= table_values || token_count == 0u || rotary_dim == 0u
+        || (rotary_dim & 1u) != 0u || theta <= 0.0f) {
+        return;
+    }
+    const unsigned token = table_index / half_dim;
+    const unsigned pair = table_index - token * half_dim;
+    const float exponent = __fdiv_rn(
+        -2.0f * static_cast<float>(pair), static_cast<float>(rotary_dim));
+    const float inverse_frequency = static_cast<float>(
+        pow(static_cast<double>(theta), static_cast<double>(exponent)));
+    const unsigned long long position = *base_position + token;
+    const float angle = __fmul_rn(static_cast<float>(position), inverse_frequency);
+    sine[table_index] = static_cast<float>(sin(static_cast<double>(angle)));
+    cosine[table_index] = static_cast<float>(cos(static_cast<double>(angle)));
+}
+
+// ref: embed_native_cuda.cu:2288-2300 (gp_qwen_increment_position)
+extern "C" __global__ void ctox_increment_u64_sm86(
+    unsigned long long* __restrict__ position) {
+    if (blockIdx.x == 0u && threadIdx.x == 0u) {
+        *position += 1ull;
+    }
+}
+
 // Apply the shared prompt table in place to token-major Q or K. The Y grid
 // owns tokens and the X grid owns (head, rotary-pair), eliminating the host
 // token loop while preserving the untouched non-rotary tail exactly.
@@ -1568,6 +1633,33 @@ struct CtoxPagedGqaParams {
     float scale;
 };
 
+struct CtoxGraphPagedGqaParams {
+    unsigned query_heads;
+    unsigned key_value_heads;
+    unsigned head_dim;
+    unsigned maximum_tokens;
+    unsigned page_tokens;
+    unsigned sink_tokens;
+    unsigned recent_tokens;
+    unsigned sink_pages;
+    unsigned q4_ring_pages;
+    unsigned combined_values;
+    unsigned q2_token_bytes;
+    unsigned q4_token_bytes;
+    unsigned q2_page_bytes;
+    unsigned q4_page_bytes;
+    float scale;
+};
+
+__device__ __forceinline__ unsigned graph_q4_physical_slot(
+    unsigned logical_page,
+    unsigned sink_pages,
+    unsigned q4_ring_pages) {
+    return logical_page < sink_pages
+        ? logical_page
+        : sink_pages + logical_page % q4_ring_pages;
+}
+
 __device__ __forceinline__ float warp_max(float value) {
 #pragma unroll
     for (unsigned offset = kWarpSize / 2; offset != 0; offset >>= 1) {
@@ -1735,6 +1827,157 @@ void ctox_demote_paged_kv_q4_to_q2_sm86(
         | (q4_code_to_q2(first >> 4u) << 2u)
         | (q4_code_to_q2(second & 15u) << 4u)
         | (q4_code_to_q2(second >> 4u) << 6u));
+}
+
+// Graph-stable decode storage uses logical Q2 pages plus a bounded Q4 ring for
+// sink/recent pages. Both addresses are pure functions of device position;
+// no host slot allocation or descriptor upload occurs between graph replays.
+// ref: embed_native_cuda.cu:1669-1680 (gp_qwen_cache_write_position)
+extern "C" __global__ __launch_bounds__(64, 8)
+void ctox_pack_graph_kv_q4_f32_sm86(
+    unsigned char* __restrict__ q4_pages,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const unsigned long long* __restrict__ position,
+    unsigned maximum_tokens,
+    unsigned page_tokens,
+    unsigned sink_pages,
+    unsigned q4_ring_pages,
+    unsigned component_values,
+    unsigned q4_token_bytes,
+    unsigned q4_page_bytes) {
+    const unsigned long long logical_position = *position;
+    if (logical_position >= maximum_tokens || page_tokens == 0u) {
+        return;
+    }
+    const unsigned logical_page = static_cast<unsigned>(logical_position / page_tokens);
+    if (logical_page >= sink_pages && q4_ring_pages == 0u) {
+        return;
+    }
+    const unsigned physical_slot = graph_q4_physical_slot(
+        logical_page, sink_pages, q4_ring_pages);
+    const unsigned token_in_page = static_cast<unsigned>(logical_position % page_tokens);
+    const unsigned combined_index = blockIdx.x * kBlockLen + threadIdx.x;
+    const float item = combined_index < component_values
+        ? key[combined_index]
+        : value[combined_index - component_values];
+    float maximum = warp_max(fabsf(item));
+    __shared__ float warp_maxima[2];
+    __shared__ float block_maximum;
+    __shared__ unsigned char codes[kBlockLen];
+    const unsigned lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned warp = threadIdx.x / kWarpSize;
+    if (lane == 0u) {
+        warp_maxima[warp] = maximum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        block_maximum = fmaxf(warp_maxima[0], warp_maxima[1]);
+    }
+    __syncthreads();
+    unsigned code = 0u;
+    if (block_maximum != 0.0f) {
+        const float normalized = fminf(
+            1.0f, fmaxf(-1.0f, __fdiv_rn(item, block_maximum)));
+        const float selector = __fadd_rn(__fmul_rn(normalized, 7.5f), 7.5f);
+        code = static_cast<unsigned>(
+            fminf(15.0f, fmaxf(0.0f, roundf(selector))));
+    }
+    codes[threadIdx.x] = static_cast<unsigned char>(code);
+    __syncthreads();
+    unsigned char* packed = q4_pages
+        + static_cast<unsigned long long>(physical_slot) * q4_page_bytes
+        + static_cast<unsigned long long>(token_in_page) * q4_token_bytes
+        + blockIdx.x * kQ4BlockBytes;
+    if (threadIdx.x == 0u) {
+        *reinterpret_cast<__half*>(packed) = __float2half_rn(block_maximum);
+    }
+    if (threadIdx.x < kBlockLen / 2u) {
+        packed[2u + threadIdx.x] = codes[threadIdx.x * 2u]
+            | static_cast<unsigned char>(codes[threadIdx.x * 2u + 1u] << 4u);
+    }
+}
+
+// A fixed-grid demotion node is captured once and becomes active only when a
+// completed page leaves the recent-token window. Sink pages remain Q4.
+extern "C" __global__ __launch_bounds__(16, 16)
+void ctox_demote_graph_kv_q4_to_q2_sm86(
+    const unsigned char* __restrict__ q4_pages,
+    unsigned char* __restrict__ q2_pages,
+    const unsigned long long* __restrict__ position,
+    unsigned maximum_tokens,
+    unsigned page_tokens,
+    unsigned sink_tokens,
+    unsigned recent_tokens,
+    unsigned sink_pages,
+    unsigned q4_ring_pages,
+    unsigned blocks_per_token,
+    unsigned q2_page_bytes,
+    unsigned q4_page_bytes) {
+    const unsigned long long committed = *position + 1ull;
+    if (committed > maximum_tokens || committed <= recent_tokens
+        || page_tokens == 0u) {
+        return;
+    }
+    const unsigned long long recent_start = committed - recent_tokens;
+    if (recent_start % page_tokens != 0ull) {
+        return;
+    }
+    const unsigned first_recent_page = static_cast<unsigned>(recent_start / page_tokens);
+    if (first_recent_page == 0u) {
+        return;
+    }
+    const unsigned logical_page = first_recent_page - 1u;
+    if (logical_page * page_tokens < sink_tokens || q4_ring_pages == 0u) {
+        return;
+    }
+    const unsigned physical_slot = graph_q4_physical_slot(
+        logical_page, sink_pages, q4_ring_pages);
+    const unsigned page_block = blockIdx.x;
+    if (page_block >= page_tokens * blocks_per_token) {
+        return;
+    }
+    const unsigned token = page_block / blocks_per_token;
+    const unsigned block = page_block - token * blocks_per_token;
+    const unsigned char* source = q4_pages
+        + static_cast<unsigned long long>(physical_slot) * q4_page_bytes
+        + static_cast<unsigned long long>(token) * blocks_per_token * kQ4BlockBytes
+        + block * kQ4BlockBytes;
+    unsigned char* target = q2_pages
+        + static_cast<unsigned long long>(logical_page) * q2_page_bytes
+        + static_cast<unsigned long long>(token) * blocks_per_token * kQ2BlockBytes
+        + block * kQ2BlockBytes;
+    if (threadIdx.x == 0u) {
+        *reinterpret_cast<unsigned short*>(target) =
+            *reinterpret_cast<const unsigned short*>(source);
+    }
+    const unsigned first = source[2u + threadIdx.x * 2u];
+    const unsigned second = source[3u + threadIdx.x * 2u];
+    target[2u + threadIdx.x] = static_cast<unsigned char>(
+        q4_code_to_q2(first & 15u)
+        | (q4_code_to_q2(first >> 4u) << 2u)
+        | (q4_code_to_q2(second & 15u) << 4u)
+        | (q4_code_to_q2(second >> 4u) << 6u));
+}
+
+__device__ __forceinline__ float decode_graph_paged_kv_token(
+    const unsigned char* packed_token,
+    unsigned value_index,
+    bool q4) {
+    const unsigned block = value_index / kBlockLen;
+    const unsigned index = value_index - block * kBlockLen;
+    if (!q4) {
+        const unsigned char* packed = packed_token + block * kQ2BlockBytes;
+        const unsigned code = (packed[2u + index / 4u]
+            >> ((index & 3u) * 2u)) & 3u;
+        return load_f16(packed)
+            * (static_cast<float>(static_cast<int>(code) * 2 - 3) * (1.0f / 3.0f));
+    }
+    const unsigned char* packed = packed_token + block * kQ4BlockBytes;
+    const unsigned byte = packed[2u + index / 2u];
+    const unsigned code = (byte >> ((index & 1u) * 4u)) & 15u;
+    return load_f16(packed)
+        * (static_cast<float>(static_cast<int>(code) * 2 - 15) * (1.0f / 15.0f));
 }
 
 __device__ __forceinline__ float decode_paged_kv(
@@ -1938,6 +2181,103 @@ void ctox_paged_q2q4_gqa_prefill_f32_sm86(
     }
 }
 
+// Causal prompt attention over the same logical-Q2/fixed-Q4-ring layout used
+// by CUDA-Graph decode. Prefill is submitted in page-bounded segments; the
+// host supplies only the segment's committed-token count, while every query
+// row derives its own causal precision boundary. No descriptor arena or
+// alternate persistent cache is required.
+// ref: ggml/src/ggml-cuda/fattn-vec.cuh:1-611
+// ref: ggml/src/ggml-cuda/fattn-common.cuh:1-1274
+extern "C" __global__ __launch_bounds__(32, 16)
+void ctox_graph_paged_q2q4_gqa_prefill_f32_sm86(
+    const float* __restrict__ query,
+    const unsigned char* __restrict__ q2_pages,
+    const unsigned char* __restrict__ q4_pages,
+    float* __restrict__ output,
+    const CtoxGraphPagedGqaParams* __restrict__ params_ptr,
+    unsigned committed_tokens,
+    unsigned query_tokens) {
+    const CtoxGraphPagedGqaParams params = *params_ptr;
+    const unsigned lane = threadIdx.x;
+    const unsigned query_head = blockIdx.x % params.query_heads;
+    const unsigned query_token = blockIdx.x / params.query_heads;
+    if (query_token >= query_tokens || query_tokens == 0u
+        || committed_tokens < query_tokens
+        || committed_tokens > params.maximum_tokens
+        || params.query_heads != 24u || params.key_value_heads != 4u
+        || params.head_dim != 256u || params.page_tokens == 0u) {
+        return;
+    }
+    const unsigned query_heads_per_kv = params.query_heads / params.key_value_heads;
+    const unsigned key_value_head = query_head / query_heads_per_kv;
+    const unsigned query_base =
+        (query_token * params.query_heads + query_head) * params.head_dim;
+    const unsigned key_base = key_value_head * params.head_dim;
+    const unsigned value_base = params.combined_values / 2u + key_base;
+    const unsigned causal_tokens = committed_tokens - query_tokens + query_token + 1u;
+    const unsigned recent_start = causal_tokens > params.recent_tokens
+        ? causal_tokens - params.recent_tokens : 0u;
+    const unsigned first_recent_page = recent_start / params.page_tokens;
+
+    float query_values[8];
+    float accumulated[8] = {0.0f, 0.0f, 0.0f, 0.0f,
+                            0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        query_values[slot] = query[query_base + lane + slot * kWarpSize];
+    }
+    float maximum = -3.402823466e+38f;
+    float denominator = 0.0f;
+    for (unsigned logical_token = 0u; logical_token < causal_tokens;
+         ++logical_token) {
+        const unsigned logical_page = logical_token / params.page_tokens;
+        const unsigned token_in_page = logical_token - logical_page * params.page_tokens;
+        const bool q4 = logical_page * params.page_tokens < params.sink_tokens
+            || logical_page >= first_recent_page;
+        const unsigned char* packed_token;
+        if (q4) {
+            const unsigned physical_slot = graph_q4_physical_slot(
+                logical_page, params.sink_pages, params.q4_ring_pages);
+            packed_token = q4_pages
+                + static_cast<unsigned long long>(physical_slot) * params.q4_page_bytes
+                + static_cast<unsigned long long>(token_in_page) * params.q4_token_bytes;
+        } else {
+            packed_token = q2_pages
+                + static_cast<unsigned long long>(logical_page) * params.q2_page_bytes
+                + static_cast<unsigned long long>(token_in_page) * params.q2_token_bytes;
+        }
+        float partial = 0.0f;
+#pragma unroll
+        for (unsigned slot = 0u; slot < 8u; ++slot) {
+            const unsigned dim = lane + slot * kWarpSize;
+            partial = fmaf(
+                query_values[slot],
+                decode_graph_paged_kv_token(packed_token, key_base + dim, q4),
+                partial);
+        }
+        const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
+            * params.scale;
+        const float next_maximum = fmaxf(maximum, score);
+        const float previous_factor = expf(maximum - next_maximum);
+        const float score_factor = expf(score - next_maximum);
+        denominator = denominator * previous_factor + score_factor;
+#pragma unroll
+        for (unsigned slot = 0u; slot < 8u; ++slot) {
+            const unsigned dim = lane + slot * kWarpSize;
+            accumulated[slot] = fmaf(
+                score_factor,
+                decode_graph_paged_kv_token(packed_token, value_base + dim, q4),
+                accumulated[slot] * previous_factor);
+        }
+        maximum = next_maximum;
+    }
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        const unsigned dim = lane + slot * kWarpSize;
+        output[query_base + dim] = accumulated[slot] / denominator;
+    }
+}
+
 // Split-KV attention candidate for the target's five-token MTP verification
 // block. The existing decode kernel launches only 24 blocks; this kernel
 // exposes query-token x query-head x KV-segment parallelism and merges the
@@ -2043,6 +2383,111 @@ void ctox_paged_q2q4_gqa_split_partial_f32_sm86(
 
     const unsigned partial_index =
         (query_token * params.query_heads + query_head) * segments + segment;
+    const unsigned partial_base = partial_index * params.head_dim;
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        partial_output[partial_base + lane + slot * kWarpSize] = accumulated[slot];
+    }
+    if (lane == 0u) {
+        partial_maximum[partial_index] = maximum;
+        partial_denominator[partial_index] = denominator;
+    }
+}
+
+// Graph-stable one-token split attention. Logical page placement and Q2/Q4
+// precision are derived from the device position, so graph replay performs no
+// descriptor upload, page-slot allocation or host cache mutation.
+// ref: syv_ai/qwen38-27b-rtx3090/patches/spec-decode-attn.patch:140-337
+// ref: ggml/src/ggml-cuda/fattn-vec.cuh:1-611
+extern "C" __global__ __launch_bounds__(32, 16)
+void ctox_graph_paged_q2q4_gqa_split_partial_f32_sm86(
+    const float* __restrict__ query,
+    const unsigned char* __restrict__ q2_pages,
+    const unsigned char* __restrict__ q4_pages,
+    const unsigned long long* __restrict__ position,
+    float* __restrict__ partial_output,
+    float* __restrict__ partial_maximum,
+    float* __restrict__ partial_denominator,
+    const CtoxGraphPagedGqaParams* __restrict__ params_ptr,
+    unsigned segments) {
+    const CtoxGraphPagedGqaParams params = *params_ptr;
+    const unsigned lane = threadIdx.x;
+    const unsigned long long position64 = *position;
+    if (segments == 0u || segments > 32u || position64 >= params.maximum_tokens
+        || params.query_heads != 24u || params.key_value_heads != 4u
+        || params.head_dim != 256u || params.page_tokens == 0u) {
+        return;
+    }
+    const unsigned committed_tokens = static_cast<unsigned>(position64 + 1ull);
+    const unsigned segment = blockIdx.x % segments;
+    const unsigned query_head = blockIdx.x / segments;
+    if (query_head >= params.query_heads) {
+        return;
+    }
+    const unsigned query_heads_per_kv = params.query_heads / params.key_value_heads;
+    const unsigned key_value_head = query_head / query_heads_per_kv;
+    const unsigned query_base = query_head * params.head_dim;
+    const unsigned key_base = key_value_head * params.head_dim;
+    const unsigned value_base = params.combined_values / 2u + key_base;
+    const unsigned token_begin = committed_tokens * segment / segments;
+    const unsigned token_end = committed_tokens * (segment + 1u) / segments;
+    const unsigned recent_start = committed_tokens > params.recent_tokens
+        ? committed_tokens - params.recent_tokens : 0u;
+    const unsigned first_recent_page = recent_start / params.page_tokens;
+
+    float query_values[8];
+    float accumulated[8] = {0.0f, 0.0f, 0.0f, 0.0f,
+                            0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (unsigned slot = 0u; slot < 8u; ++slot) {
+        query_values[slot] = query[query_base + lane + slot * kWarpSize];
+    }
+    float maximum = -3.402823466e+38f;
+    float denominator = 0.0f;
+    for (unsigned logical_token = token_begin; logical_token < token_end;
+         ++logical_token) {
+        const unsigned logical_page = logical_token / params.page_tokens;
+        const unsigned token_in_page = logical_token - logical_page * params.page_tokens;
+        const bool q4 = logical_page * params.page_tokens < params.sink_tokens
+            || logical_page >= first_recent_page;
+        const unsigned char* packed_token;
+        if (q4) {
+            const unsigned physical_slot = graph_q4_physical_slot(
+                logical_page, params.sink_pages, params.q4_ring_pages);
+            packed_token = q4_pages
+                + static_cast<unsigned long long>(physical_slot) * params.q4_page_bytes
+                + static_cast<unsigned long long>(token_in_page) * params.q4_token_bytes;
+        } else {
+            packed_token = q2_pages
+                + static_cast<unsigned long long>(logical_page) * params.q2_page_bytes
+                + static_cast<unsigned long long>(token_in_page) * params.q2_token_bytes;
+        }
+        float partial = 0.0f;
+#pragma unroll
+        for (unsigned slot = 0u; slot < 8u; ++slot) {
+            const unsigned dim = lane + slot * kWarpSize;
+            partial = fmaf(
+                query_values[slot],
+                decode_graph_paged_kv_token(packed_token, key_base + dim, q4),
+                partial);
+        }
+        const float score = __shfl_sync(0xffffffffu, warp_sum(partial), 0)
+            * params.scale;
+        const float next_maximum = fmaxf(maximum, score);
+        const float previous_factor = expf(maximum - next_maximum);
+        const float score_factor = expf(score - next_maximum);
+        denominator = denominator * previous_factor + score_factor;
+#pragma unroll
+        for (unsigned slot = 0u; slot < 8u; ++slot) {
+            const unsigned dim = lane + slot * kWarpSize;
+            accumulated[slot] = fmaf(
+                score_factor,
+                decode_graph_paged_kv_token(packed_token, value_base + dim, q4),
+                accumulated[slot] * previous_factor);
+        }
+        maximum = next_maximum;
+    }
+    const unsigned partial_index = query_head * segments + segment;
     const unsigned partial_base = partial_index * params.head_dim;
 #pragma unroll
     for (unsigned slot = 0u; slot < 8u; ++slot) {
@@ -2169,6 +2614,18 @@ void ctox_argmax_f32_sm86(const float* __restrict__ values,
     }
     if (threadIdx.x == 0u) {
         result[0] = indices[0];
+    }
+}
+
+extern "C" __global__
+void ctox_map_argmax_row_u32_sm86(const unsigned* __restrict__ argmax,
+                                  const unsigned* __restrict__ canonical_rows,
+                                  unsigned* __restrict__ token,
+                                  unsigned row_count) {
+    if (blockIdx.x == 0u && threadIdx.x == 0u) {
+        const unsigned local = argmax[0];
+        token[0] = (argmax[1] == 0u && local < row_count)
+            ? canonical_rows[local] : 0u;
     }
 }
 
@@ -2322,3 +2779,10 @@ void ctox_topk_topp_sample_f32_sm86(const float* __restrict__ values,
 // Its symbols stay outside the promoted ABI until same-device numerical and
 // roofline gates pass.
 #include "q2q4_batched_mmq_sm86.cu"
+
+// Exact pinned TensorRT-LLM acceptance primitive. This is deliberately
+// included in the same cubin as the Q2/Q4 target kernels so the production
+// executor needs one module and can keep the entire speculative boundary on
+// the default stream.
+// ref: vendor/cuda/tensorrt_llm_mtp/upstream/mtpKernels.cu:250-312
+#include "../../vendor/cuda/tensorrt_llm_mtp/mtp_accept_draft_token_sm86.cu"

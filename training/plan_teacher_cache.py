@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -198,6 +200,49 @@ def plan(
     }
 
 
+def write_sample_index(path: Path, samples: list[dict[str, Any]]) -> None:
+    """Durably write the ordered, memory-bounded downstream token sidecar."""
+
+    if path.exists():
+        raise ValueError(f"refusing to overwrite {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".partial",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            for sample in samples:
+                temporary.write(
+                    json.dumps(
+                        {
+                            "id": sample["id"],
+                            "sequence_tokens": sample["sequence_tokens"],
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                )
+                temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
@@ -205,6 +250,11 @@ def main() -> None:
     parser.add_argument("--tokenizer-revision", required=True)
     parser.add_argument("--local-model-provenance", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--sample-index",
+        type=Path,
+        help="ordered JSONL id/sequence-token sidecar for million-corpus evidence",
+    )
     parser.add_argument("--hidden-size", type=int, default=5120)
     parser.add_argument("--hidden-layers", default="0,15,31,47,63")
     parser.add_argument("--top-k", type=int, default=64)
@@ -218,6 +268,8 @@ def main() -> None:
     ]
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite {args.output}")
+    if args.sample_index is not None and args.sample_index.exists():
+        raise SystemExit(f"refusing to overwrite {args.sample_index}")
     if args.hidden_size <= 0 or not args.hidden_layers or args.top_k <= 0:
         raise SystemExit("hidden size, hidden layers, and top-k must be positive")
     if min(
@@ -253,6 +305,11 @@ def main() -> None:
         local_provenance,
         local_provenance_sha256,
     )
+    if args.sample_index is not None:
+        try:
+            write_sample_index(args.sample_index, document["samples"])
+        except (OSError, ValueError) as error:
+            raise SystemExit(str(error)) from error
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(document, indent=2, sort_keys=True) + "\n",

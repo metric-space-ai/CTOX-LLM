@@ -1,9 +1,11 @@
-//! Frozen CUDA decode schedule for Qwen3.8-27B.
+//! Frozen CUDA correctness/admission schedule for Qwen3.8-27B.
 //!
-//! This is the model-specific assembly contract between prepared CUDA
-//! operators and the future production `ModelExecutor`. It deliberately
-//! contains no generic graph optimizer: every edge, state mutation, fused
-//! residual/norm binding, and token barrier is explicit.
+//! The target topology is byte-for-byte compatible with the established CTOX
+//! Qwen3.5-27B target path. Production prefill/decode therefore executes the
+//! direct layer-major Qwen3.5 path in `cuda_graph.rs`; it must never interpret
+//! these 645 records in the hot loop. This expanded schedule is retained only
+//! to prove complete resource ownership, edge order, state mutations, and the
+//! sole token/chunk commit barrier before a direct submission is admitted.
 
 use std::collections::HashSet;
 
