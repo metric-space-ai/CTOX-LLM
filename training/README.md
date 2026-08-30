@@ -24,6 +24,31 @@ The release pipeline has four immutable stages:
    residual probability mass, and selected hidden states.
 4. `train_recovery.py` freezes Q2/Q4 codes and trains channel correction scales.
 
+Before the million-sample teacher run, the admitted training partition is
+reduced to one deterministic 10,000-record throughput probe. The selector
+retains exactly 6,500/2,500/800/150/50 records in the <=2K, 2K-8K, 8K-32K,
+32K-64K, and 64K-128K buckets. It ranks identities by a fixed SHA-256 seed;
+source order cannot bias the probe.
+
+```text
+python training/select_teacher_throughput_probe.py \
+  --million-corpus-audit <million-audit.json> \
+  --million-corpus-audit-sha256 <sha256> \
+  --output <probe.jsonl> \
+  --output-token-counts <probe-tokens.jsonl> \
+  --evidence <probe-selection.json>
+```
+
+After `plan_teacher_cache.py` and `plan_teacher_batches.py` bind those two
+outputs, `run_teacher_throughput_probe.py` runs the complete BF16 top-64,
+hidden-state, and MTP target path with `CUDA_VISIBLE_DEVICES=1,2`, logical MTP
+device `cuda:1`, and at most 14 GiB weight placement per A4500. GPU0 is never
+admitted. Its result is calculated only from passed cache verifications and
+matching append-only GPU ledger entries; it records samples/s, source tokens/s,
+artifact bytes, CUDA peaks, and an explicitly linear one-million projection.
+The full teacher-cache schedule is not admitted from a microbenchmark or an
+estimated model throughput.
+
 Before end-to-end distillation, `fit_recovery_scales.py` creates a complete
 deterministic initializer for every planned matrix. It regenerates the exact
 logical Q2/Q4 codes (including mixed row layouts) from the pinned BF16 source,
