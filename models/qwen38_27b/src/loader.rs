@@ -325,6 +325,7 @@ impl ModelArtifact {
     /// host virtual memory directly. The returned bytes remain owned by every
     /// clone of this artifact; callers must retain one clone for as long as an
     /// accelerator buffer references the mapping.
+    #[allow(dead_code)] // Used only by accelerator-feature backends.
     pub(crate) fn mapped_bytes(&self) -> &[u8] {
         &self.mmap
     }

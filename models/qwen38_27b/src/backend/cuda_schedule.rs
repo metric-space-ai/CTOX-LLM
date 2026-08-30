@@ -175,8 +175,7 @@ impl CudaMtpPrefillAlignment {
     ) -> Result<Self> {
         if chunk.token_count == 0 || chunk.start_position != committed_target_tokens {
             return Err(EngineError::InvalidState(format!(
-                "CUDA MTP prefill chunk {:?} does not start at committed target position {committed_target_tokens}",
-                chunk
+                "CUDA MTP prefill chunk {chunk:?} does not start at committed target position {committed_target_tokens}",
             )));
         }
         if committed_target_tokens == 0 {

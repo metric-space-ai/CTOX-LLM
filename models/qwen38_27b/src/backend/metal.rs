@@ -746,6 +746,7 @@ impl MetalGreedyMtpPrefixParams {
 /// tensor. The Metal runtime binds offsets into the original artifact and
 /// dispatches the existing Q2 or Q4 kernel without repacking any codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Constructed only by Metal-feature verifier binaries.
 pub(crate) struct MetalMixedRowSegment {
     pub layout: MetalBlockLayout,
     pub params: MetalFusedMatVecParams,
@@ -968,6 +969,7 @@ pub(crate) fn validate_recovered_row(operation: &RecoveredRow<'_>) -> Result<Met
 
 /// Validate the exact manifest row groups of a mixed Q2/Q4 operation. Every
 /// returned dispatch covers one contiguous row and byte range exactly once.
+#[allow(dead_code)] // Called only by Metal-feature verifier binaries.
 pub(crate) fn validate_mixed_operation(
     operation: &FusedMatVec<'_>,
 ) -> Result<Vec<MetalMixedRowSegment>> {
