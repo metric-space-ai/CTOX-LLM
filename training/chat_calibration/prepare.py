@@ -93,6 +93,8 @@ def run(a):
             if counts[split,bucket]>=quotas[split]:continue
             try:text=template.render(messages=messages,tools=tools,add_generation_prompt=False,enable_thinking=False)
             except Exception as e:excluded['template_error:'+str(e)[:100]]+=1;continue
+            raw_text_sha256=digest(text)
+            text=tok.normalizer.normalize_str(text) if tok.normalizer is not None else text
             encoded=tok.encode(text,add_special_tokens=False);ids=encoded.ids
             if len(ids)>a.context:excluded['over_context']+=1;continue
             forced=tok.encode('<think>\n\n</think>\n\n',add_special_tokens=False).ids
@@ -106,7 +108,7 @@ def run(a):
             seen.update(keys);counts[split,bucket]+=1
             records.append(dict(id=r['id'],split=split,bucket=bucket,source_repo=r['source_repo'],
                 source_id=r.get('source_id'),source_revision=r.get('source_revision'),
-                text_sha256=h,user_sha256=user,token_ids=ids,
+                text_sha256=h,raw_text_sha256=raw_text_sha256,user_sha256=user,token_ids=ids,
                 positions=selected_positions(p,a.positions),assistant_tokens=len(p),
                 messages=messages,tools=tools,rendered=text))
             if all(counts[s,b]>=n for s,n in quotas.items() for b in ['tool','general']):break
@@ -118,6 +120,7 @@ def run(a):
     report=dict(format='ctox.complete-chat-calibration.v1',corpus=str(a.corpus),scanned=scanned,
         counts={f'{s}/{b}':n for (s,b),n in counts.items()},excluded=dict(excluded),
         context=a.context,positions_per_chat=a.positions,seed_policy='source identity SHA256 buckets 60/20/20',
+        tokenizer_normalizer=str(tok.normalizer),normalized_chats=sum(r['text_sha256']!=r['raw_text_sha256'] for r in records),
         selection_policy='first eligible per bucket; complete chats only; no model-based filtering',
         tokens=sum(len(r['token_ids']) for r in records),positions=sum(len(r['positions']) for r in records),
         sha256=digest((a.output/'chats.jsonl').read_text()),
