@@ -16,7 +16,11 @@ Assistant target positions are shifted by one: the last input token predicts
 the first assistant token. User/system messages, tool results, role headers and
 the automatically inserted empty reasoning prefix are excluded from the loss.
 Selected assistant positions are uniform and independent of model outputs.
-The complete preceding context is always evaluated.
+The complete preceding context is always evaluated. The tool-focused refinement
+adds up to 16 actual tool-call positions per training conversation, because
+uniform positions can otherwise be dominated by reasoning text. Tuning and
+held-out positions are unchanged. Captures are merged only with identical
+full contexts, runtime bindings and disjoint positions.
 
 `capture.py` runs the pinned Q8 teacher on the source continuations (teacher
 forcing). Official HF token IDs are given to both engines. Every complete
