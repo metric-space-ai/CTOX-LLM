@@ -17,6 +17,9 @@ def run(a):
     from diagnose_q8_recovery import a8
     torch.set_num_threads(2);torch.manual_seed(20261016)
     torch.backends.cuda.matmul.allow_tf32=False
+    complete=json.loads((a.root/'teacher.complete.json').read_text())
+    if sha(a.root/'teacher-targets.npy')!=complete['targets_sha256'] or sha(a.root/'chats.jsonl')!=complete['chats_sha256']:
+        raise ValueError('teacher targets or complete chats changed after capture')
     teacher=[json.loads(x) for x in (a.root/'teacher.jsonl').read_text().splitlines()]
     native=[json.loads(x) for x in (a.root/'student.jsonl').read_text().splitlines()]
     if len(teacher)!=len(native) or any((t['id'],t['position'],t['row'])!=(s['id'],s['position'],s['row']) for t,s in zip(teacher,native)):

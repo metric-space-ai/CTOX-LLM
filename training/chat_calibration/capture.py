@@ -50,6 +50,8 @@ def run(a):
     finally:b.tv_close(s)
     (root/'teacher.complete.json').write_text(json.dumps(dict(rows=rowno,vocab=vocab,teacher_sha256=expected,
         targets_sha256=sha(root/'teacher-targets.npy'),chats_sha256=sha(a.chats),profile=PROFILE,
+        library_sha256=sha(a.library),bridge_sha256=sha(a.bridge),
+        tokenizer_sha256=sha(a.teacher_root/'tokenizer.json'),template_sha256=sha(a.teacher_root/'chat_template.jinja'),
         cache_precision='maximum-centered fp16 logits; exact float64 post-sampler reference retained',
         trajectory='source-chat teacher forcing',phase='assistant_only',
         input_tokenizer='official HF; Q8 vocabulary byte round-trip verified for every complete chat',
