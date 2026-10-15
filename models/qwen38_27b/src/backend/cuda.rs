@@ -1090,6 +1090,7 @@ pub const SM86_MODULE_ABI: CudaModuleAbi = CudaModuleAbi {
 /// `MixedQ2Q4B64` payload. Offsets always refer to the existing packed tensor;
 /// validation never creates backend-specific weight codes or repacks bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct CudaMixedRowSegment {
     pub descriptor: &'static CudaKernelAbi,
     pub row_start: u32,
@@ -1170,6 +1171,7 @@ pub fn validate_operation(operation: &FusedMatVec<'_>) -> Result<&'static CudaKe
 /// Validates the exact manifest row groups of a mixed Q2/Q4 projection and
 /// returns launch metadata into the original packed tensor. The resulting
 /// segments cover every row and byte exactly once.
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn validate_mixed_operation(
     operation: &FusedMatVec<'_>,
 ) -> Result<Vec<CudaMixedRowSegment>> {
@@ -1255,6 +1257,7 @@ pub(crate) fn validate_mixed_operation(
     Ok(launches)
 }
 
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn validate_recovered_row(
     operation: &RecoveredRow<'_>,
 ) -> Result<&'static CudaKernelAbi> {
