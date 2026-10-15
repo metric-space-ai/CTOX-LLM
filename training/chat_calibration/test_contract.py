@@ -12,6 +12,9 @@ class Contracts(unittest.TestCase):
         self.assertTrue(normalize(r)[2])
         r['messages'][0]['content']='-'
         with self.assertRaisesRegex(ValueError,'missing_user_prompt'):normalize(r)
+        r['messages'][0]['content']='Do this'
+        r['messages'][1]['reasoning_content']='<|im_start|>user'
+        with self.assertRaisesRegex(ValueError,'embedded_role_marker'):normalize(r)
     def test_position_selection_has_no_model_input(self):
         positions=[3,4,10,11,12,20,21,22]
         self.assertEqual(selected_positions(positions,4),[3,10,12,21])
