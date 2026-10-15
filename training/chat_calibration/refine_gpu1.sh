@@ -15,8 +15,9 @@ printf '%s  %s\n' b756d08e6e5db2ffe528b00055c24d1f0ed312e47a97a402898caf58193ad8
 "$python" "$source/check_sampler_contracts.py"
 "$python" "$source/prepare_tool_supplement.py" --chats "$previous/chats.jsonl" --tokenizer "$base/qwen38-q8-teacher/tokenizer.json" --output "$root/supplement"
 "$python" "$source/capture.py" --chats "$root/supplement/chats.jsonl" --output "$root/supplement" --teacher-root "$base/qwen38-q8-teacher" --library "$base/llama.cpp/build-cuda-shim3/bin/libllama.so" --bridge "$source/q8_bridge.so"
-"$source/chat-calibration-student" "$artifact" "$module" "$root/supplement/student" < "$root/supplement/chats.jsonl"
-"$python" "$source/merge_captures.py" --base "$previous" --supplement "$root/supplement" --output "$root/kl-variant"
+"$python" "$source/prepare_replay.py" --previous /home/deck/ctox-chat-calibration-20261016-v5 --supplement "$root/supplement/chats.jsonl" --output "$root"
+"$source/chat-calibration-student" "$artifact" "$module" "$root/replay/student" < "$root/replay/chats.jsonl"
+"$python" "$source/merge_captures.py" --base "$previous" --supplement "$root/supplement" --native-captures "$root/completed" "$root/replay" --output "$root/kl-variant"
 "$python" "$source/fit.py" --root "$root/kl-variant" --artifact "$artifact" --legacy-training /home/deck/ctox-p3a-clip-refit-source-20260908-v3
 mkdir "$root/tv-variant"
 for name in chats.jsonl teacher.jsonl teacher.complete.json teacher-targets.npy student.jsonl student.f32; do ln -s "$root/kl-variant/$name" "$root/tv-variant/$name"; done
