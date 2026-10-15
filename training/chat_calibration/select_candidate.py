@@ -7,7 +7,7 @@ from measure import sha
 
 def run(a):
     reports=[json.loads((r/'fit-result.json').read_text()) for r in a.candidates]
-    if len(reports)!=2 or [r['tv_weight'] for r in reports]!=[0.,1.]:raise ValueError('expected predeclared KL and KL+TV variants')
+    if len(reports)!=2 or [r.get('tv_weight',0.) for r in reports]!=[0.,1.]:raise ValueError('expected predeclared KL and KL+TV variants')
     if any(r['sources']!=reports[0]['sources'] or r['student_sha256']!=reports[0]['student_sha256'] for r in reports):raise ValueError('candidate data or model bindings differ')
     scores=[r['after']['tune']['tv']['mean_percent'] for r in reports]
     chosen=min(range(len(scores)),key=lambda i:(scores[i],i));root=a.candidates[chosen]
