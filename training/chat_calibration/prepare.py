@@ -60,6 +60,9 @@ def normalize(r):
         if any(c['name'] not in names for m in messages for c in m.get('tool_calls',[])):
             raise ValueError('undeclared_tool')
     if messages[-1]['role']!='assistant':raise ValueError('unfinished_chat')
+    serialized=json.dumps([messages,tools],ensure_ascii=False)
+    if any(marker in serialized for marker in ['<|im_start|>','<|im_end|>']):
+        raise ValueError('embedded_role_marker')
     return messages,tools,has_calls
 
 
