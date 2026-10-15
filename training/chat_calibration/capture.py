@@ -19,13 +19,23 @@ def run(a):
         n=sum(len(r['positions']) for r in records)
         if n*vocab*2>600*1024**2:raise ValueError('target cache exceeds 600 MiB budget')
         targets=np.lib.format.open_memmap(root/'teacher-targets.npy',mode='w+',dtype='<f2',shape=(n,vocab))
-        rowno=0
+        rowno=0;piece_cache={};tokenizer_differences=[]
         with (root/'teacher.jsonl').open('x') as f:
             for rec in records:
                 ids=rec['token_ids'];encoded=rec['rendered'].encode();tmp=(C.c_int32*2048)()
                 count=b.tv_tokenize(s,encoded,len(encoded),tmp,2048)
-                if list(tmp[:count])!=ids or ids!=tokenizer.encode(rec['rendered'],add_special_tokens=False).ids:
-                    raise ValueError('GGUF/HF token mismatch')
+                if ids!=tokenizer.encode(rec['rendered'],add_special_tokens=False).ids:
+                    raise ValueError('official tokenizer/selection changed')
+                if count<0 or list(tmp[:count])!=ids:
+                    tokenizer_differences.append(dict(id=rec['id'],hf_tokens=len(ids),gguf_tokens=count))
+                # HF defines canonical input IDs. Different segmentation is permitted
+                # only if Q8's vocabulary decodes those exact IDs to identical bytes.
+                for token in set(ids)-piece_cache.keys():
+                    piece=C.create_string_buffer(4096);length=b.tv_piece(s,token,piece,4096)
+                    if length<0:raise ValueError('token piece exceeds buffer')
+                    piece_cache[token]=piece.raw[:length]
+                if b''.join(piece_cache[t] for t in ids)!=encoded:
+                    raise ValueError('GGUF vocabulary does not round-trip official input IDs')
                 b.tv_reset(s);cursor=0
                 for pos in rec['positions']:
                     chunk=ids[cursor:pos+1];arr=(C.c_int32*len(chunk))(*chunk)
@@ -41,7 +51,9 @@ def run(a):
     (root/'teacher.complete.json').write_text(json.dumps(dict(rows=rowno,vocab=vocab,teacher_sha256=expected,
         targets_sha256=sha(root/'teacher-targets.npy'),chats_sha256=sha(a.chats),profile=PROFILE,
         cache_precision='maximum-centered fp16 logits; exact float64 post-sampler reference retained',
-        trajectory='source-chat teacher forcing',phase='assistant_only'))+'\n')
+        trajectory='source-chat teacher forcing',phase='assistant_only',
+        input_tokenizer='official HF; Q8 vocabulary byte round-trip verified for every complete chat',
+        gguf_segmentation_differences=tokenizer_differences))+'\n')
 if __name__=='__main__':
     p=argparse.ArgumentParser()
     for k in ['chats','output','teacher-root','library','bridge']:p.add_argument('--'+k,type=Path,required=True)
