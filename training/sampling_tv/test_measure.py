@@ -18,4 +18,26 @@ class MetricContract(unittest.TestCase):
         self.assertEqual(m.distribution([math.log(.96),math.log(.04)]+[-1000.]*22),[[0,1.]])
         self.assertEqual([i for i,p in m.distribution([0.]*24)],list(range(19)))
         with self.assertRaises(ValueError): m.distribution([float('nan')]*24)
+    def test_only_aligned_generation_positions_are_counted(self):
+        import tempfile, json, struct, types, hashlib
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder); ids=[10,11,12,0,1]
+            (root/'capture.complete').write_text('fixture')
+            (root/'metadata.json').write_text('{}')
+            (root/'requests.jsonl').write_text(json.dumps(dict(id='a',token_ids=ids,prompt_tokens=3,generated_tokens=2,vocab_size=24))+'\n')
+            (root/'answers.jsonl').write_text(json.dumps(dict(id='a',bucket='text',pieces_hex=['61','62'],stop='eog'))+'\n')
+            teacher=[]; student=[]
+            for off in range(2):
+                prefix=ids[:3+off]
+                teacher.append(dict(id='a',offset=off,phase='assistant_generation',bucket='text',sampled_token=ids[3+off],prefix_sha256=hashlib.sha256(struct.pack('<'+'I'*len(prefix),*prefix)).hexdigest(),distribution=[[0,.51],[1,.49]]))
+                student.append(dict(id='a',offset=off,distribution=[[0,.49],[1,.51]]))
+            def write(name,rows): (root/name).write_text(''.join(json.dumps(x)+'\n' for x in rows))
+            write('teacher.jsonl',teacher); write('student.jsonl',student)
+            m.compare(types.SimpleNamespace(output=str(root)))
+            result=json.loads((root/'result.json').read_text())
+            self.assertEqual(result['overall']['tokens'],2)
+            self.assertAlmostEqual(result['overall']['mean_percent'],2)
+            (root/'result.json').unlink(); (root/'positions.jsonl').unlink()
+            teacher[0]['phase']='prompt_processing'; write('teacher.jsonl',teacher)
+            with self.assertRaises(ValueError): m.compare(types.SimpleNamespace(output=str(root)))
 if __name__=='__main__': unittest.main()
