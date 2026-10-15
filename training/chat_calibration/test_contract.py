@@ -21,4 +21,9 @@ class Contracts(unittest.TestCase):
     def test_forced_empty_reasoning_prefix_excluded(self):
         ids=[1,5,4,70,71,72,73,40,2]
         self.assertEqual(assistant_positions(ids,1,2,[5,4],[70,71,72,73]),[6,7])
+    def test_embedded_reasoning_is_not_wrapped_twice(self):
+        r={'messages':[{'role':'user','content':'Question'},{'role':'assistant','content':'<think>reason</think>answer'}]}
+        messages,_,_=normalize(r)
+        self.assertEqual(messages[1]['reasoning_content'],'reason')
+        self.assertEqual(messages[1]['content'],'answer')
 if __name__=='__main__':unittest.main()

@@ -43,6 +43,11 @@ def normalize(r):
         if not isinstance(content,str):content=json.dumps(content,ensure_ascii=False)
         if any(t in content for t in ['<|im_start|>','<|im_end|>']):raise ValueError('embedded_role_marker')
         if m['role']=='user' and content.strip() in ['','-','...']:raise ValueError('missing_user_prompt')
+        if m['role']=='assistant' and content.lstrip().startswith('<think>'):
+            match=re.fullmatch(r'\s*<think>(.*?)</think>(.*)',content,flags=re.S)
+            if match is None or m.get('reasoning_content'):raise ValueError('ambiguous_reasoning_format')
+            m['reasoning_content']=match.group(1).strip()
+            content=match.group(2).lstrip()
         m['content']=content
         calls=m.get('tool_calls') or []
         normalized=[]
@@ -96,6 +101,8 @@ def run(a):
             raw_text_sha256=digest(text)
             text=tok.normalizer.normalize_str(text) if tok.normalizer is not None else text
             encoded=tok.encode(text,add_special_tokens=False);ids=encoded.ids
+            if tok.decode(ids,skip_special_tokens=False)!=text:
+                raise ValueError('official tokenizer cannot round-trip normalized chat')
             if len(ids)>a.context:excluded['over_context']+=1;continue
             forced=tok.encode('<think>\n\n</think>\n\n',add_special_tokens=False).ids
             p=assistant_positions(ids,start,end,header,forced)
