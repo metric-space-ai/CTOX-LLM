@@ -89,6 +89,11 @@ pub struct ExecutorStep {
     /// Compact accelerator result for deterministic MTP verification. This is
     /// mutually exclusive with the three logit-based speculative fields.
     pub compact_greedy_mtp: Option<GreedyMtpVerification>,
+    /// A device-complete compact verification. Unlike `compact_greedy_mtp`,
+    /// this does not fabricate distributions for candidates after the first
+    /// mismatch: the accelerator reports the proposed/verified counts, the
+    /// accepted causal prefix, and the target correction directly.
+    pub resolved_greedy_mtp: Option<ResolvedGreedyMtpVerification>,
 }
 
 /// Causal MTP verification decisions selected from device-resident logits.
@@ -100,6 +105,34 @@ pub struct GreedyMtpVerification {
     pub draft_tokens: Vec<u32>,
     pub target_tokens: Vec<u32>,
     pub bonus_token: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGreedyMtpVerification {
+    pub proposed_drafts: u32,
+    pub verified_drafts: u32,
+    pub accepted_draft_tokens: Vec<u32>,
+    pub next_token: u32,
+}
+
+impl ResolvedGreedyMtpVerification {
+    fn validate(&self, vocab_size: usize, maximum_draft_tokens: u32) -> bool {
+        let accepted = self.accepted_draft_tokens.len() as u32;
+        self.proposed_drafts > 0
+            && self.proposed_drafts <= maximum_draft_tokens
+            && accepted <= self.proposed_drafts
+            && self.verified_drafts
+                == if accepted == self.proposed_drafts {
+                    self.proposed_drafts
+                } else {
+                    accepted + 1
+                }
+            && self
+                .accepted_draft_tokens
+                .iter()
+                .chain(std::iter::once(&self.next_token))
+                .all(|token| (*token as usize) < vocab_size)
+    }
 }
 
 impl GreedyMtpVerification {
@@ -194,6 +227,9 @@ pub struct GeneratedStep {
 
 impl ExecutorStep {
     fn draft_count(&self) -> usize {
+        if let Some(verification) = &self.resolved_greedy_mtp {
+            return verification.proposed_drafts as usize;
+        }
         self.compact_greedy_mtp
             .as_ref()
             .map_or(self.draft_logits.len(), |verification| {
@@ -216,6 +252,7 @@ impl ExecutorStep {
                 || !self.target_verification_logits.is_empty()
                 || self.bonus_logits.is_some();
             let has_compact_verification = self.compact_greedy_mtp.is_some();
+            let has_resolved_verification = self.resolved_greedy_mtp.is_some();
             let valid_logit_verification = has_logit_verification
                 && has_valid_target_logits
                 && !self.draft_logits.is_empty()
@@ -244,9 +281,25 @@ impl ExecutorStep {
                             .validate(capabilities.vocab_size, capabilities.maximum_draft_tokens)
                     })
                 && !has_logit_verification;
+            let valid_resolved_verification = has_resolved_verification
+                && capabilities.compact_greedy_mtp_verification
+                && self
+                    .resolved_greedy_mtp
+                    .as_ref()
+                    .is_some_and(|verification| {
+                        verification
+                            .validate(capabilities.vocab_size, capabilities.maximum_draft_tokens)
+                    })
+                && !has_logit_verification
+                && !has_compact_verification;
             if !capabilities.mtp
-                || has_logit_verification == has_compact_verification
-                || !(valid_logit_verification || valid_compact_verification)
+                || usize::from(has_logit_verification)
+                    + usize::from(has_compact_verification)
+                    + usize::from(has_resolved_verification)
+                    != 1
+                || !(valid_logit_verification
+                    || valid_compact_verification
+                    || valid_resolved_verification)
             {
                 return Err(EngineError::InvalidArtifact(
                     "MTP output contains an invalid or unverifiable draft distribution".into(),
@@ -256,6 +309,7 @@ impl ExecutorStep {
             || !self.target_verification_logits.is_empty()
             || self.bonus_logits.is_some()
             || self.compact_greedy_mtp.is_some()
+            || self.resolved_greedy_mtp.is_some()
         {
             return Err(EngineError::InvalidArtifact(
                 "executor returned MTP drafts while MTP is disabled".into(),
@@ -859,6 +913,13 @@ fn greedy_token(logits: &[f32]) -> Result<u32> {
 }
 
 fn verify_greedy_mtp(output: &ExecutorStep) -> Result<(u32, u32, Vec<u32>)> {
+    if let Some(verification) = &output.resolved_greedy_mtp {
+        return Ok((
+            verification.next_token,
+            verification.verified_drafts,
+            verification.accepted_draft_tokens.clone(),
+        ));
+    }
     if let Some(verification) = &output.compact_greedy_mtp {
         let mut accepted = Vec::new();
         let mut verified = 0_u32;
@@ -928,6 +989,7 @@ mod tests {
                     target_verification_logits: Vec::new(),
                     bonus_logits: None,
                     compact_greedy_mtp: None,
+                    resolved_greedy_mtp: None,
                 };
             }
             let target_logits = vec![0.0, 1.0, 2.0];
@@ -945,6 +1007,7 @@ mod tests {
                 target_verification_logits: if mtp { vec![target_logits] } else { Vec::new() },
                 bonus_logits: mtp.then_some(vec![0.0, 2.0, 1.0]),
                 compact_greedy_mtp: None,
+                resolved_greedy_mtp: None,
             }
         }
     }
@@ -1160,6 +1223,7 @@ mod tests {
             target_verification_logits: vec![target; 4],
             bonus_logits: Some(vec![0.0, 2.0, 1.0]),
             compact_greedy_mtp: None,
+            resolved_greedy_mtp: None,
         };
         let (token, verified, accepted) = verify_greedy_mtp(&output).unwrap();
         assert_eq!(token, 2);
@@ -1193,6 +1257,7 @@ mod tests {
                 target_tokens: vec![2, 2, 0, 2],
                 bonus_token: 1,
             }),
+            resolved_greedy_mtp: None,
         };
         let mut capabilities = ExecutorCapabilities {
             vocab_size: 3,
@@ -1223,6 +1288,7 @@ mod tests {
                 target_tokens: vec![2, 1],
                 bonus_token: 0,
             }),
+            resolved_greedy_mtp: None,
             ..output
         };
         capabilities.resident_target_selection = true;
@@ -1231,6 +1297,50 @@ mod tests {
             verify_greedy_mtp(&all_accepted).unwrap(),
             (0, 2, vec![2, 1])
         );
+    }
+
+    #[test]
+    fn resolved_greedy_mtp_preserves_device_verified_counts_without_fake_suffixes() {
+        let mut capabilities = ExecutorCapabilities {
+            vocab_size: 8,
+            maximum_context_tokens: 32,
+            mtp: true,
+            maximum_draft_tokens: 4,
+            compact_greedy_mtp_verification: true,
+            resident_target_selection: true,
+            cancellation: true,
+            session_reset: true,
+            no_hidden_fallbacks: true,
+        };
+        let output = ExecutorStep {
+            target_logits: Vec::new(),
+            draft_logits: Vec::new(),
+            target_verification_logits: Vec::new(),
+            bonus_logits: None,
+            compact_greedy_mtp: None,
+            resolved_greedy_mtp: Some(ResolvedGreedyMtpVerification {
+                proposed_drafts: 4,
+                verified_drafts: 3,
+                accepted_draft_tokens: vec![2, 3],
+                next_token: 7,
+            }),
+        };
+        output.validate(&capabilities, true).unwrap();
+        assert_eq!(output.draft_count(), 4);
+        assert_eq!(verify_greedy_mtp(&output).unwrap(), (7, 3, vec![2, 3]));
+
+        let malformed = ExecutorStep {
+            resolved_greedy_mtp: Some(ResolvedGreedyMtpVerification {
+                proposed_drafts: 4,
+                verified_drafts: 4,
+                accepted_draft_tokens: vec![2, 3],
+                next_token: 7,
+            }),
+            ..output.clone()
+        };
+        assert!(malformed.validate(&capabilities, true).is_err());
+        capabilities.compact_greedy_mtp_verification = false;
+        assert!(output.validate(&capabilities, true).is_err());
     }
 
     #[test]
@@ -1245,6 +1355,7 @@ mod tests {
             target_verification_logits: vec![target],
             bonus_logits: Some(vec![0.0, 0.1, 0.2, 3.0, 0.4, 0.5]),
             compact_greedy_mtp: None,
+            resolved_greedy_mtp: None,
         };
         let capabilities = ExecutorCapabilities {
             vocab_size: 6,
@@ -1295,6 +1406,7 @@ mod tests {
                 target_verification_logits: vec![vec![0.0; 6]],
                 bonus_logits: Some(vec![0.0; 6]),
                 compact_greedy_mtp: None,
+                resolved_greedy_mtp: None,
             };
             assert!(output.validate(&capabilities, true).is_err());
         }

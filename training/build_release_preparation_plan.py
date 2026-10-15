@@ -12,6 +12,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from build_recovery_run_plan import validate_million_corpus_audit
 from recovery_io import atomic_json
 
 
@@ -20,8 +21,6 @@ EXECUTION_FORMAT = "ctox.recovery.execution-plan.v1"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 FOLD_PACKAGE_LIMIT_BYTES = 8_373_089_075
-TRAIN_SAMPLES = 2_328
-EVALUATION_SAMPLES = 642
 
 
 def sha256_path(path: Path) -> str:
@@ -36,7 +35,24 @@ def resolved(path: Path) -> str:
     return str(path.expanduser().resolve())
 
 
-def batch_verifications(plan_path: Path, root: Path, prefix: str) -> list[Path]:
+def executable_path(path: Path) -> str:
+    """Return an absolute executable entry point without dereferencing it.
+
+    Python virtual-environment launchers are commonly symlinks.  Resolving the
+    symlink changes ``sys.prefix`` back to the system installation and silently
+    drops the admitted package environment, so execution plans must retain the
+    operator-supplied absolute entry point.
+    """
+
+    return str(path.expanduser().absolute())
+
+
+def batch_verifications(
+    plan_path: Path,
+    root: Path,
+    prefix: str,
+    expected_samples: int | None = None,
+) -> list[Path]:
     document = json.loads(plan_path.read_text(encoding="utf-8"))
     batches = document.get("batches")
     if not isinstance(batches, list) or not batches:
@@ -46,6 +62,10 @@ def batch_verifications(plan_path: Path, root: Path, prefix: str) -> list[Path]:
         raise ValueError(f"batch plan is not contiguous from zero: {plan_path}")
     if int(document.get("summary", {}).get("batches", -1)) != len(indices):
         raise ValueError(f"batch plan summary differs: {plan_path}")
+    if expected_samples is not None and int(
+        document.get("summary", {}).get("samples", -1)
+    ) != expected_samples:
+        raise ValueError(f"batch plan sample count differs: {plan_path}")
     return [
         root / f"{prefix}-batch-{index:03d}-v1-verification-v1.json"
         for index in indices
@@ -133,7 +153,7 @@ def script_argv(python: Path, source_root: Path, name: str, *values: object) -> 
     if not script.is_file():
         raise ValueError(f"source snapshot lacks required script: {script}")
     return [
-        resolved(python),
+        executable_path(python),
         resolved(script),
         *(str(value) for value in values),
     ]
@@ -142,16 +162,34 @@ def script_argv(python: Path, source_root: Path, name: str, *values: object) -> 
 def build(args: argparse.Namespace) -> dict[str, Any]:
     source = validate_source_snapshot(args.source_root, args.source_commit)
     source_root = Path(source["path"])
-    python = args.python.expanduser().resolve()
+    python = args.python.expanduser().absolute()
     if not python.is_file() or not os.access(python, os.X_OK):
         raise ValueError("recovery Python is absent or not executable")
     if not SHA256.fullmatch(args.teacher_provenance_sha256):
         raise ValueError("teacher provenance is not a lowercase SHA-256")
 
+    corpus_audit, corpus_evidence = validate_million_corpus_audit(
+        args.million_corpus_audit,
+        args.million_corpus_audit_sha256,
+    )
+    corpus_partitions = corpus_evidence["partitions"]
+    expected_train_samples = int(corpus_audit["partitions"]["train"]["records"])
+    expected_calibration_samples = int(
+        corpus_audit["partitions"]["calibration"]["records"]
+    )
+    expected_evaluation_samples = int(
+        corpus_audit["partitions"]["held_out"]["records"]
+    )
+    calibration_input = Path(
+        corpus_partitions["calibration"]["binding_paths"]["materialized_sha256"]
+    )
+
     immutable_inputs = {
         "local_model_provenance": args.local_model_provenance,
         "train_input": args.train_input,
+        "calibration_input": calibration_input,
         "evaluation_input": args.evaluation_input,
+        "million_corpus_audit": args.million_corpus_audit,
         "train_missing_batch_plan": args.train_missing_batch_plan,
         "evaluation_batch_plan": args.evaluation_batch_plan,
         "activation_batch_plan": args.activation_batch_plan,
@@ -171,19 +209,45 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("local BF16 model source is absent")
     if not args.hf_home.expanduser().resolve().is_dir():
         raise ValueError("Hugging Face cache root is absent")
-    train_ids = jsonl_ids(args.train_input, TRAIN_SAMPLES, "training cohort")
-    evaluation_ids = jsonl_ids(
-        args.evaluation_input, EVALUATION_SAMPLES, "evaluation cohort"
+    expected_inputs = {
+        "train": args.train_input,
+        "calibration": calibration_input,
+        "held_out": args.evaluation_input,
+    }
+    for partition, path in expected_inputs.items():
+        binding = corpus_partitions[partition]
+        admitted = Path(binding["binding_paths"]["materialized_sha256"])
+        if path.expanduser().resolve() != admitted.expanduser().resolve():
+            raise ValueError(
+                f"{partition} materialized path differs from million-corpus evidence"
+            )
+        if sha256_path(path) != binding["materialized_sha256"]:
+            raise ValueError(
+                f"{partition} materialized cohort changed after corpus admission"
+            )
+
+    train_ids = jsonl_ids(
+        args.train_input, expected_train_samples, "training cohort"
     )
-    if train_ids.intersection(evaluation_ids):
-        raise ValueError("training and evaluation cohorts overlap")
+    calibration_ids = jsonl_ids(
+        calibration_input, expected_calibration_samples, "calibration cohort"
+    )
+    evaluation_ids = jsonl_ids(
+        args.evaluation_input, expected_evaluation_samples, "held-out cohort"
+    )
+    if (
+        train_ids & calibration_ids
+        or train_ids & evaluation_ids
+        or calibration_ids & evaluation_ids
+    ):
+        raise ValueError("training, calibration, and held-out cohorts overlap")
     if args.smoke_sample_id not in train_ids:
         raise ValueError("smoke sample is absent from the complete training cohort")
 
     data = args.data_root.expanduser().resolve()
     teacher_root = data / "teacher-cache"
-    train_cache = teacher_root / "release-recovery-train-2328-v1-cache-set.json"
-    evaluation_cache = teacher_root / "release-recovery-evaluation-642-v1-cache-set.json"
+    train_cache = teacher_root / "release-recovery-train-v1-cache-set.json"
+    evaluation_cache = teacher_root / "release-recovery-heldout-v1-cache-set.json"
     train_missing_plan = args.train_missing_batch_plan.expanduser().resolve()
     evaluation_plan = args.evaluation_batch_plan.expanduser().resolve()
     activation_plan = args.activation_batch_plan.expanduser().resolve()
@@ -196,8 +260,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             f"teacher cache is not terminal; {len(absent)} batch verifications are absent"
         )
     existing = [path.expanduser().resolve() for path in args.train_existing_verification]
-    if len(existing) != 5 or any(not path.is_file() for path in existing):
-        raise ValueError("release training cache requires exactly five existing verifications")
+    if any(not path.is_file() for path in existing):
+        raise ValueError("an existing release training verification is absent")
     if len(set(existing)) != len(existing):
         raise ValueError("existing teacher verification is repeated")
 
@@ -229,10 +293,16 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     evaluation_verifications = batch_verifications(
-        evaluation_plan, teacher_root, args.evaluation_prefix
+        evaluation_plan,
+        teacher_root,
+        args.evaluation_prefix,
+        expected_evaluation_samples,
     )
     activation_verifications = batch_verifications(
-        activation_plan, data / "activation-stats", args.activation_prefix
+        activation_plan,
+        data / "activation-stats",
+        args.activation_prefix,
+        expected_calibration_samples,
     )
     common_teacher = [
         "--model",
@@ -249,10 +319,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         resolved(args.hf_home),
         "--gpus",
         "2",
+        "--physical-gpus",
+        "1,2",
         "--reserved-gpu-hours",
         "24",
         "--gpu-weight-memory-gib",
-        "16",
+        "14",
         "--long-context-gpu-weight-memory-gib",
         "10",
         "--long-context-threshold-tokens",
@@ -311,7 +383,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "--plan",
         resolved(args.base_quant_plan),
         "--input",
-        resolved(args.train_input),
+        resolved(calibration_input),
         "--model",
         resolved(args.model_source),
         "--revision",
@@ -328,10 +400,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         resolved(args.hf_home),
         "--gpus",
         "2",
+        "--physical-gpus",
+        "1,2",
         "--reserved-gpu-hours",
         "24",
         "--gpu-weight-memory-gib",
-        "16",
+        "14",
         "--long-context-gpu-weight-memory-gib",
         "10",
         "--long-context-threshold-tokens",
@@ -344,16 +418,16 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "512",
     )
 
-    merged = data / "activation-stats/release-activation-full-train-2328-merged-v1.safetensors"
-    sensitivity = data / "sensitivity/release-activation-full-train-2328-all506-v1.json"
-    assignment = data / "assignments/release-activation-full-train-2328-all506-v1.json"
-    final_quant_plan = data / "plans/release-activation-full-train-2328-all506-v1.json"
+    merged = data / "activation-stats/release-calibration-merged-v1.safetensors"
+    sensitivity = data / "sensitivity/release-calibration-sensitivity-v1.json"
+    assignment = data / "assignments/release-calibration-q2q4-v1.json"
+    final_quant_plan = data / "plans/release-calibration-q2q4-v1.json"
     scale_fit = (
         data
-        / "recovery/release-activation-full-train-2328-all506-scale-fit-v1.safetensors"
+        / "recovery/release-calibration-scale-initializer-v1.safetensors"
     )
-    scale_report = data / "recovery/release-activation-full-train-2328-all506-scale-fit-v1.json"
-    artifact = data / "packs/release-activation-full-train-2328-all506-scale-fit-v1.ctoxq"
+    scale_report = data / "recovery/release-calibration-scale-initializer-v1.json"
+    artifact = data / "packs/release-calibration-initializer-v1.ctoxq"
     smoke_base = data / "recovery/release-recovery-e2e-full-train-smoke-1step-v1"
     smoke_outputs = [
         smoke_base.with_suffix(".safetensors"),
@@ -370,7 +444,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "--plan",
         resolved(args.base_quant_plan),
         "--input",
-        resolved(args.train_input),
+        resolved(calibration_input),
         "--artifact-root",
         resolved(data / "activation-stats"),
         "--artifact-prefix",
@@ -568,13 +642,19 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "immutable_inputs": input_bindings,
         "cohorts": {
             "training_samples": len(train_ids),
-            "evaluation_samples": len(evaluation_ids),
+            "calibration_samples": len(calibration_ids),
+            "held_out_samples": len(evaluation_ids),
             "overlap": 0,
             "smoke_sample_id": args.smoke_sample_id,
         },
-        "immutable_inputs": input_bindings,
+        "million_corpus": {
+            "audit": resolved(args.million_corpus_audit),
+            "audit_sha256": args.million_corpus_audit_sha256,
+            "evidence": corpus_audit["evidence"],
+            "evidence_sha256": corpus_audit["evidence_sha256"],
+        },
         "implementation": {
-            "python": resolved(python),
+            "python": executable_path(python),
             "scripts": scripts,
         },
         "model": "Qwen/Qwen3.8-27B",
@@ -599,6 +679,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--revision", required=True)
     parser.add_argument("--local-model-provenance", type=Path, required=True)
     parser.add_argument("--teacher-provenance-sha256", required=True)
+    parser.add_argument("--million-corpus-audit", type=Path, required=True)
+    parser.add_argument("--million-corpus-audit-sha256", required=True)
     parser.add_argument("--train-input", type=Path, required=True)
     parser.add_argument("--train-existing-verification", type=Path, action="append", default=[])
     parser.add_argument("--train-missing-batch-plan", type=Path, required=True)

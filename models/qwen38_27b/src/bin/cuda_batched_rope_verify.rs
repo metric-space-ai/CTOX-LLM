@@ -23,6 +23,8 @@ struct Args {
     start_position: u64,
     #[arg(long, default_value_t = 5.0e-4)]
     absolute_tolerance: f32,
+    #[arg(long, default_value_t = 1_000)]
+    graph_replays: usize,
 }
 
 #[derive(Serialize)]
@@ -52,6 +54,9 @@ struct Report<'a> {
     driver_free_bytes_after_prepare: usize,
     driver_free_bytes_after_drop: usize,
     observed_reclaimed_bytes: usize,
+    graph_replays: usize,
+    graph_microseconds_per_replay: f64,
+    graph_maximum_absolute_delta: f32,
     note: &'static str,
 }
 
@@ -68,6 +73,8 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to read CUDA module {}", args.module.display()))?;
     let module_sha256 = format!("{:x}", Sha256::digest(&module));
     let runtime = CudaCandidateRuntime::new(&module, args.device)?;
+    let graph_verification =
+        runtime.verifier_capture_rope_graph(args.start_position, args.graph_replays)?;
     let (free_before_prepare, _) = runtime.memory_info()?;
 
     let query_config = CudaPartialRopeConfig {
@@ -266,7 +273,10 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes,
-            note: "One device-built [token, rotary-pair] table is shared by token-major query and key in-place kernels. The same table drives batched Q/Gate deinterleave, resident Q RMSNorm, and query RoPE. Sequential CUDA is the oracle; no host token loop exists in the batched path and no model operation falls back to CPU.",
+            graph_replays: graph_verification.iterations,
+            graph_microseconds_per_replay: graph_verification.microseconds_per_replay,
+            graph_maximum_absolute_delta: graph_verification.maximum_absolute_delta,
+            note: "One device-built [token, rotary-pair] table is shared by token-major query and key in-place kernels. The same table drives batched Q/Gate deinterleave, resident Q RMSNorm, and query RoPE. Sequential CUDA is the oracle; no host token loop exists in the batched path and no model operation falls back to CPU. Dedicated-stream CUDA graph capture/replay is hardware-verified, but its one-kernel timing is not a model throughput benchmark.",
         })?
     );
     Ok(())

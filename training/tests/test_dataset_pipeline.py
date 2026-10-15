@@ -72,7 +72,7 @@ from optimize_q4_budget import (  # noqa: E402
     optimized_selections,
     validate_sensitivity_contract,
 )
-from plan_teacher_cache import sample_tensor_bytes  # noqa: E402
+from plan_teacher_cache import sample_tensor_bytes, write_sample_index  # noqa: E402
 from plan_teacher_batches import batches as plan_teacher_batches  # noqa: E402
 from plan_activation_batches import activation_batches  # noqa: E402
 from prompt_format import normalize_content, normalize_messages, normalize_tool_call  # noqa: E402
@@ -162,6 +162,7 @@ from verify_activation_stats import (  # noqa: E402
     expected_keys as expected_activation_keys,
 )
 from run_teacher_batches import (  # noqa: E402
+    bind_physical_gpus,
     cache_environment,
     completed_batch_matches,
     gpu_weight_memory_for_batch,
@@ -1992,6 +1993,25 @@ class DatasetPipelineTests(unittest.TestCase):
             },
         )
 
+    def test_teacher_cache_sample_index_is_ordered_atomic_and_minimal(self) -> None:
+        samples = [
+            {"id": "sample-a", "sequence_tokens": 32, "tensor_bytes": 100},
+            {"id": "sample-b", "sequence_tokens": 65_537, "tensor_bytes": 200},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "token-counts.jsonl"
+            write_sample_index(output, samples)
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(
+                rows,
+                [
+                    {"id": "sample-a", "sequence_tokens": 32},
+                    {"id": "sample-b", "sequence_tokens": 65_537},
+                ],
+            )
+            with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
+                write_sample_index(output, samples)
+
     def test_teacher_cache_verifier_contract_includes_mtp_and_hidden_layers(
         self,
     ) -> None:
@@ -2302,6 +2322,21 @@ class DatasetPipelineTests(unittest.TestCase):
             self.assertEqual(inherited["HF_HOME"], "/stale/cache")
             with self.assertRaisesRegex(ValueError, "not a directory"):
                 cache_environment(inherited, cache / "missing")
+
+    def test_teacher_batch_runner_reserves_physical_gpu_zero(self) -> None:
+        inherited = {"UNCHANGED": "yes"}
+        environment = bind_physical_gpus(inherited, "1,2", 2, "cuda:1")
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "1,2")
+        self.assertEqual(environment["UNCHANGED"], "yes")
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", inherited)
+        for physical, count, mtp in (
+            ("0,1", 2, "cuda:1"),
+            ("1,1", 2, "cuda:1"),
+            ("1", 2, "cuda:1"),
+            ("1,2", 2, "cuda:2"),
+        ):
+            with self.assertRaises(ValueError):
+                bind_physical_gpus(inherited, physical, count, mtp)
 
     def test_python_ctox_reader_matches_native_header_and_tensor_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

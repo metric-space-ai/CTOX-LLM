@@ -13,13 +13,13 @@ use std::thread::{self, JoinHandle};
 
 use crate::backend::cuda_graph::PreparedCudaProjectionGraph;
 use crate::backend::cuda_runtime::{
-    CudaCandidateRuntime, CudaDeviceF32View, CudaSubmissionStats, PreparedCudaArgmax,
-    PreparedCudaTopKTopPSampler,
+    CudaCandidateRuntime, CudaDeviceF32View, CudaMtpCompactResultRecord, CudaSubmissionStats,
+    PreparedCudaArgmax, PreparedCudaTopKTopPSampler,
 };
 use crate::backend::{BackendKind, PromotionState};
 use crate::engine::{
     AllocationSnapshot, CancellationToken, DraftDistribution, ExecutorCapabilities, ExecutorStep,
-    GreedyMtpVerification, ModelExecutor,
+    GreedyMtpVerification, ModelExecutor, ResolvedGreedyMtpVerification,
 };
 use crate::loader::ModelArtifact;
 use crate::memory::{LinearStateDType, SpeculativeStateStrategy};
@@ -55,8 +55,9 @@ pub struct CudaAllocatorStats {
 }
 
 #[derive(Debug)]
-struct PendingCudaSpeculativeBranch {
-    candidate_tokens: Vec<u32>,
+enum PendingCudaSpeculativeBranch {
+    Serial { candidate_tokens: Vec<u32> },
+    CapturedMtp4 { result: CudaMtpCompactResultRecord },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +79,7 @@ pub struct CudaModelExecutor {
     free_bytes_before_graph: Option<usize>,
     allocator_stats: CudaAllocatorStats,
     mtp_output_mode: CudaMtpOutputMode,
+    mtp4_session_seeded: bool,
     warmed: bool,
     allocations: AllocationSnapshot,
 }
@@ -178,6 +180,7 @@ impl CudaModelExecutor {
             free_bytes_before_graph: None,
             allocator_stats: CudaAllocatorStats::default(),
             mtp_output_mode,
+            mtp4_session_seeded: false,
             warmed: false,
             allocations: AllocationSnapshot::default(),
         })
@@ -679,6 +682,7 @@ impl ModelExecutor for CudaModelExecutor {
         self.mtp_draft_token_ids = mtp_draft_token_ids.to_vec();
         self.admitted_context = admitted_context;
         self.admitted_draft_tokens = profile.mtp_draft_tokens as usize;
+        self.mtp4_session_seeded = false;
         self.free_bytes_before_graph = Some(free_before_graph);
         let free_before_load_bytes = u64::try_from(free_before_graph)
             .map_err(|_| EngineError::MemoryBudget("CUDA baseline bytes exceed u64".into()))?;
@@ -732,6 +736,7 @@ impl ModelExecutor for CudaModelExecutor {
             .as_mut()
             .expect("validated CUDA graph")
             .reset_session()?;
+        self.mtp4_session_seeded = false;
         let mut target_logits = Vec::new();
         let runtime = self.runtime.as_ref().expect("validated CUDA runtime");
         let graph = self.graph.as_mut().expect("validated CUDA graph");
@@ -785,6 +790,7 @@ impl ModelExecutor for CudaModelExecutor {
             target_verification_logits: Vec::new(),
             bonus_logits: None,
             compact_greedy_mtp: None,
+            resolved_greedy_mtp: None,
         })
     }
 
@@ -822,6 +828,60 @@ impl ModelExecutor for CudaModelExecutor {
         } else {
             0
         };
+        if mtp_enabled
+            && speculative_draft_count == MAXIMUM_CHAINED_MTP_DRAFTS
+            && self.mtp_output_mode == CudaMtpOutputMode::CompactGreedy
+        {
+            if !self.mtp4_session_seeded {
+                graph.capture_target_decode_graph(runtime, &self.config, token as usize)?;
+                if !graph.has_captured_mtp_decode_graph() {
+                    graph.capture_mtp_decode_graph(runtime, &self.config)?;
+                }
+                if !graph.has_captured_mtp4_draft_graph() {
+                    graph.capture_mtp4_draft_graph(runtime, &self.config)?;
+                }
+                if !graph.has_captured_mtp4_target_verify_graph() {
+                    graph.capture_mtp4_target_verify_graph(runtime, &self.config)?;
+                }
+                self.mtp4_session_seeded = true;
+            }
+            graph.begin_speculative_branch(runtime)?;
+            let transaction = (|| {
+                graph.launch_captured_mtp4_drafts()?;
+                graph.launch_captured_mtp4_target_verify()?;
+                graph.verifier_read_captured_mtp4_acceptance(runtime)
+            })();
+            let result = match transaction {
+                Ok(result) => result,
+                Err(error) => {
+                    return match graph.restore_speculative_branch(runtime) {
+                        Ok(()) => Err(error),
+                        Err(restore_error) => Err(EngineError::InvalidState(format!(
+                            "CUDA captured MTP4 submission failed ({error}) and rollback failed: {restore_error}"
+                        ))),
+                    };
+                }
+            };
+            let accepted = result.accepted_count as usize;
+            self.pending_speculative = Some(PendingCudaSpeculativeBranch::CapturedMtp4 { result });
+            return Ok(ExecutorStep {
+                target_logits: Vec::new(),
+                draft_logits: Vec::new(),
+                target_verification_logits: Vec::new(),
+                bonus_logits: None,
+                compact_greedy_mtp: None,
+                resolved_greedy_mtp: Some(ResolvedGreedyMtpVerification {
+                    proposed_drafts: MAXIMUM_CHAINED_MTP_DRAFTS as u32,
+                    verified_drafts: if accepted == MAXIMUM_CHAINED_MTP_DRAFTS {
+                        MAXIMUM_CHAINED_MTP_DRAFTS as u32
+                    } else {
+                        (accepted + 1) as u32
+                    },
+                    accepted_draft_tokens: result.emitted_tokens[..accepted].to_vec(),
+                    next_token: result.bonus_token,
+                }),
+            });
+        }
         let first_draft = if mtp_enabled {
             if self.admitted_draft_tokens == 0 {
                 return Err(EngineError::InvalidState(
@@ -875,6 +935,7 @@ impl ModelExecutor for CudaModelExecutor {
                 target_verification_logits: Vec::new(),
                 bonus_logits: None,
                 compact_greedy_mtp: None,
+                resolved_greedy_mtp: None,
             });
         }
 
@@ -928,7 +989,7 @@ impl ModelExecutor for CudaModelExecutor {
                 )?;
                 current_target = runtime.dispatch_argmax_f32_device(argmax, next_target_view)?;
             }
-            self.pending_speculative = Some(PendingCudaSpeculativeBranch {
+            self.pending_speculative = Some(PendingCudaSpeculativeBranch::Serial {
                 candidate_tokens: candidate_tokens.clone(),
             });
             return Ok(ExecutorStep {
@@ -941,6 +1002,7 @@ impl ModelExecutor for CudaModelExecutor {
                     target_tokens,
                     bonus_token: current_target,
                 }),
+                resolved_greedy_mtp: None,
             });
         }
 
@@ -999,13 +1061,14 @@ impl ModelExecutor for CudaModelExecutor {
             )?;
             current_target = read_valid_logits(runtime, next_target_view)?;
         }
-        self.pending_speculative = Some(PendingCudaSpeculativeBranch { candidate_tokens });
+        self.pending_speculative = Some(PendingCudaSpeculativeBranch::Serial { candidate_tokens });
         Ok(ExecutorStep {
             target_logits,
             draft_logits,
             target_verification_logits,
             bonus_logits: Some(current_target),
             compact_greedy_mtp: None,
+            resolved_greedy_mtp: None,
         })
     }
 
@@ -1049,13 +1112,6 @@ impl ModelExecutor for CudaModelExecutor {
         let branch = self.pending_speculative.take().ok_or_else(|| {
             EngineError::InvalidState("CUDA executor has no pending speculative branch".into())
         })?;
-        let accepted = usize::try_from(accepted_drafts)
-            .map_err(|_| EngineError::InvalidState("CUDA accepted depth exceeds usize".into()))?;
-        if accepted > branch.candidate_tokens.len() {
-            return Err(EngineError::InvalidState(
-                "CUDA accepted depth exceeds pending candidate block".into(),
-            ));
-        }
         let runtime = self.runtime.as_ref().ok_or_else(|| {
             EngineError::InvalidState("CUDA speculative commit has no runtime".into())
         })?;
@@ -1066,7 +1122,28 @@ impl ModelExecutor for CudaModelExecutor {
             graph.restore_speculative_branch(runtime)?;
             return Err(EngineError::Cancelled);
         }
-        if accepted == branch.candidate_tokens.len() {
+        let accepted = usize::try_from(accepted_drafts)
+            .map_err(|_| EngineError::InvalidState("CUDA accepted depth exceeds usize".into()))?;
+        let candidate_tokens = match branch {
+            PendingCudaSpeculativeBranch::CapturedMtp4 { result } => {
+                if accepted_drafts != result.accepted_count {
+                    graph.restore_speculative_branch(runtime)?;
+                    return Err(EngineError::InvalidState(
+                        "CUDA engine acceptance differs from captured MTP4 verifier".into(),
+                    ));
+                }
+                graph.resolve_captured_mtp4_acceptance(runtime, result)?;
+                return Ok(());
+            }
+            PendingCudaSpeculativeBranch::Serial { candidate_tokens } => candidate_tokens,
+        };
+        if accepted > candidate_tokens.len() {
+            graph.restore_speculative_branch(runtime)?;
+            return Err(EngineError::InvalidState(
+                "CUDA accepted depth exceeds pending candidate block".into(),
+            ));
+        }
+        if accepted == candidate_tokens.len() {
             graph.commit_speculative_branch()?;
             return Ok(());
         }
@@ -1080,7 +1157,7 @@ impl ModelExecutor for CudaModelExecutor {
         // than exposing a half-accepted session.
         graph.begin_speculative_branch(runtime)?;
         let replay = (|| {
-            for candidate in branch.candidate_tokens.into_iter().take(accepted) {
+            for candidate in candidate_tokens.into_iter().take(accepted) {
                 if cancellation.is_cancelled() {
                     return Err(EngineError::Cancelled);
                 }
@@ -1114,6 +1191,7 @@ impl ModelExecutor for CudaModelExecutor {
 
     fn reset_session(&mut self) -> Result<()> {
         self.pending_speculative = None;
+        self.mtp4_session_seeded = false;
         if let Some(graph) = self.graph.as_mut() {
             graph.reset_session()?;
         }
@@ -1126,6 +1204,7 @@ impl ModelExecutor for CudaModelExecutor {
         self.mtp_draft_token_ids.clear();
         self.admitted_context = 0;
         self.admitted_draft_tokens = 0;
+        self.mtp4_session_seeded = false;
         let graph = self.graph.take();
         drop(graph);
         let argmax = self.argmax.take();

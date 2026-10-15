@@ -27,8 +27,6 @@ from teacher_cache_dataset import VerifiedTeacherCache
 
 
 MODEL = "Qwen/Qwen3.8-27B"
-TRAIN_SAMPLES = 2_328
-EVALUATION_SAMPLES = 642
 FOLD_PACKAGE_LIMIT_BYTES = 8_375_186_227
 REQUIRED_LOSSES = frozenset(
     {"kl", "ce", "hidden", "mtp_kl", "mtp_ce", "mtp_hidden"}
@@ -92,7 +90,15 @@ def validate_cache(
     expected_samples: int,
     revision: str,
     provenance_sha256: str,
+    expected_input_sha256: str,
 ) -> VerifiedTeacherCache:
+    encoded_manifest = path.read_bytes()
+    raw_manifest = json.loads(encoded_manifest)
+    expected_input = raw_manifest.get("expected_input")
+    if not isinstance(expected_input, dict):
+        raise ValueError("teacher cache-set does not bind its materialized input")
+    if expected_input.get("sha256") != expected_input_sha256:
+        raise ValueError("teacher cache-set materialized input differs from million-corpus evidence")
     cache = VerifiedTeacherCache.from_manifest(path, expected_sha256)
     if len(cache.artifacts) != expected_samples:
         raise ValueError(
@@ -113,6 +119,43 @@ def validate_cache(
     return cache
 
 
+def validate_million_corpus_audit(
+    path: Path,
+    expected_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    require_sha256(expected_sha256, "million-corpus audit hash")
+    encoded = path.read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != expected_sha256:
+        raise ValueError("million-corpus audit hash differs from contract")
+    audit = json.loads(encoded)
+    if audit.get("format") != "ctox.recovery-million-corpus-audit.v1":
+        raise ValueError("unsupported million-corpus audit")
+    if audit.get("status") != "passed" or audit.get("hard_gate_gaps") != {}:
+        raise ValueError("million-corpus audit did not pass")
+    partitions = audit.get("partitions")
+    if not isinstance(partitions, dict) or set(partitions) != {
+        "train",
+        "calibration",
+        "held_out",
+    }:
+        raise ValueError("million-corpus audit has the wrong partitions")
+    minima = {"train": 1_000_000, "calibration": 50_000, "held_out": 50_000}
+    for partition, minimum in minima.items():
+        record = partitions[partition]
+        if record.get("status") != "passed" or int(record.get("records", -1)) < minimum:
+            raise ValueError(f"million-corpus {partition} partition is not admitted")
+    evidence_path = Path(str(audit.get("evidence", "")))
+    evidence_bytes = evidence_path.read_bytes()
+    if hashlib.sha256(evidence_bytes).hexdigest() != audit.get("evidence_sha256"):
+        raise ValueError("million-corpus evidence changed after audit")
+    evidence = json.loads(evidence_bytes)
+    if evidence.get("format") != "ctox.recovery-million-corpus-evidence.v1":
+        raise ValueError("unsupported million-corpus evidence")
+    if any(int(value) != 0 for value in evidence.get("hard_gates", {}).values()):
+        raise ValueError("million-corpus evidence contains a failed hard gate")
+    return audit, evidence
+
+
 def validate_activation_assignment(
     activation_stats: Path,
     sensitivity_path: Path,
@@ -120,7 +163,7 @@ def validate_activation_assignment(
     plan_path: Path,
     revision: str,
     provenance_sha256: str,
-    training_ids: set[str],
+    calibration_ids: set[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     plan_bytes = plan_path.read_bytes()
     plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
@@ -151,11 +194,11 @@ def validate_activation_assignment(
     activation_ids = [str(value) for value in json.loads(metadata["sample_ids"])]
     if len(activation_ids) != len(set(activation_ids)):
         raise ValueError("activation statistics contain duplicate sample IDs")
-    if set(activation_ids) != training_ids:
+    if set(activation_ids) != calibration_ids:
         raise ValueError(
-            "final Q2/Q4 assignment was not measured over the complete training cohort"
+            "final Q2/Q4 assignment was not measured over the admitted calibration cohort"
         )
-    if int(metadata.get("samples", -1)) != len(training_ids):
+    if int(metadata.get("samples", -1)) != len(calibration_ids):
         raise ValueError("activation-statistics sample count differs")
 
     sensitivity = read_json(sensitivity_path, "sensitivity report")
@@ -344,6 +387,8 @@ def main() -> None:
     parser.add_argument("--model-source", type=Path, required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--local-model-provenance", type=Path, required=True)
+    parser.add_argument("--million-corpus-audit", type=Path, required=True)
+    parser.add_argument("--million-corpus-audit-sha256", required=True)
     parser.add_argument("--train-cache-set", type=Path, required=True)
     parser.add_argument("--train-cache-set-sha256", required=True)
     parser.add_argument("--evaluation-cache-set", type=Path, required=True)
@@ -408,19 +453,31 @@ def main() -> None:
         if provenance_sha256 is None:
             raise ValueError("recovery planning requires a verified local BF16 model")
 
+        corpus_audit, corpus_evidence = validate_million_corpus_audit(
+            args.million_corpus_audit,
+            args.million_corpus_audit_sha256,
+        )
+        corpus_partitions = corpus_evidence["partitions"]
+        expected_train_samples = int(corpus_audit["partitions"]["train"]["records"])
+        expected_evaluation_samples = int(
+            corpus_audit["partitions"]["held_out"]["records"]
+        )
+
         train_cache = validate_cache(
             args.train_cache_set,
             args.train_cache_set_sha256,
-            TRAIN_SAMPLES,
+            expected_train_samples,
             args.revision,
             provenance_sha256,
+            corpus_partitions["train"]["materialized_sha256"],
         )
         evaluation_cache = validate_cache(
             args.evaluation_cache_set,
             args.evaluation_cache_set_sha256,
-            EVALUATION_SAMPLES,
+            expected_evaluation_samples,
             args.revision,
             provenance_sha256,
+            corpus_partitions["held_out"]["materialized_sha256"],
         )
         if train_cache.settings != evaluation_cache.settings:
             raise ValueError("training and held-out teacher settings differ")
@@ -437,6 +494,25 @@ def main() -> None:
         ):
             require_exact_ids(evaluation_ids, load_indexed_jsonl(path, label), label)
 
+        calibration_binding = corpus_partitions["calibration"]
+        calibration_path = Path(
+            calibration_binding["binding_paths"]["materialized_sha256"]
+        )
+        if sha256_path(calibration_path) != calibration_binding["materialized_sha256"]:
+            raise ValueError("calibration materialized cohort changed after corpus admission")
+        calibration_ids = {
+            str(record["id"])
+            for record in load_indexed_jsonl(
+                calibration_path, "calibration materialized cohort"
+            )
+        }
+        if len(calibration_ids) != int(
+            corpus_audit["partitions"]["calibration"]["records"]
+        ):
+            raise ValueError("calibration identities differ from million-corpus audit")
+        if calibration_ids & train_ids or calibration_ids & evaluation_ids:
+            raise ValueError("calibration identities overlap training or held-out cache")
+
         plan, assignment_evidence = validate_activation_assignment(
             args.activation_stats,
             args.sensitivity,
@@ -444,7 +520,7 @@ def main() -> None:
             args.quant_plan,
             args.revision,
             provenance_sha256,
-            train_ids,
+            calibration_ids,
         )
         artifact = validate_artifact(
             args.artifact,
@@ -646,7 +722,7 @@ def main() -> None:
                         ("--direct", resolved(outputs["direct_evaluation"])),
                         ("--recovered", resolved(outputs["recovered_evaluation"])),
                         ("--output", resolved(outputs["comparison"])),
-                        ("--minimum-gap-closed", 0.30),
+                        ("--minimum-gap-closed", 0.50),
                     ],
                 ),
                 "outputs": [resolved(outputs["comparison"])],
@@ -660,6 +736,15 @@ def main() -> None:
             "local_model_provenance": {
                 "path": resolved(args.local_model_provenance),
                 "sha256": provenance_sha256,
+            },
+            "million_corpus": {
+                "audit": resolved(args.million_corpus_audit),
+                "audit_sha256": args.million_corpus_audit_sha256,
+                "evidence": corpus_audit["evidence"],
+                "evidence_sha256": corpus_audit["evidence_sha256"],
+                "training_samples": expected_train_samples,
+                "calibration_samples": len(calibration_ids),
+                "held_out_samples": expected_evaluation_samples,
             },
             "initializer_artifact": artifact,
             "assignment_evidence": assignment_evidence,
@@ -697,7 +782,7 @@ def main() -> None:
                 "epochs": args.epochs,
                 "gradient_accumulation": args.gradient_accumulation,
                 "expected_optimizer_steps": math.ceil(
-                    TRAIN_SAMPLES / args.gradient_accumulation
+                    len(train_ids) / args.gradient_accumulation
                 )
                 * args.epochs,
                 "fixed_logical_qcodes": True,

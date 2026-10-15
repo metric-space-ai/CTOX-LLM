@@ -1,7 +1,20 @@
 # Recovery training
 
-Training is offline tooling, not an inference-runtime dependency. The release
-pipeline has four immutable stages:
+Training is offline tooling, not an inference-runtime dependency. "Training"
+in this repository means quantization-error recovery only: logical Q2/Q4 codes,
+the BF16 teacher, model topology, tokenizer, template, and MTP weights remain
+frozen. It is not LoRA, SFT, knowledge training, or a separately resident
+runtime adapter.
+
+The one-release program admits at least 1,000,000 recovery-training records
+plus 50,000 calibration and 50,000 held-out records. The machine-readable
+quotas live in `MILLION_RECOVERY_POLICY.json`; `audit_million_corpus.py`
+requires content hashes for every source evidence file and rejects ID,
+payload, or semantic-cluster overlap before teacher-cache planning. The older
+2,328/642 corpus remains a pipeline and regression cohort, not the final
+million-sample qualification set.
+
+The release pipeline has four immutable stages:
 
 1. `build_manifest.py` streams source datasets and emits provenance records.
 2. `materialize_prompts.py` re-streams the pinned revisions, verifies each
@@ -10,6 +23,31 @@ pipeline has four immutable stages:
 3. `cache_teacher.py` runs the pinned BF16 teacher and stores top-64 logits,
    residual probability mass, and selected hidden states.
 4. `train_recovery.py` freezes Q2/Q4 codes and trains channel correction scales.
+
+Before the million-sample teacher run, the admitted training partition is
+reduced to one deterministic 10,000-record throughput probe. The selector
+retains exactly 6,500/2,500/800/150/50 records in the <=2K, 2K-8K, 8K-32K,
+32K-64K, and 64K-128K buckets. It ranks identities by a fixed SHA-256 seed;
+source order cannot bias the probe.
+
+```text
+python training/select_teacher_throughput_probe.py \
+  --million-corpus-audit <million-audit.json> \
+  --million-corpus-audit-sha256 <sha256> \
+  --output <probe.jsonl> \
+  --output-token-counts <probe-tokens.jsonl> \
+  --evidence <probe-selection.json>
+```
+
+After `plan_teacher_cache.py` and `plan_teacher_batches.py` bind those two
+outputs, `run_teacher_throughput_probe.py` runs the complete BF16 top-64,
+hidden-state, and MTP target path with `CUDA_VISIBLE_DEVICES=1,2`, logical MTP
+device `cuda:1`, and at most 14 GiB weight placement per A4500. GPU0 is never
+admitted. Its result is calculated only from passed cache verifications and
+matching append-only GPU ledger entries; it records samples/s, source tokens/s,
+artifact bytes, CUDA peaks, and an explicitly linear one-million projection.
+The full teacher-cache schedule is not admitted from a microbenchmark or an
+estimated model throughput.
 
 Before end-to-end distillation, `fit_recovery_scales.py` creates a complete
 deterministic initializer for every planned matrix. It regenerates the exact
@@ -464,7 +502,7 @@ produce both sample-mean and exact target-count-weighted KL, CE, hidden, MTP-KL,
 MTP-CE, and MTP-hidden metrics for categories, languages, primary and
 multi-label domains, service modes, and sources.
 `compare_recovery_evaluations.py` then requires the same ordered cohort,
-sidecar hashes, compute contract, and logical-code root. Its 30% gate measures
+sidecar hashes, compute contract, and logical-code root. Its 50% gate measures
 the recoverable BF16 distillation gap using KL/hidden families whose ideal is
 zero; ordinary CE is still reported but is not incorrectly treated as having
 zero BF16 baseline. This numerical gate does not replace task-level generation,
@@ -472,15 +510,16 @@ tool-execution, weighted benchmark, or 128K retrieval gates.
 
 `build_recovery_run_plan.py` is the fail-closed admission boundary before the
 unbounded recovery run. It rehashes every training and held-out teacher
-artifact, requires exactly 2,328/642 disjoint identities under one BF16
-provenance and teacher contract, and checks the held-out cohort plus domain and
-service-mode sidecars for exact identity. It also verifies every tensor in the
-initializer CTOXQ pack and proves that its fixed logical codes came from the
-specified final v2 quant plan.
+artifact, requires a passed and hash-bound million-corpus audit with at least
+1,000,000/50,000/50,000 disjoint identities under one BF16 provenance and
+teacher contract, and checks the held-out cohort plus domain and service-mode
+sidecars for exact identity. It also verifies every tensor in the initializer
+CTOXQ pack and proves that its fixed logical codes came from the specified
+final v2 quant plan.
 
 The final sensitivity chain is deliberately stricter than a calibration
-pilot: the activation-statistics sample IDs must equal the complete 2,328-item
-training cohort, every quantized matrix must be observed, and the statistics,
+pilot: the activation-statistics sample IDs must equal the complete admitted
+50,000-item calibration cohort, every quantized matrix must be observed, and the statistics,
 sensitivity report, measured Q2/Q4 assignment, rebuilt plan, and initializer
 pack must form one uninterrupted SHA-256 chain. A 256-sample assignment is
 useful for pilot training but cannot admit the release run. Admission also
@@ -489,7 +528,7 @@ the full run; a gradient-checkpointing-only smoke does not prove that path.
 
 The emitted `ctox.recovery.execution-plan.v1` contains argv arrays for complete
 training, trained packing, direct and recovered held-out evaluation, and the
-30% gap-closure comparison. It records exact output paths, expected optimizer
+50% gap-closure comparison. It records exact output paths, expected optimizer
 steps, checkpoint/resume contract, current ledger usage, all remaining stage
 reserves, and refuses the whole sequence if its projected total exceeds 240
 GPU-hours. `run_recovery_execution_plan.py` executes that immutable plan

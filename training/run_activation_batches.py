@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from plan_activation_batches import activation_batches
-from run_teacher_batches import cache_environment, gpu_weight_memory_for_batch
+from run_teacher_batches import (
+    bind_physical_gpus,
+    cache_environment,
+    gpu_weight_memory_for_batch,
+)
 from select_activation_calibration import load_jsonl, load_token_counts
 
 
@@ -118,6 +122,10 @@ def main() -> None:
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--hf-home", type=Path)
     parser.add_argument("--gpus", type=int, default=2)
+    parser.add_argument(
+        "--physical-gpus",
+        help="comma-separated physical CUDA devices; GPU0 is reserved for Greppy",
+    )
     parser.add_argument("--reserved-gpu-hours", type=float, default=4.0)
     parser.add_argument("--gpu-weight-memory-gib", type=int, default=16)
     parser.add_argument(
@@ -136,6 +144,12 @@ def main() -> None:
     parser.add_argument("--start-batch", type=int, default=0)
     parser.add_argument("--end-batch", type=int)
     args = parser.parse_args()
+
+    if args.physical_gpus:
+        try:
+            bind_physical_gpus(args.physical_gpus, args.gpus, args.mtp_device)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
 
     batch_plan_bytes = args.batch_plan.read_bytes()
     batch_plan = json.loads(batch_plan_bytes)

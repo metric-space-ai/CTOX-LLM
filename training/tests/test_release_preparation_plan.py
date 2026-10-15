@@ -7,6 +7,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -64,6 +65,8 @@ class ReleasePreparationPlanTests(unittest.TestCase):
             "revision": "b" * 40,
             "local-model-provenance": "/provenance.json",
             "teacher-provenance-sha256": "c" * 64,
+            "million-corpus-audit": "/million-audit.json",
+            "million-corpus-audit-sha256": "d" * 64,
             "train-input": "/train.jsonl",
             "train-missing-batch-plan": "/missing-plan.json",
             "train-missing-prefix": "missing",
@@ -114,21 +117,25 @@ class ReleasePreparationPlanTests(unittest.TestCase):
         hf_home.mkdir()
 
         train = data / "materialized/train.jsonl"
+        calibration = data / "materialized/calibration.jsonl"
         evaluation = data / "materialized/evaluation.jsonl"
         write_jsonl(train, "train", 2_328)
+        write_jsonl(calibration, "calibration", 50)
         write_jsonl(evaluation, "evaluation", 642)
         missing_plan = data / "plans/missing.json"
         evaluation_plan = data / "plans/evaluation.json"
         activation_plan = data / "plans/activation.json"
         write_batch_plan(missing_plan, 2, 1_735)
         write_batch_plan(evaluation_plan, 2, 642)
-        write_batch_plan(activation_plan, 2, 2_328)
+        write_batch_plan(activation_plan, 2, 50)
         base_plan = data / "plans/base.json"
         provenance = data / "provenance/model.json"
         ledger = data / "ledger.jsonl"
         base_plan.write_text("{}\n", encoding="utf-8")
         provenance.write_text("{}\n", encoding="utf-8")
         ledger.write_text("", encoding="utf-8")
+        audit = data / "million-audit.json"
+        audit.write_text("{}\n", encoding="utf-8")
 
         existing = []
         for index in range(5):
@@ -151,6 +158,8 @@ class ReleasePreparationPlanTests(unittest.TestCase):
             revision="b" * 40,
             local_model_provenance=provenance,
             teacher_provenance_sha256="c" * 64,
+            million_corpus_audit=audit,
+            million_corpus_audit_sha256=hashlib.sha256(audit.read_bytes()).hexdigest(),
             train_input=train,
             train_existing_verification=existing,
             train_missing_batch_plan=missing_plan,
@@ -167,14 +176,45 @@ class ReleasePreparationPlanTests(unittest.TestCase):
             output=root / "plan.json",
         )
 
+    def admitted_corpus(self, args: argparse.Namespace):
+        def partition(path: Path) -> dict[str, object]:
+            return {
+                "materialized_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "binding_paths": {"materialized_sha256": str(path.resolve())},
+            }
+
+        calibration = args.data_root / "materialized/calibration.jsonl"
+        evidence = {
+            "partitions": {
+                "train": partition(args.train_input),
+                "calibration": partition(calibration),
+                "held_out": partition(args.evaluation_input),
+            }
+        }
+        audit = {
+            "partitions": {
+                "train": {"records": 2_328},
+                "calibration": {"records": 50},
+                "held_out": {"records": 642},
+            },
+            "evidence": "/evidence.json",
+            "evidence_sha256": "e" * 64,
+        }
+        return audit, evidence
+
     def test_plan_is_hash_bound_serial_and_never_uses_gpu_zero(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = self.fixture(Path(temporary))
-            document = build(args)
+            with patch(
+                "build_release_preparation_plan.validate_million_corpus_audit",
+                return_value=self.admitted_corpus(args),
+            ):
+                document = build(args)
             stages = validate_stages(document)
             self.assertEqual(len(stages), 9)
             self.assertEqual(document["cohorts"]["training_samples"], 2_328)
-            self.assertEqual(document["cohorts"]["evaluation_samples"], 642)
+            self.assertEqual(document["cohorts"]["calibration_samples"], 50)
+            self.assertEqual(document["cohorts"]["held_out_samples"], 642)
             self.assertEqual(document["source_snapshot"]["commit"], "a" * 40)
             self.assertEqual(document["source_snapshot"]["files"], len(SCRIPTS))
             for stage in stages:
@@ -187,6 +227,16 @@ class ReleasePreparationPlanTests(unittest.TestCase):
             self.assertNotIn("--verification", train_cache)
             self.assertNotIn("--batch-group", train_cache)
             self.assertEqual(stages[-1]["resume_policy"], "none")
+            teacher_stage = stages[1]["argv"]
+            activation_stage = stages[3]["argv"]
+            for argv in (teacher_stage, activation_stage):
+                self.assertIn("--physical-gpus", argv)
+                self.assertEqual(argv[argv.index("--physical-gpus") + 1], "1,2")
+                self.assertEqual(argv[argv.index("--gpu-weight-memory-gib") + 1], "14")
+            self.assertEqual(
+                activation_stage[activation_stage.index("--input") + 1],
+                str((args.data_root / "materialized/calibration.jsonl").resolve()),
+            )
 
     def test_source_snapshot_must_be_read_only_and_symlink_free(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -195,6 +245,26 @@ class ReleasePreparationPlanTests(unittest.TestCase):
             source.chmod(0o755)
             with self.assertRaisesRegex(ValueError, "writable"):
                 validate_source_snapshot(source, "a" * 40)
+
+    def test_python_virtual_environment_entrypoint_is_not_dereferenced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.fixture(root)
+            launcher = root / "recovery-venv" / "bin" / "python"
+            launcher.parent.mkdir(parents=True)
+            launcher.symlink_to(Path(sys.executable))
+            args.python = launcher
+
+            with patch(
+                "build_release_preparation_plan.validate_million_corpus_audit",
+                return_value=self.admitted_corpus(args),
+            ):
+                document = build(args)
+
+            expected = str(launcher.absolute())
+            self.assertEqual(document["implementation"]["python"], expected)
+            self.assertTrue(all(stage["argv"][0] == expected for stage in document["stages"]))
+            self.assertNotEqual(expected, str(launcher.resolve()))
 
 
 if __name__ == "__main__":

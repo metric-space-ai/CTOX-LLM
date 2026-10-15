@@ -29,6 +29,37 @@ def cache_environment(
     return environment
 
 
+def bind_physical_gpus(
+    environment: dict[str, str],
+    physical_gpus: str | None,
+    gpu_count: int,
+    mtp_device: str,
+) -> dict[str, str]:
+    if gpu_count <= 0:
+        raise ValueError("GPU count must be positive")
+    if physical_gpus is None:
+        return environment
+    try:
+        devices = [int(value) for value in physical_gpus.split(",") if value != ""]
+    except ValueError as error:
+        raise ValueError("physical GPUs must be comma-separated integer indices") from error
+    if len(devices) != gpu_count or len(set(devices)) != len(devices):
+        raise ValueError("physical GPU list must contain exactly --gpus unique indices")
+    if any(device <= 0 for device in devices):
+        raise ValueError("physical GPU 0 is reserved for Greppy")
+    if not mtp_device.startswith("cuda:"):
+        raise ValueError("MTP device must be a logical CUDA device")
+    try:
+        logical_mtp = int(mtp_device.split(":", 1)[1])
+    except ValueError as error:
+        raise ValueError("MTP device has an invalid logical CUDA index") from error
+    if not 0 <= logical_mtp < gpu_count:
+        raise ValueError("MTP logical CUDA device is outside the isolated GPU set")
+    bound = environment.copy()
+    bound["CUDA_VISIBLE_DEVICES"] = ",".join(str(device) for device in devices)
+    return bound
+
+
 def gpu_weight_memory_for_batch(
     default_gib: int,
     long_context_gib: int | None,
@@ -90,6 +121,10 @@ def main() -> None:
         help="validated cache root inherited by the pinned kernel/model loaders",
     )
     parser.add_argument("--gpus", type=int, default=3)
+    parser.add_argument(
+        "--physical-gpus",
+        help="ordered physical CUDA devices; GPU 0 is rejected (release profile: 1,2)",
+    )
     parser.add_argument("--reserved-gpu-hours", type=float, default=4.0)
     parser.add_argument("--gpu-weight-memory-gib", type=int, default=16)
     parser.add_argument(
@@ -127,7 +162,15 @@ def main() -> None:
         raise SystemExit("invalid batch range")
     args.output_root.mkdir(parents=True, exist_ok=True)
 
-    environment = cache_environment(os.environ, args.hf_home)
+    try:
+        environment = bind_physical_gpus(
+            cache_environment(os.environ, args.hf_home),
+            args.physical_gpus,
+            args.gpus,
+            args.mtp_device,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     environment.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     for batch in batches[args.start_batch:end_batch]:
         index = int(batch["batch_index"])

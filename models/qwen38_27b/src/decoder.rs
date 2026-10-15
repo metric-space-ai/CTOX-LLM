@@ -1271,6 +1271,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             target_verification_logits: Vec::new(),
             bonus_logits: None,
             compact_greedy_mtp: None,
+            resolved_greedy_mtp: None,
         })
     }
 
@@ -1389,6 +1390,7 @@ impl ModelExecutor for CpuCorrectnessExecutor {
             target_verification_logits,
             bonus_logits,
             compact_greedy_mtp: None,
+            resolved_greedy_mtp: None,
         })
     }
 

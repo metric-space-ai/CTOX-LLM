@@ -41,6 +41,9 @@ struct Report<'a> {
     mixed_q2_tokens: usize,
     mixed_q4_tokens: usize,
     mixed_batch_page_launches: usize,
+    graph_prefill_matches_sequential_decode: bool,
+    maximum_graph_prefill_decode_absolute_delta: f32,
+    graph_prefill_committed_tokens: usize,
     maximum_mixed_oracle_absolute_error: f32,
     maximum_mixed_oracle_relative_error: f32,
     verifier_allocated_bytes: usize,
@@ -77,6 +80,8 @@ fn main() -> anyhow::Result<()> {
         .map(|index| ((index.wrapping_mul(13) % 503) as f32 - 251.0) * 0.0021)
         .collect();
     let query_staging = runtime.prepare_verifier_f32_tensor(&queries)?;
+    let key_staging = runtime.prepare_verifier_f32_tensor(&keys)?;
+    let value_staging = runtime.prepare_verifier_f32_tensor(&values)?;
 
     let all_q4_config = CudaPagedGqaConfig {
         query_heads,
@@ -133,6 +138,18 @@ fn main() -> anyhow::Result<()> {
         recent_tokens: 8,
     };
     let mut mixed = runtime.prepare_paged_q2q4_gqa(mixed_config)?;
+    let mut mixed_sequential = runtime.prepare_paged_q2q4_gqa(mixed_config)?;
+    let mut mixed_sequential_outputs = Vec::with_capacity(args.tokens * query_values);
+    for token in 0..args.tokens {
+        let query_start = token * query_values;
+        let component_start = token * component_values;
+        mixed_sequential_outputs.extend(runtime.append_and_dispatch_paged_q2q4_gqa(
+            &mut mixed_sequential,
+            &queries[query_start..query_start + query_values],
+            &keys[component_start..component_start + component_values],
+            &values[component_start..component_start + component_values],
+        )?);
+    }
     let mixed_batch_page_launches =
         runtime.seed_paged_q2q4_gqa_batch_verifier(&mut mixed, &keys, &values)?;
     anyhow::ensure!(
@@ -148,6 +165,25 @@ fn main() -> anyhow::Result<()> {
         args.tokens,
     )?;
     let mixed_actual = runtime.verifier_read_f32(mixed_view)?;
+
+    let mut graph_mixed = runtime.prepare_graph_paged_q2q4_gqa(mixed_config)?;
+    let graph_output = runtime.prepare_paged_q2q4_gqa_prefill_output(mixed_config, args.tokens)?;
+    let graph_view = runtime.append_and_dispatch_graph_paged_q2q4_gqa_prefill_device(
+        &mut graph_mixed,
+        &graph_output,
+        query_staging.device_view()?,
+        key_staging.device_view()?,
+        value_staging.device_view()?,
+        args.tokens,
+    )?;
+    let graph_actual = runtime.verifier_read_f32(graph_view)?;
+    let (maximum_graph_prefill_decode_absolute_delta, _) =
+        compare(&mixed_sequential_outputs, &graph_actual);
+    let graph_prefill_matches_sequential_decode = mixed_sequential_outputs == graph_actual;
+    anyhow::ensure!(
+        graph_prefill_matches_sequential_decode,
+        "graph-ring causal prefill differs from sequential descriptor decode (max abs {maximum_graph_prefill_decode_absolute_delta})"
+    );
 
     let mut oracle = PagedKvCache::new(
         mixed_config.maximum_tokens,
@@ -196,6 +232,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let verifier_allocated_bytes = query_staging.resident_bytes()
+        + key_staging.resident_bytes()
+        + value_staging.resident_bytes()
         + sequential.packed_device_bytes()
         + sequential.transient_bytes()
         + all_q4_prefill.packed_device_bytes()
@@ -203,16 +241,26 @@ fn main() -> anyhow::Result<()> {
         + all_q4_output.transient_bytes()
         + mixed.packed_device_bytes()
         + mixed.transient_bytes()
-        + mixed_output.transient_bytes();
+        + mixed_output.transient_bytes()
+        + mixed_sequential.packed_device_bytes()
+        + mixed_sequential.transient_bytes()
+        + graph_mixed.packed_device_bytes()
+        + graph_output.transient_bytes();
     let mixed_q2_tokens = mixed.q2_tokens();
     let mixed_q4_tokens = mixed.q4_tokens();
     let (free_after_prepare, _) = runtime.memory_info()?;
     drop(query_staging);
+    drop(key_staging);
+    drop(value_staging);
     drop(sequential);
     drop(all_q4_prefill);
     drop(all_q4_output);
     drop(mixed);
     drop(mixed_output);
+    drop(mixed_sequential);
+    let graph_prefill_committed_tokens = graph_mixed.tokens();
+    drop(graph_mixed);
+    drop(graph_output);
     let (free_after_drop, _) = runtime.memory_info()?;
     let observed_reclaimed_bytes = free_after_drop.saturating_sub(free_after_prepare);
     anyhow::ensure!(
@@ -242,6 +290,9 @@ fn main() -> anyhow::Result<()> {
             mixed_q2_tokens,
             mixed_q4_tokens,
             mixed_batch_page_launches,
+            graph_prefill_matches_sequential_decode,
+            maximum_graph_prefill_decode_absolute_delta,
+            graph_prefill_committed_tokens,
             maximum_mixed_oracle_absolute_error,
             maximum_mixed_oracle_relative_error,
             verifier_allocated_bytes,
@@ -249,7 +300,7 @@ fn main() -> anyhow::Result<()> {
             driver_free_bytes_after_prepare: free_after_prepare,
             driver_free_bytes_after_drop: free_after_drop,
             observed_reclaimed_bytes,
-            note: "The unpromoted direct causal prefill kernel consumes token-major queries and the canonical mixed Q2/Q4 cache without per-query host dispatch. The production-shaped KV packer consumes device K/V views and submits one two-dimensional launch per crossed page, never per token. Controlled latency and complete graph integration remain required.",
+            note: "The graph-ring causal prefill writes directly into decode's logical-Q2/fixed-Q4-ring cache and is compared against sequential descriptor decode. The production-shaped KV packer consumes device K/V views and submits page-bounded two-dimensional launches, never one host dispatch per token. Controlled full-model latency remains required.",
         })?
     );
     Ok(())

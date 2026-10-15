@@ -16,7 +16,7 @@ paths needed to build them.
 | BF16 origin | `Qwen/Qwen3.8-27B` revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`; 23 files/55,575,959,504 bytes verified under root SHA-256 `c63bc259cd8d18b0a701983a226867927b4ec19b376a684b218c3fa572754524` | Bind tokenizer, template, special-token, model-file, logical-checkpoint, and backend-pack digests in the final release manifest |
 | Native baseline | 8,342,484,480-byte CTOXQ file; 8,342,086,656 resident bytes; text plus MTP; SHA-256 `02d38cc877ad2ae8bea244bc11d4572ca0a8c84e757bdfbcb27ebbb9ed8c47f6` | Recovery scales are identity values; this is not the quality checkpoint |
 | Release calibration initializer | 256 final-corpus samples/917,704 observed tokens across all 36 domains, 15 language strata, and 14 service modes; all 506 matrices covered; 123 Q4, 381 Q2, and two mixed matrices; fixed-code channel scales reduce the activation-weighted error by 48.27%; 8,373,052,416 resident bytes; fully checksummed 8,373,658,112-byte CTOXQ pack | Complete teacher cache, end-to-end KL/CE/hidden/MTP recovery, held-out evaluation, and final logical digest |
-| Recovery data | Final quality-filtered 2,328 training and 642 held-out samples; 36 service domains in ten families; 15 language strata; 503 code, 381 agentic, 523 math, 866 ordinary-chat, and 55 long-context training records; zero ID and complete-payload overlap; fail-closed admission plus a plan/script/output-hashed serial runner with exact-checkpoint resume | Cache the 1,735 training identities not yet covered by the five verified release batches, assemble one 2,328-sample teacher cache set, then run final sensitivity/recovery/evaluation |
+| Recovery data | The existing 2,328 training/642 held-out cohort is complete pipeline and regression evidence only. The release policy now requires at least 1,000,000 training, 50,000 calibration, and 50,000 held-out records with exact domain, language, context, provenance, license, payload, and semantic-cluster gates. The scalable evidence builder, admission audit, ordered token sidecar, and million-bound recovery-plan contract are implemented. | Materialize and semantically deduplicate the million-scale partitions, run the 10,000-sample GPU1+2 throughput probe, complete BF16 teacher caches, then train and evaluate recovery. |
 | CPU | Scalar Qwen oracle, mmap-bound recovered target+MTP decoder correctness graph, engine-owned greedy MTP4 verification with partial-prefix replay/commit, release-bound restricted LM-head row execution, and experimental packed AVX2/NEON Q2/Q4/mixed projections plus embedding gather | Production token-mixer kernels, chunked prefill, ISA expansion, full-artifact golden run, and roofline/reference benchmark |
 | CUDA | Pinned llama.cpp, TensorRT-LLM, and syv-ai split-KV reference sources, SM86 ABI, direct Driver API runtime, resident pure/mixed embedding plus a 505-projection/262-activation mmap-backed target+MTP graph, all 48 linear token-mixer parameter/state groups, context-sized Q2/Q4 KV for 16 target plus one MTP full-attention state, all 134 target/MTP norm operators, fused residual/RMSNorm, SwiGLU/A8/down and attention-gate/A8/output paths, exact prepared-resource bindings for all 645 frozen decode and 645 layer-major prefill steps, compiled target-token, one-layer MTP draft, and target-verification device chains, one transactional commit barrier per complete target/MTP step, bounded FP16/retained-KV checkpoint/restore, chained greedy MTP4 partial-prefix restore/replay in `CudaModelExecutor`, a Q2/Q4-aware gathered 40,000-row draft head, finite-checking deterministic device argmax, resident ordinary-target selection through a bounded top-k/top-p candidate with canonical engine draws, an isolated five-query/16-segment mixed-Q2/Q4 split-KV verifier candidate, a verified upstream-derived SM86 Q2/Q4 MMQ tile, single-copy batched projection and shared RMSNorm workspaces, exact sequential-equivalent causal-convolution, fully prepared GatedDelta, direct mixed-Q2/Q4 paged-GQA scans, a verified one-launch-per-page persistent batched KV packer, shared-table batched partial RoPE, batched Query/Gate+Q-RMSNorm+RoPE fusion, a bit-exact mixed-Q2/Q4 batched embedding gather, a graph-owned 73,533,440-byte embedding/frontend/full-attention pool shared across every 512-token target/MTP chunk, an allocated 82,968,576-byte four-slot projection arena covering all 504 chunk-wide matrices while keeping LM-head last-row-only with bit-exact mixed-Q2/Q4 A4500 offset-view evidence, and an allocated 84,082,688-byte causal-convolution/GatedDelta/gated-RMSNorm pool shared across all 48 linear layers (240,584,704 total graph-owned chunk workspaces), a frozen 645-step layer-major chunked-prefill schedule with explicit key-RoPE/KV-append state mutations, a fail-closed cursor that admits only the exact committed start and returns a new commit position only after all 645 ordered steps plus the final barrier, and a dedicated driver-owning server thread | Pass the queued target/MTP, gathered-head/argmax, stochastic-sampling primitive/lifecycle, split-KV numerical/latency, barrier-count, bit-exact replay, threaded lifecycle, and 128K hardware runs; hardware-verify the batched gated-RMSNorm/complete linear pool, integrate all verified chunk operators into the executor, add device RNG, probability-correct stochastic MTP, and unrestricted top-p; replace sequential prefill with the chunk schedule; run the controlled roofline sweep and full-model golden/unload run |
 | Metal | Direct MSL compilation/dispatch, no-copy mmap artifact ownership, recovered embedding/projection/token-mixer candidates, Q2/Q4 same-device oracle comparison, shape-local simdgroup tuning, a frozen 645-step decode schedule, exact binding of all 505 projection/262 activation resources, one allocated 1,173,760-byte alias-safe shared decode-activation arena plus a separate 180,224-byte liveness-packed MTP scratch arena, real buffer/offset views for every read/write of all 645 steps, a native target-argmax/dynamic-embedding/pre-FC-norm/concat/`mtp.fc`/input-norm frontend followed by the complete one-layer Q/K/V/RoPE/paged-GQA/gated-output/residual/SwiGLU MTP transformer with append rollback, an offset-view canonical restricted Q2/Q4 draft head, device-side restricted argmax plus local-row-to-global-token mapping, a causally aligned initial MTP/target pair that advances both graphs from the same real token, an accepted-only one-command continuation with device-side compact acceptance/status preserving target-one-ahead state without a host token-to-embedding handoff, a fixed 64-byte four-record verifier history, device-side causal-prefix/target-fallback/true post-draft bonus-token reduction, a three-record queued MTP4 tail with partial-prefix restore and exact ordinary-verifier replay, a fused from-token four-record branch whose fifth transition consumes the fourth accepted draft without a separate completion wait, immutable causal RoPE/GQA plans backed by a resident five-slot metadata pool, single-use device-only target-hidden plus FP16 convolution/GatedDelta checkpoints, bounded append-only paged-KV rollback without arena duplication, one fail-closed atomic transaction across the final target hidden plus all 17 attention and 48 paired linear-state owners, ordinary/continuation/target-only complete-token entry points, a five-transition block cursor that publishes input plus four accepted drafts only after the shared GPU barrier, an embeddable verifier `MetalModelExecutor` owning load, serial causally shifted prefill, resident greedy selection, MTP4/variable-depth decode, reset, allocation reporting, and complete owned-resource unload, plus a safe dedicated-thread adapter and signed-profile `qwen38-server --verification-metal` Unix-socket path | Add the chunked prefill arena and stochastic resident sampler; hardware-prove fused MTP4 and hidden-state rollback on the full artifact, remove the verifier CPU KV mirror, prove allocator high-watermark/unload behavior, capture stable controlled roofline/reference evidence and a full-model golden run, then promote |
@@ -47,16 +47,13 @@ not fit. The MTP correction is recorded in
 correction in `models/qwen38_27b/docs/MEMORY_PLAN_CORRECTION_V4.json`. Likewise,
 the planned 9.6976-GiB vision phase is not yet Android device evidence.
 
-The five reused release teacher-cache batches plus missing-plan batches 0-13
-currently cover 2,111 of the 2,328 final training identities. Every reusable
-identity is content-bound to the same BF16 teacher revision and provenance.
-Batch 14 is active on GPU1+2; 217 records remain at the 2026-08-27 snapshot.
-No smoke cache or failed/OOM directory counts toward those numbers.
-
-The exact missing cohort and its 16-batch execution plan are frozen in
-`models/qwen38_27b/docs/TEACHER_CACHE_FINAL_PLAN_V1.json`: 12,908,476 input
-tokens and 19,892,384,032 projected cache bytes (18.5263 GiB). The plan is
-disk-admitted on GPU3 and preserves the complete final domain/language mix.
+The final training cache set now covers all 2,328 admitted identities and is
+content-bound to the BF16 teacher revision. Activation collection is likewise
+complete at 2,328 samples and 13,971,665 observed sequence tokens across all
+506 recoverable modules. The held-out 642-sample cache is the active GPU1+2
+stage; it remains excluded from quality claims until all eight batches and the
+cache-set manifest are terminal and rehashed. No smoke cache or failed/OOM
+directory counts toward these totals.
 
 ## Frozen release invariants
 
@@ -102,36 +99,40 @@ These constraints apply to every phase:
 - A backend-pack verifier proves equal logical tensor digests.
 - ABI lifecycle tests include cancelled loads and repeated load/unload cycles.
 
-## Phase 1: freeze the recovery corpus and finish teacher evidence
+## Phase 1: freeze the million-sample recovery corpus and finish teacher evidence
 
-**Status:** corpus selection and held-out disjointness are complete; 2,111 of
-2,328 final teacher identities are verified as of 2026-08-27. Batch 14 of the
-missing-cache plan is active; 217 identities remain.
+**Status:** the 2,328/642 pilot is preserved as regression evidence. It cannot
+admit the final release. `training/MILLION_RECOVERY_POLICY.json`,
+`build_million_corpus_evidence.py`, and `audit_million_corpus.py` now define the
+release boundary for 1,000,000/50,000/50,000 disjoint records. No million-scale
+teacher-cache or recovery-quality claim exists yet.
 
 **Work**
 
-1. Preserve the final 2,328/642 materialized identities and provenance-only
-   manifests recorded by `RECOVERY_CORPUS_V4.json`; do not reuse the superseded
-   2,072/524 cohort as release evidence.
-2. Compute the exact final-minus-verified set from passed batch-verification
-   manifests. Reject smoke, failed, duplicate, wrong-revision, or
-   wrong-provenance cache entries.
-3. Plan and execute the missing 1,735 records in token-aware immutable batches.
-   Long-context batches use the already measured safe memory profiles and exact
-   prefix-resume semantics.
-4. Capture BF16 top-64 logits, residual mass, selected hidden states, and MTP
+1. Preserve the 2,328/642 materialized identities as regression inputs only;
+   neither their teacher cache nor their scales may be relabeled as final.
+2. Materialize at least 1,000,000 recovery-training, 50,000 calibration, and
+   50,000 held-out identities under the frozen mix and source-license policy.
+3. Produce ordered domain, service-mode, token-count, provenance, and semantic
+   cluster sidecars. The evidence builder rejects changed order and the final
+   audit requires zero within- or cross-partition duplicates.
+4. Run a 10,000-sample throughput probe on physical GPU1+2 with at most 14 GiB
+   weight placement per A4500 before admitting the full teacher-cache schedule.
+   GPU0 remains reserved for Greppy.
+5. Capture BF16 top-64 logits, residual mass, selected hidden states, and MTP
    targets under the same settings as the existing verified batches.
-5. Assemble all passed batches into one content-addressed 2,328-sample cache-set
+6. Assemble every passed partition into its own content-addressed cache-set
    manifest and rehash every artifact before recovery admission.
-6. Keep Nemotron v2 quarantined until its public derivative-use decision is
+7. Keep Nemotron v2 quarantined until its public derivative-use decision is
    documented. Track all GPU work in the 240-GPU-hour ledger.
 
 **Exit evidence**
 
 - Immutable provenance and cohort manifests with no unresolved release-license
-  finding; 36/36 domains and 15/15 language strata pass in both partitions.
-- Exactly 2,328 unique, verified teacher artifacts under one teacher revision,
-  provenance digest, loss-position contract, and cache-set root hash.
+  finding; 36/36 domains and all required language strata pass in the training,
+  calibration, and held-out partitions.
+- At least 1,000,000/50,000/50,000 unique, verified artifacts under one teacher
+  revision, provenance digest, loss-position contract, and partition root hash.
 - Reproducible teacher-cache hashes and coverage report for every planned loss;
   missing, duplicate, and extra cache identities are all hard failures.
 - Separate calibration, recovery-training, and held-out evaluation splits.
@@ -140,7 +141,8 @@ missing-cache plan is active; 217 identities remain.
 
 **Work**
 
-1. Recompute activation-weighted Q2-vs-Q4 error with the complete corpus.
+1. Recompute activation-weighted Q2-vs-Q4 error with the complete admitted
+   50,000-sample calibration partition.
    Allocate Q4 where measured error reduction per byte is greatest; keep Q2
    elsewhere. Q3 remains absent.
 2. Extend assignment granularity for embedding and LM-head storage to
@@ -165,7 +167,7 @@ missing-cache plan is active; 217 identities remain.
 
 - Final text+MTP resident bytes at or below 8,375,186,227 bytes (7.8 GiB).
 - Weighted benchmark score at least 95% of BF16; no primary category below 90%.
-- Recovery closes at least 30% of the direct-Q2/Q4-to-BF16 quality gap.
+- Recovery closes at least 50% of the direct-Q2/Q4-to-BF16 quality gap.
 - Agentic/tool-calling, German, code, and MTP gates pass on held-out samples.
 - Held-out agent traces include actionable tool failures and require immediate
   exact recovery: qualify an ambiguous symbol or use the observed repository

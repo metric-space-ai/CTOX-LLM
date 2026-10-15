@@ -33,6 +33,13 @@ Vendored third-party source:
   adaptation scope are recorded in the adjacent UPSTREAM.json. The patch is
   reference material only; CTOX does not link vLLM or Triton.
 
+- models/qwen38_27b/vendor/cuda/tensorrt_llm_mtp/ contains byte-identical
+  Apache-2.0 MTP audit sources and a standalone verifier extraction from
+  NVIDIA TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM), pinned to
+  revision 390f92d76377afe0159e8d7ffd2312483cf2a358. The adjacent
+  UPSTREAM.json records exact source hashes and the lines retained. CTOX does
+  not link the TensorRT-LLM runtime or allocator.
+
 Direct driver binding dependency:
 
 - The optional macOS `metal` feature uses metal-rs 0.33.0
