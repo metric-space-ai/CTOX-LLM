@@ -7,7 +7,7 @@ use std::{fs,io::{self,BufRead,Write}};
 struct Request { id:String, token_ids:Vec<u32>, prompt_tokens:usize, generated_tokens:usize, vocab_size:usize }
 #[derive(Serialize)]
 struct Row { id:String, offset:usize, distribution:Vec<(usize,f64)> }
-fn sample_distribution(logits:&[f32]) -> anyhow::Result<Vec<(usize,f64)>> {
+pub fn sample_distribution(logits:&[f32]) -> anyhow::Result<Vec<(usize,f64)>> {
     ensure!(logits.len() >= 20 && logits.iter().all(|x|x.is_finite()), "invalid logits");
     let mut ids:Vec<usize>=(0..logits.len()).collect();
     // Fixed measured profile: temperature=1, top-k=20, then top-p=.95.
