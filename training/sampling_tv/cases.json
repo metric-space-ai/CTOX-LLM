@@ -1,0 +1,612 @@
+[
+  {
+    "id": "text-01",
+    "bucket": "text",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Erkläre in drei kurzen Sätzen, warum der Himmel blau erscheint."
+      }
+    ]
+  },
+  {
+    "id": "text-02",
+    "bucket": "text",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Fasse zusammen: Ein Team verschob seine Veröffentlichung um zwei Tage, weil die Installation nach einem Neustart fehlschlug. Nach einer Reparatur funktionierte sie wieder. Verwende einen Satz."
+      }
+    ]
+  },
+  {
+    "id": "text-03",
+    "bucket": "text",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Translate into German: The meeting starts at half past nine. Please bring the revised report."
+      }
+    ]
+  },
+  {
+    "id": "text-04",
+    "bucket": "text",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "A shop discounts an 80 euro item by 15 percent. State the discount and final price in one sentence."
+      }
+    ]
+  },
+  {
+    "id": "text-05",
+    "bucket": "text",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "List three differences between a process and a thread, briefly."
+      }
+    ]
+  },
+  {
+    "id": "text-06",
+    "bucket": "text",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Wandle dieses Datum in ISO 8601 um: 16. Oktober 2026. Antworte nur mit dem Datum."
+      }
+    ]
+  },
+  {
+    "id": "text-07",
+    "bucket": "text",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Rewrite politely: You forgot the attachment. Send it today."
+      }
+    ]
+  },
+  {
+    "id": "text-08",
+    "bucket": "text",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Given the record {\"name\":\"Mara\",\"count\":7,\"active\":true}, output only the name and count as JSON."
+      }
+    ]
+  },
+  {
+    "id": "code-01",
+    "bucket": "code",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Write a Python function clamp(value, lower, upper). Raise ValueError when lower > upper. Return only the function."
+      }
+    ]
+  },
+  {
+    "id": "code-02",
+    "bucket": "code",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Write a JavaScript function uniqueStable(items) that removes duplicates while preserving order. Code only."
+      }
+    ]
+  },
+  {
+    "id": "code-03",
+    "bucket": "code",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Fix this Python function and return only code: def last(xs): return xs[len(xs)] . For empty input return None."
+      }
+    ]
+  },
+  {
+    "id": "code-04",
+    "bucket": "code",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Write a SQL query that returns customer_id and total order amount from orders, only totals above 100. Columns: customer_id, amount."
+      }
+    ]
+  },
+  {
+    "id": "code-05",
+    "bucket": "code",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Write a Rust function safe_div(a: i64, b: i64) -> Option<i64> using checked_div. Code only."
+      }
+    ]
+  },
+  {
+    "id": "code-06",
+    "bucket": "code",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Write a Python function that checks whether a string has balanced parentheses, ignoring other characters. Code only."
+      }
+    ]
+  },
+  {
+    "id": "code-07",
+    "bucket": "code",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Write a TypeScript type for a result that is either {ok:true,value:string} or {ok:false,error:string}. Then a function extracting value or throwing. Code only."
+      }
+    ]
+  },
+  {
+    "id": "code-08",
+    "bucket": "code",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Write a Python function parse_port(text) that returns an integer from 1 to 65535 and raises ValueError otherwise. Code only."
+      }
+    ]
+  },
+  {
+    "id": "tool-01",
+    "bucket": "tool",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Search for reset_session in the repository. Return at most 5 matches."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search_files",
+          "description": "Search filenames and file content in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "query",
+              "limit"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a named repository file.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "tool-02",
+    "bucket": "tool",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Read src/main.rs."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search_files",
+          "description": "Search filenames and file content in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "query",
+              "limit"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a named repository file.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "tool-03",
+    "bucket": "tool",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "What is the weather in Berlin in Celsius?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get current weather.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "tool-04",
+    "bucket": "tool",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Use the calculator for (128 * 17) - 39."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "Evaluate an arithmetic expression.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "expression": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "expression"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "tool-05",
+    "bucket": "tool",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Look up order ORD-2026-0017."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "lookup_order",
+          "description": "Read an order by its exact order ID.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "order_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_id"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "search_files",
+          "description": "Search filenames and file content in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "query",
+              "limit"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "tool-06",
+    "bucket": "tool",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "Search for the literal string \"connection refused\" and limit the results to 3."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search_files",
+          "description": "Search filenames and file content in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "query",
+              "limit"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a named repository file.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "tool-07",
+    "bucket": "tool",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Follow the user request precisely."
+      },
+      {
+        "role": "user",
+        "content": "What is 2+2? Answer directly without using a tool."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calculate",
+          "description": "Evaluate an arithmetic expression.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "expression": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "expression"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "tool-08",
+    "bucket": "tool",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be concise. Preserve exact identifiers and amounts."
+      },
+      {
+        "role": "user",
+        "content": "What is the status and total for ORD-2026-0017?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "function": {
+              "name": "lookup_order",
+              "arguments": {
+                "order_id": "ORD-2026-0017"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"order_id\":\"ORD-2026-0017\",\"status\":\"shipped\",\"total_eur\":42.50}"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "lookup_order",
+          "description": "Read an order by its exact order ID.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "order_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_id"
+            ]
+          }
+        }
+      }
+    ]
+  }
+]
