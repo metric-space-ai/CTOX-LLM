@@ -31,7 +31,10 @@ head-only calibration screen**: only existing LM-head input/output scales can
 change. Packed codes, body scales and model size stay fixed. The differentiable
 surrogate applies FP16 scale rounding and A8 activation rounding; it must first
 match native baseline distributions. Full-vocabulary Q8 KL supplies gradients;
-only tuning TV selects a checkpoint. A straight-through derivative is used for
+only tuning TV selects a checkpoint. An optional, independently checked TV loss
+adds gradients for the exact fixed sampler within its selected support. The
+predeclared refinement compares KL-only and KL+TV (weight 1), choosing only by
+tuning TV before native and original-benchmark validation. A straight-through derivative is used for
 rounding. This is scale fitting, not full-weight fine-tuning.
 
 `head.rs` verifies the selected scales with the actual native packed projection
