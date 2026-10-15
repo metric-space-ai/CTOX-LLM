@@ -9,6 +9,20 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'sampling_tv'))
 from measure import distribution,tv,summary,sha
 
+def sampler_tv_loss(logits, reference, torch):
+    """Exact fixed-profile TV value; gradients within the selected support.
+
+    KL remains necessary to pull missing teacher tokens into the support.
+    Ties use lower token ID, matching the measurement sampler.
+    """
+    ix=torch.argsort(logits,dim=-1,descending=True,stable=True)[:,:20]
+    probabilities=logits.gather(1,ix).double().softmax(-1)
+    keep=(probabilities.cumsum(-1)-probabilities)<.95
+    probabilities=probabilities*keep
+    probabilities=probabilities/probabilities.sum(-1,keepdim=True)
+    q=torch.zeros_like(logits,dtype=torch.float64).scatter(1,ix,probabilities)
+    return .5*(q-reference.double()).abs().sum(-1).mean()
+
 def run(a):
     sys.path.insert(0,str(a.legacy_training))
     import numpy as np
@@ -25,6 +39,10 @@ def run(a):
     if len(teacher)!=len(native) or any((t['id'],t['position'],t['row'])!=(s['id'],s['position'],s['row']) for t,s in zip(teacher,native)):
         raise ValueError('teacher/native rows misaligned')
     target=np.load(a.root/'teacher-targets.npy',mmap_mode='r');n,vocab=target.shape
+    reference_sparse=torch.zeros((n,vocab),device='cpu',dtype=torch.float32) if a.tv_weight else None
+    if reference_sparse is not None:
+        for i,r in enumerate(teacher):
+            for token,probability in r['distribution']:reference_sparse[i,token]=probability
     x=np.fromfile(a.root/'student.f32',dtype='<f4').reshape(n,5120)
     x=torch.from_numpy(x).cuda()
     ids={s:[i for i,r in enumerate(teacher) if r['split']==s] for s in ['train','tune','heldout']}
@@ -74,6 +92,8 @@ def run(a):
         logits=predict(ix);kl=(ref.exp()*(ref-logits.log_softmax(-1))).sum(-1).mean()
         penalty=a.regularization*((p_in-base_in).square().mean()+(p_out-base_out).square().mean())
         loss=kl+penalty
+        if a.tv_weight:
+            loss=loss+a.tv_weight*sampler_tv_loss(logits,reference_sparse[ix].cuda(),torch)
         if not torch.isfinite(loss):raise ValueError('nonfinite calibration loss')
         optimizer.zero_grad();loss.backward();torch.nn.utils.clip_grad_norm_([p_in,p_out],1.0);optimizer.step()
         with torch.no_grad():p_in.clamp_(math.log(.25),math.log(4));p_out.clamp_(math.log(.25),math.log(4))
@@ -89,7 +109,7 @@ def run(a):
     native_before={s:summary([tv(teacher[i]['distribution'],native[i]['distribution']) for i in ids[s]]) for s in ids}
     result=dict(format='ctox.complete-chat-head-scale-screen.v1',scope='lm_head s_in/s_out only; body and quantized codes frozen',
         before=before,native_baseline=native_before,after=after,selected_step=chosen,history=history,
-        elapsed=time.monotonic()-started,steps=a.steps,lr=a.lr,regularization=a.regularization,
+        elapsed=time.monotonic()-started,steps=a.steps,lr=a.lr,regularization=a.regularization,tv_weight=a.tv_weight,
         student_sha256=sha(a.artifact),sources={p:sha(a.root/p) for p in ['chats.jsonl','teacher.jsonl','student.jsonl','student.f32','teacher-targets.npy']},
         native_candidate_verified=False,target_met=False,
         limitations=['selected assistant positions on teacher-forced complete source chats','bounded 2048-token cohort','head-only calibration; no general quantization recovery claim','MTP not evaluated'])
@@ -99,4 +119,5 @@ if __name__=='__main__':
     p=argparse.ArgumentParser()
     for name in ['root','artifact','legacy-training']:p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--steps',type=int,default=192);p.add_argument('--lr',type=float,default=.001);p.add_argument('--regularization',type=float,default=.1)
+    p.add_argument('--tv-weight',type=float,default=0.)
     run(p.parse_args())
