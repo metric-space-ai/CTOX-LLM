@@ -4,12 +4,17 @@ import argparse,json,subprocess,sys
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'sampling_tv'))
 from measure import tv,summary,sha
+from analyze import tool_positions,paired_summary
 
 def run(a):
     a.output.mkdir(parents=True,exist_ok=False)
     requests=[json.loads(l) for l in (a.reference/'requests.jsonl').read_text().splitlines()]
     teacher=[json.loads(l) for l in (a.reference/'teacher.jsonl').read_text().splitlines()]
     old=[json.loads(l) for l in (a.reference/'student.jsonl').read_text().splitlines()]
+    from tokenizers import Tokenizer
+    tok=Tokenizer.from_file(str(a.tokenizer))
+    opening=tok.encode('<tool_call>',add_special_tokens=False).ids;closing=tok.encode('</tool_call>',add_special_tokens=False).ids
+    spans={r['id']:tool_positions(r['token_ids'],opening,closing,tok.token_to_id('<|im_start|>')) for r in requests}
     rows=[];native_requests=[]
     for r in requests:
         positions=list(range(r['prompt_tokens']-1,len(r['token_ids'])-1))
@@ -27,14 +32,17 @@ def run(a):
         if c['row']!=b['row']:raise ValueError('candidate row differs')
         parity.append(tv(o['distribution'],b['distribution']))
         oldvalues.append(tv(t['distribution'],o['distribution']))
-        for label in ['overall',t['bucket']]:groups.setdefault(label,[]).append(tv(t['distribution'],c['distribution']))
+        kind='tool_call' if b['position']+1 in spans[t['id']] else 'other_assistant'
+        value=tv(t['distribution'],c['distribution'])
+        rows.append((t['id'],oldvalues[-1],value))
+        for label in ['overall',t['bucket'],'span/'+kind]:groups.setdefault(label,[]).append(value)
     if max(parity)>1e-6:raise ValueError('legacy baseline replay differs')
-    result=dict(format='ctox.original-tv-calibration-regression.v1',baseline=summary(oldvalues),native_replay_parity=summary(parity),
+    result=dict(format='ctox.original-tv-calibration-regression.v1',baseline=summary(oldvalues),native_replay_parity=summary(parity),paired=paired_summary(rows),
         candidate={k:summary(v) for k,v in groups.items()},below_5_percent=summary(groups['overall'])['mean_percent']<5,
         reference_hashes={n:sha(a.reference/n) for n in ['requests.jsonl','teacher.jsonl','student.jsonl']},
         scales_hashes={str(p):sha(p) for p in [Path(str(a.scales)+'.s_in.f16'),Path(str(a.scales)+'.s_out.f16')]})
     (a.output/'result.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result),flush=True)
 if __name__=='__main__':
     p=argparse.ArgumentParser()
-    for k in ['reference','output','student','head','artifact','cubin','scales']:p.add_argument('--'+k,type=Path,required=True)
+    for k in ['reference','output','student','head','artifact','cubin','scales','tokenizer']:p.add_argument('--'+k,type=Path,required=True)
     run(p.parse_args())

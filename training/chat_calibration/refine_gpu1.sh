@@ -19,5 +19,6 @@ for name in chats.jsonl teacher.jsonl teacher.complete.json teacher-targets.npy 
 "$python" "$source/select_candidate.py" --candidates "$previous" "$root/tv-variant" --output "$root/selected"
 "$source/chat-calibration-head" "$artifact" "$module" "$root/selected/student.f32" "$root/selected/head" "$root/selected/head-native.jsonl"
 "$python" "$source/verify.py" --root "$root/selected"
-"$python" "$source/legacy_check.py" --reference /home/deck/ctox-sampling-tv-20261016-v1/result --output "$root/legacy" --student "$source/chat-calibration-student" --head "$source/chat-calibration-head" --artifact "$artifact" --cubin "$module" --scales "$root/selected/head"
+"$python" "$source/analyze.py" --root "$root/selected" --tokenizer "$base/qwen38-q8-teacher/tokenizer.json"
+"$python" "$source/legacy_check.py" --reference /home/deck/ctox-sampling-tv-20261016-v1/result --output "$root/legacy" --student "$source/chat-calibration-student" --head "$source/chat-calibration-head" --artifact "$artifact" --cubin "$module" --scales "$root/selected/head" --tokenizer "$base/qwen38-q8-teacher/tokenizer.json"
 sha256sum "$source"/*.py "$source"/*.rs "$source"/*.sh "$source/chat-calibration-student" "$source/chat-calibration-head" > "$root/source-sha256.txt"
