@@ -84,7 +84,7 @@ def capture(a):
         teacher_sha256=expected,teacher_library_sha256=sha(a.library),bridge_sha256=sha(a.bridge),
         tokenizer_sha256=sha(root/'tokenizer.json'),template_sha256=sha(root/'chat_template.jinja'),
         cases_sha256=sha(a.cases),enable_thinking=False,trajectory='sampled-Q8',
-        phase='assistant_generation',forced_prefix_included=False,measured_precision='Q8-F16-state versus Q2/Q4-native-state',
+        phase='assistant_generation',forced_prefix_included=False,measured_precision='Q8 via llama.cpp versus native Q2/Q4 calibration graph; state and KV differences not isolated',
         intended_samples=len(cases))
     (out/'metadata.json').write_text(json.dumps(meta,indent=2)+'\n')
     b,s=load_bridge(a.library,a.bridge,model)
