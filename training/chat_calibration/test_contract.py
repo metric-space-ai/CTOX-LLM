@@ -15,4 +15,7 @@ class Contracts(unittest.TestCase):
     def test_position_selection_has_no_model_input(self):
         positions=[3,4,10,11,12,20,21,22]
         self.assertEqual(selected_positions(positions,4),[3,10,12,21])
+    def test_forced_empty_reasoning_prefix_excluded(self):
+        ids=[1,5,4,70,71,72,73,40,2]
+        self.assertEqual(assistant_positions(ids,1,2,[5,4],[70,71,72,73]),[6,7])
 if __name__=='__main__':unittest.main()

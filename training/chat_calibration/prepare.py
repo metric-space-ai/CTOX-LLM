@@ -12,12 +12,14 @@ def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def assistant_positions(ids, start_id, end_id, header):
+def assistant_positions(ids, start_id, end_id, header, forced_prefix=()):
     positions=[]; active=False; i=0
     while i<len(ids):
         if ids[i]==start_id:
             active=ids[i+1:i+1+len(header)]==header
             i+=1+len(header) if active else 1
+            if active and forced_prefix and ids[i:i+len(forced_prefix)]==list(forced_prefix):
+                i+=len(forced_prefix)
             continue
         if active and i>0: positions.append(i-1)  # prefix position predicts assistant token
         if ids[i]==end_id: active=False
@@ -42,15 +44,15 @@ def normalize(r):
         if any(t in content for t in ['<|im_start|>','<|im_end|>']):raise ValueError('embedded_role_marker')
         if m['role']=='user' and content.strip() in ['','-','...']:raise ValueError('missing_user_prompt')
         m['content']=content
-        calls=m.get('tool_calls',[])
+        calls=m.get('tool_calls') or []
         normalized=[]
         for c in calls:
             f=c.get('function',c);args=f.get('arguments',{})
             if isinstance(args,str):args=json.loads(args)
             if not isinstance(args,dict) or not isinstance(f.get('name'),str):raise ValueError('invalid_call')
             normalized.append({'name':f['name'],'arguments':args}); has_calls=True
-        if normalized:m['tool_calls']=normalized
-        else:m.pop('tool_calls',None)
+        m['tool_calls']=normalized
+        m['reasoning_content']=m.get('reasoning_content') or ''
     tools=r.get('tools') or []
     if has_calls and not tools:raise ValueError('missing_tool_schema')
     if tools:
@@ -87,10 +89,11 @@ def run(a):
             bucket='tool' if calls else 'general'
             if counts[split,bucket]>=quotas[split]:continue
             try:text=template.render(messages=messages,tools=tools,add_generation_prompt=False,enable_thinking=False)
-            except Exception:excluded['template_error']+=1;continue
+            except Exception as e:excluded['template_error:'+str(e)[:100]]+=1;continue
             encoded=tok.encode(text,add_special_tokens=False);ids=encoded.ids
             if len(ids)>a.context:excluded['over_context']+=1;continue
-            p=assistant_positions(ids,start,end,header)
+            forced=tok.encode('<think>\n\n</think>\n\n',add_special_tokens=False).ids
+            p=assistant_positions(ids,start,end,header,forced)
             if len(p)<8:excluded['too_few_assistant_tokens']+=1;continue
             h=digest(text)
             # First user prompt also prevents near-identical answer variants crossing splits.
