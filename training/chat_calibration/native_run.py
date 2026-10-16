@@ -4,7 +4,7 @@ import json,os,signal,subprocess,sys,time
 from pathlib import Path
 root=Path(sys.argv[1]);source=Path(__file__).resolve().parent
 runner=sys.argv[2] if len(sys.argv)>2 else "run_gpu1.sh"
-if runner not in {"run_gpu1.sh","refine_gpu1.sh"}:raise SystemExit("unknown bounded runner")
+if runner not in {"run_gpu1.sh","refine_gpu1.sh","diagnose_gpu1.sh"}:raise SystemExit("unknown bounded runner")
 deadline=int(sys.argv[3]) if len(sys.argv)>3 else 4500
 if not 1<=deadline<=4500:raise SystemExit("invalid bounded deadline")
 admitted=json.loads((root/'admitted.json').read_text())

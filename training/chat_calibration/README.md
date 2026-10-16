@@ -59,3 +59,10 @@ No weights, dense target caches or conversation contents belong in Git.
 
 Contract verification: run `check_contracts.py` through the admitted lane. It
 also mutates the assistant-role check and requires the masking contract to fail.
+
+`head_diagnosis.py` asks whether substituting a higher-precision output projection
+can recover the Q8 distributions while retaining the same native body states.
+It evaluates training and tuning positions only, with Q8 head weights and either
+FP32 inputs or native-style A8 rounding. It removes learned Q2/Q4 head corrections.
+This diagnostic is neither a native Q8 replay nor an additive decomposition of
+quantization error, and does not produce a deployable mixed-precision model.
