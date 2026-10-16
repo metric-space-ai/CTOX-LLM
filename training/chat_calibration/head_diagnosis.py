@@ -39,7 +39,7 @@ def run(a):
     result=dict(format='ctox.native-body-q8-head-diagnostic.v1',metrics={k:summary(v) for k,v in groups.items()},heldout_evaluated=False,
         scope='Frozen native normalized body states, Q8 head weights, no learned Q2/Q4 head corrections; FP32 matmul with either FP32 input or native-style A8 rounding',
         limitations=['Diagnostic only; not a native Q8 engine replay or shippable mixed-precision candidate','Not an additive attribution of body versus head quantization error; body/kernel/state differences remain'],
-        teacher_sha256=complete['teacher_sha256'],source_hashes={n:sha(a.root/n) for n in ['teacher.complete.json','teacher.jsonl','student.jsonl','student.f32']})
+        teacher_sha256=complete['teacher_sha256'],helper_hashes={name:sha(a.legacy_training/name) for name in ['q8_gguf.py','diagnose_q8_recovery.py']},source_hashes={n:sha(a.root/n) for n in ['teacher.complete.json','teacher.jsonl','student.jsonl','student.f32']})
     with a.output.open('x') as f:f.write(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result),flush=True)
 if __name__=='__main__':
