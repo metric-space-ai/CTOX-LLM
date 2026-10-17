@@ -32,5 +32,6 @@ for strength in 0.25 0.5 1.0; do
     "$python" "$source/replay.py" --artifact "$artifact" --overrides "$root/result/scale-overrides.npz" --native "$source/chat-calibration-student" --module "$module" --chats "$root/result/tune-chats.jsonl" --output "$root/result/candidate-$strength" --strength "$strength"
     "$python" "$source/verify.py" --reference "$root/result/tune-teacher.jsonl" --baseline "$root/result/student.jsonl" --candidate "$root/result/candidate-$strength/student.jsonl" --output "$root/result/candidate-$strength/tv.json"
 done
+"$python" "$source/evaluate.py" --root "$root/result" --frozen "$source/frozen" --legacy "$source/legacy" --tokenizer "$base/qwen38-q8-teacher/tokenizer.json" --artifact "$artifact" --native "$source/chat-calibration-student" --module "$module"
 sha256sum "$source"/*.py "$source"/*.rs "$source"/*.cpp "$source"/*.sh "$source"/*student "$source/block_bridge.so" > "$root/source-sha256.txt"
 du -sh "$root/result"
