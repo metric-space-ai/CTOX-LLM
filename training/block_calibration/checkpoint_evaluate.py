@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """Screen two preregistered checkpoint variants, then use the original generation guard."""
-import argparse,json
+import argparse,json,subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import replay,verify
 
 def run(a):
-    a.output.mkdir(exist_ok=False);scores=[]
+    a.output.mkdir(exist_ok=False);scores=[];failures=[]
     for name in ['body-only','all-scales']:
         output=a.output/name
-        replay.run(SimpleNamespace(artifact=a.artifact,overrides=a.scales/(name+'.npz'),native=a.native,module=a.module,
-            chats=a.previous/'tune-chats.jsonl',output=output,strength=1.,timeout=900,scale_scope='recovery'))
+        try:
+            replay.run(SimpleNamespace(artifact=a.artifact,overrides=a.scales/(name+'.npz'),native=a.native,module=a.module,
+                chats=a.previous/'tune-chats.jsonl',output=output,strength=1.,timeout=900,scale_scope='recovery'))
+        except subprocess.CalledProcessError as e:
+            failure=dict(variant=name,native_exit=e.returncode,quality_assessed=False)
+            failures.append(failure);(output/'native-failure.json').write_text(json.dumps(failure)+'\n')
+            continue
         verify.run(SimpleNamespace(reference=a.previous/'tune-teacher.jsonl',baseline=a.previous/'student.jsonl',candidate=output/'student.jsonl',output=output/'tv.json'))
         result=json.loads((output/'tv.json').read_text());scores.append((result['paired']['tune']['paired_delta_percentage_points'],name))
+    if not scores:
+        (a.output/'evaluation.json').write_text(json.dumps(dict(failed_variants=failures,target_met=False,status='no valid native candidate'))+'\n');return
     delta,name=min(scores)
-    selection=dict(variant=name,tuning_delta_pp=delta,policy='best of fixed body-only/all-scales variants by full-chat tuning TV',target_met=False)
+    selection=dict(variant=name,tuning_delta_pp=delta,failed_variants=failures,policy='best valid candidate among fixed body-only/all-scales variants by full-chat tuning TV',target_met=False)
     (a.output/'selection.json').write_text(json.dumps(selection,indent=2)+'\n')
     if delta>=0:
         print('Historical checkpoint rejected on full-chat tuning',flush=True);return
