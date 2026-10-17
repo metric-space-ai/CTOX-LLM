@@ -30,7 +30,7 @@ def run(a):
                         if not np.isfinite(values).all():raise ValueError('nonfinite state')
                         hf.write(values.astype('<f4').tobytes())
                     logits=np.ctypeslib.as_array(b.tv_logits(s),shape=(vocab,))
-                    jf.write(json.dumps(dict(id=r['id'],position=pos,row=rowno,split=r['split'],bucket=r['bucket'],distribution=distribution(logits)))+'\n')
+                    jf.write(json.dumps(dict(id=r['id'],position=pos,row=rowno,split=r['split'],bucket=r['bucket'],is_tool_call=pos in r['tool_positions'],distribution=distribution(logits)))+'\n')
                     rowno+=1;cursor=pos+1
                 hf.flush();jf.flush();print(f'Q8 blocks {r["id"][:12]} {len(r["positions"])} positions',flush=True)
     finally:b.tv_close(s)

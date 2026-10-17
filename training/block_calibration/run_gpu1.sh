@@ -23,6 +23,11 @@ r=Path(sys.argv[1])
 for src,dst in [('chats.jsonl','tune-chats.jsonl'),('teacher.jsonl','tune-teacher.jsonl')]:
  (r/dst).write_text(''.join(json.dumps(v)+'\n' for v in map(json.loads,(r/src).read_text().splitlines()) if v['split']=='tune'))
 PY
+chosen_count=$("$python" -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["chosen"]))' "$root/result/analysis.json")
+if [ "$chosen_count" = 0 ]; then
+    echo 'No bounded correction improved both train and tuning residuals; no candidate promoted.'
+    exit 0
+fi
 for strength in 0.25 0.5 1.0; do
     "$python" "$source/replay.py" --artifact "$artifact" --overrides "$root/result/scale-overrides.npz" --native "$source/chat-calibration-student" --module "$module" --chats "$root/result/tune-chats.jsonl" --output "$root/result/candidate-$strength" --strength "$strength"
     "$python" "$source/verify.py" --reference "$root/result/tune-teacher.jsonl" --candidate "$root/result/candidate-$strength/student.jsonl" --output "$root/result/candidate-$strength/tv.json"

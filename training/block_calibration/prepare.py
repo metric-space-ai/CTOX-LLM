@@ -24,7 +24,7 @@ def run(a):
         tool=sorted({i-1 for i in tool_positions(r['token_ids'],enc('<tool_call>'),enc('</tool_call>'),start)}&eligible)
         general=chat.selected_positions(sorted(eligible),8)
         p=sorted(set(general+(chat.selected_positions(tool,8) if tool else [])))
-        selected.append(dict(r,positions=p));counts[key]+=1;tool_count+=len(set(p)&set(tool))
+        selected.append(dict(r,positions=p,tool_positions=sorted(set(p)&set(tool))));counts[key]+=1;tool_count+=len(set(p)&set(tool))
     if any(counts[s,b]!=n for s,n in [('train',4),('tune',2)] for b in ['tool','general']):raise ValueError('cohort incomplete')
     a.output.mkdir(parents=True,exist_ok=False)
     (a.output/'chats.jsonl').write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in selected))

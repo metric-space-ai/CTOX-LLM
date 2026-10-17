@@ -60,6 +60,7 @@ def run(a):
     np.savez(a.root/'scale-overrides.npz',**arrays)
     result=dict(format='ctox.full-context-block-calibration.v1',boundaries=boundaries,chosen=chosen,
         baseline_tv={k:summary([tv(t[i]['distribution'],s[i]['distribution']) for i in v]) for k,v in ix.items()},
+        baseline_tool_tv={k:summary([tv(t[i]['distribution'],s[i]['distribution']) for i in v if t[i]['is_tool_call']]) for k,v in ix.items()},
         policy='train-only ridge fit of FFN s_out; gains restricted to +/-10%; at most4 blocks ranked by train local gain, each must improve local tuning MSE; native downstream TV still required',
         artifact_sha256=sha(a.artifact),sources={p:sha(a.root/p) for p in ['teacher.f32','student.f32','student-ffn.f32','teacher.jsonl','student.jsonl','chats.jsonl']},
         target_met=False,native_candidate_verified=False,
