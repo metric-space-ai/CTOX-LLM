@@ -41,3 +41,19 @@ binaries, and private input chats. Use the existing paired lane admission and
 bounded native supervisor; never launch it alongside an unowned GPU workload.
 `check_contracts.py` also verifies a mutation: omitting the residual subtraction
 must break known-scale recovery. The native run is the integration check.
+
+`prepare_checkpoint.py` recovers a completed historical fit only when its scale
+metadata binds the fit report, original artifact and pinned Q8 teacher. All
+non-scale tensor identities must match the current artifact, and evaluation
+conversation identities must be absent from historical calibration. It exports
+two fixed variants: the 64 main blocks only, and all saved scales. These are
+historical short-window fits, not new training on complete chats.
+
+The default replay scope remains FFN output scales. `--scale-scope recovery`
+explicitly permits existing FP16 input/output scales; tensor shapes, bounds and
+all quantized payloads stay fixed. `checkpoint_evaluate.py` selects between the
+two variants on full-chat tuning and then uses the original generation guard.
+The selected variant also runs on the frozen complete-chat holdout without
+further selection; `--holdout-only` resumes that step after a completed generation
+guard. The holdout was used in earlier experiments, so it is not fresh blind
+acceptance. This evaluator never promotes a model or declares the target met.

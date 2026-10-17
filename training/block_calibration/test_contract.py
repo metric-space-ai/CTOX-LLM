@@ -1,7 +1,12 @@
 import unittest,numpy as np,os,sys
 from analyze import fit_gain
 from replay import patched_manifest,seal_memfd
+from prepare_checkpoint import compare_weights
 class Contracts(unittest.TestCase):
+    def test_checkpoint_rejects_different_quantized_weights(self):
+        original={'tensors':[dict(name='model.weight',dtype='q2_b64',shape=[64],length=18,sha256='a'*64)]}
+        changed={'tensors':[dict(original['tensors'][0],sha256='b'*64)]}
+        with self.assertRaises(ValueError):compare_weights(original,changed)
     @unittest.skipUnless(sys.platform=='linux','Linux kernel contract')
     def test_sealed_candidate_cannot_be_modified(self):
         fd=os.memfd_create('ctox-seal-contract',os.MFD_ALLOW_SEALING)
@@ -23,4 +28,12 @@ class Contracts(unittest.TestCase):
         self.assertEqual(original['tensors'][1]['sha256'],'b'*64)
         with self.assertRaises(ValueError):patched_manifest(original,{'model.weight':np.ones(64)})
         with self.assertRaises(ValueError):patched_manifest(original,{name:np.array([np.nan,1.])})
+    def test_input_scale_requires_explicit_recovery_scope(self):
+        name='model.language_model.layers.0.mlp.down_proj.weight.s_in'
+        manifest={'tensors':[dict(name=name,dtype='f16',offset=0,length=4,shape=[2],sha256='a'*64)]}
+        values={name:np.ones(2,dtype='f2')}
+        with self.assertRaises(ValueError):patched_manifest(manifest,values)
+        updated,changes=patched_manifest(manifest,values,scope='recovery')
+        self.assertEqual(set(changes),{0})
+        self.assertNotEqual(updated['tensors'][0]['sha256'],manifest['tensors'][0]['sha256'])
 if __name__=='__main__':unittest.main()

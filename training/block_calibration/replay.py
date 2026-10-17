@@ -16,12 +16,13 @@ def seal_memfd(fd):
     fcntl.fcntl(fd,add,mask)
     if fcntl.fcntl(fd,get)&mask!=mask:raise RuntimeError('candidate sealing incomplete')
 
-def patched_manifest(manifest,overrides):
+def patched_manifest(manifest,overrides,scope='ffn-output'):
     import numpy as np
     doc=json.loads(json.dumps(manifest));changes={}
     entries={x['name']:x for x in doc['tensors']}
     for name,value in overrides.items():
-        if not name.endswith('.mlp.down_proj.weight.s_out') or name not in entries:raise ValueError('only existing FFN output scales may change')
+        allowed=name.endswith('.mlp.down_proj.weight.s_out') if scope=='ffn-output' else scope=='recovery' and name.endswith(('.weight.s_in','.weight.s_out'))
+        if not allowed or name not in entries:raise ValueError('only existing scales in the requested scope may change')
         e=entries[name];v=np.asarray(value,dtype='<f2')
         if e['dtype']!='f16' or list(v.shape)!=e['shape'] or not np.isfinite(v).all() or not ((v>=.25)&(v<=4)).all():raise ValueError('invalid scale shape/range')
         payload=v.tobytes()
@@ -42,7 +43,7 @@ def run(a):
             for name,value in overrides.items():
                 e=entries[name];source.seek(offset+e['offset']);old=np.frombuffer(source.read(e['length']),dtype='<f2').astype('f4')
                 overrides[name]=(old+(value.astype('f4')-old)*a.strength).astype('<f2')
-        doc,changes=patched_manifest(manifest,overrides)
+        doc,changes=patched_manifest(manifest,overrides,getattr(a,'scale_scope','ffn-output'))
         data=json.dumps(doc,separators=(',',':'),sort_keys=True).encode()
         if 64+len(data)>offset:raise ValueError('manifest exceeds original reserved area')
         header[3]=len(data)
@@ -59,7 +60,7 @@ def run(a):
             with a.chats.open() as request:
                 command=[str(a.native),f'/proc/self/fd/{fd}',str(a.module),str(a.output/'student')]
                 subprocess.run(command,stdin=request,pass_fds=(fd,),check=True,timeout=a.timeout)
-            (a.output/'override.json').write_text(json.dumps(dict(strength=a.strength,changed_tensors=list(overrides),
+            (a.output/'override.json').write_text(json.dumps(dict(strength=a.strength,scale_scope=getattr(a,'scale_scope','ffn-output'),changed_tensors=list(overrides),
                 overrides_sha256=hashlib.sha256(a.overrides.read_bytes()).hexdigest(),manifest_sha256=hashlib.sha256(data).hexdigest(),
                 backing='sealed memfd; all original quantized tensor payloads preserved'))+'\n')
         finally:os.close(fd)
@@ -67,6 +68,7 @@ if __name__=='__main__':
     p=argparse.ArgumentParser()
     for name in ['artifact','overrides','native','module','chats','output']:p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--strength',type=float,default=1);p.add_argument('--timeout',type=int,default=1200)
+    p.add_argument('--scale-scope',choices=['ffn-output','recovery'],default='ffn-output')
     a=p.parse_args()
     if not 0<a.strength<=1:raise SystemExit('invalid strength')
     run(a)
