@@ -53,4 +53,7 @@ The default replay scope remains FFN output scales. `--scale-scope recovery`
 explicitly permits existing FP16 input/output scales; tensor shapes, bounds and
 all quantized payloads stay fixed. `checkpoint_evaluate.py` selects between the
 two variants on full-chat tuning and then uses the original generation guard.
-It does not promote a model or replace independent holdout acceptance.
+The selected variant also runs on the frozen complete-chat holdout without
+further selection; `--holdout-only` resumes that step after a completed generation
+guard. The holdout was used in earlier experiments, so it is not fresh blind
+acceptance. This evaluator never promotes a model or declares the target met.
