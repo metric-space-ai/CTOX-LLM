@@ -60,7 +60,7 @@ def run(a):
             with a.chats.open() as request:
                 command=[str(a.native),f'/proc/self/fd/{fd}',str(a.module),str(a.output/'student')]
                 subprocess.run(command,stdin=request,pass_fds=(fd,),check=True,timeout=a.timeout)
-            (a.output/'override.json').write_text(json.dumps(dict(strength=a.strength,changed_tensors=list(overrides),
+            (a.output/'override.json').write_text(json.dumps(dict(strength=a.strength,scale_scope=getattr(a,'scale_scope','ffn-output'),changed_tensors=list(overrides),
                 overrides_sha256=hashlib.sha256(a.overrides.read_bytes()).hexdigest(),manifest_sha256=hashlib.sha256(data).hexdigest(),
                 backing='sealed memfd; all original quantized tensor payloads preserved'))+'\n')
         finally:os.close(fd)
