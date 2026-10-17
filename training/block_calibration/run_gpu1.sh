@@ -15,7 +15,7 @@ printf '%s  %s\n' b756d08e6e5db2ffe528b00055c24d1f0ed312e47a97a402898caf58193ad8
 "$python" "$source/prepare.py" --chats "$source/input-chats.jsonl" --tokenizer "$base/qwen38-q8-teacher/tokenizer.json" --output "$root/result"
 "$python" "$source/capture.py" --chats "$root/result/chats.jsonl" --output "$root/result" --teacher-root "$base/qwen38-q8-teacher" --library "$base/llama.cpp/build-cuda-shim3/bin/libllama.so" --bridge "$source/block_bridge.so"
 "$source/block-calibration-student" "$artifact" "$module" "$root/result/student" < "$root/result/chats.jsonl"
-"$python" "$source/analyze.py" --root "$root/result" --artifact "$artifact" --legacy-training /home/deck/ctox-p3a-clip-refit-source-20260908-v3
+"$python" "$source/analyze.py" --root "$root/result" --artifact "$artifact" --legacy-training /home/deck/ctox-p3a-clip-refit-source-20260908-v3 --frozen "$source/frozen"
 "$python" - "$root/result" <<'PY'
 import json,sys
 from pathlib import Path

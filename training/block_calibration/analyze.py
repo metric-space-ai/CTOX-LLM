@@ -26,6 +26,16 @@ def run(a):
     s=[json.loads(x) for x in (a.root/'student.jsonl').read_text().splitlines()]
     if len(t)!=len(s) or any((x['id'],x['position'],x['row'])!=(y['id'],y['position'],y['row']) for x,y in zip(t,s)):
         raise ValueError('state/target alignment')
+    frozen_chats={r['id']:r for r in map(json.loads,(a.frozen/'chats.jsonl').read_text().splitlines())}
+    for r in map(json.loads,(a.root/'chats.jsonl').read_text().splitlines()):
+        if r['token_ids']!=frozen_chats[r['id']]['token_ids']:raise ValueError('control conversation changed')
+    controls={}
+    for name,current in [('teacher',t),('student',s)]:
+        old={(r['id'],r['position']):r for r in map(json.loads,(a.frozen/(name+'.jsonl')).read_text().splitlines())}
+        values=[tv(r['distribution'],old[r['id'],r['position']]['distribution']) for r in current if (r['id'],r['position']) in old]
+        if len(values)<96:raise ValueError('insufficient shared control positions')
+        controls[name]=summary(values)
+        if name=='student' and max(values)>1e-8:raise ValueError(f'instrumented native replay changed distributions: {controls[name]}')
     n=len(t);teacher=np.memmap(a.root/'teacher.f32',dtype='<f4',mode='r',shape=(n,65,5120))
     student=np.memmap(a.root/'student.f32',dtype='<f4',mode='r',shape=(n,65,5120))
     terms=np.memmap(a.root/'student-ffn.f32',dtype='<f4',mode='r',shape=(n,64,2,5120))
@@ -58,7 +68,7 @@ def run(a):
     arrays={r['name']:np.asarray(r.pop('values'),dtype='<f2') for r in chosen}
     for r in chosen:r.pop('old')
     np.savez(a.root/'scale-overrides.npz',**arrays)
-    result=dict(format='ctox.full-context-block-calibration.v1',boundaries=boundaries,chosen=chosen,
+    result=dict(format='ctox.full-context-block-calibration.v1',boundaries=boundaries,chosen=chosen,control_replay_tv=controls,
         baseline_tv={k:summary([tv(t[i]['distribution'],s[i]['distribution']) for i in v]) for k,v in ix.items()},
         baseline_tool_tv={k:summary([tv(t[i]['distribution'],s[i]['distribution']) for i in v if t[i]['is_tool_call']]) for k,v in ix.items()},
         policy='train-only ridge fit of FFN s_out; gains restricted to +/-10%; at most4 blocks ranked by train local gain, each must improve local tuning MSE; native downstream TV still required',
@@ -69,5 +79,5 @@ def run(a):
     print(json.dumps({'baseline_tv':result['baseline_tv'],'chosen':chosen,'boundaries':boundaries}),flush=True)
 if __name__=='__main__':
     p=argparse.ArgumentParser()
-    for name in ['root','artifact','legacy-training']:p.add_argument('--'+name,type=Path,required=True)
+    for name in ['root','artifact','legacy-training','frozen']:p.add_argument('--'+name,type=Path,required=True)
     run(p.parse_args())
