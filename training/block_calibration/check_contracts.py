@@ -12,6 +12,14 @@ try:
  assert r.returncode!=0 and 'FAIL:' in r.stderr,r.stderr
  print('MUTATION PROOF: omit residual subtraction -> known scale recovery fails',flush=True)
 finally:p.write_text(original)
+p=root/'prepare_checkpoint.py';original=p.read_text();needle='if weights(original)!=weights(current):'
+assert original.count(needle)==1
+try:
+ p.write_text(original.replace(needle,'if False:'))
+ r=subprocess.run([sys.executable,str(root/'test_contract.py'),'Contracts.test_checkpoint_rejects_different_quantized_weights'],capture_output=True,text=True)
+ assert r.returncode!=0 and 'FAIL:' in r.stderr,r.stderr
+ print('MUTATION PROOF: remove checkpoint weight binding -> incompatible-weight rejection fails',flush=True)
+finally:p.write_text(original)
 if sys.platform=='linux':
  p=root/'replay.py';original=p.read_text();needle='fcntl.fcntl(fd,add,mask)'
  assert original.count(needle)==1
