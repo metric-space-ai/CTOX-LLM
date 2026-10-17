@@ -46,7 +46,7 @@ def run(a):
         verify.run(SimpleNamespace(reference=d/'teacher.jsonl',baseline=d/'baseline.jsonl',candidate=d/'candidate/student.jsonl',output=d/'tv.json'))
         reports[name]=json.loads((d/'tv.json').read_text())
     result=dict(selection=selection,cohorts=reports,target_met=False,
-        limitation='Independent cohort results require review; source-chat prefixes and Q8-generated prefixes are distinct populations')
+        limitation='Frozen holdout is excluded from this fit/selection but was evaluated in earlier experiments; it is not a new blind test. Source-chat and Q8-generated prefixes are distinct populations')
     (a.root/'evaluation.json').write_text(json.dumps(result,indent=2)+'\n')
 if __name__=='__main__':
     p=argparse.ArgumentParser()

@@ -1,6 +1,8 @@
 import subprocess,sys
 from pathlib import Path
 root=Path(__file__).resolve().parent
+for script in root.glob('*.py'):
+ compile(script.read_text(),str(script),'exec')
 subprocess.run([sys.executable,str(root/'test_contract.py')],check=True)
 p=root/'analyze.py';original=p.read_text();needle='np.sum(x*(target-residual),axis=0)'
 assert original.count(needle)==1
