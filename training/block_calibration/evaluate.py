@@ -42,7 +42,7 @@ def run(a):
         d=a.root/name;d.mkdir(exist_ok=False)
         for fn,rows in [('chats.jsonl',chats),('teacher.jsonl',teacher),('baseline.jsonl',baseline)]:write(d/fn,rows)
         replay.run(SimpleNamespace(artifact=a.artifact,overrides=a.root/'scale-overrides.npz',native=a.native,module=a.module,
-            chats=d/'chats.jsonl',output=d/'candidate',strength=strength,timeout=1500))
+            chats=d/'chats.jsonl',output=d/'candidate',strength=strength,timeout=2400))
         verify.run(SimpleNamespace(reference=d/'teacher.jsonl',baseline=d/'baseline.jsonl',candidate=d/'candidate/student.jsonl',output=d/'tv.json'))
         reports[name]=json.loads((d/'tv.json').read_text())
     result=dict(selection=selection,cohorts=reports,target_met=False,
