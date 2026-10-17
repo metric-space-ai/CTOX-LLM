@@ -7,6 +7,15 @@ The memfd is released when the bounded child completes.
 import argparse,hashlib,json,os,struct,subprocess,sys
 from pathlib import Path
 
+def seal_memfd(fd):
+    import fcntl
+    if sys.platform!='linux':raise RuntimeError('sealed candidate artifacts require Linux memfd')
+    # Linux UAPI values: some embedded CPython builds omit these module names.
+    add=getattr(fcntl,'F_ADD_SEALS',1033);get=getattr(fcntl,'F_GET_SEALS',1034)
+    mask=1|2|4|8  # SEAL_SEAL, SEAL_SHRINK, SEAL_GROW, SEAL_WRITE
+    fcntl.fcntl(fd,add,mask)
+    if fcntl.fcntl(fd,get)&mask!=mask:raise RuntimeError('candidate sealing incomplete')
+
 def patched_manifest(manifest,overrides):
     import numpy as np
     doc=json.loads(json.dumps(manifest));changes={}
@@ -22,7 +31,7 @@ def patched_manifest(manifest,overrides):
     return doc,changes
 
 def run(a):
-    import numpy as np,fcntl
+    import numpy as np
     header_struct=struct.Struct('<8sIIQQII24x')
     with a.artifact.open('rb') as source:
         header=list(header_struct.unpack(source.read(64)));length,offset=header[3:5]
@@ -45,7 +54,7 @@ def run(a):
                 target.seek(0);target.write(header_struct.pack(*header));target.write(data);target.write(bytes(offset-64-len(data)))
                 for start,payload in changes.items():target.seek(offset+start);target.write(payload)
                 target.flush()
-            fcntl.fcntl(fd,fcntl.F_ADD_SEALS,fcntl.F_SEAL_WRITE|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_GROW|fcntl.F_SEAL_SEAL)
+            seal_memfd(fd)
             a.output.mkdir(parents=True,exist_ok=False)
             with a.chats.open() as request:
                 command=[str(a.native),f'/proc/self/fd/{fd}',str(a.module),str(a.output/'student')]

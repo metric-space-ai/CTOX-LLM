@@ -1,7 +1,15 @@
-import unittest,numpy as np
+import unittest,numpy as np,os,sys
 from analyze import fit_gain
-from replay import patched_manifest
+from replay import patched_manifest,seal_memfd
 class Contracts(unittest.TestCase):
+    @unittest.skipUnless(sys.platform=='linux','Linux kernel contract')
+    def test_sealed_candidate_cannot_be_modified(self):
+        fd=os.memfd_create('ctox-seal-contract',os.MFD_ALLOW_SEALING)
+        try:
+            os.write(fd,b'original');seal_memfd(fd)
+            with self.assertRaises(PermissionError):os.pwrite(fd,b'changed!',0)
+            with self.assertRaises(PermissionError):os.ftruncate(fd,0)
+        finally:os.close(fd)
     def test_known_scale_recovery_and_trust_bound(self):
         x=np.array([[1.,2.],[2.,1.],[3.,4.]]);r=np.ones_like(x)
         np.testing.assert_allclose(fit_gain(x,r,r+1.05*x,0),[1.05,1.05],atol=1e-10)
