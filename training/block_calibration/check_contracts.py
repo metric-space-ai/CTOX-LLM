@@ -29,3 +29,20 @@ if sys.platform=='linux':
   assert r.returncode!=0 and 'FAIL:' in r.stderr,r.stderr
   print('MUTATION PROOF: omit memfd sealing -> kernel immutability contract fails',flush=True)
  finally:p.write_text(original)
+subprocess.run([sys.executable,str(root/'test_resume.py')],check=True)
+p=root/'resume_holdout.py';original=p.read_text();needle='if sha(path)!=contract[\'sha256\'][name]:'
+assert original.count(needle)==1
+try:
+ p.write_text(original.replace(needle,'if False:'))
+ r=subprocess.run([sys.executable,str(root/'test_resume.py'),'ResumeContracts.test_changed_runtime_or_sampler_cannot_resume'],capture_output=True,text=True)
+ assert r.returncode!=0 and 'FAIL:' in r.stderr,r.stderr
+ print('MUTATION PROOF: omit resume hash comparison -> changed-runtime rejection fails',flush=True)
+finally:p.write_text(original)
+p=root/'resume_holdout.py';original=p.read_text();needle='if seen[key]==expected[key]'
+assert original.count(needle)==1
+try:
+ p.write_text(original.replace(needle,'if seen[key]'))
+ r=subprocess.run([sys.executable,str(root/'test_resume.py'),'ResumeContracts.test_partial_chat_is_replayed_whole_and_merge_is_exact'],capture_output=True,text=True)
+ assert r.returncode!=0 and 'FAIL:' in r.stderr,r.stderr
+ print('MUTATION PROOF: accept partial chats as complete -> whole-chat continuation contract fails',flush=True)
+finally:p.write_text(original)
